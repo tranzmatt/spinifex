@@ -13,7 +13,7 @@ import (
 
 // TestBuildHeartbeat verifies that buildHeartbeat populates the struct from daemon state.
 func TestBuildHeartbeat(t *testing.T) {
-	rm, err := NewResourceManager()
+	rm, err := NewResourceManager(nil, nil, nil)
 	require.NoError(t, err)
 
 	d := &Daemon{
@@ -25,7 +25,7 @@ func TestBuildHeartbeat(t *testing.T) {
 			Services: []string{"daemon", "nats", "viperblock"},
 		},
 		resourceMgr: rm,
-		Instances:   vm.Instances{VMS: make(map[string]*vm.VM)},
+		vmMgr:       vm.NewManager(),
 	}
 
 	h := d.buildHeartbeat()
@@ -46,7 +46,7 @@ func TestBuildHeartbeat(t *testing.T) {
 
 // TestHeartbeatReflectsAllocation verifies that allocating resources changes the heartbeat values.
 func TestHeartbeatReflectsAllocation(t *testing.T) {
-	rm, err := NewResourceManager()
+	rm, err := NewResourceManager(nil, nil, nil)
 	require.NoError(t, err)
 
 	d := &Daemon{
@@ -58,7 +58,7 @@ func TestHeartbeatReflectsAllocation(t *testing.T) {
 			Services: []string{"daemon"},
 		},
 		resourceMgr: rm,
-		Instances:   vm.Instances{VMS: make(map[string]*vm.VM)},
+		vmMgr:       vm.NewManager(),
 	}
 
 	// Take a heartbeat before allocation
@@ -79,13 +79,11 @@ func TestHeartbeatReflectsAllocation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add a VM to the instance map
-	d.Instances.Mu.Lock()
-	d.Instances.VMS["i-test-001"] = &vm.VM{
+	d.vmMgr.Insert(&vm.VM{
 		ID:           "i-test-001",
 		Status:       vm.StateRunning,
 		InstanceType: allocType,
-	}
-	d.Instances.Mu.Unlock()
+	})
 
 	// Take a heartbeat after allocation
 	after := d.buildHeartbeat()

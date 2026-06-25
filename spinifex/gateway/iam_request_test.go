@@ -96,6 +96,10 @@ func (m *flexMockIAMService) GetPolicyVersion(_ string, _ *iam.GetPolicyVersionI
 	return &iam.GetPolicyVersionOutput{}, nil
 }
 
+func (m *flexMockIAMService) ListPolicyVersions(_ string, _ *iam.ListPolicyVersionsInput) (*iam.ListPolicyVersionsOutput, error) {
+	return &iam.ListPolicyVersionsOutput{}, nil
+}
+
 func (m *flexMockIAMService) ListPolicies(_ string, _ *iam.ListPoliciesInput) (*iam.ListPoliciesOutput, error) {
 	return &iam.ListPoliciesOutput{}, nil
 }
@@ -120,6 +124,10 @@ func (m *flexMockIAMService) GetUserPolicies(_, _ string) ([]handlers_iam.Policy
 	return nil, nil
 }
 
+func (m *flexMockIAMService) GetRolePolicies(_, _ string) ([]handlers_iam.PolicyDocument, error) {
+	return nil, nil
+}
+
 func (m *flexMockIAMService) LookupAccessKey(_ string) (*handlers_iam.AccessKey, error) {
 	return nil, errors.New("not implemented")
 }
@@ -134,8 +142,59 @@ func (m *flexMockIAMService) CreateAccount(_ string) (*handlers_iam.Account, err
 func (m *flexMockIAMService) GetAccount(_ string) (*handlers_iam.Account, error) { return nil, nil }
 func (m *flexMockIAMService) ListAccounts() ([]*handlers_iam.Account, error)     { return nil, nil }
 
-// setupIAMRequestHandler creates an http.Handler wired for IAM_Request testing.
-// It injects sigv4 context values so individual tests don't need SigV4 auth.
+func (m *flexMockIAMService) CreateRole(_ string, _ *iam.CreateRoleInput) (*iam.CreateRoleOutput, error) {
+	return &iam.CreateRoleOutput{}, nil
+}
+func (m *flexMockIAMService) GetRole(_ string, _ *iam.GetRoleInput) (*iam.GetRoleOutput, error) {
+	return &iam.GetRoleOutput{}, nil
+}
+func (m *flexMockIAMService) ListRoles(_ string, _ *iam.ListRolesInput) (*iam.ListRolesOutput, error) {
+	return &iam.ListRolesOutput{}, nil
+}
+func (m *flexMockIAMService) DeleteRole(_ string, _ *iam.DeleteRoleInput) (*iam.DeleteRoleOutput, error) {
+	return &iam.DeleteRoleOutput{}, nil
+}
+func (m *flexMockIAMService) UpdateRole(_ string, _ *iam.UpdateRoleInput) (*iam.UpdateRoleOutput, error) {
+	return &iam.UpdateRoleOutput{}, nil
+}
+func (m *flexMockIAMService) UpdateAssumeRolePolicy(_ string, _ *iam.UpdateAssumeRolePolicyInput) (*iam.UpdateAssumeRolePolicyOutput, error) {
+	return &iam.UpdateAssumeRolePolicyOutput{}, nil
+}
+func (m *flexMockIAMService) AttachRolePolicy(_ string, _ *iam.AttachRolePolicyInput) (*iam.AttachRolePolicyOutput, error) {
+	return &iam.AttachRolePolicyOutput{}, nil
+}
+func (m *flexMockIAMService) DetachRolePolicy(_ string, _ *iam.DetachRolePolicyInput) (*iam.DetachRolePolicyOutput, error) {
+	return &iam.DetachRolePolicyOutput{}, nil
+}
+func (m *flexMockIAMService) ListAttachedRolePolicies(_ string, _ *iam.ListAttachedRolePoliciesInput) (*iam.ListAttachedRolePoliciesOutput, error) {
+	return &iam.ListAttachedRolePoliciesOutput{}, nil
+}
+func (m *flexMockIAMService) CreateInstanceProfile(_ string, _ *iam.CreateInstanceProfileInput) (*iam.CreateInstanceProfileOutput, error) {
+	return &iam.CreateInstanceProfileOutput{}, nil
+}
+func (m *flexMockIAMService) GetInstanceProfile(_ string, _ *iam.GetInstanceProfileInput) (*iam.GetInstanceProfileOutput, error) {
+	return &iam.GetInstanceProfileOutput{}, nil
+}
+func (m *flexMockIAMService) ListInstanceProfiles(_ string, _ *iam.ListInstanceProfilesInput) (*iam.ListInstanceProfilesOutput, error) {
+	return &iam.ListInstanceProfilesOutput{}, nil
+}
+func (m *flexMockIAMService) DeleteInstanceProfile(_ string, _ *iam.DeleteInstanceProfileInput) (*iam.DeleteInstanceProfileOutput, error) {
+	return &iam.DeleteInstanceProfileOutput{}, nil
+}
+func (m *flexMockIAMService) ListInstanceProfilesForRole(_ string, _ *iam.ListInstanceProfilesForRoleInput) (*iam.ListInstanceProfilesForRoleOutput, error) {
+	return &iam.ListInstanceProfilesForRoleOutput{}, nil
+}
+func (m *flexMockIAMService) AddRoleToInstanceProfile(_ string, _ *iam.AddRoleToInstanceProfileInput) (*iam.AddRoleToInstanceProfileOutput, error) {
+	return &iam.AddRoleToInstanceProfileOutput{}, nil
+}
+func (m *flexMockIAMService) RemoveRoleFromInstanceProfile(_ string, _ *iam.RemoveRoleFromInstanceProfileInput) (*iam.RemoveRoleFromInstanceProfileOutput, error) {
+	return &iam.RemoveRoleFromInstanceProfileOutput{}, nil
+}
+func (m *flexMockIAMService) ResolveInstanceProfile(_, _ string) (*handlers_iam.InstanceProfile, error) {
+	return nil, nil
+}
+
+// setupIAMRequestHandler wires an http.Handler for IAM_Request with injected SigV4 context values.
 func setupIAMRequestHandler(svc handlers_iam.IAMService) http.Handler {
 	gw := &GatewayConfig{
 		DisableLogging: true,
@@ -284,7 +343,6 @@ func TestIAMRequest_MissingAccountID(t *testing.T) {
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), ctxService, "iam")
-		// No ctxAccountID set
 		r = r.WithContext(ctx)
 		if err := gw.IAM_Request(w, r); err != nil {
 			gw.ErrorHandler(w, r, err)
@@ -302,7 +360,6 @@ func TestIAMRequest_MissingAccountID(t *testing.T) {
 }
 
 func TestIAMRequest_ValidationError(t *testing.T) {
-	// CreateUser with missing UserName should return MissingParameter
 	handler := setupIAMRequestHandler(&flexMockIAMService{})
 
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("Action=CreateUser"))

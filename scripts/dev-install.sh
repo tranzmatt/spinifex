@@ -33,6 +33,8 @@ mkdir -p "$STAGING/systemd"
 cp "$PROJECT_ROOT/build/systemd/"* "$STAGING/systemd/"
 mkdir -p "$STAGING/scripts"
 cp "$PROJECT_ROOT/build/scripts/"* "$STAGING/scripts/"
+mkdir -p "$STAGING/udev"
+cp "$PROJECT_ROOT/build/udev/"* "$STAGING/udev/"
 cp "$PROJECT_ROOT/build/logrotate/spinifex" "$STAGING/logrotate-spinifex"
 tar czf /tmp/spinifex-local.tar.gz -C "$STAGING" .
 
@@ -42,9 +44,9 @@ sudo systemctl stop spinifex.target 2>/dev/null || true
 sudo systemctl reset-failed 'spinifex-*' 2>/dev/null || true
 
 # Remove stale files owned by the dev user in production paths.
-# Previous dev-mode installs (admin init without sudo, start-dev.sh) leave
-# files owned by tf-user that service users (spinifex-nats, etc.) can't read
-# under systemd's ProtectSystem=strict sandboxing.
+# A prior admin init run without sudo can leave files owned by tf-user that
+# service users (spinifex-nats, etc.) can't read under systemd's
+# ProtectSystem=strict sandboxing.
 for dir in /var/lib/spinifex /var/log/spinifex /etc/spinifex; do
     if [ -d "$dir" ]; then
         # Remove PID files, stale logs, and the legacy ~/spinifex/config symlink
@@ -77,10 +79,6 @@ SPINIFEX_AZ="${SPINIFEX_AZ:-${SPINIFEX_REGION}a}"
 echo "=== Initializing (region=$SPINIFEX_REGION az=$SPINIFEX_AZ) ==="
 sudo spx admin init --force --region "$SPINIFEX_REGION" --az "$SPINIFEX_AZ" --node node1 --nodes 1
 
-echo "=== Installing CA certificate ==="
-sudo cp /etc/spinifex/ca.pem /usr/local/share/ca-certificates/spinifex-ca.crt
-sudo update-ca-certificates
-
 echo "=== Starting services ==="
 sudo systemctl start spinifex.target
 
@@ -89,9 +87,19 @@ if ! id -Gn 2>/dev/null | grep -qw spinifex; then
     newgrp spinifex
 fi
 
-echo "=== Building and importing LB image ==="
-cd "$PROJECT_ROOT" && make build-lb-agent
-"$PROJECT_ROOT/scripts/build-system-image.sh" "$PROJECT_ROOT/scripts/images/lb.conf" --import --quiet
+echo "=== Building and installing microVM artifacts ==="
+cd "$PROJECT_ROOT" && make build-lb-agent install-microvm
+
+# Unified EKS node AMI (server + agent; role chosen at first boot). Heavy (full
+# Alpine + K3s build, needs sudo + network), so it is opt-in: set
+# DEV_INSTALL_EKS=1 to build + register it. Without it, `aws eks create-cluster`
+# fails AMI resolution until the operator runs `make import-eks-node-image`.
+if [ "${DEV_INSTALL_EKS:-0}" = "1" ]; then
+    echo "=== Building + importing eks-node AMI ==="
+    cd "$PROJECT_ROOT" && make import-eks-node-image
+else
+    echo "=== Skipping eks-node AMI (set DEV_INSTALL_EKS=1 to enable, or run 'make import-eks-node-image') ==="
+fi
 
 echo "=== Done ==="
 echo "Services: sudo systemctl status spinifex.target"

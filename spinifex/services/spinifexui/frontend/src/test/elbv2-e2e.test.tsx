@@ -178,14 +178,14 @@ const { sdk } = vi.hoisted(() => {
     ],
   ])
 
-  const send = vi.fn((command: Command): Promise<unknown> => {
+  const send = vi.fn(async (command: Command): Promise<unknown> => {
     const handler = handlers.get(command.constructor.name)
     if (!handler) {
-      return Promise.reject(
-        new Error(`No E2E handler for SDK command ${command.constructor.name}`),
+      throw new Error(
+        `No E2E handler for SDK command ${command.constructor.name}`,
       )
     }
-    return Promise.resolve(handler(command.input))
+    return handler(command.input)
   })
 
   return {
@@ -209,9 +209,7 @@ vi.mock("@/lib/awsClient", () => ({
 }))
 
 import {
-  useCreateListener,
-  useCreateLoadBalancer,
-  useCreateTargetGroup,
+  useCreateLoadBalancerWizard,
   useRegisterTargets,
 } from "@/mutations/elbv2"
 import {
@@ -237,22 +235,20 @@ function mustString(value: string | undefined, label: string): string {
   return value
 }
 
-beforeEach(() => {
-  sdk.reset()
-})
+function Harness() {
+  return {
+    wizard: useCreateLoadBalancerWizard(),
+    registerTargets: useRegisterTargets(),
+  }
+}
 
 describe("ELBv2 cross-slice flow (mocked SDK)", () => {
-  it("creates TG → LB → listener → registers targets → observes healthy state", async () => {
-    const qc = createQueryClient()
+  beforeEach(() => {
+    sdk.reset()
+  })
 
-    function Harness() {
-      return {
-        createTg: useCreateTargetGroup(),
-        createLb: useCreateLoadBalancer(),
-        createListener: useCreateListener(),
-        registerTargets: useRegisterTargets(),
-      }
-    }
+  it("creates TG → LB → listener via wizard → registers targets → observes healthy state", async () => {
+    const qc = createQueryClient()
 
     const { result } = renderHook(Harness, {
       wrapper: ({ children }: { children: ReactNode }) => (
@@ -260,51 +256,48 @@ describe("ELBv2 cross-slice flow (mocked SDK)", () => {
       ),
     })
 
-    // Step 1: create TG
-    const tgResult = await result.current.createTg.mutateAsync({
-      name: "my-tg",
-      protocol: "HTTP",
-      port: 80,
-      vpcId: "vpc-aaa",
-      healthCheck: {
-        protocol: "HTTP",
-        path: "/",
-        port: "traffic-port",
-        intervalSeconds: 30,
-        timeoutSeconds: 5,
-        healthyThresholdCount: 5,
-        unhealthyThresholdCount: 2,
-        matcher: "200",
+    // Step 1: wizard creates TG + LB + listener in one mutation
+    const wizardResult = await result.current.wizard.mutateAsync({
+      lb: {
+        name: "my-alb",
+        type: "application",
+        scheme: "internet-facing",
+        vpcId: "vpc-aaa",
+        subnetIds: ["subnet-a", "subnet-b"],
+        securityGroupIds: ["sg-1"],
+        tags: [],
       },
-      tags: [],
+      listener: {
+        protocol: "HTTP",
+        port: 80,
+        targetGroupMode: "new",
+        newTargetGroup: {
+          name: "my-tg",
+          protocol: "HTTP",
+          port: 80,
+          vpcId: "vpc-aaa",
+          healthCheck: {
+            protocol: "HTTP",
+            path: "/",
+            port: "traffic-port",
+            intervalSeconds: 30,
+            timeoutSeconds: 5,
+            healthyThresholdCount: 5,
+            unhealthyThresholdCount: 2,
+            matcher: "200",
+          },
+          tags: [],
+        },
+      },
     })
+    expect(wizardResult.error).toBeUndefined()
+    const lbArn = mustString(wizardResult.loadBalancerArn, "lbArn")
     const tgArn = mustString(
-      tgResult.TargetGroups?.[0]?.TargetGroupArn,
+      wizardResult.created.find((c) => c.type === "Target Group")?.id,
       "tgArn",
     )
 
-    // Step 2: create LB
-    const lbResult = await result.current.createLb.mutateAsync({
-      name: "my-alb",
-      scheme: "internet-facing",
-      subnetIds: ["subnet-a", "subnet-b"],
-      securityGroupIds: ["sg-1"],
-      tags: [],
-    })
-    const lbArn = mustString(
-      lbResult.LoadBalancers?.[0]?.LoadBalancerArn,
-      "lbArn",
-    )
-
-    // Step 3: create listener
-    await result.current.createListener.mutateAsync({
-      loadBalancerArn: lbArn,
-      protocol: "HTTP",
-      port: 80,
-      defaultTargetGroupArn: tgArn,
-    })
-
-    // Step 4: register two targets
+    // Step 2: register two targets
     await result.current.registerTargets.mutateAsync({
       targetGroupArn: tgArn,
       targets: [{ id: "i-aaa" }, { id: "i-bbb" }],

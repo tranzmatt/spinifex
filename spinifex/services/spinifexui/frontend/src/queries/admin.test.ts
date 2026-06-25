@@ -31,7 +31,7 @@ function getQueryFn(opts: {
 
 describe("adminNodesQueryOptions", () => {
   it("has the correct query key", () => {
-    expect(adminNodesQueryOptions.queryKey).toEqual(["admin", "nodes"])
+    expect(adminNodesQueryOptions.queryKey).toStrictEqual(["admin", "nodes"])
   })
 
   it("throws when not authenticated", async () => {
@@ -42,7 +42,12 @@ describe("adminNodesQueryOptions", () => {
   })
 
   it("calls signedFetch with GetNodes action", async () => {
-    const creds = { accessKeyId: "ak", secretAccessKey: "sk" }
+    const creds = {
+      accessKeyId: "ASIAak",
+      secretAccessKey: "sk",
+      sessionToken: "token",
+      expiration: new Date(Date.now() + 60_000).toISOString(),
+    }
     mockGetCredentials.mockReturnValue(creds)
     mockSignedFetch.mockResolvedValue({ nodes: [], cluster_mode: "single" })
 
@@ -57,7 +62,7 @@ describe("adminNodesQueryOptions", () => {
 
 describe("adminVMsQueryOptions", () => {
   it("has the correct query key", () => {
-    expect(adminVMsQueryOptions.queryKey).toEqual(["admin", "vms"])
+    expect(adminVMsQueryOptions.queryKey).toStrictEqual(["admin", "vms"])
   })
 
   it("throws when not authenticated", async () => {
@@ -68,7 +73,12 @@ describe("adminVMsQueryOptions", () => {
   })
 
   it("calls signedFetch with GetVMs action", async () => {
-    const creds = { accessKeyId: "ak", secretAccessKey: "sk" }
+    const creds = {
+      accessKeyId: "ASIAak",
+      secretAccessKey: "sk",
+      sessionToken: "token",
+      expiration: new Date(Date.now() + 60_000).toISOString(),
+    }
     mockGetCredentials.mockReturnValue(creds)
     mockSignedFetch.mockResolvedValue({ vms: [] })
 
@@ -83,7 +93,7 @@ describe("adminVMsQueryOptions", () => {
 
 describe("adminStorageStatusQueryOptions", () => {
   it("has the correct query key", () => {
-    expect(adminStorageStatusQueryOptions.queryKey).toEqual([
+    expect(adminStorageStatusQueryOptions.queryKey).toStrictEqual([
       "admin",
       "storageStatus",
     ])
@@ -97,7 +107,12 @@ describe("adminStorageStatusQueryOptions", () => {
   })
 
   it("calls signedFetch with GetStorageStatus action", async () => {
-    const creds = { accessKeyId: "ak", secretAccessKey: "sk" }
+    const creds = {
+      accessKeyId: "ASIAak",
+      secretAccessKey: "sk",
+      sessionToken: "token",
+      expiration: new Date(Date.now() + 60_000).toISOString(),
+    }
     mockGetCredentials.mockReturnValue(creds)
     mockSignedFetch.mockResolvedValue({})
 

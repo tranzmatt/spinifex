@@ -26,8 +26,6 @@ import (
 	"time"
 )
 
-// Helper functions for OS images
-
 var ErrQCOWDetected = errors.New("qcow format detected")
 
 const sumsFileMaxSize = 1 * 1024 * 1024 // 1 MB, matches formation.go JoinRequest cap.
@@ -39,26 +37,15 @@ var (
 	ErrChecksumFetchFailed     = errors.New("checksum fetch failed")
 )
 
-// checksumExtraRootCAs is a test-only hook so unit tests can stand up an
-// httptest.NewTLSServer (which uses a self-signed cert) without relaxing the
-// HTTPS enforcement. Production builds leave this nil and the verification
-// client uses the system trust store.
+// checksumExtraRootCAs is a test-only hook for httptest TLS servers; nil in production.
 var checksumExtraRootCAs *x509.CertPool
 
-// checksumFetchTimeout is a var (not const) so tests can shrink it to exercise
-// the context-deadline path without waiting 30s.
+// checksumFetchTimeout is a var so tests can shrink it to exercise the deadline path.
 var checksumFetchTimeout = 30 * time.Second
 
-// VerifyImageChecksum fetches the sums file at checksumURL, locates the entry
-// for imagePath's basename, hashes imagePath with the algorithm named by
-// checksumType ("sha256" or "sha512"), and compares digests.
-//
-// Fails closed: every error path returns without accepting the image. A
-// non-HTTPS scheme, non-2xx status, transport error, response over 1 MB, or
-// cross-scheme redirect all wrap ErrChecksumFetchFailed. Unknown algorithm
-// wraps ErrUnsupportedChecksumType. Missing filename entry wraps
-// ErrChecksumNotFound. Digest mismatch wraps ErrChecksumMismatch and the
-// wrapped error's %v includes expected and actual hex.
+// VerifyImageChecksum fetches the sums file at checksumURL, finds the entry for imagePath's basename,
+// hashes the file with checksumType ("sha256" or "sha512"), and compares digests.
+// Fails closed: non-HTTPS, non-2xx, oversized response, or digest mismatch all return a wrapped error.
 func VerifyImageChecksum(imagePath, checksumURL, checksumType string) error {
 	hasher, err := newHasher(checksumType)
 	if err != nil {
@@ -71,8 +58,7 @@ func VerifyImageChecksum(imagePath, checksumURL, checksumType string) error {
 		return err
 	}
 
-	// Distinct error for a catalog/sums-file algorithm mismatch — without this
-	// it'd surface as "tampering" via ConstantTimeCompare's length-0 return.
+	// Catch algorithm mismatch before ConstantTimeCompare; a length mismatch would look like tampering.
 	if len(expected) != hasher.Size()*2 {
 		return fmt.Errorf("%w: digest length %d from sums file does not match %s output length %d",
 			ErrChecksumFetchFailed, len(expected), checksumType, hasher.Size()*2)
@@ -108,10 +94,8 @@ func newHasher(checksumType string) (hash.Hash, error) {
 	}
 }
 
-// fetchExpectedDigest downloads the sums file and returns the hex digest for
-// the given filename. Enforces HTTPS on initial URL and every redirect hop,
-// caps redirects at 10, and truncates response at sumsFileMaxSize+1 so the
-// size check is unambiguous.
+// fetchExpectedDigest downloads the sums file and returns the hex digest for filename.
+// Enforces HTTPS on every redirect hop, caps at 10 redirects, and limits response to sumsFileMaxSize.
 func fetchExpectedDigest(checksumURL, filename string) (string, error) {
 	parsed, err := url.Parse(checksumURL)
 	if err != nil {
@@ -182,13 +166,9 @@ func fetchExpectedDigest(checksumURL, filename string) (string, error) {
 	return digest, nil
 }
 
-// parseSumsFile scans a coreutils-style sums file and returns the hex digest
-// matching filename. Filename match is case-sensitive: upstream Debian/Ubuntu/
-// Alpine sums are consistently lowercase and a divergence is a real signal.
-//
-// Accepts three on-the-wire shapes: "<hex>  <name>" (text mode), "<hex> *<name>"
-// (binary mode), and a bare single-token "<hex>" line (single-file .sha512 from
-// Alpine, which does not carry a filename).
+// parseSumsFile scans a sums file and returns the hex digest matching filename (case-sensitive).
+// Accepts GNU coreutils text/binary, BSD-style, and bare single-token (Alpine .sha512) formats.
+// GPG cleartext-signed armor is tolerated: its body lines always appear in pairs, keeping bareCount ≥ 2.
 func parseSumsFile(body []byte, filename string) (string, error) {
 	var bareDigest string
 	bareCount := 0
@@ -209,19 +189,24 @@ func parseSumsFile(body []byte, filename string) (string, error) {
 			if name == filename {
 				return fields[0], nil
 			}
+		case 4:
+			// BSD-style: "<algo> (<name>) = <hex>". The "=" guard rejects PGP armor lines that happen to tokenise to 4 fields.
+			if fields[2] != "=" || !strings.HasPrefix(fields[1], "(") || !strings.HasSuffix(fields[1], ")") {
+				continue
+			}
+			name := strings.TrimSuffix(strings.TrimPrefix(fields[1], "("), ")")
+			if name == filename {
+				return fields[3], nil
+			}
 		default:
-			// More than two fields: not a format we recognise. Skip rather than
-			// reject outright — signed sums files occasionally have trailing
-			// commentary we want to tolerate.
+			// Skip unrecognised shapes; signed sums files may have trailing commentary.
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return "", fmt.Errorf("%w: scan sums file: %v", ErrChecksumFetchFailed, err)
 	}
 
-	// Alpine single-file .sha512 fallback: exactly one bare-digest line in the
-	// whole file. Any more and we refuse, because we can't tell which line is
-	// the right one without a filename.
+	// Alpine single-file fallback: accept only if exactly one bare-digest line in the file.
 	if bareCount == 1 {
 		return bareDigest, nil
 	}
@@ -229,10 +214,8 @@ func parseSumsFile(body []byte, filename string) (string, error) {
 	return "", fmt.Errorf("%w: %s", ErrChecksumNotFound, filename)
 }
 
-// hashImageFile streams the image through hasher and returns the digest as
-// lowercase hex. Zero-byte files are rejected outright so a truncated
-// download surfaces as an explicit error rather than an opaque "checksum
-// mismatch".
+// hashImageFile streams imagePath through hasher and returns lowercase hex.
+// Rejects zero-byte files so a truncated download surfaces as an explicit error.
 func hashImageFile(imagePath string, hasher hash.Hash) (string, error) {
 	f, err := os.Open(imagePath)
 	if err != nil {
@@ -266,159 +249,211 @@ type Images struct {
 	Checksum     string    `json:"checksum"`
 	ChecksumType string    `json:"checksum_type"`
 	BootMode     string    `json:"boot_mode"`
-	Starred      bool      `json:"starred"`
-	// Tags are copied onto the imported AMI's AMIMetadata.Tags so the UI
-	// can filter/classify the image. Used to mark system-owned AMIs
-	// (e.g. the LB/HAProxy image) via spinifex:managed-by.
+	// Tags are copied onto the imported AMI's metadata for UI filtering (e.g. spinifex:managed-by).
 	Tags map[string]string `json:"tags,omitempty"`
+}
+
+// distroFamilies maps a distro name to its cloud-init family. Keys are lowercase.
+var distroFamilies = map[string]string{
+	"debian": "debian",
+	"ubuntu": "debian",
+	"rocky":  "rhel",
+	"rhel":   "rhel",
+	"alma":   "rhel",
+	"fedora": "rhel",
+	"centos": "rhel",
+	"alpine": "alpine",
+}
+
+// DistroFamily returns the cloud-init family for distro.
+// Unknown or empty distro defaults to "debian" with a warning; RHEL family requires an explicit distro flag.
+func DistroFamily(distro string) string {
+	d := strings.ToLower(strings.TrimSpace(distro))
+	if family, ok := distroFamilies[d]; ok {
+		return family
+	}
+	slog.Warn("unknown distro, defaulting to debian-family cloud-init", "distro", distro)
+	return "debian"
 }
 
 var AvailableImages = map[string]Images{
 
-	"debian-12-x86_64": {
-		Name:         "debian-12-x86_64",
-		Description:  "Debian 12 (Bookworm) x86_64 cloud image",
+	"debian-13-x86_64": {
+		Name:         "debian-13-x86_64",
+		Description:  "Debian 13 (Trixie) x86_64 cloud image",
 		Distro:       "debian",
-		Version:      "12",
+		Version:      "13",
 		Arch:         "x86_64",
 		Platform:     "Linux/UNIX",
-		CreatedAt:    time.Date(2025, 10, 6, 0, 0, 0, 0, time.UTC),
-		URL:          "https://cdimage.debian.org/cdimage/cloud/bookworm/latest/debian-12-generic-amd64.tar.xz",
-		Checksum:     "https://cdimage.debian.org/cdimage/cloud/bookworm/latest/SHA512SUMS",
+		CreatedAt:    time.Date(2026, 5, 18, 0, 0, 0, 0, time.UTC),
+		URL:          "https://cloud.debian.org/images/cloud/trixie/20260518-2482/debian-13-genericcloud-amd64-20260518-2482.tar.xz",
+		Checksum:     "https://cloud.debian.org/images/cloud/trixie/20260518-2482/SHA512SUMS",
 		ChecksumType: "sha512",
-		BootMode:     "bios",
-		Starred:      true,
+		BootMode:     "uefi",
 	},
 
-	"debian-12-arm64": {
-		Name:         "debian-12-arm64",
-		Description:  "Debian 12 (Bookworm) arm64 cloud image",
+	"debian-13-arm64": {
+		Name:         "debian-13-arm64",
+		Description:  "Debian 13 (Trixie) arm64 cloud image",
 		Distro:       "debian",
-		Version:      "12",
+		Version:      "13",
 		Arch:         "arm64",
 		Platform:     "Linux/UNIX",
-		CreatedAt:    time.Date(2025, 10, 6, 0, 0, 0, 0, time.UTC),
-		URL:          "https://cdimage.debian.org/cdimage/cloud/bookworm/latest/debian-12-generic-arm64.tar.xz",
-		Checksum:     "https://cdimage.debian.org/cdimage/cloud/bookworm/latest/SHA512SUMS",
+		CreatedAt:    time.Date(2026, 5, 18, 0, 0, 0, 0, time.UTC),
+		URL:          "https://cloud.debian.org/images/cloud/trixie/20260518-2482/debian-13-genericcloud-arm64-20260518-2482.tar.xz",
+		Checksum:     "https://cloud.debian.org/images/cloud/trixie/20260518-2482/SHA512SUMS",
 		ChecksumType: "sha512",
-		BootMode:     "bios",
-		Starred:      true,
+		BootMode:     "uefi",
 	},
 
-	"ubuntu-24.04-x86_64": {
-		Name:         "ubuntu-24.04-x86_64",
-		Description:  "Ubuntu 24.04 LTS (Noble Numbat) x86_64 cloud image",
+	"ubuntu-26.04-x86_64": {
+		Name:         "ubuntu-26.04-x86_64",
+		Description:  "Ubuntu 26.04 LTS (Resolute Reindeer) x86_64 cloud image",
 		Distro:       "ubuntu",
-		Version:      "24.04",
+		Version:      "26.04",
 		Arch:         "x86_64",
 		Platform:     "Linux/UNIX",
-		CreatedAt:    time.Date(2025, 10, 6, 0, 0, 0, 0, time.UTC),
-		URL:          "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
-		Checksum:     "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS",
+		CreatedAt:    time.Date(2026, 4, 21, 0, 0, 0, 0, time.UTC),
+		URL:          "https://cloud-images.ubuntu.com/resolute/20260421/resolute-server-cloudimg-amd64.img",
+		Checksum:     "https://cloud-images.ubuntu.com/resolute/20260421/SHA256SUMS",
 		ChecksumType: "sha256",
-		BootMode:     "bios",
-		Starred:      false,
+		BootMode:     "uefi",
 	},
 
-	"ubuntu-24.04-arm64": {
-		Name:         "ubuntu-24.04-arm64",
-		Description:  "Ubuntu 24.04 LTS (Noble Numbat) arm64 cloud image",
+	"ubuntu-26.04-arm64": {
+		Name:         "ubuntu-26.04-arm64",
+		Description:  "Ubuntu 26.04 LTS (Resolute Reindeer) arm64 cloud image",
 		Distro:       "ubuntu",
-		Version:      "24.04",
+		Version:      "26.04",
 		Arch:         "arm64",
 		Platform:     "Linux/UNIX",
-		CreatedAt:    time.Date(2025, 10, 6, 0, 0, 0, 0, time.UTC),
-		URL:          "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img",
-		Checksum:     "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS",
+		CreatedAt:    time.Date(2026, 4, 21, 0, 0, 0, 0, time.UTC),
+		URL:          "https://cloud-images.ubuntu.com/resolute/20260421/resolute-server-cloudimg-arm64.img",
+		Checksum:     "https://cloud-images.ubuntu.com/resolute/20260421/SHA256SUMS",
+		ChecksumType: "sha256",
+		BootMode:     "uefi",
+	},
+
+	"alpine-3.22.4-x86_64": {
+		Name:         "alpine-3.22.4-x86_64",
+		Description:  "Alpine Linux 3.22.4 x86_64 cloud image",
+		Distro:       "alpine",
+		Version:      "3.22.4",
+		Arch:         "x86_64",
+		Platform:     "Linux/UNIX",
+		CreatedAt:    time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC),
+		URL:          "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.4-x86_64-uefi-cloudinit-r0.qcow2",
+		Checksum:     "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.4-x86_64-uefi-cloudinit-r0.qcow2.sha512",
+		ChecksumType: "sha512",
+		BootMode:     "uefi",
+	},
+
+	"alpine-3.22.4-arm64": {
+		Name:         "alpine-3.22.4-arm64",
+		Description:  "Alpine Linux 3.22.4 arm64 cloud image",
+		Distro:       "alpine",
+		Version:      "3.22.4",
+		Arch:         "arm64",
+		Platform:     "Linux/UNIX",
+		CreatedAt:    time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC),
+		URL:          "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.4-aarch64-uefi-cloudinit-r0.qcow2",
+		Checksum:     "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.4-aarch64-uefi-cloudinit-r0.qcow2.sha512",
+		ChecksumType: "sha512",
+		BootMode:     "uefi",
+	},
+
+	"rocky-10-x86_64": {
+		Name:         "rocky-10-x86_64",
+		Description:  "Rocky Linux 10 x86_64 cloud image",
+		Distro:       "rocky",
+		Version:      "10",
+		Arch:         "x86_64",
+		Platform:     "Linux/UNIX",
+		CreatedAt:    time.Date(2025, 11, 16, 0, 0, 0, 0, time.UTC),
+		URL:          "https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base-10.1-20251116.0.x86_64.qcow2",
+		Checksum:     "https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base-10.1-20251116.0.x86_64.qcow2.CHECKSUM",
+		ChecksumType: "sha256",
+		BootMode:     "uefi",
+	},
+
+	"rocky-10-arm64": {
+		Name:         "rocky-10-arm64",
+		Description:  "Rocky Linux 10 arm64 cloud image",
+		Distro:       "rocky",
+		Version:      "10",
+		Arch:         "arm64",
+		Platform:     "Linux/UNIX",
+		CreatedAt:    time.Date(2025, 11, 16, 0, 0, 0, 0, time.UTC),
+		URL:          "https://dl.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-GenericCloud-Base-10.1-20251116.0.aarch64.qcow2",
+		Checksum:     "https://dl.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-GenericCloud-Base-10.1-20251116.0.aarch64.qcow2.CHECKSUM",
+		ChecksumType: "sha256",
+		BootMode:     "uefi",
+	},
+
+	"ubuntu-26.04-nvidia-gpu-x86_64": {
+		Name:         "ubuntu-26.04-nvidia-gpu-x86_64",
+		Description:  "Ubuntu 26.04 NVIDIA GPU base image — NVIDIA server driver, Python toolchain, Docker, nvidia-container-toolkit",
+		Distro:       "ubuntu",
+		Version:      "26.04",
+		Arch:         "x86_64",
+		Platform:     "Linux/UNIX",
+		CreatedAt:    time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		URL:          "https://iso.mulgadc.com/system-ami/ubuntu-26.04-nvidia-gpu-x86_64.qcow2",
+		Checksum:     "https://iso.mulgadc.com/system-ami/ubuntu-26.04-nvidia-gpu-x86_64.qcow2.sha256",
+		ChecksumType: "sha256",
+		BootMode:     "uefi",
+		Tags:         map[string]string{"gpu-vendor": "nvidia"},
+	},
+
+	"ubuntu-26.04-amd-gpu-x86_64": {
+		Name:         "ubuntu-26.04-amd-gpu-x86_64",
+		Description:  "Ubuntu 26.04 AMD GPU base image — linux-firmware, ROCm CLI, Python toolchain, Docker",
+		Distro:       "ubuntu",
+		Version:      "26.04",
+		Arch:         "x86_64",
+		Platform:     "Linux/UNIX",
+		CreatedAt:    time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		URL:          "https://iso.mulgadc.com/system-ami/ubuntu-26.04-amd-gpu-x86_64.qcow2",
+		Checksum:     "https://iso.mulgadc.com/system-ami/ubuntu-26.04-amd-gpu-x86_64.qcow2.sha256",
+		ChecksumType: "sha256",
+		BootMode:     "uefi",
+		Tags:         map[string]string{"gpu-vendor": "amd"},
+	},
+
+	// EKS node system AMI. Resolved by spinifex:managed-by=eks tag — importing this entry is sufficient for CreateCluster/CreateNodegroup.
+	"spinifex-eks-node": {
+		Name:         "spinifex-eks-node",
+		Description:  "Mulga EKS node image — Alpine 3.21.7 + K3s v1.32.5 + eks-token-webhook (server|agent role selected at first boot)",
+		Distro:       "alpine",
+		Version:      "3.21.7",
+		Arch:         "x86_64",
+		Platform:     "Linux/UNIX",
+		CreatedAt:    time.Date(2026, 6, 8, 0, 0, 0, 0, time.UTC),
+		URL:          "https://iso.mulgadc.com/system-ami/spinifex-eks-node-x86_64.qcow2",
+		Checksum:     "https://iso.mulgadc.com/system-ami/spinifex-eks-node-x86_64.qcow2.sha256",
 		ChecksumType: "sha256",
 		BootMode:     "bios",
-		Starred:      false,
-	},
-
-	"alpine-3.22.2-x86_64": {
-		Name:         "alpine-3.22.2-x86_64",
-		Description:  "Alpine Linux 3.22.2 x86_64 cloud image",
-		Distro:       "alpine",
-		Version:      "3.22.2",
-		Arch:         "x86_64",
-		Platform:     "Linux/UNIX",
-		CreatedAt:    time.Date(2025, 10, 6, 0, 0, 0, 0, time.UTC),
-		URL:          "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2",
-		Checksum:     "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2.sha512",
-		ChecksumType: "sha512",
-		BootMode:     "bios",
-		Starred:      false,
-	},
-
-	/*
-		"alpine-3.22.2-arm64":
-		// Alpine Linux (cloud init) arm64 (Requires UEFI boot, TODO)
-		{
-			Name:         "alpine-3.22.2-arm64",
-			Description:  "Alpine Linux 3.22.2 arm64 cloud image",
-			Distro:       "alpine",
-			Version:      "3.22.2",
-			Arch:         "arm64",
-			Platform:     "Linux/UNIX",
-			CreatedAt:    time.Date(2025, 10, 6, 0, 0, 0, 0, time.UTC),
-			URL:          "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/gcp_alpine-3.22.2-aarch64-uefi-cloudinit-metal-r0.raw.tar.gz",
-			Checksum:     "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/gcp_alpine-3.22.2-aarch64-uefi-cloudinit-metal-r0.raw.tar.gz.sha512",
-			ChecksumType: "sha512",
-			BootMode:     "uefi",
-			Starred:      false,
-		},
-	*/
-
-	// Alpine Linux (cloud init) x86_64 — LB system image with HAProxy and lb-agent
-	"lb-alpine-3.21.6-x86_64": {
-		Name:         "lb-alpine-3.21.6-x86_64",
-		Description:  "LB Alpine Linux 3.21.6 x86_64 system image",
-		Distro:       "alpine",
-		Version:      "3.21.6",
-		Arch:         "x86_64",
-		Platform:     "Linux/UNIX",
-		CreatedAt:    time.Date(2026, 03, 27, 0, 0, 0, 0, time.UTC),
-		URL:          "https://iso.mulgadc.com/system-ami/lb-alpine-3.21.6-x86_64.raw",
-		Checksum:     "https://iso.mulgadc.com/system-ami/lb-alpine-3.21.6-x86_64.raw.sha512",
-		ChecksumType: "sha512",
-		BootMode:     "bios",
-		Starred:      false,
-		// Marked system-managed: the UI hides this AMI from the Images
-		// page so customers don't mistake it for a bootable OS image.
-		Tags: map[string]string{
-			"spinifex:managed-by": "elbv2",
-		},
+		Tags:         map[string]string{"spinifex:managed-by": "eks"},
 	},
 }
 
-// AMI / image extraction utils
 func ExtractDiskImageFromFile(imagepath string, tmpdir string) (diskimage string, err error) {
 	var args []string
 	var execCmd string
 
-	// Confirm file exists
 	_, err = os.Stat(imagepath)
-
 	if err != nil {
 		return diskimage, err
 	}
 
-	// Extract the filepath
 	imagefile := filepath.Base(imagepath)
 
-	// Already in raw/image formt, confirm the file contains a valid disk image/MBR
 	if strings.HasSuffix(imagefile, ".raw") || strings.HasSuffix(imagefile, ".img") || strings.HasSuffix(imagefile, ".qcow2") || strings.HasSuffix(imagefile, ".qcow") {
 		path, err := filepath.Abs(imagepath)
-
 		if err != nil {
 			return path, err
 		}
-
-		// Validate the specified filename is indeed a disk image / MBR
 		err = validateDiskImagePath(path)
-
-		// Check error response
-
 		if errors.Is(err, ErrQCOWDetected) {
 			extractpath := fmt.Sprintf("%s/%s", tmpdir, imagefile)
 			extractpath = strings.TrimSuffix(extractpath, ".qcow2") + ".raw"

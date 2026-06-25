@@ -17,28 +17,33 @@ on:
       - dev
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build_and_test:
     name: Build and Test
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout Spinifex
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: spinifex
           fetch-depth: 2
 
       - name: Checkout Viperblock
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: mulgadc/viperblock
+          ref: dev
           path: viperblock
 
       - name: Checkout Predastore
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: mulgadc/predastore
+          ref: dev
           path: predastore
 
       - name: Setup Go
@@ -53,32 +58,40 @@ jobs:
       - name: Build Spinifex
         run: make -C spinifex build
 
+      - name: Manifest check + drift lint
+        run: make -C spinifex manifest-check manifest-lint
+
       - name: Run Tests with Coverage
         run: make -C spinifex test-cover
+
+      - name: Run Action Tests
+        run: make -C spinifex test-actions
 
       - name: Check Diff Coverage
         run: cd spinifex && scripts/diff-coverage.sh coverage.out --base HEAD~1
 
   race_detection:
     name: Race Detection
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout Spinifex
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: spinifex
 
       - name: Checkout Viperblock
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: mulgadc/viperblock
+          ref: dev
           path: viperblock
 
       - name: Checkout Predastore
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: mulgadc/predastore
+          ref: dev
           path: predastore
 
       - name: Setup Go
@@ -95,24 +108,26 @@ jobs:
 
   lint_and_security:
     name: Lint and Security
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout Spinifex
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: spinifex
 
       - name: Checkout Viperblock
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: mulgadc/viperblock
+          ref: dev
           path: viperblock
 
       - name: Checkout Predastore
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: mulgadc/predastore
+          ref: dev
           path: predastore
 
       - name: Setup Go
@@ -127,7 +142,7 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.11.3
+          version: v2.12.2
           working-directory: spinifex
 
       - name: Govulncheck

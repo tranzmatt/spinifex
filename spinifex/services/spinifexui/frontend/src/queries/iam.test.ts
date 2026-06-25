@@ -8,21 +8,27 @@ vi.mock("@/lib/awsClient", () => ({
 
 import {
   iamAccessKeysQueryOptions,
+  iamAttachedRolePoliciesQueryOptions,
   iamAttachedUserPoliciesQueryOptions,
+  iamInstanceProfileQueryOptions,
+  iamInstanceProfilesForRoleQueryOptions,
+  iamInstanceProfilesQueryOptions,
   iamPoliciesQueryOptions,
   iamPolicyQueryOptions,
   iamPolicyVersionQueryOptions,
+  iamRoleQueryOptions,
+  iamRolesQueryOptions,
   iamUserQueryOptions,
   iamUsersQueryOptions,
 } from "./iam"
 
 describe("query keys", () => {
   it("iamUsersQueryOptions has correct key", () => {
-    expect(iamUsersQueryOptions.queryKey).toEqual(["iam", "users"])
+    expect(iamUsersQueryOptions.queryKey).toStrictEqual(["iam", "users"])
   })
 
   it("iamUserQueryOptions includes userName in key", () => {
-    expect(iamUserQueryOptions("admin").queryKey).toEqual([
+    expect(iamUserQueryOptions("admin").queryKey).toStrictEqual([
       "iam",
       "users",
       "admin",
@@ -30,7 +36,7 @@ describe("query keys", () => {
   })
 
   it("iamAccessKeysQueryOptions includes userName in key", () => {
-    expect(iamAccessKeysQueryOptions("admin").queryKey).toEqual([
+    expect(iamAccessKeysQueryOptions("admin").queryKey).toStrictEqual([
       "iam",
       "access-keys",
       "admin",
@@ -38,20 +44,20 @@ describe("query keys", () => {
   })
 
   it("iamPoliciesQueryOptions has correct key", () => {
-    expect(iamPoliciesQueryOptions.queryKey).toEqual(["iam", "policies"])
+    expect(iamPoliciesQueryOptions.queryKey).toStrictEqual(["iam", "policies"])
   })
 
   it("iamPolicyQueryOptions includes policyArn in key", () => {
     expect(
       iamPolicyQueryOptions("arn:aws:iam::123:policy/ReadOnly").queryKey,
-    ).toEqual(["iam", "policies", "arn:aws:iam::123:policy/ReadOnly"])
+    ).toStrictEqual(["iam", "policies", "arn:aws:iam::123:policy/ReadOnly"])
   })
 
   it("iamPolicyVersionQueryOptions includes policyArn and versionId in key", () => {
     expect(
       iamPolicyVersionQueryOptions("arn:aws:iam::123:policy/ReadOnly", "v1")
         .queryKey,
-    ).toEqual([
+    ).toStrictEqual([
       "iam",
       "policy-versions",
       "arn:aws:iam::123:policy/ReadOnly",
@@ -60,11 +66,46 @@ describe("query keys", () => {
   })
 
   it("iamAttachedUserPoliciesQueryOptions includes userName in key", () => {
-    expect(iamAttachedUserPoliciesQueryOptions("admin").queryKey).toEqual([
+    expect(iamAttachedUserPoliciesQueryOptions("admin").queryKey).toStrictEqual(
+      ["iam", "attached-user-policies", "admin"],
+    )
+  })
+
+  it("iamRolesQueryOptions has correct key", () => {
+    expect(iamRolesQueryOptions.queryKey).toStrictEqual(["iam", "roles"])
+  })
+
+  it("iamRoleQueryOptions includes roleName in key", () => {
+    expect(iamRoleQueryOptions("my-role").queryKey).toStrictEqual([
       "iam",
-      "attached-user-policies",
-      "admin",
+      "roles",
+      "my-role",
     ])
+  })
+
+  it("iamAttachedRolePoliciesQueryOptions includes roleName in key", () => {
+    expect(
+      iamAttachedRolePoliciesQueryOptions("my-role").queryKey,
+    ).toStrictEqual(["iam", "attached-role-policies", "my-role"])
+  })
+
+  it("iamInstanceProfilesQueryOptions has correct key", () => {
+    expect(iamInstanceProfilesQueryOptions.queryKey).toStrictEqual([
+      "iam",
+      "instance-profiles",
+    ])
+  })
+
+  it("iamInstanceProfileQueryOptions includes name in key", () => {
+    expect(iamInstanceProfileQueryOptions("my-profile").queryKey).toStrictEqual(
+      ["iam", "instance-profiles", "my-profile"],
+    )
+  })
+
+  it("iamInstanceProfilesForRoleQueryOptions includes roleName in key", () => {
+    expect(
+      iamInstanceProfilesForRoleQueryOptions("my-role").queryKey,
+    ).toStrictEqual(["iam", "instance-profiles-for-role", "my-role"])
   })
 })
 
@@ -111,7 +152,7 @@ describe("queryFn", () => {
     ) => Promise<unknown>
     await queryFn({} as never)
     expect(mockSend).toHaveBeenCalledOnce()
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({})
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({})
   })
 
   it("iamUserQueryOptions sends GetUserCommand with userName", async () => {
@@ -119,7 +160,9 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({ UserName: "admin" })
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
+      UserName: "admin",
+    })
   })
 
   it("iamAccessKeysQueryOptions sends ListAccessKeysCommand", async () => {
@@ -127,7 +170,9 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({ UserName: "admin" })
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
+      UserName: "admin",
+    })
   })
 
   it("iamPoliciesQueryOptions sends ListPoliciesCommand with Local scope", async () => {
@@ -135,7 +180,7 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({ Scope: "Local" })
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({ Scope: "Local" })
   })
 
   it("iamPolicyQueryOptions sends GetPolicyCommand with policyArn", async () => {
@@ -143,7 +188,7 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       PolicyArn: "arn:test",
     })
   })
@@ -153,7 +198,7 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       PolicyArn: "arn:test",
       VersionId: "v1",
     })
@@ -164,6 +209,63 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({ UserName: "admin" })
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
+      UserName: "admin",
+    })
+  })
+
+  it("iamRolesQueryOptions sends ListRolesCommand", async () => {
+    const queryFn = iamRolesQueryOptions.queryFn as (
+      ctx: never,
+    ) => Promise<unknown>
+    await queryFn({} as never)
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({})
+  })
+
+  it("iamRoleQueryOptions sends GetRoleCommand with roleName", async () => {
+    const queryFn = iamRoleQueryOptions("my-role").queryFn as (
+      ctx: never,
+    ) => Promise<unknown>
+    await queryFn({} as never)
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
+      RoleName: "my-role",
+    })
+  })
+
+  it("iamAttachedRolePoliciesQueryOptions sends ListAttachedRolePoliciesCommand", async () => {
+    const queryFn = iamAttachedRolePoliciesQueryOptions("my-role").queryFn as (
+      ctx: never,
+    ) => Promise<unknown>
+    await queryFn({} as never)
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
+      RoleName: "my-role",
+    })
+  })
+
+  it("iamInstanceProfilesQueryOptions sends ListInstanceProfilesCommand", async () => {
+    const queryFn = iamInstanceProfilesQueryOptions.queryFn as (
+      ctx: never,
+    ) => Promise<unknown>
+    await queryFn({} as never)
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({})
+  })
+
+  it("iamInstanceProfileQueryOptions sends GetInstanceProfileCommand", async () => {
+    const queryFn = iamInstanceProfileQueryOptions("my-profile").queryFn as (
+      ctx: never,
+    ) => Promise<unknown>
+    await queryFn({} as never)
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
+      InstanceProfileName: "my-profile",
+    })
+  })
+
+  it("iamInstanceProfilesForRoleQueryOptions sends ListInstanceProfilesForRoleCommand", async () => {
+    const queryFn = iamInstanceProfilesForRoleQueryOptions("my-role")
+      .queryFn as (ctx: never) => Promise<unknown>
+    await queryFn({} as never)
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
+      RoleName: "my-role",
+    })
   })
 })

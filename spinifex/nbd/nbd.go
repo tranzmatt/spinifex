@@ -25,6 +25,11 @@ type NBDKitConfig struct {
 	CacheSize  int    `json:"cache_size"`
 	ShardWAL   bool   `json:"shardwal"` // Enable sharded WAL (default false)
 	UseTCP     bool   `json:"use_tcp"`  // If true, use TCP transport; otherwise use Unix socket
+
+	// EncryptionKeyFile is the path to the shared AES-256 master key. When set,
+	// it is forwarded to the viperblock plugin so encrypted volumes open with
+	// matching encryption state. Empty → plugin opens in cleartext mode.
+	EncryptionKeyFile string `json:"encryption_key_file"`
 }
 
 // buildArgs constructs the nbdkit command-line arguments from the config.
@@ -66,18 +71,17 @@ func (cfg *NBDKitConfig) buildArgs() ([]string, error) {
 		fmt.Sprintf("shardwal=%t", cfg.ShardWAL),
 	}
 
+	// Only forward the key when configured; an empty value would explicitly
+	// set the plugin to cleartext and override its ENCRYPTION_KEY_FILE fallback.
+	if cfg.EncryptionKeyFile != "" {
+		pluginArgs = append(pluginArgs, fmt.Sprintf("encryption_key_file=%s", cfg.EncryptionKeyFile))
+	}
+
 	args = append(args, pluginArgs...)
 	return args, nil
 }
 
 func (cfg *NBDKitConfig) Execute() (*exec.Cmd, error) {
-	// TODO: Consider setting threads to X% of the host availability (preference for VMs)
-	/*
-			--threads=THREADS
-		           Set the number of threads to be used per connection, which in turn controls the number of outstanding requests  that  can
-		           be  processed  at  once.   Only  matters  for  plugins  with  thread_model=parallel  (where it defaults to 16).  To force
-		           serialized behavior (useful if the client is not prepared for out-of-order responses), set this to 1.
-	*/
 	args, err := cfg.buildArgs()
 	if err != nil {
 		return nil, err

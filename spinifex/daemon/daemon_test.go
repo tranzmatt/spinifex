@@ -10,24 +10,40 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
+	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/config"
+	"github.com/mulgadc/spinifex/spinifex/gpu"
+	handlers_ec2_account "github.com/mulgadc/spinifex/spinifex/handlers/ec2/account"
+	handlers_ec2_eigw "github.com/mulgadc/spinifex/spinifex/handlers/ec2/eigw"
+	handlers_ec2_eip "github.com/mulgadc/spinifex/spinifex/handlers/ec2/eip"
+	handlers_ec2_igw "github.com/mulgadc/spinifex/spinifex/handlers/ec2/igw"
+	handlers_ec2_image "github.com/mulgadc/spinifex/spinifex/handlers/ec2/image"
 	handlers_ec2_instance "github.com/mulgadc/spinifex/spinifex/handlers/ec2/instance"
+	handlers_ec2_natgw "github.com/mulgadc/spinifex/spinifex/handlers/ec2/natgw"
+	handlers_ec2_placementgroup "github.com/mulgadc/spinifex/spinifex/handlers/ec2/placementgroup"
+	handlers_ec2_routetable "github.com/mulgadc/spinifex/spinifex/handlers/ec2/routetable"
+	handlers_ec2_snapshot "github.com/mulgadc/spinifex/spinifex/handlers/ec2/snapshot"
 	handlers_ec2_volume "github.com/mulgadc/spinifex/spinifex/handlers/ec2/volume"
+	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
+	handlers_elbv2 "github.com/mulgadc/spinifex/spinifex/handlers/elbv2"
 	"github.com/mulgadc/spinifex/spinifex/instancetypes"
 	"github.com/mulgadc/spinifex/spinifex/objectstore"
 	"github.com/mulgadc/spinifex/spinifex/qmp"
@@ -46,10 +62,13 @@ import (
 func drainAndClose(t *testing.T, nc *nats.Conn) {
 	t.Helper()
 	done := make(chan struct{})
-	nc.SetClosedHandler(func(*nats.Conn) { close(done) })
+	var once sync.Once
+	nc.SetClosedHandler(func(*nats.Conn) { once.Do(func() { close(done) }) })
 	if err := nc.Drain(); err != nil {
 		nc.Close()
-		return
+		// Do not return early: the handler callback may still be running
+		// (e.g. writing state to the temp dir). Fall through to the wait so
+		// we give it time to finish before t.TempDir() RemoveAll runs.
 	}
 	select {
 	case <-done:
@@ -71,6 +90,7 @@ func createTestDaemon(t *testing.T, natsURL string) *Daemon {
 
 	cfg := &config.Config{
 		BaseDir: tmpDir,
+		DataDir: tmpDir,
 		WalDir:  tmpDir,
 		NATS: config.NATSConfig{
 			Host: natsURL,
@@ -100,9 +120,23 @@ func createTestDaemon(t *testing.T, natsURL string) *Daemon {
 	daemon.natsConn = nc
 	daemon.detachDelay = 0 // Skip sleep in tests
 
-	// Initialize services (needed for handler tests)
-	daemon.instanceService = handlers_ec2_instance.NewInstanceServiceImpl(cfg, daemon.resourceMgr.instanceTypes, nc, &daemon.Instances, objectstore.NewMemoryObjectStore())
+	// Initialize services (needed for handler tests).
+	// jsManager is nil here; pass a nil literal to keep the StoppedInstanceStore
+	// interface itself nil (rather than a typed-nil pointer) so the service can
+	// short-circuit cleanly when no KV is available.
+	daemon.instanceService = handlers_ec2_instance.NewInstanceServiceImpl(cfg, daemon.resourceMgr.instanceTypes, nc, objectstore.NewMemoryObjectStore(), daemon.vmMgr, daemon.resourceMgr, nil)
 	daemon.volumeService = handlers_ec2_volume.NewVolumeServiceImplWithStore(cfg, objectstore.NewMemoryObjectStore(), nc)
+
+	// Wire the minimum vm.Deps that handler tests rely on. Lifecycle (Run/Start/
+	// Stop/Terminate) tests still set up their own deps; this gives the
+	// AttachVolume / DetachVolume manager methods enough plumbing to drive
+	// ebs.mount/unmount over NATS using the test's connection.
+	daemon.vmMgr.SetDeps(vm.Deps{
+		NodeID:             daemon.node,
+		VolumeMounter:      newVolumeMounterAdapter(daemon.natsConn, daemon.node, daemon.volumeService),
+		VolumeStateUpdater: daemon.volumeService,
+		DetachDelay:        daemon.detachDelay,
+	})
 
 	t.Cleanup(func() {
 		if daemon.natsConn != nil {
@@ -116,7 +150,7 @@ func createTestDaemon(t *testing.T, natsURL string) *Daemon {
 // getTestInstanceType returns a valid instance type for testing based on the system's CPU
 func getTestInstanceType(t *testing.T) string {
 	t.Helper()
-	rm, err := NewResourceManager()
+	rm, err := NewResourceManager(nil, nil, nil)
 	require.NoError(t, err)
 	// Find any .micro instance type
 	for key := range rm.instanceTypes {
@@ -145,261 +179,9 @@ func seedTestAMI(t *testing.T, store *objectstore.MemoryObjectStore, bucket, ima
 	require.NoError(t, err)
 }
 
-// TestHandleEC2RunInstances_MessageParsing tests that the handler correctly parses NATS messages
-func TestHandleEC2RunInstances_MessageParsing(t *testing.T) {
-	// Skip integration tests on macOS since viperblock/nbdkit are not available
-	if os.Getenv("SKIP_INTEGRATION") != "" {
-		t.Skip("Skipping integration test - SKIP_INTEGRATION is set")
-	}
-
-	tests := []struct {
-		name           string
-		input          any
-		expectError    bool
-		errorInPayload bool
-		validate       func(t *testing.T, reply *nats.Msg)
-	}{
-		{
-			name:           "Valid RunInstancesInput",
-			input:          createValidRunInstancesInput(t),
-			expectError:    false,
-			errorInPayload: false,
-			validate: func(t *testing.T, reply *nats.Msg) {
-				var reservation ec2.Reservation
-				err := json.Unmarshal(reply.Data, &reservation)
-				require.NoError(t, err, "Failed to unmarshal reservation response")
-
-				assert.NotNil(t, reservation.ReservationId)
-				assert.Len(t, reservation.Instances, 1)
-
-				if len(reservation.Instances) > 0 {
-					instance := reservation.Instances[0]
-					assert.NotNil(t, instance.InstanceId)
-					assert.True(t, len(*instance.InstanceId) > 0)
-					// Instance should be in pending state initially
-					assert.Equal(t, int64(0), *instance.State.Code)
-					assert.Equal(t, "pending", *instance.State.Name)
-				}
-			},
-		},
-		{
-			name: "Invalid Instance Type",
-			input: &ec2.RunInstancesInput{
-				ImageId:      aws.String("ami-0abcdef1234567890"),
-				InstanceType: aws.String("invalid.type"),
-				MinCount:     aws.Int64(1),
-				MaxCount:     aws.Int64(1),
-			},
-			expectError:    false, // No transport error
-			errorInPayload: true,  // But payload contains error
-			validate: func(t *testing.T, reply *nats.Msg) {
-				// Should receive an error response
-				assert.NotNil(t, reply.Data)
-				// The response should contain error information
-				t.Logf("Error response: %s", string(reply.Data))
-			},
-		},
-		{
-			name: "Missing Required ImageId",
-			input: &ec2.RunInstancesInput{
-				InstanceType: aws.String("t3.micro"),
-				MinCount:     aws.Int64(1),
-				MaxCount:     aws.Int64(1),
-			},
-			expectError:    false,
-			errorInPayload: true,
-			validate: func(t *testing.T, reply *nats.Msg) {
-				assert.NotNil(t, reply.Data)
-				t.Logf("Error response: %s", string(reply.Data))
-			},
-		},
-		{
-			name: "Invalid MinCount (zero)",
-			input: &ec2.RunInstancesInput{
-				ImageId:      aws.String("ami-0abcdef1234567890"),
-				InstanceType: aws.String("t3.micro"),
-				MinCount:     aws.Int64(0),
-				MaxCount:     aws.Int64(1),
-			},
-			expectError:    false,
-			errorInPayload: true,
-			validate: func(t *testing.T, reply *nats.Msg) {
-				assert.NotNil(t, reply.Data)
-				t.Logf("Error response: %s", string(reply.Data))
-			},
-		},
-		{
-			name:           "Malformed JSON",
-			input:          []byte(`{"invalid": json}`),
-			expectError:    false,
-			errorInPayload: true,
-			validate: func(t *testing.T, reply *nats.Msg) {
-				assert.NotNil(t, reply.Data)
-				t.Logf("Error response: %s", string(reply.Data))
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Skip "Valid RunInstancesInput" test as it requires full infrastructure
-			// (Predastore S3 backend, Viperblock, NBDkit) to actually create volumes
-			if tt.name == "Valid RunInstancesInput" {
-				t.Skip("Skipping valid input test - requires full spinifex infrastructure (viperblock, nbdkit, predastore)")
-			}
-
-			// Start test NATS server
-			natsURL := sharedNATSURL
-
-			// Create test daemon with all services initialized (image, key, etc.)
-			daemon := createFullTestDaemon(t, natsURL)
-
-			// Subscribe to the ec2.launch topic with the handler
-			sub, err := daemon.natsConn.QueueSubscribe("ec2.launch", "spinifex-workers", daemon.handleEC2RunInstances)
-			require.NoError(t, err, "Failed to subscribe to ec2.launch")
-			defer sub.Unsubscribe()
-
-			// Prepare message data
-			var msgData []byte
-			switch v := tt.input.(type) {
-			case []byte:
-				msgData = v
-			default:
-				msgData, err = json.Marshal(tt.input)
-				require.NoError(t, err, "Failed to marshal input")
-			}
-
-			// Send request to NATS and wait for response
-			reply, err := daemon.natsConn.Request("ec2.launch", msgData, 5*time.Second)
-
-			if tt.expectError {
-				assert.Error(t, err, "Expected error but got none")
-				return
-			}
-
-			require.NoError(t, err, "Request failed")
-			require.NotNil(t, reply, "No reply received")
-
-			// Validate response
-			if tt.validate != nil {
-				tt.validate(t, reply)
-			}
-		})
-	}
-}
-
-// TestHandleEC2RunInstances_ResourceManagement tests resource allocation and validation
-// NOTE: This test validates message handling and resource allocation logic without
-// actually launching VMs. Full VM launch requires viperblock, nbdkit, and QEMU/KVM
-// which are not available on macOS.
-func TestHandleEC2RunInstances_ResourceManagement(t *testing.T) {
-	// Skip this test as it requires full infrastructure
-	// The test validates NATS message handling, but daemon.handleEC2RunInstances
-	// attempts to create viperblock volumes which requires:
-	// - S3 backend (predastore) running
-	// - viperblock library with S3 backend
-	// - nbdkit for NBD mounting
-	// - QEMU for VM launch
-	t.Skip("Skipping resource management test - requires full spinifex infrastructure (viperblock, nbdkit, predastore)")
-
-	tests := []struct {
-		name             string
-		instanceType     string
-		expectAllocation bool
-		description      string
-	}{
-		{
-			name:             "Valid t3.micro allocation",
-			instanceType:     "t3.micro",
-			expectAllocation: true,
-			description:      "Should successfully allocate resources for t3.micro",
-		},
-		{
-			name:             "Valid t3.nano allocation",
-			instanceType:     "t3.nano",
-			expectAllocation: true,
-			description:      "Should successfully allocate resources for t3.nano",
-		},
-		{
-			name:             "Invalid instance type",
-			instanceType:     "t99.invalid",
-			expectAllocation: false,
-			description:      "Should fail for invalid instance type",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			natsURL := sharedNATSURL
-
-			daemon := createTestDaemon(t, natsURL)
-
-			sub, err := daemon.natsConn.QueueSubscribe("ec2.launch", "spinifex-workers", daemon.handleEC2RunInstances)
-			require.NoError(t, err)
-			defer sub.Unsubscribe()
-
-			input := &ec2.RunInstancesInput{
-				ImageId:      aws.String("ami-0abcdef1234567890"),
-				InstanceType: aws.String(tt.instanceType),
-				MinCount:     aws.Int64(1),
-				MaxCount:     aws.Int64(1),
-				KeyName:      aws.String("test-key"),
-				SubnetId:     aws.String("subnet-test"),
-				UserData:     aws.String(""), // Empty UserData to bypass cloud-init requirements
-			}
-
-			msgData, err := json.Marshal(input)
-			require.NoError(t, err)
-
-			reply, err := daemon.natsConn.Request("ec2.launch", msgData, 5*time.Second)
-			require.NoError(t, err)
-			require.NotNil(t, reply)
-
-			if tt.expectAllocation {
-				var reservation ec2.Reservation
-				err := json.Unmarshal(reply.Data, &reservation)
-				require.NoError(t, err)
-				assert.Len(t, reservation.Instances, 1)
-			} else {
-				// Should receive error response
-				t.Logf("Expected error response: %s", string(reply.Data))
-			}
-		})
-	}
-}
-
-// TestDaemon_Initialization tests daemon initialization
-func TestDaemon_Initialization(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// New cluster config
-	clusterCfg := &config.ClusterConfig{
-		Node:  "node-1",
-		Nodes: map[string]config.Config{},
-	}
-
-	cfg := &config.Config{
-		BaseDir: tmpDir,
-		WalDir:  tmpDir,
-		NATS: config.NATSConfig{
-			Host: "nats://localhost:4222",
-		},
-	}
-
-	clusterCfg.Nodes["node-1"] = *cfg
-
-	daemon, err := NewDaemon(clusterCfg)
-	require.NoError(t, err)
-
-	assert.NotNil(t, daemon)
-	assert.NotNil(t, daemon.resourceMgr)
-	assert.NotNil(t, daemon.Instances.VMS)
-	assert.Equal(t, cfg, daemon.config)
-}
-
 // TestResourceManager tests resource manager functionality
 func TestResourceManager(t *testing.T) {
-	rm, err := NewResourceManager()
+	rm, err := NewResourceManager(nil, nil, nil)
 	require.NoError(t, err)
 
 	require.NotNil(t, rm)
@@ -434,12 +216,9 @@ func TestResourceManager(t *testing.T) {
 	if instanceType.VCpuInfo != nil && instanceType.VCpuInfo.DefaultVCpus != nil {
 		vCPUs = *instanceType.VCpuInfo.DefaultVCpus
 	}
-	memoryGB := float64(0)
-	if instanceType.MemoryInfo != nil && instanceType.MemoryInfo.SizeInMiB != nil {
-		memoryGB = float64(*instanceType.MemoryInfo.SizeInMiB) / 1024.0
-	}
+	expectedMem := float64(rm.instanceMemChargeMiB(instanceType)) / 1024.0 // guest -m + nbdkit (RG-6)
 	assert.Equal(t, int(vCPUs), rm.allocatedVCPU)
-	assert.Equal(t, memoryGB, rm.allocatedMem)
+	assert.Equal(t, expectedMem, rm.allocatedMem)
 
 	// Deallocate
 	rm.deallocate(instanceType)
@@ -449,8 +228,9 @@ func TestResourceManager(t *testing.T) {
 	// Test canAllocate with count parameter
 	t.Run("canAllocate_with_count", func(t *testing.T) {
 		// Fresh resource manager for predictable testing
-		rm, err := NewResourceManager()
+		rm, err := NewResourceManager(nil, nil, nil)
 		require.NoError(t, err)
+		rm.readMemAvailableGB = nil // accounting test: decrement must track allocations, not live /proc
 
 		// Find a .micro instance type
 		var microType *ec2.InstanceTypeInfo
@@ -486,7 +266,7 @@ func TestResourceManager(t *testing.T) {
 
 // TestGetInstanceTypeInfos tests the GetInstanceTypeInfos method
 func TestGetInstanceTypeInfos(t *testing.T) {
-	rm, err := NewResourceManager()
+	rm, err := NewResourceManager(nil, nil, nil)
 	require.NoError(t, err)
 
 	infos := rm.GetInstanceTypeInfos()
@@ -514,7 +294,7 @@ func TestGetInstanceTypeInfos(t *testing.T) {
 
 // TestGetAvailableInstanceTypeInfos_ResourceFiltering tests that instance types are filtered by available resources
 func TestGetAvailableInstanceTypeInfos_ResourceFiltering(t *testing.T) {
-	rm, err := NewResourceManager()
+	rm, err := NewResourceManager(nil, nil, nil)
 	require.NoError(t, err)
 
 	// Get initial count of all available types
@@ -652,8 +432,10 @@ func TestHandleEC2DescribeInstanceTypes(t *testing.T) {
 		err = json.Unmarshal(reply.Data, &output)
 		require.NoError(t, err)
 
-		// Get expected instance types from ResourceManager
-		expectedTypes := daemon.resourceMgr.GetAvailableInstanceTypeInfos(false)
+		// Get expected instance types from ResourceManager. The no-filter
+		// handler path returns the supported set (AWS-compatible), not the
+		// capacity-gated set, so compare against the same source.
+		expectedTypes := daemon.resourceMgr.GetSupportedInstanceTypeInfos()
 		require.NotEmpty(t, expectedTypes, "Should have expected instance types")
 
 		// Build map of expected instance type names
@@ -682,9 +464,11 @@ func TestHandleEC2DescribeInstanceTypes(t *testing.T) {
 		t.Logf("Verified %d instance types match expected list", len(output.InstanceTypes))
 	})
 
-	// Test 3: Filter unavailable types after allocating 2 CPUs
-	t.Run("FilterUnavailableTypesAfterAllocation", func(t *testing.T) {
-		// Get initial available types
+	// Test 3a: No-filter responses list every supported type even when an
+	// allocation has consumed slots. This is the AWS-compatible semantics
+	// that lets the Terraform provider look up an instance type's metadata
+	// after RunInstances has taken the last free slot.
+	t.Run("NoFilterReturnsSupportedRegardlessOfAllocation", func(t *testing.T) {
 		input := &ec2.DescribeInstanceTypesInput{}
 		msgData, err := json.Marshal(input)
 		require.NoError(t, err)
@@ -698,110 +482,125 @@ func TestHandleEC2DescribeInstanceTypes(t *testing.T) {
 		require.NoError(t, err)
 
 		initialCount := len(initialOutput.InstanceTypes)
-		t.Logf("Initial available instance types: %d", initialCount)
+		t.Logf("Initial supported instance types: %d", initialCount)
 
-		// Find an instance type that uses 2 vCPUs from the available types
-		// (not the raw map, which may contain types that exceed host memory)
+		// Pin host capacity so the allocate below is independent of the
+		// runner's live headroom. Without this, readMemAvailableGB reads
+		// live /proc MemAvailable, which a box already running VMs can drive
+		// below a 2 vCPU type's footprint, failing allocate spuriously.
+		daemon.resourceMgr.mu.Lock()
+		daemon.resourceMgr.hostVCPU = 16
+		daemon.resourceMgr.hostMemGB = 32.0
+		daemon.resourceMgr.reservedVCPU = 0
+		daemon.resourceMgr.reservedMem = 0
+		daemon.resourceMgr.readMemAvailableGB = nil
+		daemon.resourceMgr.mu.Unlock()
+
+		schedulableMem := daemon.resourceMgr.hostMemGB - daemon.resourceMgr.reservedMem
 		var instanceType2CPU *ec2.InstanceTypeInfo
-		var instanceTypeName string
 		for _, it := range initialOutput.InstanceTypes {
-			if it.VCpuInfo != nil && it.VCpuInfo.DefaultVCpus != nil && *it.VCpuInfo.DefaultVCpus == 2 {
-				instanceType2CPU = it
-				if it.InstanceType != nil {
-					instanceTypeName = *it.InstanceType
-				}
-				break
+			if it.VCpuInfo == nil || it.VCpuInfo.DefaultVCpus == nil || *it.VCpuInfo.DefaultVCpus != 2 {
+				continue
 			}
+			if it.MemoryInfo == nil || it.MemoryInfo.SizeInMiB == nil {
+				continue
+			}
+			if float64(*it.MemoryInfo.SizeInMiB)/1024.0 > schedulableMem {
+				continue
+			}
+			instanceType2CPU = it
+			break
 		}
+		require.NotNil(t, instanceType2CPU, "Should find a 2 vCPU instance type that fits schedulable memory")
 
-		require.NotNil(t, instanceType2CPU, "Should find an instance type with 2 vCPUs")
-		t.Logf("Allocating instance type: %s (2 vCPUs)", instanceTypeName)
-
-		// Allocate the 2 vCPU instance type
 		err = daemon.resourceMgr.allocate(instanceType2CPU)
 		require.NoError(t, err, "Should be able to allocate 2 vCPU instance")
+		assert.Equal(t, 2, daemon.resourceMgr.allocatedVCPU)
 
-		// Verify allocation
-		assert.Equal(t, 2, daemon.resourceMgr.allocatedVCPU, "Should have allocated 2 vCPUs")
-		t.Logf("Allocated resources: %d vCPUs, %.2f GB RAM",
-			daemon.resourceMgr.allocatedVCPU, daemon.resourceMgr.allocatedMem)
-
-		// Get available types after allocation
 		reply, err = daemon.natsConn.Request("ec2.DescribeInstanceTypes", msgData, 5*time.Second)
 		require.NoError(t, err)
-		require.NotNil(t, reply)
 
 		var afterAllocationOutput ec2.DescribeInstanceTypesOutput
 		err = json.Unmarshal(reply.Data, &afterAllocationOutput)
 		require.NoError(t, err)
 
-		afterAllocationCount := len(afterAllocationOutput.InstanceTypes)
-		t.Logf("Available instance types after allocation: %d", afterAllocationCount)
+		assert.Equal(t, initialCount, len(afterAllocationOutput.InstanceTypes),
+			"no-filter response must list the same supported types before and after allocation")
 
-		// Verify fewer types are available
-		assert.LessOrEqual(t, afterAllocationCount, initialCount,
-			"Should have fewer or equal instance types after allocation")
+		afterTypes := make(map[string]bool)
+		for _, info := range afterAllocationOutput.InstanceTypes {
+			require.NotNil(t, info.InstanceType)
+			afterTypes[*info.InstanceType] = true
+		}
+		require.NotNil(t, instanceType2CPU.InstanceType)
+		assert.True(t, afterTypes[*instanceType2CPU.InstanceType],
+			"the allocated type %s must still appear in no-filter responses", *instanceType2CPU.InstanceType)
 
-		// Calculate remaining schedulable resources (host - reserved - allocated).
+		daemon.resourceMgr.deallocate(instanceType2CPU)
+		assert.Equal(t, 0, daemon.resourceMgr.allocatedVCPU)
+	})
+
+	// Test 3b: capacity=true must still gate on remaining schedulable
+	// resources so cluster-wide aggregation reflects current load.
+	t.Run("CapacityFilterRespectsAllocation", func(t *testing.T) {
+		capInput := &ec2.DescribeInstanceTypesInput{
+			Filters: []*ec2.Filter{
+				{Name: aws.String("capacity"), Values: []*string{aws.String("true")}},
+			},
+		}
+		capMsgData, err := json.Marshal(capInput)
+		require.NoError(t, err)
+
+		// Pick the smallest-memory 2-vCPU type from the capacity-aware set
+		// so it is guaranteed to fit the host. Selecting the first match by
+		// map-iteration order is non-deterministic and intermittently picks a
+		// type near the schedulable-memory boundary that the allocator then
+		// rejects, flaking the test on small hosts.
+		var instanceType2CPU *ec2.InstanceTypeInfo
+		for _, it := range daemon.resourceMgr.GetAvailableInstanceTypeInfos(true) {
+			if it.VCpuInfo == nil || it.VCpuInfo.DefaultVCpus == nil || *it.VCpuInfo.DefaultVCpus != 2 ||
+				it.MemoryInfo == nil || it.MemoryInfo.SizeInMiB == nil {
+				continue
+			}
+			if instanceType2CPU == nil || *it.MemoryInfo.SizeInMiB < *instanceType2CPU.MemoryInfo.SizeInMiB {
+				instanceType2CPU = it
+			}
+		}
+		require.NotNil(t, instanceType2CPU, "Should find a 2-vCPU type that fits the host")
+
+		err = daemon.resourceMgr.allocate(instanceType2CPU)
+		require.NoError(t, err)
+		defer daemon.resourceMgr.deallocate(instanceType2CPU)
+
+		reply, err := daemon.natsConn.Request("ec2.DescribeInstanceTypes", capMsgData, 5*time.Second)
+		require.NoError(t, err)
+
+		var capOutput ec2.DescribeInstanceTypesOutput
+		err = json.Unmarshal(reply.Data, &capOutput)
+		require.NoError(t, err)
+
 		remainingVCPU := daemon.resourceMgr.hostVCPU - daemon.resourceMgr.reservedVCPU - daemon.resourceMgr.allocatedVCPU
 		remainingMem := daemon.resourceMgr.hostMemGB - daemon.resourceMgr.reservedMem - daemon.resourceMgr.allocatedMem
-
 		t.Logf("Remaining resources: %d vCPUs, %.2f GB RAM", remainingVCPU, remainingMem)
 
-		// Verify all returned types fit within remaining resources
-		for _, info := range afterAllocationOutput.InstanceTypes {
-			require.NotNil(t, info.InstanceType, "InstanceType should not be nil")
-			require.NotNil(t, info.VCpuInfo, "VCpuInfo should not be nil")
-			require.NotNil(t, info.VCpuInfo.DefaultVCpus, "DefaultVCpus should not be nil")
-			require.NotNil(t, info.MemoryInfo, "MemoryInfo should not be nil")
-			require.NotNil(t, info.MemoryInfo.SizeInMiB, "SizeInMiB should not be nil")
+		for _, info := range capOutput.InstanceTypes {
+			require.NotNil(t, info.InstanceType)
+			require.NotNil(t, info.VCpuInfo)
+			require.NotNil(t, info.VCpuInfo.DefaultVCpus)
+			require.NotNil(t, info.MemoryInfo)
+			require.NotNil(t, info.MemoryInfo.SizeInMiB)
 
 			typeName := *info.InstanceType
 			vcpus := int(*info.VCpuInfo.DefaultVCpus)
 			memGB := float64(*info.MemoryInfo.SizeInMiB) / 1024.0
 
 			assert.LessOrEqual(t, vcpus, remainingVCPU,
-				"Instance type %s (%d vCPUs) should not exceed remaining vCPUs (%d)",
+				"capacity=true: %s (%d vCPUs) should not exceed remaining vCPUs (%d)",
 				typeName, vcpus, remainingVCPU)
 			assert.LessOrEqual(t, memGB, remainingMem,
-				"Instance type %s (%.2f GB) should not exceed remaining memory (%.2f GB)",
+				"capacity=true: %s (%.2f GB) should not exceed remaining memory (%.2f GB)",
 				typeName, memGB, remainingMem)
-
-			t.Logf("Available: %s (vCPUs: %d, Memory: %.2f GB)", typeName, vcpus, memGB)
 		}
-
-		// Verify that instance types requiring more than remaining resources are NOT returned
-		// Find instance types that should be filtered out
-		for _, it := range daemon.resourceMgr.instanceTypes {
-			if it.InstanceType == nil || it.VCpuInfo == nil || it.VCpuInfo.DefaultVCpus == nil {
-				continue
-			}
-
-			typeName := *it.InstanceType
-			vcpus := int(*it.VCpuInfo.DefaultVCpus)
-			memGB := float64(0)
-			if it.MemoryInfo != nil && it.MemoryInfo.SizeInMiB != nil {
-				memGB = float64(*it.MemoryInfo.SizeInMiB) / 1024.0
-			}
-
-			// If this type exceeds remaining resources, it should NOT be in the response
-			if vcpus > remainingVCPU || memGB > remainingMem {
-				found := false
-				for _, returnedInfo := range afterAllocationOutput.InstanceTypes {
-					if returnedInfo.InstanceType != nil && *returnedInfo.InstanceType == typeName {
-						found = true
-						break
-					}
-				}
-				assert.False(t, found,
-					"Instance type %s (%d vCPUs, %.2f GB) should NOT be returned as it exceeds remaining resources",
-					typeName, vcpus, memGB)
-			}
-		}
-
-		// Cleanup: deallocate
-		daemon.resourceMgr.deallocate(instanceType2CPU)
-		assert.Equal(t, 0, daemon.resourceMgr.allocatedVCPU, "Should have deallocated all vCPUs")
 	})
 
 	// Test 4: Verify "capacity" filter returns duplicates
@@ -845,16 +644,16 @@ func TestHandleEC2DescribeInstanceTypes(t *testing.T) {
 		err = json.Unmarshal(reply.Data, &output)
 		require.NoError(t, err)
 
-		// With 2 vCPUs and 16GB, every type with 2 vCPUs and <=16GB memory should have 1 slot.
-		// Calculate expected by counting fitting types directly.
+		// With 2 vCPUs and 16GB, every type whose full charge (guest -m + nbdkit,
+		// RG-6) fits 2 vCPUs / 16GB should have 1 slot. Calculate expected directly.
 		expectedSlots := 0
 		for name, it := range daemon.resourceMgr.instanceTypes {
 			if instancetypes.IsSystemType(name) {
 				continue
 			}
 			vcpus := *it.VCpuInfo.DefaultVCpus
-			memGB := float64(*it.MemoryInfo.SizeInMiB) / 1024.0
-			if vcpus <= 2 && memGB <= 16.0 {
+			chargeGB := float64(daemon.resourceMgr.instanceMemChargeMiB(it)) / 1024.0
+			if vcpus <= 2 && chargeGB <= 16.0 {
 				expectedSlots++
 			}
 		}
@@ -926,11 +725,11 @@ func TestDaemon_BootAllocation(t *testing.T) {
 	// Create daemon with NATS connection
 	clusterCfg := &config.ClusterConfig{
 		Node:  "node-1",
-		Nodes: map[string]config.Config{"node-1": {BaseDir: tmpDir}},
+		Nodes: map[string]config.Config{"node-1": {BaseDir: tmpDir, DataDir: tmpDir}},
 	}
 	daemon, err := NewDaemon(clusterCfg)
 	require.NoError(t, err)
-	daemon.config = &config.Config{BaseDir: tmpDir}
+	daemon.config = &config.Config{BaseDir: tmpDir, DataDir: tmpDir}
 
 	// Connect to NATS and initialize JetStream
 	nc, err := nats.Connect(natsURL)
@@ -943,9 +742,9 @@ func TestDaemon_BootAllocation(t *testing.T) {
 	err = daemon.jsManager.InitKVBucket()
 	require.NoError(t, err)
 
-	// Pre-populate JetStream with test state
-	testInstances := &vm.Instances{VMS: vms}
-	err = daemon.jsManager.WriteState("node-1", testInstances)
+	// Pre-populate the local state file with test state. Post-1a, LoadState
+	// reads from the local file (KV is best-effort cache only).
+	err = WriteLocalState(daemon.localStatePath(), vms)
 	require.NoError(t, err)
 
 	// Manually trigger the LoadState and allocation logic normally found in Start()
@@ -953,7 +752,7 @@ func TestDaemon_BootAllocation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Simulate the allocation loop in Start()
-	for _, instance := range daemon.Instances.VMS {
+	for _, instance := range daemon.vmMgr.Snapshot() {
 		if instance.Status != vm.StateTerminated && !instance.Attributes.StopInstance {
 			instanceType, ok := daemon.resourceMgr.instanceTypes[instance.InstanceType]
 			if ok {
@@ -966,64 +765,16 @@ func TestDaemon_BootAllocation(t *testing.T) {
 	// Verify only i-running was allocated
 	instanceType := daemon.resourceMgr.instanceTypes[vms["i-running"].InstanceType]
 	expectedVCPU := int(*instanceType.VCpuInfo.DefaultVCpus)
-	expectedMem := float64(*instanceType.MemoryInfo.SizeInMiB) / 1024.0
+	expectedMem := float64(daemon.resourceMgr.instanceMemChargeMiB(instanceType)) / 1024.0 // guest -m + nbdkit (RG-6)
 
 	assert.Equal(t, expectedVCPU, daemon.resourceMgr.allocatedVCPU)
 	assert.Equal(t, expectedMem, daemon.resourceMgr.allocatedMem)
 }
 
-// TestStopInstance_Deallocation verifies that stopping an instance deallocates resources
-func TestStopInstance_Deallocation(t *testing.T) {
-	clusterCfg := &config.ClusterConfig{
-		Node:  "node-1",
-		Nodes: map[string]config.Config{"node-1": {BaseDir: "/tmp"}},
-	}
-	daemon, err := NewDaemon(clusterCfg)
-	require.NoError(t, err)
-
-	// Setup a running instance with allocated resources
-	instanceId := "i-test-stop"
-	instanceTypeStr := getTestInstanceType(t)
-	instanceType := daemon.resourceMgr.instanceTypes[instanceTypeStr]
-	daemon.Instances.VMS[instanceId] = &vm.VM{
-		ID:           instanceId,
-		InstanceType: instanceTypeStr,
-		Status:       vm.StateRunning,
-		AccountID:    testAccountID,
-	}
-
-	err = daemon.resourceMgr.allocate(instanceType)
-	require.NoError(t, err)
-	assert.Greater(t, daemon.resourceMgr.allocatedVCPU, 0)
-
-	// Call stopInstance (we can't easily wait for QMP/PID here, so we just want to see deallocate call)
-	// Actually stopInstance runs in goroutines and waits for PID removal.
-	// This might be tricky to test without heavy mocking.
-
-	// Let's test the ResourceManager deallocate directly since we've already verified
-	// that stopInstance calls it in the code.
-	daemon.resourceMgr.deallocate(instanceType)
-	assert.Equal(t, 0, daemon.resourceMgr.allocatedVCPU)
-}
-
-// createValidRunInstancesInput creates a valid RunInstancesInput for testing
-func createValidRunInstancesInput(t *testing.T) *ec2.RunInstancesInput {
-	t.Helper()
-	return &ec2.RunInstancesInput{
-		ImageId:      aws.String("ami-0abcdef1234567890"),
-		InstanceType: aws.String(getTestInstanceType(t)),
-		MinCount:     aws.Int64(1),
-		MaxCount:     aws.Int64(1),
-		KeyName:      aws.String("test-key"),
-		SubnetId:     aws.String("subnet-test"),
-		UserData:     aws.String(""), // Empty UserData to bypass cloud-init requirements
-	}
-}
-
 // TestCanAllocate_CountEdgeCases tests edge cases for canAllocate with count parameter
 func TestCanAllocate_CountEdgeCases(t *testing.T) {
 	t.Run("MinCount_equals_MaxCount", func(t *testing.T) {
-		rm, err := NewResourceManager()
+		rm, err := NewResourceManager(nil, nil, nil)
 		require.NoError(t, err)
 
 		var microType *ec2.InstanceTypeInfo
@@ -1042,7 +793,7 @@ func TestCanAllocate_CountEdgeCases(t *testing.T) {
 	})
 
 	t.Run("Request_exceeds_capacity", func(t *testing.T) {
-		rm, err := NewResourceManager()
+		rm, err := NewResourceManager(nil, nil, nil)
 		require.NoError(t, err)
 
 		// Find the largest instance type to exhaust resources faster
@@ -1065,7 +816,7 @@ func TestCanAllocate_CountEdgeCases(t *testing.T) {
 	})
 
 	t.Run("Capacity_decreases_after_allocation", func(t *testing.T) {
-		rm, err := NewResourceManager()
+		rm, err := NewResourceManager(nil, nil, nil)
 		require.NoError(t, err)
 
 		var microType *ec2.InstanceTypeInfo
@@ -1086,6 +837,7 @@ func TestCanAllocate_CountEdgeCases(t *testing.T) {
 		rm.hostMemGB = 32.0
 		rm.reservedVCPU = 0
 		rm.reservedMem = 0
+		rm.readMemAvailableGB = nil // accounting test: pin to synthetic host, not live /proc
 		rm.mu.Unlock()
 
 		initial := rm.canAllocate(microType, 100)
@@ -1115,7 +867,7 @@ func TestCanAllocate_CountEdgeCases(t *testing.T) {
 	})
 
 	t.Run("Mixed_instance_types", func(t *testing.T) {
-		rm, err := NewResourceManager()
+		rm, err := NewResourceManager(nil, nil, nil)
 		require.NoError(t, err)
 
 		var microType, mediumType *ec2.InstanceTypeInfo
@@ -1129,6 +881,18 @@ func TestCanAllocate_CountEdgeCases(t *testing.T) {
 		}
 		require.NotNil(t, microType)
 		require.NotNil(t, mediumType)
+
+		// Pin host capacity so the test is independent of the runner's
+		// schedulable headroom. A constrained box (e.g. 4 vCPU, 2 schedulable
+		// after reserve, more when EKS VMs hold capacity) cannot fit a medium
+		// and rm.allocate would fail with an unexpected insufficient-capacity error.
+		rm.mu.Lock()
+		rm.hostVCPU = 16
+		rm.hostMemGB = 32.0
+		rm.reservedVCPU = 0
+		rm.reservedMem = 0
+		rm.readMemAvailableGB = nil // accounting test: pin to synthetic host, not live /proc
+		rm.mu.Unlock()
 
 		initialMicro := rm.canAllocate(microType, 100)
 		initialMedium := rm.canAllocate(mediumType, 100)
@@ -1148,7 +912,7 @@ func TestCanAllocate_CountEdgeCases(t *testing.T) {
 	})
 
 	t.Run("Zero_and_negative_counts", func(t *testing.T) {
-		rm, err := NewResourceManager()
+		rm, err := NewResourceManager(nil, nil, nil)
 		require.NoError(t, err)
 
 		var microType *ec2.InstanceTypeInfo
@@ -1170,6 +934,87 @@ func TestCanAllocate_CountEdgeCases(t *testing.T) {
 	})
 }
 
+// TestAllocate_NoOvercommitUnderContention exercises the TOCTOU window that
+// the pre-fix code had between canAllocate's RUnlock and the subsequent
+// mu.Lock(): N concurrent allocate() callers on a pool with capacity for
+// exactly N-1 must produce exactly N-1 successes and 1 insufficient-capacity
+// failure. Run under -race to also catch any regression that re-introduces
+// a check-then-commit gap. Pre-fix this test would intermittently overcommit;
+// post-fix the per-call write-lock acquisition makes it deterministic.
+func TestAllocate_NoOvercommitUnderContention(t *testing.T) {
+	rm, err := NewResourceManager(nil, nil, nil)
+	require.NoError(t, err)
+
+	var microType *ec2.InstanceTypeInfo
+	for key, it := range rm.instanceTypes {
+		if strings.HasSuffix(key, ".micro") {
+			microType = it
+			break
+		}
+	}
+	require.NotNil(t, microType, "test requires a .micro instance type")
+
+	vCPUs := int(instanceTypeVCPUs(microType))
+	// Size the pool on the full per-instance charge (guest -m + nbdkit, RG-6),
+	// not bare guest -m, so capacityFor slots still fit exactly after RG-6.
+	memGB := float64(rm.instanceMemChargeMiB(microType)) / 1024.0
+	require.Greater(t, vCPUs, 0, "micro type must report vCPU count")
+	require.Greater(t, memGB, float64(0), "micro type must report memory")
+
+	const capacityFor = 8 // slots
+	const goroutines = capacityFor + 1
+	rm.mu.Lock()
+	rm.hostVCPU = vCPUs * capacityFor
+	rm.hostMemGB = memGB * float64(capacityFor)
+	rm.reservedVCPU = 0
+	rm.reservedMem = 0
+	rm.allocatedVCPU = 0
+	rm.allocatedMem = 0
+	rm.readMemAvailableGB = nil // accounting test: pin to synthetic host, not live /proc
+	rm.mu.Unlock()
+
+	require.Equal(t, capacityFor, rm.canAllocate(microType, goroutines),
+		"setup sanity: pool should have exactly capacityFor slots")
+
+	var (
+		wg           sync.WaitGroup
+		startGate    = make(chan struct{})
+		successes    int64
+		insufficient int64
+		otherErrs    int64
+		errsMu       sync.Mutex
+		seenErrs     []string
+	)
+	for range goroutines {
+		wg.Go(func() {
+			<-startGate
+			if err := rm.allocate(microType); err == nil {
+				atomic.AddInt64(&successes, 1)
+			} else if strings.Contains(err.Error(), "insufficient resources") {
+				atomic.AddInt64(&insufficient, 1)
+			} else {
+				atomic.AddInt64(&otherErrs, 1)
+				errsMu.Lock()
+				seenErrs = append(seenErrs, err.Error())
+				errsMu.Unlock()
+			}
+		})
+	}
+	close(startGate)
+	wg.Wait()
+
+	assert.Equal(t, int64(0), otherErrs, "unexpected error classes: %v", seenErrs)
+	assert.Equal(t, int64(capacityFor), successes, "must commit exactly capacityFor allocations")
+	assert.Equal(t, int64(1), insufficient, "exactly one caller must observe insufficient capacity")
+
+	rm.mu.RLock()
+	finalVCPU := rm.allocatedVCPU
+	finalMem := rm.allocatedMem
+	rm.mu.RUnlock()
+	assert.Equal(t, vCPUs*capacityFor, finalVCPU, "allocated vCPU must not exceed schedulable pool")
+	assert.InDelta(t, memGB*float64(capacityFor), finalMem, 0.001, "allocated memory must not exceed schedulable pool")
+}
+
 // TestDescribeInstances_ReservationGrouping tests that instances are grouped by reservation ID
 func TestDescribeInstances_ReservationGrouping(t *testing.T) {
 	natsURL := sharedNATSURL
@@ -1188,13 +1033,13 @@ func TestDescribeInstances_ReservationGrouping(t *testing.T) {
 		ec2Instance.SetInstanceId(instanceID)
 		ec2Instance.SetInstanceType("t3.micro")
 
-		daemon.Instances.VMS[instanceID] = &vm.VM{
+		daemon.vmMgr.Insert(&vm.VM{
 			ID:          instanceID,
 			Status:      vm.StateRunning,
 			AccountID:   testAccountID,
 			Reservation: reservation1,
 			Instance:    ec2Instance,
-		}
+		})
 	}
 
 	// Create another reservation with 2 instances
@@ -1208,13 +1053,13 @@ func TestDescribeInstances_ReservationGrouping(t *testing.T) {
 		ec2Instance.SetInstanceId(instanceID)
 		ec2Instance.SetInstanceType("t3.small")
 
-		daemon.Instances.VMS[instanceID] = &vm.VM{
+		daemon.vmMgr.Insert(&vm.VM{
 			ID:          instanceID,
 			Status:      vm.StateRunning,
 			AccountID:   testAccountID,
 			Reservation: reservation2,
 			Instance:    ec2Instance,
-		}
+		})
 	}
 
 	// Create a single-instance reservation
@@ -1226,13 +1071,13 @@ func TestDescribeInstances_ReservationGrouping(t *testing.T) {
 	ec2Instance.SetInstanceId("i-single-001")
 	ec2Instance.SetInstanceType("t3.large")
 
-	daemon.Instances.VMS["i-single-001"] = &vm.VM{
+	daemon.vmMgr.Insert(&vm.VM{
 		ID:          "i-single-001",
 		Status:      vm.StateStopped,
 		AccountID:   testAccountID,
 		Reservation: reservation3,
 		Instance:    ec2Instance,
-	}
+	})
 
 	// Subscribe to handle DescribeInstances
 	sub, err := daemon.natsConn.Subscribe("ec2.DescribeInstances", daemon.handleEC2DescribeInstances)
@@ -1390,12 +1235,13 @@ func TestRunInstances_CountValidation(t *testing.T) {
 		resp, err := natsRequest(daemon.natsConn, topic, inputJSON, 5*time.Second)
 		require.NoError(t, err)
 
-		// Should return validation error
+		// MinCount=5 / MaxCount=3 — handleEC2RunInstances reaches the
+		// allocatableCount<minCount branch and returns
+		// InsufficientInstanceCapacity.
 		var errResp map[string]any
 		err = json.Unmarshal(resp.Data, &errResp)
 		require.NoError(t, err)
-		assert.Contains(t, errResp, "Code", "Should return error response")
-		t.Logf("Error response: %v", errResp)
+		assert.Equal(t, awserrors.ErrorInsufficientInstanceCapacity, errResp["Code"])
 	})
 
 	t.Run("MaxCount_zero", func(t *testing.T) {
@@ -1410,10 +1256,12 @@ func TestRunInstances_CountValidation(t *testing.T) {
 		resp, err := natsRequest(daemon.natsConn, topic, inputJSON, 5*time.Second)
 		require.NoError(t, err)
 
+		// MaxCount=0 → canAllocate(0)=0 → 0<MinCount=1 →
+		// InsufficientInstanceCapacity.
 		var errResp map[string]any
 		err = json.Unmarshal(resp.Data, &errResp)
 		require.NoError(t, err)
-		assert.Contains(t, errResp, "Code")
+		assert.Equal(t, awserrors.ErrorInsufficientInstanceCapacity, errResp["Code"])
 	})
 
 	t.Run("InsufficientCapacity_for_MinCount", func(t *testing.T) {
@@ -1432,9 +1280,23 @@ func TestRunInstances_CountValidation(t *testing.T) {
 		var errResp map[string]any
 		err = json.Unmarshal(resp.Data, &errResp)
 		require.NoError(t, err)
-		assert.Equal(t, "InsufficientInstanceCapacity", errResp["Code"])
+		assert.Equal(t, awserrors.ErrorInsufficientInstanceCapacity, errResp["Code"])
 		t.Logf("Got expected error: %v", errResp["Code"])
 	})
+}
+
+// countSubsBySuffix splits a subscription map into (without-suffix, with-suffix)
+// counts. Node-targeted (unicast) topics carry the node ID as a trailing
+// suffix; queue (anycast) topics do not — so this distinguishes the two.
+func countSubsBySuffix(subs map[string]*nats.Subscription, suffix string) (without, with int) {
+	for topic := range subs {
+		if strings.HasSuffix(topic, suffix) {
+			with++
+		} else {
+			without++
+		}
+	}
+	return without, with
 }
 
 // TestInstanceTypeSubscriptions tests dynamic NATS subscription management
@@ -1444,14 +1306,14 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 
 	t.Run("InitialSubscriptions", func(t *testing.T) {
 		// A fresh ResourceManager should subscribe to all instance types that fit
-		rm, err := NewResourceManager()
+		rm, err := NewResourceManager(nil, nil, nil)
 		require.NoError(t, err)
 		nc, err := nats.Connect(natsURL)
 		require.NoError(t, err)
 		defer nc.Close()
 
 		handler := func(msg *nats.Msg) {}
-		rm.initSubscriptions(nc, handler, "test-node")
+		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		// Count how many types actually fit on this machine (excluding system types)
 		fittableTypes := 0
@@ -1478,14 +1340,14 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 	})
 
 	t.Run("UnsubscribesWhenFull", func(t *testing.T) {
-		rm, err := NewResourceManager()
+		rm, err := NewResourceManager(nil, nil, nil)
 		require.NoError(t, err)
 		nc, err := nats.Connect(natsURL)
 		require.NoError(t, err)
 		defer nc.Close()
 
 		handler := func(msg *nats.Msg) {}
-		rm.initSubscriptions(nc, handler, "test-node")
+		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		initialCount := len(rm.instanceSubs)
 		require.Greater(t, initialCount, 0)
@@ -1498,19 +1360,26 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 
 		rm.updateInstanceSubscriptions()
 
-		assert.Equal(t, 0, len(rm.instanceSubs),
-			"should unsubscribe from all types when node is full")
+		// Queue (anycast) subscriptions drop when the node fills so NATS reroutes
+		// launches to a node with room. Node-targeted (unicast) subscriptions
+		// persist regardless of capacity so a committed placement that names this
+		// node still reaches a responder — capacity is enforced at launch time.
+		queueSubs, nodeSubs := countSubsBySuffix(rm.instanceSubs, ".test-node")
+		assert.Equal(t, 0, queueSubs,
+			"queue subscriptions should drop when the node is full")
+		assert.Greater(t, nodeSubs, 0,
+			"node-targeted subscriptions persist regardless of capacity")
 	})
 
 	t.Run("ResubscribesWhenFreed", func(t *testing.T) {
-		rm, err := NewResourceManager()
+		rm, err := NewResourceManager(nil, nil, nil)
 		require.NoError(t, err)
 		nc, err := nats.Connect(natsURL)
 		require.NoError(t, err)
 		defer nc.Close()
 
 		handler := func(msg *nats.Msg) {}
-		rm.initSubscriptions(nc, handler, "test-node")
+		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		expectedCount := len(rm.instanceSubs)
 
@@ -1520,7 +1389,9 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		rm.allocatedMem = rm.hostMemGB - rm.reservedMem
 		rm.mu.Unlock()
 		rm.updateInstanceSubscriptions()
-		assert.Equal(t, 0, len(rm.instanceSubs))
+		queueSubs, nodeSubs := countSubsBySuffix(rm.instanceSubs, ".test-node")
+		assert.Equal(t, 0, queueSubs, "queue subscriptions drop when the node is full")
+		assert.Greater(t, nodeSubs, 0, "node-targeted subscriptions persist when full")
 
 		// Free all resources
 		rm.mu.Lock()
@@ -1534,19 +1405,20 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 	})
 
 	t.Run("PartialCapacity", func(t *testing.T) {
-		rm, err := NewResourceManager()
+		rm, err := NewResourceManager(nil, nil, nil)
 		require.NoError(t, err)
 		nc, err := nats.Connect(natsURL)
 		require.NoError(t, err)
 		defer nc.Close()
 
 		handler := func(msg *nats.Msg) {}
-		rm.initSubscriptions(nc, handler, "test-node")
+		rm.initSubscriptions(nc, handler, nil, "test-node")
 
-		// Leave only 2 vCPUs and 1 GB schedulable — enough for nano/micro but not larger types.
+		// Leave only 2 vCPUs and 2.5 GB schedulable — enough for a nano/micro plus
+		// its nbdkit charge (RG-6), but not larger types.
 		rm.mu.Lock()
 		rm.allocatedVCPU = (rm.hostVCPU - rm.reservedVCPU) - 2
-		rm.allocatedMem = (rm.hostMemGB - rm.reservedMem) - 1.0
+		rm.allocatedMem = (rm.hostMemGB - rm.reservedMem) - 2.5
 		rm.mu.Unlock()
 		rm.updateInstanceSubscriptions()
 
@@ -1563,14 +1435,14 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 	})
 
 	t.Run("AllocateTriggersSubs", func(t *testing.T) {
-		rm, err := NewResourceManager()
+		rm, err := NewResourceManager(nil, nil, nil)
 		require.NoError(t, err)
 		nc, err := nats.Connect(natsURL)
 		require.NoError(t, err)
 		defer nc.Close()
 
 		handler := func(msg *nats.Msg) {}
-		rm.initSubscriptions(nc, handler, "test-node")
+		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		initialCount := len(rm.instanceSubs)
 		require.Greater(t, initialCount, 0)
@@ -1607,14 +1479,14 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 	})
 
 	t.Run("NoRespondersWhenFull", func(t *testing.T) {
-		rm, err := NewResourceManager()
+		rm, err := NewResourceManager(nil, nil, nil)
 		require.NoError(t, err)
 		nc, err := nats.Connect(natsURL)
 		require.NoError(t, err)
 		defer nc.Close()
 
 		handler := func(msg *nats.Msg) {}
-		rm.initSubscriptions(nc, handler, "test-node")
+		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		// Fill the node completely
 		rm.mu.Lock()
@@ -1622,9 +1494,11 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		rm.allocatedMem = rm.hostMemGB - rm.reservedMem
 		rm.mu.Unlock()
 		rm.updateInstanceSubscriptions()
-		assert.Equal(t, 0, len(rm.instanceSubs))
+		queueSubs, _ := countSubsBySuffix(rm.instanceSubs, ".test-node")
+		assert.Equal(t, 0, queueSubs, "queue subscriptions drop when the node is full")
 
-		// Publishing to an instance type topic should get no responders
+		// Publishing to an instance type's queue (anycast) topic should get no
+		// responders — that subject is torn down on capacity so launches reroute.
 		instanceType := getTestInstanceType(t)
 		topic := fmt.Sprintf("ec2.RunInstances.%s", instanceType)
 
@@ -1632,11 +1506,57 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		assert.ErrorIs(t, err, nats.ErrNoResponders,
 			"request to a type with no subscribed nodes should return ErrNoResponders")
 	})
+
+	// A full node must still answer a node-targeted (unicast) launch: a committed
+	// placement reservation names this node specifically, so dropping the
+	// subscription would turn a real capacity decision into 'no responders' and
+	// fail the reservation spuriously (e.g. an EKS HA control-plane leg).
+	t.Run("NodeTargetedRespondsWhenFull", func(t *testing.T) {
+		rm, err := NewResourceManager(nil, nil, nil)
+		require.NoError(t, err)
+		nc, err := nats.Connect(natsURL)
+		require.NoError(t, err)
+		defer nc.Close()
+
+		handler := func(msg *nats.Msg) {}
+		rm.initSubscriptions(nc, handler, nil, "test-node")
+
+		// Pick a type that fits at init so it gets both a queue and a
+		// node-targeted subscription.
+		var fitType string
+		for key, it := range rm.instanceTypes {
+			if !instancetypes.IsSystemType(key) && rm.canAllocate(it, 1) >= 1 {
+				fitType = key
+				break
+			}
+		}
+		require.NotEmpty(t, fitType, "host must fit at least one instance type")
+		queueTopic := fmt.Sprintf("ec2.RunInstances.%s", fitType)
+		nodeTopic := fmt.Sprintf("ec2.RunInstances.%s.test-node", fitType)
+		require.Contains(t, rm.instanceSubs, queueTopic)
+		require.Contains(t, rm.instanceSubs, nodeTopic)
+
+		// Fill the node completely.
+		rm.mu.Lock()
+		rm.allocatedVCPU = rm.hostVCPU - rm.reservedVCPU
+		rm.allocatedMem = rm.hostMemGB - rm.reservedMem
+		rm.mu.Unlock()
+		rm.updateInstanceSubscriptions()
+
+		// A live entry in instanceSubs is a live NATS subscription on nc, so a
+		// request to that subject reaches a responder. The queue (anycast) subject
+		// drops so launches reroute; the node-targeted (unicast) subject persists
+		// so a committed placement still gets a real capacity decision.
+		assert.NotContains(t, rm.instanceSubs, queueTopic,
+			"queue subject should be unsubscribed when the node is full")
+		assert.Contains(t, rm.instanceSubs, nodeTopic,
+			"node-targeted subject must stay subscribed when the node is full")
+	})
 }
 
 // TestResourceManager_ConcurrentAccess tests thread safety of resource manager
 func TestResourceManager_ConcurrentAccess(t *testing.T) {
-	rm, err := NewResourceManager()
+	rm, err := NewResourceManager(nil, nil, nil)
 	require.NoError(t, err)
 
 	var microType *ec2.InstanceTypeInfo
@@ -1655,9 +1575,13 @@ func TestResourceManager_ConcurrentAccess(t *testing.T) {
 	// Goroutine 1: Allocate and deallocate
 	go func() {
 		for range iterations {
+			// canAllocate -> allocate is non-atomic; allocate re-checks under
+			// the write lock and may fail if another goroutine took the slot.
+			// Only deallocate when allocate actually succeeded.
 			if rm.canAllocate(microType, 1) >= 1 {
-				rm.allocate(microType)
-				rm.deallocate(microType)
+				if err := rm.allocate(microType); err == nil {
+					rm.deallocate(microType)
+				}
 			}
 		}
 		done <- true
@@ -1675,8 +1599,9 @@ func TestResourceManager_ConcurrentAccess(t *testing.T) {
 	go func() {
 		for range iterations {
 			if rm.canAllocate(microType, 1) >= 1 {
-				rm.allocate(microType)
-				rm.deallocate(microType)
+				if err := rm.allocate(microType); err == nil {
+					rm.deallocate(microType)
+				}
 			}
 		}
 		done <- true
@@ -1692,368 +1617,126 @@ func TestResourceManager_ConcurrentAccess(t *testing.T) {
 	assert.Equal(t, float64(0), rm.allocatedMem, "All memory should be deallocated")
 }
 
-// TestEBSRequest_DeleteOnTermination_DefaultFalse verifies the default value
-func TestEBSRequest_DeleteOnTermination_DefaultFalse(t *testing.T) {
-	req := types.EBSRequest{
-		Name: "vol-test",
-		Boot: true,
-	}
-	assert.False(t, req.DeleteOnTermination, "DeleteOnTermination should default to false")
-}
-
-// TestEBSRequest_DeleteOnTermination_SetTrue verifies the field can be set
-func TestEBSRequest_DeleteOnTermination_SetTrue(t *testing.T) {
-	req := types.EBSRequest{
-		Name:                "vol-test",
-		Boot:                true,
-		DeleteOnTermination: true,
-	}
-	assert.True(t, req.DeleteOnTermination)
-}
-
-// TestGenerateVolumes_DeleteOnTermination_FromBlockDeviceMapping verifies that
-// the deleteOnTermination flag from RunInstancesInput.BlockDeviceMappings is
-// propagated to the EBSRequest on the instance's volume list.
-func TestGenerateVolumes_DeleteOnTermination_FromBlockDeviceMapping(t *testing.T) {
-	tests := []struct {
-		name                    string
-		deleteOnTerminationFlag *bool
-		expectedFlag            bool
-	}{
-		{
-			name:                    "DeleteOnTermination=true",
-			deleteOnTerminationFlag: aws.Bool(true),
-			expectedFlag:            true,
-		},
-		{
-			name:                    "DeleteOnTermination=false",
-			deleteOnTerminationFlag: aws.Bool(false),
-			expectedFlag:            false,
-		},
-		{
-			name:                    "DeleteOnTermination=nil (defaults to true)",
-			deleteOnTerminationFlag: nil,
-			expectedFlag:            true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Build a RunInstancesInput with BlockDeviceMappings
-			input := &ec2.RunInstancesInput{
-				ImageId:      aws.String("vol-existing-volume"),
-				InstanceType: aws.String("t3.micro"),
-				MinCount:     aws.Int64(1),
-				MaxCount:     aws.Int64(1),
-			}
-
-			if tt.deleteOnTerminationFlag != nil {
-				input.BlockDeviceMappings = []*ec2.BlockDeviceMapping{
-					{
-						DeviceName: aws.String("/dev/vda"),
-						Ebs: &ec2.EbsBlockDevice{
-							VolumeSize:          aws.Int64(8),
-							DeleteOnTermination: tt.deleteOnTerminationFlag,
-						},
-					},
-				}
-			}
-
-			// Exercise the parsing logic that GenerateVolumes uses
-			// Default is true (matches AWS RunInstances behavior for root volumes)
-			deleteOnTermination := true
-			if len(input.BlockDeviceMappings) > 0 {
-				bdm := input.BlockDeviceMappings[0]
-				if bdm.Ebs != nil && bdm.Ebs.DeleteOnTermination != nil {
-					deleteOnTermination = *bdm.Ebs.DeleteOnTermination
-				}
-			}
-
-			assert.Equal(t, tt.expectedFlag, deleteOnTermination,
-				"deleteOnTermination should match expected value")
-
-			// Verify the flag is correctly assigned to an EBSRequest
-			ebsReq := types.EBSRequest{
-				Name:                "vol-test",
-				Boot:                true,
-				DeleteOnTermination: deleteOnTermination,
-			}
-			assert.Equal(t, tt.expectedFlag, ebsReq.DeleteOnTermination)
-		})
-	}
-}
-
-// TestStopInstance_DeleteOnTermination_VolumeDeletion tests that stopInstance
-// correctly handles DeleteOnTermination for each volume type.
-// Uses embedded NATS with mock subscribers to verify NATS messages.
-func TestStopInstance_DeleteOnTermination_VolumeDeletion(t *testing.T) {
+// TestInstanceCleanerAdapter_DeleteVolumes_DeleteOnTermination tests that
+// the instanceCleanerAdapter correctly handles DeleteOnTermination for each
+// volume type: internal volumes (EFI, cloud-init) always go through
+// ebs.delete; user volumes only when DeleteOnTermination is true.
+func TestInstanceCleanerAdapter_DeleteVolumes_DeleteOnTermination(t *testing.T) {
 	natsURL := sharedNATSURL
 
 	daemon := createTestDaemon(t, natsURL)
 
-	// Track which NATS messages are received
 	var mu sync.Mutex
-	unmountedVolumes := make(map[string]bool)
 	ebsDeletedVolumes := make(map[string]bool)
+	const expectedDeletes = 2 // EFI + cloud-init; vol-root has no S3 backend
+	allDeletes := make(chan struct{})
 
-	// Mock ebs.unmount subscriber
-	unmountSub, err := daemon.natsConn.Subscribe("ebs.node-1.unmount", func(msg *nats.Msg) {
-		var req types.EBSRequest
-		json.Unmarshal(msg.Data, &req)
-		mu.Lock()
-		unmountedVolumes[req.Name] = true
-		mu.Unlock()
-		resp := types.EBSUnMountResponse{Volume: req.Name, Mounted: false}
-		data, _ := json.Marshal(resp)
-		msg.Respond(data)
-	})
-	require.NoError(t, err)
-	defer unmountSub.Unsubscribe()
-
-	// Mock ebs.delete subscriber
 	deleteSub, err := daemon.natsConn.Subscribe("ebs.delete", func(msg *nats.Msg) {
 		var req types.EBSDeleteRequest
 		json.Unmarshal(msg.Data, &req)
 		mu.Lock()
 		ebsDeletedVolumes[req.Volume] = true
+		done := len(ebsDeletedVolumes) == expectedDeletes
 		mu.Unlock()
 		resp := types.EBSDeleteResponse{Volume: req.Volume, Success: true}
 		data, _ := json.Marshal(resp)
 		msg.Respond(data)
+		if done {
+			close(allDeletes)
+		}
 	})
 	require.NoError(t, err)
 	defer deleteSub.Unsubscribe()
 
-	// Subscribe to the instance NATS topic to avoid unsubscribe errors
-	instanceSub, err := daemon.natsConn.Subscribe("ec2.cmd.i-test-dot", func(msg *nats.Msg) {})
-	require.NoError(t, err)
-	defer instanceSub.Unsubscribe()
-	daemon.natsSubscriptions["ec2.cmd.i-test-dot"] = instanceSub
-
 	instance := &vm.VM{
-		ID:           "i-test-dot",
-		InstanceType: getTestInstanceType(t),
-		Status:       vm.StateRunning,
-		AccountID:    testAccountID,
-		QMPClient:    &qmp.QMPClient{}, // nil encoder/decoder => QMP will fail, which is fine
+		ID:        "i-test-dot",
+		AccountID: testAccountID,
 		EBSRequests: types.EBSRequests{
 			Requests: []types.EBSRequest{
-				{
-					Name:                "vol-root",
-					Boot:                true,
-					DeleteOnTermination: true,
-				},
-				{
-					Name: "vol-root-efi",
-					EFI:  true,
-				},
-				{
-					Name:      "vol-root-cloudinit",
-					CloudInit: true,
-				},
+				{Name: "vol-root", Boot: true, DeleteOnTermination: true},
+				{Name: "vol-root-efi", EFI: true},
+				{Name: "vol-root-cloudinit", CloudInit: true},
 			},
 		},
 	}
 
-	// Allocate resources so deallocate doesn't go negative
-	instanceType := daemon.resourceMgr.instanceTypes[instance.InstanceType]
-	require.NotNil(t, instanceType)
-	err = daemon.resourceMgr.allocate(instanceType)
-	require.NoError(t, err)
+	cleaner := newInstanceCleanerAdapter(daemon)
+	cleaner.DeleteVolumes(instance)
 
-	daemon.Instances.VMS[instance.ID] = instance
-
-	// Call stopInstance with deleteVolume=true (termination)
-	err = daemon.stopInstance(map[string]*vm.VM{instance.ID: instance}, true)
-	assert.NoError(t, err)
-
-	// Allow NATS messages to propagate
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-allDeletes:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for ebs.delete fan-out")
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
-
-	// All volumes should be unmounted
-	assert.True(t, unmountedVolumes["vol-root"], "Root volume should be unmounted")
-	assert.True(t, unmountedVolumes["vol-root-efi"], "EFI volume should be unmounted")
-	assert.True(t, unmountedVolumes["vol-root-cloudinit"], "Cloud-init volume should be unmounted")
 
 	// Internal volumes (EFI, cloud-init) should receive ebs.delete
 	assert.True(t, ebsDeletedVolumes["vol-root-efi"], "EFI volume should receive ebs.delete")
 	assert.True(t, ebsDeletedVolumes["vol-root-cloudinit"], "Cloud-init volume should receive ebs.delete")
 }
 
-// TestStopInstance_DeleteOnTermination_False_SkipsVolumeDeletion verifies that
-// volumes with DeleteOnTermination=false are NOT deleted during termination.
-func TestStopInstance_DeleteOnTermination_False_SkipsVolumeDeletion(t *testing.T) {
+// TestInstanceCleanerAdapter_DeleteVolumes_DeleteOnTermination_False verifies
+// that volumes with DeleteOnTermination=false are NOT deleted during
+// termination, while internal volumes still are.
+func TestInstanceCleanerAdapter_DeleteVolumes_DeleteOnTermination_False(t *testing.T) {
 	natsURL := sharedNATSURL
 
 	daemon := createTestDaemon(t, natsURL)
 
 	var mu sync.Mutex
-	unmountedVolumes := make(map[string]bool)
 	ebsDeletedVolumes := make(map[string]bool)
+	const expectedDeletes = 2 // only the two internal volumes; vol-keep is skipped
+	allDeletes := make(chan struct{})
 
-	// Mock ebs.unmount subscriber
-	unmountSub, err := daemon.natsConn.Subscribe("ebs.node-1.unmount", func(msg *nats.Msg) {
-		var req types.EBSRequest
-		json.Unmarshal(msg.Data, &req)
-		mu.Lock()
-		unmountedVolumes[req.Name] = true
-		mu.Unlock()
-		resp := types.EBSUnMountResponse{Volume: req.Name, Mounted: false}
-		data, _ := json.Marshal(resp)
-		msg.Respond(data)
-	})
-	require.NoError(t, err)
-	defer unmountSub.Unsubscribe()
-
-	// Mock ebs.delete subscriber
 	deleteSub, err := daemon.natsConn.Subscribe("ebs.delete", func(msg *nats.Msg) {
 		var req types.EBSDeleteRequest
 		json.Unmarshal(msg.Data, &req)
 		mu.Lock()
 		ebsDeletedVolumes[req.Volume] = true
+		done := len(ebsDeletedVolumes) == expectedDeletes
 		mu.Unlock()
 		resp := types.EBSDeleteResponse{Volume: req.Volume, Success: true}
 		data, _ := json.Marshal(resp)
 		msg.Respond(data)
+		if done {
+			close(allDeletes)
+		}
 	})
 	require.NoError(t, err)
 	defer deleteSub.Unsubscribe()
 
-	// Subscribe to the instance NATS topic
-	instanceSub, err := daemon.natsConn.Subscribe("ec2.cmd.i-test-no-delete", func(msg *nats.Msg) {})
-	require.NoError(t, err)
-	defer instanceSub.Unsubscribe()
-	daemon.natsSubscriptions["ec2.cmd.i-test-no-delete"] = instanceSub
-
 	instance := &vm.VM{
-		ID:           "i-test-no-delete",
-		InstanceType: getTestInstanceType(t),
-		Status:       vm.StateRunning,
-		AccountID:    testAccountID,
-		QMPClient:    &qmp.QMPClient{},
+		ID:        "i-test-no-delete",
+		AccountID: testAccountID,
 		EBSRequests: types.EBSRequests{
 			Requests: []types.EBSRequest{
-				{
-					Name:                "vol-keep",
-					Boot:                true,
-					DeleteOnTermination: false, // Should NOT be deleted
-				},
-				{
-					Name: "vol-keep-efi",
-					EFI:  true,
-				},
-				{
-					Name:      "vol-keep-cloudinit",
-					CloudInit: true,
-				},
+				{Name: "vol-keep", Boot: true, DeleteOnTermination: false},
+				{Name: "vol-keep-efi", EFI: true},
+				{Name: "vol-keep-cloudinit", CloudInit: true},
 			},
 		},
 	}
 
-	instanceType := daemon.resourceMgr.instanceTypes[instance.InstanceType]
-	require.NotNil(t, instanceType)
-	err = daemon.resourceMgr.allocate(instanceType)
-	require.NoError(t, err)
+	cleaner := newInstanceCleanerAdapter(daemon)
+	cleaner.DeleteVolumes(instance)
 
-	daemon.Instances.VMS[instance.ID] = instance
-
-	// Call stopInstance with deleteVolume=true (termination)
-	err = daemon.stopInstance(map[string]*vm.VM{instance.ID: instance}, true)
-	assert.NoError(t, err)
-
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-allDeletes:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for ebs.delete fan-out")
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
 
-	// All volumes should still be unmounted
-	assert.True(t, unmountedVolumes["vol-keep"], "Root volume should be unmounted")
-	assert.True(t, unmountedVolumes["vol-keep-efi"], "EFI volume should be unmounted")
-	assert.True(t, unmountedVolumes["vol-keep-cloudinit"], "Cloud-init volume should be unmounted")
-
-	// Internal volumes should still get ebs.delete (always cleaned up)
+	// Internal volumes still get ebs.delete (always cleaned up)
 	assert.True(t, ebsDeletedVolumes["vol-keep-efi"], "EFI volume should receive ebs.delete even when root has DeleteOnTermination=false")
 	assert.True(t, ebsDeletedVolumes["vol-keep-cloudinit"], "Cloud-init volume should receive ebs.delete even when root has DeleteOnTermination=false")
 
-	// Root volume with DeleteOnTermination=false should NOT have ebs.delete called
+	// Root volume with DeleteOnTermination=false should NOT receive ebs.delete
 	assert.False(t, ebsDeletedVolumes["vol-keep"], "Root volume with DeleteOnTermination=false should NOT be deleted")
-}
-
-// TestStopInstance_NoDelete_OnStop verifies that volumes are NOT deleted during
-// a regular stop (non-termination), regardless of DeleteOnTermination flag.
-func TestStopInstance_NoDelete_OnStop(t *testing.T) {
-	natsURL := sharedNATSURL
-
-	daemon := createTestDaemon(t, natsURL)
-
-	var mu sync.Mutex
-	ebsDeletedVolumes := make(map[string]bool)
-
-	// Mock ebs.unmount subscriber
-	unmountSub, err := daemon.natsConn.Subscribe("ebs.node-1.unmount", func(msg *nats.Msg) {
-		resp := types.EBSUnMountResponse{Mounted: false}
-		data, _ := json.Marshal(resp)
-		msg.Respond(data)
-	})
-	require.NoError(t, err)
-	defer unmountSub.Unsubscribe()
-
-	// Mock ebs.delete subscriber - should NOT be called
-	deleteSub, err := daemon.natsConn.Subscribe("ebs.delete", func(msg *nats.Msg) {
-		var req types.EBSDeleteRequest
-		json.Unmarshal(msg.Data, &req)
-		mu.Lock()
-		ebsDeletedVolumes[req.Volume] = true
-		mu.Unlock()
-		resp := types.EBSDeleteResponse{Volume: req.Volume, Success: true}
-		data, _ := json.Marshal(resp)
-		msg.Respond(data)
-	})
-	require.NoError(t, err)
-	defer deleteSub.Unsubscribe()
-
-	instance := &vm.VM{
-		ID:           "i-test-stop-only",
-		InstanceType: getTestInstanceType(t),
-		Status:       vm.StateRunning,
-		AccountID:    testAccountID,
-		QMPClient:    &qmp.QMPClient{},
-		EBSRequests: types.EBSRequests{
-			Requests: []types.EBSRequest{
-				{
-					Name:                "vol-stop-root",
-					Boot:                true,
-					DeleteOnTermination: true, // Even with true, stop should NOT delete
-				},
-				{
-					Name: "vol-stop-efi",
-					EFI:  true,
-				},
-			},
-		},
-	}
-
-	instanceType := daemon.resourceMgr.instanceTypes[instance.InstanceType]
-	require.NotNil(t, instanceType)
-	err = daemon.resourceMgr.allocate(instanceType)
-	require.NoError(t, err)
-
-	daemon.Instances.VMS[instance.ID] = instance
-
-	// Call stopInstance with deleteVolume=false (stop, not terminate)
-	err = daemon.stopInstance(map[string]*vm.VM{instance.ID: instance}, false)
-	assert.NoError(t, err)
-
-	time.Sleep(200 * time.Millisecond)
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	// No volumes should be deleted during a stop operation
-	assert.Empty(t, ebsDeletedVolumes, "No volumes should be deleted during stop (not terminate)")
 }
 
 // TestHandleEC2Events_AttachVolume tests the attach-volume handler in handleEC2Events
@@ -2075,7 +1758,7 @@ func TestHandleEC2Events_AttachVolume(t *testing.T) {
 		Instance:     &ec2.Instance{},
 		QMPClient:    &qmp.QMPClient{}, // nil encoder/decoder
 	}
-	daemon.Instances.VMS[instanceID] = instance
+	daemon.vmMgr.Insert(instance)
 
 	// Subscribe the handler to the instance's per-instance topic
 	sub, err := daemon.natsConn.Subscribe(
@@ -2107,11 +1790,9 @@ func TestHandleEC2Events_AttachVolume(t *testing.T) {
 	})
 
 	t.Run("InstanceNotRunning", func(t *testing.T) {
-		// Temporarily set status to stopped
-		daemon.Instances.Mu.Lock()
-		instance.Status = vm.StateStopped
-		daemon.Instances.Mu.Unlock()
-
+		// Temporarily set status to stopped under the manager lock so -race
+		// reflects production discipline.
+		daemon.vmMgr.UpdateState(instance.ID, func(v *vm.VM) { v.Status = vm.StateStopped })
 		command := types.EC2InstanceCommand{
 			ID: instanceID,
 			Attributes: types.EC2CommandAttributes{
@@ -2132,9 +1813,7 @@ func TestHandleEC2Events_AttachVolume(t *testing.T) {
 		assert.Contains(t, string(resp.Data), "IncorrectInstanceState")
 
 		// Restore running state
-		daemon.Instances.Mu.Lock()
-		instance.Status = vm.StateRunning
-		daemon.Instances.Mu.Unlock()
+		daemon.vmMgr.UpdateState(instance.ID, func(v *vm.VM) { v.Status = vm.StateRunning })
 	})
 
 	t.Run("VolumeNotFound", func(t *testing.T) {
@@ -2160,29 +1839,6 @@ func TestHandleEC2Events_AttachVolume(t *testing.T) {
 		// Should fail at volume validation (no S3 backend)
 		assert.Contains(t, string(resp.Data), "InvalidVolume.NotFound")
 	})
-}
-
-// TestEBSRequest_JSON_Serialization verifies DeleteOnTermination survives JSON round-trip
-// (important for JetStream state persistence)
-func TestEBSRequest_JSON_Serialization(t *testing.T) {
-	original := types.EBSRequest{
-		Name:                "vol-test-json",
-		Boot:                true,
-		DeleteOnTermination: true,
-		NBDURI:              "nbd:unix:/tmp/test.sock",
-	}
-
-	data, err := json.Marshal(original)
-	require.NoError(t, err)
-
-	var restored types.EBSRequest
-	err = json.Unmarshal(data, &restored)
-	require.NoError(t, err)
-
-	assert.Equal(t, original.Name, restored.Name)
-	assert.Equal(t, original.Boot, restored.Boot)
-	assert.Equal(t, original.DeleteOnTermination, restored.DeleteOnTermination)
-	assert.Equal(t, original.NBDURI, restored.NBDURI)
 }
 
 // TestHandleEC2Events_DetachVolume tests the detach-volume handler in handleEC2Events
@@ -2221,7 +1877,7 @@ func TestHandleEC2Events_DetachVolume(t *testing.T) {
 			},
 		},
 	}
-	daemon.Instances.VMS[instanceID] = instance
+	daemon.vmMgr.Insert(instance)
 
 	// Subscribe the handler to the instance's per-instance topic
 	sub, err := daemon.natsConn.Subscribe(
@@ -2251,11 +1907,9 @@ func TestHandleEC2Events_DetachVolume(t *testing.T) {
 	})
 
 	t.Run("InstanceNotRunning", func(t *testing.T) {
-		// Temporarily set status to stopped
-		daemon.Instances.Mu.Lock()
-		instance.Status = vm.StateStopped
-		daemon.Instances.Mu.Unlock()
-
+		// Temporarily set status to stopped under the manager lock so -race
+		// reflects production discipline.
+		daemon.vmMgr.UpdateState(instance.ID, func(v *vm.VM) { v.Status = vm.StateStopped })
 		command := types.EC2InstanceCommand{
 			ID: instanceID,
 			Attributes: types.EC2CommandAttributes{
@@ -2276,9 +1930,7 @@ func TestHandleEC2Events_DetachVolume(t *testing.T) {
 		assert.Contains(t, string(resp.Data), "IncorrectInstanceState")
 
 		// Restore running state
-		daemon.Instances.Mu.Lock()
-		instance.Status = vm.StateRunning
-		daemon.Instances.Mu.Unlock()
+		daemon.vmMgr.UpdateState(instance.ID, func(v *vm.VM) { v.Status = vm.StateRunning })
 	})
 
 	t.Run("VolumeNotAttached", func(t *testing.T) {
@@ -2429,8 +2081,8 @@ func TestHandleEC2Events_DetachVolume(t *testing.T) {
 	})
 
 	t.Run("QMPDeviceDelFails_NoForce", func(t *testing.T) {
-		// With nil QMPClient encoder/decoder, SendQMPCommand returns error.
-		// Without force=true, this should return ServerInternal.
+		// With nil QMPClient encoder/decoder, the QMP device_del returns
+		// error. Without force=true, this should return ServerInternal.
 		command := types.EC2InstanceCommand{
 			ID: instanceID,
 			Attributes: types.EC2CommandAttributes{
@@ -2570,7 +2222,7 @@ func TestDetachVolume_SuccessPath(t *testing.T) {
 			},
 		},
 	}
-	daemon.Instances.VMS[instanceID] = instance
+	daemon.vmMgr.Insert(instance)
 
 	// Subscribe a mock ebs.unmount handler
 	ebsUnmountCalled := make(chan string, 1)
@@ -2640,7 +2292,6 @@ func TestDetachVolume_SuccessPath(t *testing.T) {
 	instance.EBSRequests.Mu.Unlock()
 
 	// Verify volume removed from BlockDeviceMappings
-	daemon.Instances.Mu.Lock()
 	for _, bdm := range instance.Instance.BlockDeviceMappings {
 		if bdm.Ebs != nil && bdm.Ebs.VolumeId != nil {
 			assert.NotEqual(t, volumeID, *bdm.Ebs.VolumeId, "Volume should be removed from BlockDeviceMappings")
@@ -2649,7 +2300,6 @@ func TestDetachVolume_SuccessPath(t *testing.T) {
 	// Root volume should still be present
 	assert.Len(t, instance.Instance.BlockDeviceMappings, 1)
 	assert.Equal(t, "vol-root", *instance.Instance.BlockDeviceMappings[0].Ebs.VolumeId)
-	daemon.Instances.Mu.Unlock()
 }
 
 // TestDetachVolume_ForceFlag tests that force=true continues past device_del failure
@@ -2713,7 +2363,7 @@ func TestDetachVolume_ForceFlag(t *testing.T) {
 			},
 		},
 	}
-	daemon.Instances.VMS[instanceID] = instance
+	daemon.vmMgr.Insert(instance)
 
 	// Mock ebs.unmount
 	ebsSub, err := daemon.natsConn.Subscribe("ebs.node-1.unmount", func(msg *nats.Msg) {
@@ -2827,7 +2477,7 @@ func TestDetachVolume_BlockdevDelFailure(t *testing.T) {
 			},
 		},
 	}
-	daemon.Instances.VMS[instanceID] = instance
+	daemon.vmMgr.Insert(instance)
 
 	sub, err := daemon.natsConn.Subscribe(
 		fmt.Sprintf("ec2.cmd.%s", instanceID),
@@ -2868,7 +2518,6 @@ func TestDetachVolume_BlockdevDelFailure(t *testing.T) {
 	assert.True(t, found, "Volume must remain in EBSRequests when blockdev-del fails")
 
 	// Critical: BlockDeviceMappings must NOT be cleaned up
-	daemon.Instances.Mu.Lock()
 	bdmFound := false
 	for _, bdm := range instance.Instance.BlockDeviceMappings {
 		if bdm.Ebs != nil && bdm.Ebs.VolumeId != nil && *bdm.Ebs.VolumeId == volumeID {
@@ -2876,7 +2525,6 @@ func TestDetachVolume_BlockdevDelFailure(t *testing.T) {
 			break
 		}
 	}
-	daemon.Instances.Mu.Unlock()
 	assert.True(t, bdmFound, "Volume must remain in BlockDeviceMappings when blockdev-del fails")
 }
 
@@ -2919,7 +2567,7 @@ func TestDetachVolume_SuccessWithDeviceMatch(t *testing.T) {
 			},
 		},
 	}
-	daemon.Instances.VMS[instanceID] = instance
+	daemon.vmMgr.Insert(instance)
 
 	ebsSub, err := daemon.natsConn.Subscribe("ebs.node-1.unmount", func(msg *nats.Msg) {
 		resp := types.EBSUnMountResponse{Mounted: false}
@@ -2995,7 +2643,7 @@ func TestAttachVolume_ReplacesStaleEBSRequest(t *testing.T) {
 			},
 		},
 	}
-	daemon.Instances.VMS[instanceID] = instance
+	daemon.vmMgr.Insert(instance)
 
 	// Mock ebs.mount to return success with a new NBDURI
 	ebsSub, err := daemon.natsConn.Subscribe("ebs.node-1.mount", func(msg *nats.Msg) {
@@ -3163,19 +2811,67 @@ func TestInstanceTypeMemoryMiB_NilSafety(t *testing.T) {
 }
 
 // --- Daemon.WriteState / Daemon.LoadState nil jsManager ---
+//
+// Post-1a: local file is the source of truth, KV is best-effort. A nil
+// jsManager is a valid configuration (e.g. standalone daemon, fresh install
+// before NATS is up) and must not block local persistence.
 
 func TestDaemon_WriteState_NilJSManager(t *testing.T) {
-	d := &Daemon{jsManager: nil}
-	err := d.WriteState()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "JetStream manager not initialized")
+	tmpDir := t.TempDir()
+	d := &Daemon{
+		jsManager: nil,
+		config:    &config.Config{DataDir: tmpDir},
+		vmMgr:     vm.NewManager(),
+	}
+	d.vmMgr.Insert(&vm.VM{ID: "i-1"})
+	require.NoError(t, d.WriteState())
+
+	state, err := ReadLocalState(LocalStatePath(tmpDir))
+	require.NoError(t, err)
+	require.NotNil(t, state)
+	assert.Contains(t, state.VMS, "i-1")
 }
 
 func TestDaemon_LoadState_NilJSManager(t *testing.T) {
-	d := &Daemon{jsManager: nil}
+	tmpDir := t.TempDir()
+	require.NoError(t, WriteLocalState(LocalStatePath(tmpDir), map[string]*vm.VM{
+		"i-seed": {ID: "i-seed"},
+	}))
+
+	d := &Daemon{
+		jsManager: nil,
+		config:    &config.Config{DataDir: tmpDir},
+		vmMgr:     vm.NewManager(),
+	}
+	require.NoError(t, d.LoadState())
+	_, ok := d.vmMgr.Get("i-seed")
+	assert.True(t, ok)
+}
+
+func TestDaemon_LoadState_MissingFileIsFreshInstall(t *testing.T) {
+	d := &Daemon{
+		jsManager: nil,
+		config:    &config.Config{DataDir: t.TempDir()},
+		vmMgr:     vm.NewManager(),
+	}
+	require.NoError(t, d.LoadState())
+	assert.Equal(t, 0, d.vmMgr.Count())
+}
+
+func TestDaemon_LoadState_CorruptFileFatal(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := LocalStatePath(tmpDir)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+	require.NoError(t, os.WriteFile(path, []byte("{not json"), 0o600))
+
+	d := &Daemon{
+		jsManager: nil,
+		config:    &config.Config{DataDir: tmpDir},
+		vmMgr:     vm.NewManager(),
+	}
 	err := d.LoadState()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "JetStream manager not initialized")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read local state")
 }
 
 // --- GetAvailableInstanceTypeInfos edge cases ---
@@ -3226,6 +2922,210 @@ func TestGetAvailableInstanceTypeInfos_ShowCapacity(t *testing.T) {
 	assert.Len(t, infos, 1)
 }
 
+// --- GPU-gated GetAvailableInstanceTypeInfos ---
+
+func makeGPUInstanceType(name string, vcpus int64, memMiB int64) *ec2.InstanceTypeInfo {
+	return &ec2.InstanceTypeInfo{
+		InstanceType: aws.String(name),
+		VCpuInfo:     &ec2.VCpuInfo{DefaultVCpus: aws.Int64(vcpus)},
+		MemoryInfo:   &ec2.MemoryInfo{SizeInMiB: aws.Int64(memMiB)},
+		GpuInfo: &ec2.GpuInfo{
+			Gpus: []*ec2.GpuDeviceInfo{{
+				Count:        aws.Int64(int64(instancetypes.GPUCountForType(name))),
+				Manufacturer: aws.String("AMD"),
+				Name:         aws.String("Instinct MI350X"),
+				MemoryInfo:   &ec2.GpuDeviceMemoryInfo{SizeInMiB: aws.Int64(294896)},
+			}},
+		},
+	}
+}
+
+func makeGPUDevice() gpu.GPUDevice {
+	return gpu.GPUDevice{VendorID: "1002", DeviceID: "75a0", PCIAddress: "0000:03:00.0", Vendor: gpu.VendorAMD}
+}
+
+// GPU types with no gpuManager are hidden — there is no GPU hardware on this node.
+func TestGetAvailableInstanceTypeInfos_GPUType_NoManager_Hidden(t *testing.T) {
+	rm := &ResourceManager{
+		hostVCPU:  128,
+		hostMemGB: 1024.0,
+		instanceTypes: map[string]*ec2.InstanceTypeInfo{
+			"g7e.4xlarge": makeGPUInstanceType("g7e.4xlarge", 16, 128*1024),
+		},
+	}
+	infos := rm.GetAvailableInstanceTypeInfos(false)
+	assert.Empty(t, infos, "GPU type must not appear when gpuManager is nil")
+}
+
+// GPU types gate on pool availability, not host CPU/memory — even a tiny host
+// with a GPU pool exposes the type.
+func TestGetAvailableInstanceTypeInfos_GPUType_GatedByPool(t *testing.T) {
+	mgr := gpu.NewManager([]gpu.GPUDevice{makeGPUDevice(), makeGPUDevice()})
+	rm := &ResourceManager{
+		hostVCPU:  4,   // would normally block a 16-vCPU instance
+		hostMemGB: 8.0, // would normally block a 128 GB instance
+		instanceTypes: map[string]*ec2.InstanceTypeInfo{
+			"g7e.4xlarge": makeGPUInstanceType("g7e.4xlarge", 16, 128*1024),
+		},
+		gpuManager: mgr,
+	}
+	infos := rm.GetAvailableInstanceTypeInfos(false)
+	assert.Len(t, infos, 1, "GPU type must appear when pool has free GPUs regardless of CPU/memory")
+}
+
+// Multi-GPU type (g7e.12xlarge, needs 2) appears only when pool has ≥ 2 free GPUs.
+func TestGetAvailableInstanceTypeInfos_MultiGPUType_RequiresTwoGPUs(t *testing.T) {
+	oneGPU := gpu.NewManager([]gpu.GPUDevice{makeGPUDevice()})
+	rm := &ResourceManager{
+		hostVCPU:  128,
+		hostMemGB: 1024.0,
+		instanceTypes: map[string]*ec2.InstanceTypeInfo{
+			"g7e.12xlarge": makeGPUInstanceType("g7e.12xlarge", 48, 512*1024),
+		},
+		gpuManager: oneGPU,
+	}
+	infos := rm.GetAvailableInstanceTypeInfos(false)
+	assert.Empty(t, infos, "g7e.12xlarge must not appear with only 1 free GPU")
+
+	twoGPUs := gpu.NewManager([]gpu.GPUDevice{makeGPUDevice(), makeGPUDevice()})
+	rm.gpuManager = twoGPUs
+	infos = rm.GetAvailableInstanceTypeInfos(false)
+	assert.Len(t, infos, 1, "g7e.12xlarge must appear when pool has ≥ 2 free GPUs")
+}
+
+// showCapacity=true for GPU types emits pool/gpuCount slots.
+func TestGetAvailableInstanceTypeInfos_GPUType_ShowCapacity(t *testing.T) {
+	mgr := gpu.NewManager([]gpu.GPUDevice{makeGPUDevice(), makeGPUDevice(), makeGPUDevice(), makeGPUDevice()})
+	rm := &ResourceManager{
+		hostVCPU:  128,
+		hostMemGB: 1024.0,
+		instanceTypes: map[string]*ec2.InstanceTypeInfo{
+			"g7e.4xlarge":  makeGPUInstanceType("g7e.4xlarge", 16, 128*1024),
+			"g7e.12xlarge": makeGPUInstanceType("g7e.12xlarge", 48, 512*1024),
+		},
+		gpuManager: mgr,
+	}
+	// 4 GPUs → 4× g7e.4xlarge (1 GPU each) or 2× g7e.12xlarge (2 GPUs each)
+	infos := rm.GetAvailableInstanceTypeInfos(true)
+	count4xl := 0
+	count12xl := 0
+	for _, it := range infos {
+		switch *it.InstanceType {
+		case "g7e.4xlarge":
+			count4xl++
+		case "g7e.12xlarge":
+			count12xl++
+		}
+	}
+	assert.Equal(t, 4, count4xl, "4 GPUs → 4 slots for g7e.4xlarge")
+	assert.Equal(t, 2, count12xl, "4 GPUs → 2 slots for g7e.12xlarge")
+}
+
+// canAllocate for GPU types returns count without CPU/memory gating.
+func TestCanAllocate_GPUType_BypassesCPUMemory(t *testing.T) {
+	rm := &ResourceManager{
+		hostVCPU:      4,   // deliberately tiny
+		hostMemGB:     8.0, // deliberately tiny
+		instanceTypes: map[string]*ec2.InstanceTypeInfo{},
+	}
+	gpuType := makeGPUInstanceType("g7e.4xlarge", 16, 128*1024)
+	assert.Equal(t, 1, rm.canAllocate(gpuType, 1),
+		"GPU type must be allocatable even when CPU/memory would normally block it")
+}
+
+// --- GetSupportedInstanceTypeInfos ---
+
+// Supported set is independent of remaining capacity: even when every host
+// slot for a type is occupied the type must still appear, because callers
+// (e.g. Terraform AWS provider) treat DescribeInstanceTypes as a global
+// metadata lookup, not a "what can fit right now" query.
+func TestGetSupportedInstanceTypeInfos_IgnoresFreeSlots(t *testing.T) {
+	rm := &ResourceManager{
+		hostVCPU:      4,
+		hostMemGB:     8.0,
+		allocatedVCPU: 4, // fully consumed
+		allocatedMem:  8.0,
+		instanceTypes: map[string]*ec2.InstanceTypeInfo{
+			"t3.micro": {
+				InstanceType: aws.String("t3.micro"),
+				VCpuInfo:     &ec2.VCpuInfo{DefaultVCpus: aws.Int64(2)},
+				MemoryInfo:   &ec2.MemoryInfo{SizeInMiB: aws.Int64(1024)},
+			},
+			"m5.large": {
+				InstanceType: aws.String("m5.large"),
+				VCpuInfo:     &ec2.VCpuInfo{DefaultVCpus: aws.Int64(2)},
+				MemoryInfo:   &ec2.MemoryInfo{SizeInMiB: aws.Int64(8 * 1024)},
+			},
+		},
+	}
+
+	// Capacity-gated view: nothing fits because resources are exhausted.
+	assert.Empty(t, rm.GetAvailableInstanceTypeInfos(false),
+		"capacity-gated set must be empty when resources are exhausted")
+
+	// Supported view: every loaded type is still announced.
+	supported := rm.GetSupportedInstanceTypeInfos()
+	got := make(map[string]bool)
+	for _, it := range supported {
+		require.NotNil(t, it.InstanceType)
+		got[*it.InstanceType] = true
+	}
+	assert.True(t, got["t3.micro"], "t3.micro must appear in supported set")
+	assert.True(t, got["m5.large"], "m5.large must appear in supported set even with no free slots")
+}
+
+// System types and entries missing CPU/memory metadata stay filtered — they
+// would break callers if returned regardless of capacity.
+func TestGetSupportedInstanceTypeInfos_SkipsSystemAndIncomplete(t *testing.T) {
+	systemTypeName := "sys.micro"
+	require.True(t, instancetypes.IsSystemType(systemTypeName),
+		"sentinel %s must satisfy IsSystemType — update the test if the prefix changes", systemTypeName)
+
+	rm := &ResourceManager{
+		hostVCPU:  16,
+		hostMemGB: 64.0,
+		instanceTypes: map[string]*ec2.InstanceTypeInfo{
+			systemTypeName: {
+				InstanceType: aws.String(systemTypeName),
+				VCpuInfo:     &ec2.VCpuInfo{DefaultVCpus: aws.Int64(1)},
+				MemoryInfo:   &ec2.MemoryInfo{SizeInMiB: aws.Int64(512)},
+			},
+			"t3.micro": {
+				InstanceType: aws.String("t3.micro"),
+				VCpuInfo:     &ec2.VCpuInfo{DefaultVCpus: aws.Int64(2)},
+				MemoryInfo:   &ec2.MemoryInfo{SizeInMiB: aws.Int64(1024)},
+			},
+			"broken.type": {
+				InstanceType: aws.String("broken.type"),
+				// missing VCpuInfo / MemoryInfo → metadata gate excludes it
+			},
+		},
+	}
+
+	supported := rm.GetSupportedInstanceTypeInfos()
+	require.Len(t, supported, 1, "only the well-formed non-system type must appear")
+	require.NotNil(t, supported[0].InstanceType)
+	assert.Equal(t, "t3.micro", *supported[0].InstanceType)
+}
+
+// GPU types must appear in the supported set regardless of GPU pool state —
+// the goal is to advertise what this node *can* run, not what it can run
+// right now. Capacity gating is the capacity=true path's job.
+func TestGetSupportedInstanceTypeInfos_GPUType_AppearsWithoutPool(t *testing.T) {
+	rm := &ResourceManager{
+		hostVCPU:  128,
+		hostMemGB: 1024.0,
+		instanceTypes: map[string]*ec2.InstanceTypeInfo{
+			"g7e.4xlarge": makeGPUInstanceType("g7e.4xlarge", 16, 128*1024),
+		},
+		// no gpuManager
+	}
+	supported := rm.GetSupportedInstanceTypeInfos()
+	require.Len(t, supported, 1, "GPU type must appear in supported set even without a GPU manager")
+	require.NotNil(t, supported[0].InstanceType)
+	assert.Equal(t, "g7e.4xlarge", *supported[0].InstanceType)
+}
+
 // --- NewDaemon ---
 
 func TestNewDaemon_WalDirDefaultsToBaseDir(t *testing.T) {
@@ -3260,77 +3160,18 @@ func TestNewDaemon_WalDirPreservedIfSet(t *testing.T) {
 	assert.Equal(t, "/fast-ssd/wal", d.config.WalDir)
 }
 
-// TestMarkInstanceFailed verifies that markInstanceFailed sets the StateReason and
-// transitions the instance to StateShuttingDown.
-func TestMarkInstanceFailed(t *testing.T) {
+// TestVolumeMounterAdapter_UnmountOne_Success verifies that the adapter's
+// UnmountOne sends an ebs.unmount NATS request and handles a successful
+// response. UnmountOne is shared by the AttachVolume rollback path and the
+// DetachVolume ebs.unmount step.
+func TestVolumeMounterAdapter_UnmountOne_Success(t *testing.T) {
 	natsURL := sharedNATSURL
 
 	daemon := createTestDaemon(t, natsURL)
-
-	instanceID := "i-test-mark-failed"
-	ec2Instance := &ec2.Instance{}
-	ec2Instance.SetInstanceId(instanceID)
-
-	instance := &vm.VM{
-		ID:           instanceID,
-		InstanceType: getTestInstanceType(t),
-		Status:       vm.StatePending,
-		AccountID:    testAccountID,
-		Instance:     ec2Instance,
-		QMPClient:    &qmp.QMPClient{},
-	}
-	daemon.Instances.VMS[instanceID] = instance
-
-	daemon.markInstanceFailed(instance, "volume_preparation_failed")
-
-	daemon.Instances.Mu.Lock()
-	defer daemon.Instances.Mu.Unlock()
-
-	// Verify state transitioned to shutting-down
-	assert.Equal(t, vm.StateShuttingDown, instance.Status)
-
-	// Verify StateReason was set
-	require.NotNil(t, instance.Instance.StateReason)
-	assert.Equal(t, "Server.InternalError", *instance.Instance.StateReason.Code)
-	assert.Equal(t, "volume_preparation_failed", *instance.Instance.StateReason.Message)
-}
-
-// TestMarkInstanceFailed_NilInstance verifies that markInstanceFailed handles
-// a VM with no ec2.Instance (Instance == nil) gracefully.
-func TestMarkInstanceFailed_NilInstance(t *testing.T) {
-	natsURL := sharedNATSURL
-
-	daemon := createTestDaemon(t, natsURL)
-
-	instanceID := "i-test-mark-failed-nil"
-	instance := &vm.VM{
-		ID:           instanceID,
-		InstanceType: getTestInstanceType(t),
-		Status:       vm.StatePending,
-		AccountID:    testAccountID,
-		Instance:     nil, // no ec2.Instance
-		QMPClient:    &qmp.QMPClient{},
-	}
-	daemon.Instances.VMS[instanceID] = instance
-
-	// Should not panic
-	daemon.markInstanceFailed(instance, "test_failure")
-
-	daemon.Instances.Mu.Lock()
-	defer daemon.Instances.Mu.Unlock()
-	assert.Equal(t, vm.StateShuttingDown, instance.Status)
-}
-
-// TestRollbackEBSMount_Success verifies that rollbackEBSMount sends an ebs.unmount
-// request and handles a successful unmount response.
-func TestRollbackEBSMount_Success(t *testing.T) {
-	natsURL := sharedNATSURL
-
-	daemon := createTestDaemon(t, natsURL)
+	adapter := newVolumeMounterAdapter(daemon.natsConn, daemon.node, nil)
 
 	unmountCalled := make(chan string, 1)
 
-	// Mock ebs.unmount subscriber that returns success
 	sub, err := daemon.natsConn.Subscribe("ebs.node-1.unmount", func(msg *nats.Msg) {
 		var req types.EBSRequest
 		json.Unmarshal(msg.Data, &req)
@@ -3342,12 +3183,10 @@ func TestRollbackEBSMount_Success(t *testing.T) {
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
-	ebsReq := types.EBSRequest{
+	adapter.UnmountOne(types.EBSRequest{
 		Name:       "vol-rollback-test",
 		DeviceName: "/dev/sdf",
-	}
-
-	daemon.rollbackEBSMount(ebsReq)
+	})
 
 	select {
 	case volName := <-unmountCalled:
@@ -3357,14 +3196,15 @@ func TestRollbackEBSMount_Success(t *testing.T) {
 	}
 }
 
-// TestRollbackEBSMount_UnmountError verifies that rollbackEBSMount handles
-// an error response from ebs.unmount gracefully (no panic, just logs).
-func TestRollbackEBSMount_UnmountError(t *testing.T) {
+// TestVolumeMounterAdapter_UnmountOne_UnmountError verifies that UnmountOne
+// propagates an error response from ebs.unmount. DetachVolume gates the volume's
+// available transition on this error, so it must not be swallowed.
+func TestVolumeMounterAdapter_UnmountOne_UnmountError(t *testing.T) {
 	natsURL := sharedNATSURL
 
 	daemon := createTestDaemon(t, natsURL)
+	adapter := newVolumeMounterAdapter(daemon.natsConn, daemon.node, nil)
 
-	// Mock ebs.unmount subscriber that returns an error
 	sub, err := daemon.natsConn.Subscribe("ebs.node-1.unmount", func(msg *nats.Msg) {
 		resp := types.EBSUnMountResponse{Error: "unmount failed: device busy"}
 		data, _ := json.Marshal(resp)
@@ -3373,45 +3213,267 @@ func TestRollbackEBSMount_UnmountError(t *testing.T) {
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
-	ebsReq := types.EBSRequest{Name: "vol-rollback-err"}
-
-	// Should not panic — errors are logged but not propagated
-	daemon.rollbackEBSMount(ebsReq)
+	require.Error(t, adapter.UnmountOne(types.EBSRequest{Name: "vol-rollback-err"}),
+		"an ebs.unmount error response must propagate so DetachVolume can keep the volume attached")
 }
 
-// TestRollbackEBSMount_StillMounted verifies that rollbackEBSMount handles
-// the case where the unmount response says the volume is still mounted.
-func TestRollbackEBSMount_StillMounted(t *testing.T) {
+// TestVolumeMounterAdapter_UnmountOne_StillMounted verifies that UnmountOne
+// returns an error when the unmount response reports the volume still mounted.
+func TestVolumeMounterAdapter_UnmountOne_StillMounted(t *testing.T) {
 	natsURL := sharedNATSURL
 
 	daemon := createTestDaemon(t, natsURL)
+	adapter := newVolumeMounterAdapter(daemon.natsConn, daemon.node, nil)
 
 	sub, err := daemon.natsConn.Subscribe("ebs.node-1.unmount", func(msg *nats.Msg) {
-		resp := types.EBSUnMountResponse{Mounted: true} // still mounted
+		resp := types.EBSUnMountResponse{Mounted: true}
 		data, _ := json.Marshal(resp)
 		msg.Respond(data)
 	})
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
-	ebsReq := types.EBSRequest{Name: "vol-still-mounted"}
-
-	// Should not panic
-	daemon.rollbackEBSMount(ebsReq)
+	require.Error(t, adapter.UnmountOne(types.EBSRequest{Name: "vol-still-mounted"}),
+		"a still-mounted response must propagate as an error")
 }
 
-// TestRollbackEBSMount_NATSTimeout verifies that rollbackEBSMount handles
-// NATS request timeout gracefully (no subscriber on ebs.unmount).
-func TestRollbackEBSMount_NATSTimeout(t *testing.T) {
-	natsURL := sharedNATSURL
+// TestVolumeMounterAdapter_UnmountOne_RequestFailure verifies that UnmountOne
+// surfaces a failed ebs.unmount NATS request as an error. A closed connection
+// fails immediately, rather than blocking on the full unmountSealTimeout (120s)
+// that a no-subscriber timeout would incur in every preflight run.
+func TestVolumeMounterAdapter_UnmountOne_RequestFailure(t *testing.T) {
+	nc, err := nats.Connect(sharedNATSURL)
+	require.NoError(t, err)
+	nc.Close()
 
-	daemon := createTestDaemon(t, natsURL)
+	adapter := newVolumeMounterAdapter(nc, "node-1", nil)
+	require.Error(t, adapter.UnmountOne(types.EBSRequest{Name: "vol-timeout"}),
+		"a failed ebs.unmount request must propagate as an error")
+}
 
-	// No ebs.unmount subscriber — will timeout
-	ebsReq := types.EBSRequest{Name: "vol-timeout"}
+// recordingVolState records UpdateVolumeState calls so the bulk-unmount test can
+// assert which volumes transitioned to available.
+type recordingVolState struct {
+	mu    sync.Mutex
+	calls []string
+}
 
-	// Should not panic, just log the timeout
-	daemon.rollbackEBSMount(ebsReq)
+func (r *recordingVolState) UpdateVolumeState(volumeID, state, instanceID, attachmentDevice string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, volumeID+":"+state)
+	return nil
+}
+
+func (r *recordingVolState) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.calls...)
+}
+
+var _ vm.VolumeStateUpdater = (*recordingVolState)(nil)
+
+// TestVolumeMounterAdapter_Unmount_SealFailureSkipsAvailable verifies the
+// teardown-path durability gate: a per-volume seal failure during the bulk
+// Unmount (stop/terminate) must NOT transition that volume to available — a
+// reattach on a WAL-less node would find no checkpoint (bad superblock) — while
+// other volumes still seal and the loop completes (terminate stays idempotent).
+func TestVolumeMounterAdapter_Unmount_SealFailureSkipsAvailable(t *testing.T) {
+	daemon := createTestDaemon(t, sharedNATSURL)
+	volState := &recordingVolState{}
+	adapter := newVolumeMounterAdapter(daemon.natsConn, daemon.node, volState)
+
+	sub, err := daemon.natsConn.Subscribe("ebs.node-1.unmount", func(msg *nats.Msg) {
+		var req types.EBSRequest
+		json.Unmarshal(msg.Data, &req)
+		resp := types.EBSUnMountResponse{Volume: req.Name, Mounted: false}
+		if req.Name == "vol-fail" {
+			resp.Error = "seal volume: predastore unreachable"
+		}
+		data, _ := json.Marshal(resp)
+		msg.Respond(data)
+	})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	inst := &vm.VM{
+		ID: "i-1",
+		EBSRequests: types.EBSRequests{
+			Requests: []types.EBSRequest{{Name: "vol-fail"}, {Name: "vol-ok"}},
+		},
+	}
+	require.NoError(t, adapter.Unmount(inst),
+		"bulk Unmount must tolerate a per-volume seal failure so terminate stays idempotent")
+
+	calls := volState.snapshot()
+	assert.NotContains(t, calls, "vol-fail:available",
+		"a failed seal must not transition the volume to available")
+	assert.Contains(t, calls, "vol-ok:available",
+		"a successful seal must still transition the volume to available")
+}
+
+// TestUnmountResponseError covers the shared seal-result parser used by both the
+// gated DetachVolume path (unmountOne) and the tolerated teardown path (Unmount).
+func TestUnmountResponseError(t *testing.T) {
+	t.Run("success (not mounted, no error)", func(t *testing.T) {
+		data, _ := json.Marshal(types.EBSUnMountResponse{Volume: "v", Mounted: false})
+		require.NoError(t, unmountResponseError(data))
+	})
+	t.Run("seal error propagates", func(t *testing.T) {
+		data, _ := json.Marshal(types.EBSUnMountResponse{Volume: "v", Error: "seal volume: boom"})
+		require.Error(t, unmountResponseError(data))
+	})
+	t.Run("still mounted propagates", func(t *testing.T) {
+		data, _ := json.Marshal(types.EBSUnMountResponse{Volume: "v", Mounted: true})
+		require.Error(t, unmountResponseError(data))
+	})
+	t.Run("malformed payload propagates", func(t *testing.T) {
+		require.Error(t, unmountResponseError([]byte("not json")))
+	})
+}
+
+// TestVolumeMounterAdapter_Mount_PartialFailureRollback verifies that when
+// any of Mount's per-volume failure paths fires mid-fan-out, the adapter
+// unmounts the volumes already successfully mounted in the same Mount()
+// call. Each subtest exercises a distinct rollback trigger so a regression
+// that drops rollback() from one branch (mount-response error, malformed
+// response, NATS layer failure) is caught individually. Without rollback,
+// a launch failure on the second of three volumes would leave the first
+// volume's viperblockd attached and the NBD socket live, leaking
+// resources every retry.
+func TestVolumeMounterAdapter_Mount_PartialFailureRollback(t *testing.T) {
+	tests := []struct {
+		name        string
+		respondVol2 func(msg *nats.Msg)
+		wantErrSub  string
+	}{
+		{
+			name: "MountResponseError",
+			respondVol2: func(msg *nats.Msg) {
+				resp := types.EBSMountResponse{Error: "simulated mount failure"}
+				data, _ := json.Marshal(resp)
+				msg.Respond(data)
+			},
+			wantErrSub: "simulated mount failure",
+		},
+		{
+			name: "MalformedResponse",
+			respondVol2: func(msg *nats.Msg) {
+				msg.Respond([]byte("not-valid-json"))
+			},
+			wantErrSub: "invalid character",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			daemon := createTestDaemon(t, sharedNATSURL)
+			adapter := newVolumeMounterAdapter(daemon.natsConn, daemon.node, nil)
+
+			mountSub, err := daemon.natsConn.Subscribe("ebs.node-1.mount", func(msg *nats.Msg) {
+				var req types.EBSRequest
+				require.NoError(t, json.Unmarshal(msg.Data, &req))
+				if req.Name == "vol-2" {
+					tt.respondVol2(msg)
+					return
+				}
+				resp := types.EBSMountResponse{URI: "nbd://mounted-" + req.Name}
+				data, _ := json.Marshal(resp)
+				msg.Respond(data)
+			})
+			require.NoError(t, err)
+			defer mountSub.Unsubscribe()
+
+			unmounted := make(chan string, 3)
+			unmountSub, err := daemon.natsConn.Subscribe("ebs.node-1.unmount", func(msg *nats.Msg) {
+				var req types.EBSRequest
+				require.NoError(t, json.Unmarshal(msg.Data, &req))
+				unmounted <- req.Name
+				resp := types.EBSUnMountResponse{Volume: req.Name, Mounted: false}
+				data, _ := json.Marshal(resp)
+				msg.Respond(data)
+			})
+			require.NoError(t, err)
+			defer unmountSub.Unsubscribe()
+
+			instance := &vm.VM{
+				ID:        "i-mount-rollback",
+				AccountID: testAccountID,
+				EBSRequests: types.EBSRequests{
+					Requests: []types.EBSRequest{
+						{Name: "vol-1"},
+						{Name: "vol-2"},
+						{Name: "vol-3"},
+					},
+				},
+			}
+
+			err = adapter.Mount(instance)
+			require.Error(t, err, "Mount should propagate the vol-2 failure")
+			assert.Contains(t, err.Error(), tt.wantErrSub)
+
+			// Mount returns only after rollback completes (the unmount NATS
+			// round-trip is synchronous), and the unmount subscriber sends on
+			// the buffered channel before responding — so by the time Mount
+			// returns, every rollback unmount is observable in `unmounted`.
+			require.Len(t, unmounted, 1,
+				"exactly one volume (vol-1, the previously mounted one) should be rolled back")
+			assert.Equal(t, "vol-1", <-unmounted)
+		})
+	}
+}
+
+// TestVolumeMounterAdapter_Mount_RollbackFailurePropagates verifies that
+// when the rollback unmount itself fails, Mount surfaces the failure
+// instead of swallowing it. A silent rollback failure leaves the volume
+// attached without surfacing the leak to the caller.
+func TestVolumeMounterAdapter_Mount_RollbackFailurePropagates(t *testing.T) {
+	daemon := createTestDaemon(t, sharedNATSURL)
+	adapter := newVolumeMounterAdapter(daemon.natsConn, daemon.node, nil)
+
+	mountSub, err := daemon.natsConn.Subscribe("ebs.node-1.mount", func(msg *nats.Msg) {
+		var req types.EBSRequest
+		require.NoError(t, json.Unmarshal(msg.Data, &req))
+		if req.Name == "vol-2" {
+			resp := types.EBSMountResponse{Error: "primary mount failure"}
+			data, _ := json.Marshal(resp)
+			msg.Respond(data)
+			return
+		}
+		resp := types.EBSMountResponse{URI: "nbd://mounted-" + req.Name}
+		data, _ := json.Marshal(resp)
+		msg.Respond(data)
+	})
+	require.NoError(t, err)
+	defer mountSub.Unsubscribe()
+
+	unmountSub, err := daemon.natsConn.Subscribe("ebs.node-1.unmount", func(msg *nats.Msg) {
+		resp := types.EBSUnMountResponse{Error: "rollback unmount failed"}
+		data, _ := json.Marshal(resp)
+		msg.Respond(data)
+	})
+	require.NoError(t, err)
+	defer unmountSub.Unsubscribe()
+
+	instance := &vm.VM{
+		ID:        "i-rollback-failure",
+		AccountID: testAccountID,
+		EBSRequests: types.EBSRequests{
+			Requests: []types.EBSRequest{
+				{Name: "vol-1"},
+				{Name: "vol-2"},
+			},
+		},
+	}
+
+	err = adapter.Mount(instance)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "primary mount failure",
+		"original mount error must be preserved")
+	assert.Contains(t, err.Error(), "rollback also failed",
+		"rollback failure must be surfaced, not silently logged")
+	assert.Contains(t, err.Error(), "rollback unmount failed",
+		"underlying unmount error must be wrapped in")
 }
 
 // TestDescribeInstances_InvalidInstanceIDMalformed verifies that DescribeInstances
@@ -3463,7 +3525,7 @@ func TestStopTerminate_IncorrectInstanceState(t *testing.T) {
 		AccountID:    testAccountID,
 		Instance:     &ec2.Instance{},
 	}
-	daemon.Instances.VMS[instanceID] = instance
+	daemon.vmMgr.Insert(instance)
 
 	sub, err := daemon.natsConn.Subscribe(
 		fmt.Sprintf("ec2.cmd.%s", instanceID),
@@ -3473,10 +3535,7 @@ func TestStopTerminate_IncorrectInstanceState(t *testing.T) {
 	defer sub.Unsubscribe()
 
 	t.Run("StopAlreadyStoppedInstance", func(t *testing.T) {
-		daemon.Instances.Mu.Lock()
-		instance.Status = vm.StateStopped
-		daemon.Instances.Mu.Unlock()
-
+		daemon.vmMgr.UpdateState(instance.ID, func(v *vm.VM) { v.Status = vm.StateStopped })
 		command := types.EC2InstanceCommand{
 			ID: instanceID,
 			Attributes: types.EC2CommandAttributes{
@@ -3496,10 +3555,7 @@ func TestStopTerminate_IncorrectInstanceState(t *testing.T) {
 	})
 
 	t.Run("TerminateAlreadyTerminatedInstance", func(t *testing.T) {
-		daemon.Instances.Mu.Lock()
-		instance.Status = vm.StateTerminated
-		daemon.Instances.Mu.Unlock()
-
+		daemon.vmMgr.UpdateState(instance.ID, func(v *vm.VM) { v.Status = vm.StateTerminated })
 		command := types.EC2InstanceCommand{
 			ID: instanceID,
 			Attributes: types.EC2CommandAttributes{
@@ -3517,115 +3573,6 @@ func TestStopTerminate_IncorrectInstanceState(t *testing.T) {
 		assert.Contains(t, string(resp.Data), "IncorrectInstanceState")
 		assert.NotContains(t, string(resp.Data), "ServerInternal")
 	})
-}
-
-// TestNextAvailableDevice tests the device name auto-assignment logic
-func TestNextAvailableDevice(t *testing.T) {
-	tests := []struct {
-		name       string
-		instance   *vm.VM
-		wantDevice string
-	}{
-		{
-			name: "empty instance returns first device",
-			instance: &vm.VM{
-				Instance: &ec2.Instance{},
-			},
-			wantDevice: "/dev/sdf",
-		},
-		{
-			name:       "nil Instance returns first device",
-			instance:   &vm.VM{},
-			wantDevice: "/dev/sdf",
-		},
-		{
-			name: "existing BlockDeviceMappings skipped",
-			instance: &vm.VM{
-				Instance: &ec2.Instance{
-					BlockDeviceMappings: []*ec2.InstanceBlockDeviceMapping{
-						{DeviceName: aws.String("/dev/sdf")},
-						{DeviceName: aws.String("/dev/sdg")},
-					},
-				},
-			},
-			wantDevice: "/dev/sdh",
-		},
-		{
-			name: "existing EBSRequests skipped",
-			instance: &vm.VM{
-				Instance: &ec2.Instance{},
-				EBSRequests: types.EBSRequests{
-					Requests: []types.EBSRequest{
-						{Name: "vol-1", DeviceName: "/dev/sdf"},
-					},
-				},
-			},
-			wantDevice: "/dev/sdg",
-		},
-		{
-			name: "mixed sources all skipped",
-			instance: &vm.VM{
-				Instance: &ec2.Instance{
-					BlockDeviceMappings: []*ec2.InstanceBlockDeviceMapping{
-						{DeviceName: aws.String("/dev/sdf")},
-					},
-				},
-				EBSRequests: types.EBSRequests{
-					Requests: []types.EBSRequest{
-						{Name: "vol-1", DeviceName: "/dev/sdg"},
-					},
-				},
-			},
-			wantDevice: "/dev/sdh",
-		},
-		{
-			name: "all devices f-p used returns empty",
-			instance: func() *vm.VM {
-				var bdms []*ec2.InstanceBlockDeviceMapping
-				for c := 'f'; c <= 'p'; c++ {
-					dev := fmt.Sprintf("/dev/sd%c", c)
-					bdms = append(bdms, &ec2.InstanceBlockDeviceMapping{
-						DeviceName: aws.String(dev),
-					})
-				}
-				return &vm.VM{
-					Instance: &ec2.Instance{BlockDeviceMappings: bdms},
-				}
-			}(),
-			wantDevice: "",
-		},
-		{
-			name: "nil DeviceName in BlockDeviceMappings ignored",
-			instance: &vm.VM{
-				Instance: &ec2.Instance{
-					BlockDeviceMappings: []*ec2.InstanceBlockDeviceMapping{
-						{DeviceName: nil},
-						{DeviceName: aws.String("/dev/sdf")},
-					},
-				},
-			},
-			wantDevice: "/dev/sdg",
-		},
-		{
-			name: "empty DeviceName in EBSRequests ignored",
-			instance: &vm.VM{
-				EBSRequests: types.EBSRequests{
-					Requests: []types.EBSRequest{
-						{DeviceName: ""},
-						{DeviceName: "/dev/sdf"},
-					},
-				},
-			},
-			wantDevice: "/dev/sdg",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := nextAvailableDevice(tt.instance)
-			assert.Equal(t, tt.wantDevice, got)
-		})
-	}
 }
 
 func TestCanAllocate(t *testing.T) {
@@ -3837,211 +3784,6 @@ func TestConnectNATS_SucceedsImmediately(t *testing.T) {
 	daemon.natsConn.Close()
 }
 
-// TestDaemonReadyFlag tests that the ready flag is false by default and can be set.
-func TestDaemonReadyFlag(t *testing.T) {
-	clusterCfg := &config.ClusterConfig{
-		Node:  "node-1",
-		Nodes: map[string]config.Config{},
-	}
-	cfg := config.Config{}
-	clusterCfg.Nodes["node-1"] = cfg
-	daemon, err := NewDaemon(clusterCfg)
-	require.NoError(t, err)
-
-	assert.False(t, daemon.ready.Load(), "daemon should not be ready before Start()")
-
-	daemon.ready.Store(true)
-	assert.True(t, daemon.ready.Load(), "daemon should be ready after setting flag")
-}
-
-func TestBuildBaseVMConfig(t *testing.T) {
-	tests := []struct {
-		name         string
-		instanceID   string
-		pidFile      string
-		consolePath  string
-		serialSocket string
-		architecture string
-		vCPUs        int
-		memoryMiB    int
-	}{
-		{
-			name:         "x86_64 instance",
-			instanceID:   "i-abc123",
-			pidFile:      "/tmp/qemu-i-abc123.pid",
-			consolePath:  "/run/console-i-abc123.log",
-			serialSocket: "/run/serial-i-abc123.sock",
-			architecture: "x86_64",
-			vCPUs:        4,
-			memoryMiB:    8192,
-		},
-		{
-			name:         "arm64 instance",
-			instanceID:   "i-def456",
-			pidFile:      "/tmp/qemu-i-def456.pid",
-			consolePath:  "/run/console-i-def456.log",
-			serialSocket: "/run/serial-i-def456.sock",
-			architecture: "arm64",
-			vCPUs:        2,
-			memoryMiB:    4096,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := buildBaseVMConfig(tt.instanceID, tt.pidFile, tt.consolePath, tt.serialSocket, tt.architecture, tt.vCPUs, tt.memoryMiB)
-
-			assert.Equal(t, tt.instanceID, cfg.Name)
-			assert.Equal(t, tt.pidFile, cfg.PIDFile)
-			assert.Equal(t, tt.consolePath, cfg.ConsoleLogPath)
-			assert.Equal(t, tt.serialSocket, cfg.SerialSocket)
-			assert.Equal(t, tt.architecture, cfg.Architecture)
-			assert.Equal(t, tt.vCPUs, cfg.CPUCount)
-			assert.Equal(t, tt.memoryMiB, cfg.Memory)
-			assert.True(t, cfg.EnableKVM)
-			assert.True(t, cfg.NoGraphic)
-			assert.Equal(t, "q35", cfg.MachineType)
-			assert.Equal(t, "host", cfg.CPUType)
-
-			// 11 PCIe root ports for hotplug slots
-			require.Len(t, cfg.Devices, 11)
-			for i, dev := range cfg.Devices {
-				expected := fmt.Sprintf("pcie-root-port,id=hotplug%d,chassis=%d,slot=0", i+1, i+1)
-				assert.Equal(t, expected, dev.Value)
-			}
-		})
-	}
-}
-
-func TestBuildDrives(t *testing.T) {
-	tests := []struct {
-		name          string
-		requests      []types.EBSRequest
-		cpuCount      int
-		wantDrives    int
-		wantIOThreads int
-		wantDevices   int
-		wantErr       string
-	}{
-		{
-			name: "boot volume",
-			requests: []types.EBSRequest{
-				{Name: "vol-boot", NBDURI: "nbd:unix:/tmp/boot.sock", Boot: true},
-			},
-			cpuCount:      4,
-			wantDrives:    1,
-			wantIOThreads: 1,
-			wantDevices:   1,
-		},
-		{
-			name: "cloud-init volume",
-			requests: []types.EBSRequest{
-				{Name: "vol-ci", NBDURI: "nbd:unix:/tmp/ci.sock", CloudInit: true},
-			},
-			cpuCount:      2,
-			wantDrives:    1,
-			wantIOThreads: 0,
-			wantDevices:   0,
-		},
-		{
-			name: "EFI volume skipped",
-			requests: []types.EBSRequest{
-				{Name: "vol-efi", EFI: true},
-			},
-			cpuCount:      2,
-			wantDrives:    0,
-			wantIOThreads: 0,
-			wantDevices:   0,
-		},
-		{
-			name: "missing NBDURI returns error",
-			requests: []types.EBSRequest{
-				{Name: "vol-bad"},
-			},
-			cpuCount: 2,
-			wantErr:  "NBDURI not set for volume vol-bad",
-		},
-		{
-			name: "mixed boot + cloud-init + EFI",
-			requests: []types.EBSRequest{
-				{Name: "vol-boot", NBDURI: "nbd:unix:/tmp/boot.sock", Boot: true},
-				{Name: "vol-ci", NBDURI: "nbd:unix:/tmp/ci.sock", CloudInit: true},
-				{Name: "vol-efi", EFI: true},
-			},
-			cpuCount:      4,
-			wantDrives:    2, // boot + cloud-init (EFI skipped)
-			wantIOThreads: 1, // only boot gets iothread
-			wantDevices:   1, // only boot gets virtio-blk device
-		},
-		{
-			name:          "empty requests",
-			requests:      []types.EBSRequest{},
-			cpuCount:      2,
-			wantDrives:    0,
-			wantIOThreads: 0,
-			wantDevices:   0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			drives, iothreads, devices, err := buildDrives(tt.requests, tt.cpuCount)
-
-			if tt.wantErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
-				return
-			}
-
-			require.NoError(t, err)
-			assert.Len(t, drives, tt.wantDrives)
-			assert.Len(t, iothreads, tt.wantIOThreads)
-			assert.Len(t, devices, tt.wantDevices)
-		})
-	}
-}
-
-func TestBuildDrives_BootVolume(t *testing.T) {
-	requests := []types.EBSRequest{
-		{Name: "vol-boot", NBDURI: "nbd:unix:/tmp/boot.sock", Boot: true},
-	}
-
-	drives, iothreads, devices, err := buildDrives(requests, 4)
-	require.NoError(t, err)
-
-	require.Len(t, drives, 1)
-	d := drives[0]
-	assert.Equal(t, "nbd:unix:/tmp/boot.sock", d.File)
-	assert.Equal(t, "raw", d.Format)
-	assert.Equal(t, "none", d.If)
-	assert.Equal(t, "disk", d.Media)
-	assert.Equal(t, "os", d.ID)
-	assert.Equal(t, "none", d.Cache)
-
-	require.Len(t, iothreads, 1)
-	assert.Equal(t, "ioth-os", iothreads[0].ID)
-
-	require.Len(t, devices, 1)
-	assert.Equal(t, "virtio-blk-pci,drive=os,iothread=ioth-os,num-queues=4,bootindex=1", devices[0].Value)
-}
-
-func TestBuildDrives_CloudInitVolume(t *testing.T) {
-	requests := []types.EBSRequest{
-		{Name: "vol-ci", NBDURI: "nbd:unix:/tmp/ci.sock", CloudInit: true},
-	}
-
-	drives, _, _, err := buildDrives(requests, 2)
-	require.NoError(t, err)
-
-	require.Len(t, drives, 1)
-	d := drives[0]
-	assert.Equal(t, "nbd:unix:/tmp/ci.sock", d.File)
-	assert.Equal(t, "raw", d.Format)
-	assert.Equal(t, "virtio", d.If)
-	assert.Equal(t, "cdrom", d.Media)
-	assert.Equal(t, "cloudinit", d.ID)
-}
-
 // --- ClusterManager TLS ---
 
 func TestClusterManager_TLSServesHTTPS(t *testing.T) {
@@ -4065,6 +3807,7 @@ func TestClusterManager_TLSServesHTTPS(t *testing.T) {
 		Nodes: map[string]config.Config{
 			"node-1": {
 				BaseDir: tmpDir,
+				DataDir: tmpDir,
 				Daemon: config.DaemonConfig{
 					Host:    addr,
 					TLSCert: certPath,
@@ -4174,4 +3917,394 @@ func generateTestCert(t *testing.T) (certPEM, keyPEM []byte) {
 	require.NoError(t, pem.Encode(keyBuf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
 
 	return certBuf.Bytes(), keyBuf.Bytes()
+}
+
+func TestResolveGPUModel_ProductionModel(t *testing.T) {
+	dev := gpu.GPUDevice{VendorID: "10de", DeviceID: "2236", Vendor: gpu.VendorNVIDIA}
+	m := resolveGPUModel(dev, nil)
+	assert.Equal(t, "g5", m.Family)
+	assert.Equal(t, "A10G", m.Name)
+}
+
+func TestResolveGPUModel_ConsumerGPUDefaultsToG5(t *testing.T) {
+	// Unknown PCI ID auto-maps to g5 using discovered specs — no config needed.
+	dev := gpu.GPUDevice{
+		VendorID:  "10de",
+		DeviceID:  "2487",
+		Vendor:    gpu.VendorNVIDIA,
+		Model:     "NVIDIA GeForce RTX 3060",
+		MemoryMiB: 12288,
+	}
+	m := resolveGPUModel(dev, nil)
+	assert.Equal(t, "g5", m.Family)
+	assert.Equal(t, "NVIDIA GeForce RTX 3060", m.Name)
+	assert.Equal(t, int64(12288), m.MemoryMiB)
+	assert.Equal(t, "NVIDIA", m.Manufacturer)
+}
+
+func TestResolveGPUModel_ConsumerGPUFallbackName(t *testing.T) {
+	// No Model field: name falls back to "GPU <vendor>:<device>".
+	dev := gpu.GPUDevice{VendorID: "dead", DeviceID: "beef", Vendor: gpu.VendorUnknown}
+	m := resolveGPUModel(dev, nil)
+	assert.Equal(t, "g5", m.Family)
+	assert.Equal(t, "GPU dead:beef", m.Name)
+	assert.Equal(t, "Unknown", m.Manufacturer)
+}
+
+func TestResolveGPUModel_OverrideShadowsProduction(t *testing.T) {
+	// An override for a known production PCI ID shadows the built-in entry.
+	overrides := []config.GPUModelOverride{
+		{VendorID: "10de", DeviceID: "2236", Family: "g6", Manufacturer: "NVIDIA", Name: "Custom", MemoryMiB: 999},
+	}
+	dev := gpu.GPUDevice{VendorID: "10de", DeviceID: "2236", Vendor: gpu.VendorNVIDIA}
+	m := resolveGPUModel(dev, overrides)
+	assert.Equal(t, "g6", m.Family)
+	assert.Equal(t, "Custom", m.Name)
+}
+
+func TestResolveGPUModel_OverrideCustomisesConsumerGPU(t *testing.T) {
+	// Override can pin specific name/memory for a consumer GPU that would
+	// otherwise be auto-mapped with nvidia-smi-discovered or zero values.
+	overrides := []config.GPUModelOverride{
+		{VendorID: "10de", DeviceID: "2487", Family: "g5", Manufacturer: "NVIDIA", Name: "RTX 3060", MemoryMiB: 12288},
+	}
+	dev := gpu.GPUDevice{VendorID: "10de", DeviceID: "2487", Vendor: gpu.VendorNVIDIA}
+	m := resolveGPUModel(dev, overrides)
+	assert.Equal(t, "RTX 3060", m.Name)
+	assert.Equal(t, int64(12288), m.MemoryMiB)
+}
+
+// --- initServiceWithRetry ---
+
+// stubInitRetrySleep replaces the package-level sleep seam with a recorder
+// that captures durations without sleeping. Restored via t.Cleanup.
+func stubInitRetrySleep(t *testing.T) *[]time.Duration {
+	t.Helper()
+	var sleeps []time.Duration
+	prev := initRetrySleep
+	initRetrySleep = func(d time.Duration) { sleeps = append(sleeps, d) }
+	t.Cleanup(func() { initRetrySleep = prev })
+	return &sleeps
+}
+
+func TestInitServiceWithRetry_SuccessFirstAttempt(t *testing.T) {
+	sleeps := stubInitRetrySleep(t)
+	calls := 0
+	got, err := initServiceWithRetry("svc", func() (int, error) {
+		calls++
+		return 42, nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 42, got)
+	assert.Equal(t, 1, calls)
+	assert.Empty(t, *sleeps, "no sleep on first-attempt success")
+}
+
+func TestInitServiceWithRetry_SuccessAfterRetries(t *testing.T) {
+	sleeps := stubInitRetrySleep(t)
+	calls := 0
+	got, err := initServiceWithRetry("svc", func() (string, error) {
+		calls++
+		if calls < 3 {
+			return "", errors.New("not ready")
+		}
+		return "ok", nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "ok", got)
+	assert.Equal(t, 3, calls)
+	assert.Equal(t, []time.Duration{500 * time.Millisecond, 1 * time.Second}, *sleeps,
+		"two sleeps between three attempts must follow the documented 500ms→1s schedule")
+}
+
+func TestInitServiceWithRetry_DelayCappedAt10s(t *testing.T) {
+	// Drive 7 attempts so backoff doublings hit the cap. Six sleeps separate
+	// the seven attempts: 500ms → 1s → 2s → 4s → 8s → 10s. The 6th sleep
+	// must be 10s (capped), not 16s.
+	sleeps := stubInitRetrySleep(t)
+	calls := 0
+	_, err := initServiceWithRetry("svc", func() (int, error) {
+		calls++
+		if calls >= 7 {
+			return 1, nil
+		}
+		return 0, errors.New("retry")
+	})
+	require.NoError(t, err)
+	want := []time.Duration{
+		500 * time.Millisecond,
+		1 * time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		10 * time.Second,
+	}
+	assert.Equal(t, want, *sleeps,
+		"backoff must double then cap at 10s on the 6th sleep")
+}
+
+// --- getSystemMemory ---
+
+func TestGetSystemMemory_Linux_Valid(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only branch")
+	}
+	orig := execCommand
+	t.Cleanup(func() { execCommand = orig })
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		return exec.Command("printf", "MemTotal:       16777216 kB\n")
+	}
+	mem, err := getSystemMemory()
+	require.NoError(t, err)
+	assert.InDelta(t, 16.0, mem, 0.001)
+}
+
+func TestGetSystemMemory_Linux_Malformed(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only branch")
+	}
+	orig := execCommand
+	t.Cleanup(func() { execCommand = orig })
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		return exec.Command("printf", "MemTotal:\n")
+	}
+	_, err := getSystemMemory()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected /proc/meminfo format")
+}
+
+func TestGetSystemMemory_Linux_GrepFails(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only branch")
+	}
+	orig := execCommand
+	t.Cleanup(func() { execCommand = orig })
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		return exec.Command("/bin/false")
+	}
+	_, err := getSystemMemory()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "/proc/meminfo")
+}
+
+func TestGetSystemMemory_Linux_ParseOverflow(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only branch")
+	}
+	orig := execCommand
+	t.Cleanup(func() { execCommand = orig })
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		return exec.Command("printf", "MemTotal:       99999999999999999999 kB\n")
+	}
+	_, err := getSystemMemory()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parse memory size")
+}
+
+func TestGetSystemMemory_Darwin_Valid(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("darwin-only branch; getSystemMemory dispatches on runtime.GOOS")
+	}
+	orig := execCommand
+	t.Cleanup(func() { execCommand = orig })
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		return exec.Command("printf", "17179869184\n")
+	}
+	mem, err := getSystemMemory()
+	require.NoError(t, err)
+	assert.InDelta(t, 16.0, mem, 0.001)
+}
+
+func TestGetSystemMemory_Darwin_SysctlFails(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("darwin-only branch; getSystemMemory dispatches on runtime.GOOS")
+	}
+	orig := execCommand
+	t.Cleanup(func() { execCommand = orig })
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		return exec.Command("/usr/bin/false")
+	}
+	_, err := getSystemMemory()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "macOS")
+}
+
+// --- gpuXVGAEnabled ---
+
+func TestGpuXVGAEnabled(t *testing.T) {
+	tests := []struct {
+		name      string
+		dev       *gpu.GPUDevice
+		overrides []config.GPUModelOverride
+		want      bool
+	}{
+		{
+			name: "override present XVGAOff true forces false",
+			dev:  &gpu.GPUDevice{VendorID: "10de", DeviceID: "2236"},
+			overrides: []config.GPUModelOverride{
+				{VendorID: "10de", DeviceID: "2236", XVGAOff: true},
+			},
+			want: false,
+		},
+		{
+			name: "override present XVGAOff false forces true",
+			dev:  &gpu.GPUDevice{VendorID: "10de", DeviceID: "2236"},
+			overrides: []config.GPUModelOverride{
+				{VendorID: "10de", DeviceID: "2236", XVGAOff: false},
+			},
+			want: true,
+		},
+		{
+			name: "no override compute GPU returns false",
+			dev:  &gpu.GPUDevice{VendorID: "10de", DeviceID: "2236"},
+			want: false,
+		},
+		{
+			name: "no override consumer GPU returns true",
+			dev:  &gpu.GPUDevice{VendorID: "10de", DeviceID: "2684"},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, gpuXVGAEnabled(tt.dev, tt.overrides))
+		})
+	}
+}
+
+// --- reloadGPUTypes ---
+
+func TestReloadGPUTypes_EmptyModelsPreservesCPUTypes(t *testing.T) {
+	rm := &ResourceManager{
+		instanceTypes: map[string]*ec2.InstanceTypeInfo{
+			"t3.micro": {InstanceType: aws.String("t3.micro")},
+			"t3.large": {InstanceType: aws.String("t3.large")},
+			"g5.xlarge": {
+				InstanceType: aws.String("g5.xlarge"),
+				GpuInfo: &ec2.GpuInfo{Gpus: []*ec2.GpuDeviceInfo{
+					{Count: aws.Int64(1), Name: aws.String("A10G")},
+				}},
+			},
+			"g5.4xlarge": {
+				InstanceType: aws.String("g5.4xlarge"),
+				GpuInfo: &ec2.GpuInfo{Gpus: []*ec2.GpuDeviceInfo{
+					{Count: aws.Int64(1), Name: aws.String("A10G")},
+				}},
+			},
+		},
+	}
+
+	rm.reloadGPUTypes(nil, nil, nil)
+
+	assert.Contains(t, rm.instanceTypes, "t3.micro")
+	assert.Contains(t, rm.instanceTypes, "t3.large")
+	assert.NotContains(t, rm.instanceTypes, "g5.xlarge")
+	assert.NotContains(t, rm.instanceTypes, "g5.4xlarge")
+	assert.Nil(t, rm.gpuManager)
+}
+
+func TestReloadGPUTypes_NonEmptyReplacesGPUTypes(t *testing.T) {
+	rm := &ResourceManager{
+		instanceTypes: map[string]*ec2.InstanceTypeInfo{
+			"t3.micro": {InstanceType: aws.String("t3.micro")},
+			"g5.xlarge": {
+				InstanceType: aws.String("g5.xlarge"),
+				GpuInfo: &ec2.GpuInfo{Gpus: []*ec2.GpuDeviceInfo{
+					{Count: aws.Int64(1), Name: aws.String("A10G")},
+				}},
+			},
+		},
+	}
+
+	rm.reloadGPUTypes([]instancetypes.GPUModel{instancetypes.NVIDIAt4}, nil, nil)
+
+	assert.Contains(t, rm.instanceTypes, "t3.micro", "CPU type preserved")
+	assert.NotContains(t, rm.instanceTypes, "g5.xlarge", "old GPU type removed")
+
+	hasG4dn := false
+	for name := range rm.instanceTypes {
+		if strings.HasPrefix(name, "g4dn.") {
+			hasG4dn = true
+			break
+		}
+	}
+	assert.True(t, hasG4dn, "new GPU family inserted")
+}
+
+func TestReloadGPUTypes_CallsUpdateInstanceSubscriptions(t *testing.T) {
+	// updateInstanceSubscriptions is called unconditionally at the end of
+	// reloadGPUTypes. Observe the side-effect via a real NATS connection:
+	// an empty rm.instanceSubs becomes populated after the call, proving the
+	// per-type subscribe loop ran exactly once for the new map state.
+	// Requires a non-nil gpuManager because canAllocate gates GPU types on
+	// availGPU > 0.
+	port := freePortForTest(t)
+	startTestNATSOnPortForTest(t, port)
+
+	nc, err := nats.Connect(fmt.Sprintf("nats://127.0.0.1:%d", port))
+	require.NoError(t, err)
+	t.Cleanup(func() { drainAndClose(t, nc) })
+
+	gpuMgr := gpu.NewManager([]gpu.GPUDevice{
+		{PCIAddress: "0000:01:00.0", VendorID: "10de", DeviceID: "1eb8"},
+	})
+
+	rm := &ResourceManager{
+		hostVCPU:      16,
+		hostMemGB:     64.0,
+		instanceTypes: map[string]*ec2.InstanceTypeInfo{},
+		natsConn:      nc,
+		nodeID:        "test-node",
+		instanceSubs:  make(map[string]*nats.Subscription),
+		handler:       func(*nats.Msg) {},
+	}
+
+	rm.reloadGPUTypes([]instancetypes.GPUModel{instancetypes.NVIDIAt4}, nil, gpuMgr)
+	subsAfter := len(rm.instanceSubs)
+	require.Greater(t, subsAfter, 0, "subscriptions added after reload — updateInstanceSubscriptions ran")
+
+	// Each g4dn size produces both queue and node-specific topics; record the
+	// count so we can prove a second call does not double-subscribe.
+	rm.reloadGPUTypes([]instancetypes.GPUModel{instancetypes.NVIDIAt4}, nil, gpuMgr)
+	assert.Equal(t, subsAfter, len(rm.instanceSubs),
+		"second reload with identical models must not double-subscribe — proves idempotent invocation")
+}
+
+// --- assertNoClusterServicesInitialised ---
+
+func TestAssertNoClusterServicesInitialised_PerField(t *testing.T) {
+	type fieldCase struct {
+		name    string
+		set     func(d *Daemon)
+		wantMsg string
+	}
+
+	cases := []fieldCase{
+		{name: "natsConn", set: func(d *Daemon) { d.natsConn = &nats.Conn{} }, wantMsg: "natsConn"},
+		{name: "jsManager", set: func(d *Daemon) { d.jsManager = &JetStreamManager{} }, wantMsg: "jsManager"},
+		{name: "instanceService", set: func(d *Daemon) { d.instanceService = &handlers_ec2_instance.InstanceServiceImpl{} }, wantMsg: "instanceService"},
+		{name: "imageService", set: func(d *Daemon) { d.imageService = &handlers_ec2_image.ImageServiceImpl{} }, wantMsg: "imageService"},
+		{name: "snapshotService", set: func(d *Daemon) { d.snapshotService = &handlers_ec2_snapshot.SnapshotServiceImpl{} }, wantMsg: "snapshotService"},
+		{name: "volumeService", set: func(d *Daemon) { d.volumeService = &handlers_ec2_volume.VolumeServiceImpl{} }, wantMsg: "volumeService"},
+		{name: "eigwService", set: func(d *Daemon) { d.eigwService = &handlers_ec2_eigw.EgressOnlyIGWServiceImpl{} }, wantMsg: "eigwService"},
+		{name: "igwService", set: func(d *Daemon) { d.igwService = &handlers_ec2_igw.IGWServiceImpl{} }, wantMsg: "igwService"},
+		{name: "placementGroupService", set: func(d *Daemon) { d.placementGroupService = &handlers_ec2_placementgroup.PlacementGroupServiceImpl{} }, wantMsg: "placementGroupService"},
+		{name: "vpcService", set: func(d *Daemon) { d.vpcService = &handlers_ec2_vpc.VPCServiceImpl{} }, wantMsg: "vpcService"},
+		{name: "routeTableService", set: func(d *Daemon) { d.routeTableService = &handlers_ec2_routetable.RouteTableServiceImpl{} }, wantMsg: "routeTableService"},
+		{name: "natGatewayService", set: func(d *Daemon) { d.natGatewayService = &handlers_ec2_natgw.NatGatewayServiceImpl{} }, wantMsg: "natGatewayService"},
+		{name: "externalIPAM", set: func(d *Daemon) { d.externalIPAM = &handlers_ec2_vpc.ExternalIPAM{} }, wantMsg: "externalIPAM"},
+		{name: "eipService", set: func(d *Daemon) { d.eipService = &handlers_ec2_eip.EIPServiceImpl{} }, wantMsg: "eipService"},
+		{name: "accountService", set: func(d *Daemon) { d.accountService = &handlers_ec2_account.AccountSettingsServiceImpl{} }, wantMsg: "accountService"},
+		{name: "elbv2Service", set: func(d *Daemon) { d.elbv2Service = &handlers_elbv2.ELBv2ServiceImpl{} }, wantMsg: "elbv2Service"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Daemon{}
+			tc.set(d)
+			err := d.assertNoClusterServicesInitialised()
+			require.Error(t, err, "%s set non-nil must trip invariant", tc.name)
+			assert.Contains(t, err.Error(), tc.wantMsg)
+		})
+	}
 }

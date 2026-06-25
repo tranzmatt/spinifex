@@ -170,9 +170,10 @@ if [ -e /etc/systemd/network/15-spinifex-veth-wan.netdev ] || \
     sudo networkctl reload 2>/dev/null || true
 fi
 
-# Remove macvlan interfaces created by setup-ovn.sh
+# Legacy: clean up macvlan interfaces left over from pre-veth setup-ovn.sh
+# runs. Safe to remove once no operator system retains these.
 for iface in $(ip -o link show type macvlan 2>/dev/null | awk -F': ' '{print $2}' | grep '^spx-ext-'); do
-    echo "  Deleting macvlan: $iface"
+    echo "  Deleting legacy macvlan: $iface"
     sudo ip link del "$iface" 2>/dev/null || true
 done
 
@@ -268,10 +269,9 @@ sudo systemctl start spinifex.target
 # Wait for services to start
 sleep 5
 
-# --- Build + import LB image (needs services running) ---
-echo "==> Building and importing LB image"
-cd "$PROJECT_ROOT" && make build-lb-agent
-"$PROJECT_ROOT/scripts/build-system-image.sh" "$PROJECT_ROOT/scripts/images/lb.conf" --import --quiet
+# --- Build + install microVM artifacts (kernel + initramfs for direct-boot LBs) ---
+echo "==> Building and installing microVM artifacts"
+cd "$PROJECT_ROOT" && make build-lb-agent install-microvm
 
 # --- Smoke test ---
 sudo -u "$INVOKING_USER" "$SCRIPT_DIR/smoke-test.sh"

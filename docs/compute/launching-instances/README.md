@@ -157,12 +157,22 @@ If the AMI is for a different architecture (e.g. arm64 on an x86_64 host), impor
 
 ```bash
 spx admin images list
-spx admin images import --name debian-12-x86_64
+spx admin images import --name debian-13-x86_64
 ```
 
 ### Cannot SSH Into Instance
 
 cloud-init needs time to configure the instance after boot. Wait 30-60 seconds and retry.
+
+If the connection **times out** rather than being refused, the security group is likely blocking port 22. The default security group denies all inbound traffic (matching AWS), so SSH must be explicitly allowed:
+
+```bash
+# Allow SSH from anywhere on the instance's security group
+aws ec2 authorize-security-group-ingress \
+  --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
+```
+
+See [VPC Networking — Security Groups](/docs/vpc-networking#security-groups) for scoping rules to a trusted CIDR.
 
 Verify the SSH key was specified correctly when launching:
 

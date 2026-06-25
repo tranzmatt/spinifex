@@ -6,6 +6,7 @@ Wants=spinifex-nats.service ovn-controller.service
 
 [Service]
 Type=simple
+Slice=spinifex-system.slice
 User=spinifex-vpcd
 Group=spinifex
 ExecStartPre=/var/lib/spinifex/wait-for-nats.sh
@@ -16,37 +17,25 @@ OOMScoreAdjust=-500
 Environment=SPINIFEX_CONFIG_PATH=/etc/spinifex/spinifex.toml
 Environment=SPINIFEX_BASE_DIR=/var/lib/spinifex/vpcd/
 
-# Filesystem access — NoNewPrivileges omitted (vpcd uses sudo for ovs-vsctl, ovn-nbctl, systemctl)
-ProtectSystem=full
+# RG-9: network tier. vpcd MUST share the host mount namespace — IMDS enters
+# per-VPC netns via setns(), and any filesystem-sandbox directive (ProtectSystem/
+# Home, PrivateTmp, ProtectKernel*, ProtectControlGroups/Proc, Read*Paths) forks a
+# private mount ns that traps the /run/netns bind-mount and breaks setns(2). Those,
+# plus MemoryDenyWriteExecute, are omitted by design — not regressions.
 PrivateDevices=no
-ReadOnlyPaths=/etc/spinifex/spinifex.toml /etc/spinifex/ca.pem
-ReadWritePaths=/var/lib/spinifex/vpcd /var/log/spinifex
-
-# Hardening
-ProtectHome=yes
-PrivateTmp=yes
 RestrictSUIDSGID=no
 LockPersonality=yes
 RestrictRealtime=yes
-RestrictNamespaces=yes
 ProtectClock=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectProc=invisible
+# mnt alongside net: in-netns `ip` unshares a mount ns for its own /sys
+RestrictNamespaces=net mnt
 SystemCallArchitectures=native
 MemoryDenyWriteExecute=no
-# AF_PACKET: required by the in-process DHCP client (github.com/insomniacslk/dhcp
-# / nclient4) for raw L2 BOOTP on br-wan before an IP is configured on the
-# interface. See docs/development/bugs/dhcp-allocate-error.md.
+# AF_PACKET: raw L2 BOOTP for the in-process DHCP client before the iface has an IP
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_PACKET
-# CAP_NET_RAW: open AF_PACKET sockets.
-# CAP_NET_BIND_SERVICE: covers unicast RENEW to UDP :68.
-# CAP_NET_ADMIN: already used for ovs-vsctl / ip link wiring on the bridge.
-# Note, disabled for now, sudo issue with ovs
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID
+# Caps: NET_ADMIN (ovs/ip), NET_RAW (AF_PACKET), NET_BIND_SERVICE (:68), SETUID/SETGID, SYS_ADMIN (setns into VPC netns)
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_SYS_ADMIN
 NoNewPrivileges=no
 ProtectHostname=yes
 KeyringMode=private

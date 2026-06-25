@@ -29,7 +29,7 @@ describe("createTargetGroupSchema", () => {
       healthCheck: defaultHealthCheck,
       tags: [],
     })
-    expect(result.success).toBe(true)
+    expect(result.success).toBeTruthy()
   })
 
   it("rejects name with invalid characters", () => {
@@ -41,7 +41,7 @@ describe("createTargetGroupSchema", () => {
       healthCheck: defaultHealthCheck,
       tags: [],
     })
-    expect(result.success).toBe(false)
+    expect(result.success).toBeFalsy()
   })
 
   it("rejects name >32 chars", () => {
@@ -53,7 +53,7 @@ describe("createTargetGroupSchema", () => {
       healthCheck: defaultHealthCheck,
       tags: [],
     })
-    expect(result.success).toBe(false)
+    expect(result.success).toBeFalsy()
   })
 
   it("rejects port out of range", () => {
@@ -65,7 +65,7 @@ describe("createTargetGroupSchema", () => {
       healthCheck: defaultHealthCheck,
       tags: [],
     })
-    expect(result.success).toBe(false)
+    expect(result.success).toBeFalsy()
   })
 })
 
@@ -80,6 +80,7 @@ describe("createLoadBalancerSchema", () => {
   it("accepts a valid ALB with 2+ subnets", () => {
     const result = createLoadBalancerSchema.safeParse({
       name: "my-alb",
+      type: "application",
       scheme: "internet-facing",
       vpcId: "vpc-1",
       subnetIds: ["subnet-a", "subnet-b"],
@@ -87,12 +88,13 @@ describe("createLoadBalancerSchema", () => {
       tags: [],
       listener: baseListener,
     })
-    expect(result.success).toBe(true)
+    expect(result.success).toBeTruthy()
   })
 
-  it("rejects <2 subnets", () => {
+  it("accepts a single subnet", () => {
     const result = createLoadBalancerSchema.safeParse({
       name: "my-alb",
+      type: "application",
       scheme: "internet-facing",
       vpcId: "vpc-1",
       subnetIds: ["subnet-a"],
@@ -100,12 +102,27 @@ describe("createLoadBalancerSchema", () => {
       tags: [],
       listener: baseListener,
     })
-    expect(result.success).toBe(false)
+    expect(result.success).toBeTruthy()
+  })
+
+  it("rejects zero subnets", () => {
+    const result = createLoadBalancerSchema.safeParse({
+      name: "my-alb",
+      type: "application",
+      scheme: "internet-facing",
+      vpcId: "vpc-1",
+      subnetIds: [],
+      securityGroupIds: [],
+      tags: [],
+      listener: baseListener,
+    })
+    expect(result.success).toBeFalsy()
   })
 
   it("rejects names starting with 'internal-'", () => {
     const result = createLoadBalancerSchema.safeParse({
       name: "internal-abc",
+      type: "application",
       scheme: "internal",
       vpcId: "vpc-1",
       subnetIds: ["subnet-a", "subnet-b"],
@@ -113,12 +130,13 @@ describe("createLoadBalancerSchema", () => {
       tags: [],
       listener: baseListener,
     })
-    expect(result.success).toBe(false)
+    expect(result.success).toBeFalsy()
   })
 
   it("accepts listener with mode=new without existingTargetGroupArn", () => {
     const result = createLoadBalancerSchema.safeParse({
       name: "my-alb",
+      type: "application",
       scheme: "internet-facing",
       vpcId: "vpc-1",
       subnetIds: ["subnet-a", "subnet-b"],
@@ -130,12 +148,13 @@ describe("createLoadBalancerSchema", () => {
         targetGroupMode: "new",
       },
     })
-    expect(result.success).toBe(true)
+    expect(result.success).toBeTruthy()
   })
 
   it("rejects listener with mode=existing but no existingTargetGroupArn", () => {
     const result = createLoadBalancerSchema.safeParse({
       name: "my-alb",
+      type: "application",
       scheme: "internet-facing",
       vpcId: "vpc-1",
       subnetIds: ["subnet-a", "subnet-b"],
@@ -147,7 +166,7 @@ describe("createLoadBalancerSchema", () => {
         targetGroupMode: "existing",
       },
     })
-    expect(result.success).toBe(false)
+    expect(result.success).toBeFalsy()
   })
 })
 
@@ -158,7 +177,7 @@ describe("createListenerSchema", () => {
       port: 80,
       defaultTargetGroupArn: "arn:tg:1",
     })
-    expect(result.success).toBe(true)
+    expect(result.success).toBeTruthy()
   })
 
   it("rejects listener missing default target group", () => {
@@ -167,7 +186,7 @@ describe("createListenerSchema", () => {
       port: 80,
       defaultTargetGroupArn: "",
     })
-    expect(result.success).toBe(false)
+    expect(result.success).toBeFalsy()
   })
 })
 
@@ -176,18 +195,18 @@ describe("registerTargetsSchema", () => {
     const result = registerTargetsSchema.safeParse({
       targets: [{ instanceId: "i-123" }, { instanceId: "i-456", port: 8080 }],
     })
-    expect(result.success).toBe(true)
+    expect(result.success).toBeTruthy()
   })
 
   it("rejects empty target list", () => {
     const result = registerTargetsSchema.safeParse({ targets: [] })
-    expect(result.success).toBe(false)
+    expect(result.success).toBeFalsy()
   })
 })
 
 describe("healthCheckSchema", () => {
   it("accepts the documented default values", () => {
-    expect(healthCheckSchema.parse(defaultHealthCheck)).toEqual(
+    expect(healthCheckSchema.parse(defaultHealthCheck)).toStrictEqual(
       defaultHealthCheck,
     )
   })
@@ -197,7 +216,7 @@ describe("healthCheckSchema", () => {
       ...defaultHealthCheck,
       intervalSeconds: 1,
     })
-    expect(result.success).toBe(false)
+    expect(result.success).toBeFalsy()
   })
 
   it("rejects a malformed matcher", () => {
@@ -205,6 +224,6 @@ describe("healthCheckSchema", () => {
       ...defaultHealthCheck,
       matcher: "OK",
     })
-    expect(result.success).toBe(false)
+    expect(result.success).toBeFalsy()
   })
 })

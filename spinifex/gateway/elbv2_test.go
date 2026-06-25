@@ -41,6 +41,7 @@ func TestELBv2ActionsMap_AllActionsRegistered(t *testing.T) {
 		"DeleteLoadBalancer",
 		"DescribeLoadBalancers",
 		"CreateTargetGroup",
+		"ModifyTargetGroup",
 		"DeleteTargetGroup",
 		"DescribeTargetGroups",
 		"RegisterTargets",
@@ -48,14 +49,31 @@ func TestELBv2ActionsMap_AllActionsRegistered(t *testing.T) {
 		"DescribeTargetHealth",
 		"CreateListener",
 		"DeleteListener",
+		"ModifyListener",
 		"DescribeListeners",
 		"DescribeTags",
+		"AddTags",
+		"RemoveTags",
+		"SetSecurityGroups",
+		"SetIpAddressType",
+		"SetSubnets",
 		"LBAgentHeartbeat",
 		"GetLBConfig",
 		"ModifyTargetGroupAttributes",
 		"DescribeTargetGroupAttributes",
 		"ModifyLoadBalancerAttributes",
 		"DescribeLoadBalancerAttributes",
+		"DescribeListenerAttributes",
+		"ModifyListenerAttributes",
+		"CreateRule",
+		"ModifyRule",
+		"DeleteRule",
+		"DescribeRules",
+		"SetRulePriorities",
+		"AddListenerCertificates",
+		"RemoveListenerCertificates",
+		"DescribeListenerCertificates",
+		"DescribeSSLPolicies",
 	}
 
 	for _, action := range expectedActions {
@@ -69,8 +87,6 @@ func TestELBv2ActionsMap_AllActionsRegistered(t *testing.T) {
 func TestELBv2ActionsMap_UnknownActionNotRegistered(t *testing.T) {
 	unknownActions := []string{
 		"ModifyLoadBalancer",
-		"CreateRule",
-		"DescribeRules",
 		"RunInstances",
 	}
 

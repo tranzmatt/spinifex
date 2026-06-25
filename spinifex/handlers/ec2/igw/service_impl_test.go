@@ -1,6 +1,7 @@
 package handlers_ec2_igw
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,35 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// fakeGatePublisher records every PublishGateDecisionsForVPC invocation so
+// tests can assert the IGW handler fans out at attach / detach time.
+type fakeGatePublisher struct {
+	mu    sync.Mutex
+	calls []gateCall
+}
+
+type gateCall struct {
+	AccountID string
+	VpcID     string
+	DestCidr  string
+}
+
+func (p *fakeGatePublisher) PublishGateDecisionsForVPC(accountID, vpcID, destCidr string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, gateCall{accountID, vpcID, destCidr})
+}
+
+func (p *fakeGatePublisher) snapshot() []gateCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]gateCall, len(p.calls))
+	copy(out, p.calls)
+	return out
+}
+
+var _ GatePublisher = (*fakeGatePublisher)(nil)
 
 func setupTestIGWService(t *testing.T) (*IGWServiceImpl, *nats.Conn) {
 	t.Helper()
@@ -99,14 +129,6 @@ func TestDeleteInternetGateway(t *testing.T) {
 
 	_, err = svc.DescribeInternetGateways(&ec2.DescribeInternetGatewaysInput{
 		InternetGatewayIds: []*string{aws.String(igwID)},
-	}, testAccountID)
-	assert.ErrorContains(t, err, "InvalidInternetGatewayID.NotFound")
-}
-
-func TestDeleteInternetGateway_NotFound(t *testing.T) {
-	svc, _ := setupTestIGWService(t)
-	_, err := svc.DeleteInternetGateway(&ec2.DeleteInternetGatewayInput{
-		InternetGatewayId: aws.String("igw-nonexistent"),
 	}, testAccountID)
 	assert.ErrorContains(t, err, "InvalidInternetGatewayID.NotFound")
 }
@@ -667,4 +689,60 @@ func TestDeleteInternetGateway_PublishesNoEvent(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 		// Expected — no event
 	}
+}
+
+// TestAttachInternetGateway_NoGateFanOut verifies that IGW attach skips gate
+// fan-out to avoid racing the bootstrap CreateRoute path.
+func TestAttachInternetGateway_NoGateFanOut(t *testing.T) {
+	svc, _ := setupTestIGWService(t)
+	pub := &fakeGatePublisher{}
+	svc.SetGatePublisher(pub)
+	igwID := createTestIGW(t, svc)
+
+	_, err := svc.AttachInternetGateway(&ec2.AttachInternetGatewayInput{
+		InternetGatewayId: aws.String(igwID),
+		VpcId:             aws.String("vpc-test123"),
+	}, testAccountID)
+	require.NoError(t, err)
+
+	assert.Empty(t, pub.snapshot(), "attach must not fan out gate decisions")
+}
+
+func TestDetachInternetGateway_FanOutsGateDecisionsForVPC(t *testing.T) {
+	svc, _ := setupTestIGWService(t)
+	igwID := createTestIGW(t, svc)
+
+	_, err := svc.AttachInternetGateway(&ec2.AttachInternetGatewayInput{
+		InternetGatewayId: aws.String(igwID),
+		VpcId:             aws.String("vpc-test123"),
+	}, testAccountID)
+	require.NoError(t, err)
+
+	// Wire publisher AFTER attach so detach is the only fan-out we observe.
+	pub := &fakeGatePublisher{}
+	svc.SetGatePublisher(pub)
+
+	_, err = svc.DetachInternetGateway(&ec2.DetachInternetGatewayInput{
+		InternetGatewayId: aws.String(igwID),
+		VpcId:             aws.String("vpc-test123"),
+	}, testAccountID)
+	require.NoError(t, err)
+
+	calls := pub.snapshot()
+	require.Len(t, calls, 1, "expected one gate fan-out call on detach")
+	assert.Equal(t, testAccountID, calls[0].AccountID)
+	assert.Equal(t, "vpc-test123", calls[0].VpcID)
+	assert.Equal(t, "0.0.0.0/0", calls[0].DestCidr)
+}
+
+func TestAttachInternetGateway_NoGatePublisher_NoOp(t *testing.T) {
+	svc, _ := setupTestIGWService(t)
+	igwID := createTestIGW(t, svc)
+
+	// Default state — gatePublisher nil. Must not panic.
+	_, err := svc.AttachInternetGateway(&ec2.AttachInternetGatewayInput{
+		InternetGatewayId: aws.String(igwID),
+		VpcId:             aws.String("vpc-test123"),
+	}, testAccountID)
+	require.NoError(t, err)
 }

@@ -15,27 +15,58 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/predastore/ratelimit"
 	"github.com/mulgadc/spinifex/spinifex/awsec2query"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
+	gateway_ecr "github.com/mulgadc/spinifex/spinifex/gateway/ecr"
+	gateway_ecrauth "github.com/mulgadc/spinifex/spinifex/gateway/ecrauth"
 	"github.com/mulgadc/spinifex/spinifex/gateway/policy"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
+	handlers_sts "github.com/mulgadc/spinifex/spinifex/handlers/sts"
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go"
 )
 
-// contextKey is a typed key for storing values in request context.
+// contextKey is a typed key for request context values.
 type contextKey string
 
 const (
-	ctxIdentity  contextKey = "sigv4.identity"
-	ctxAccountID contextKey = "sigv4.accountId"
-	ctxService   contextKey = "sigv4.service"
-	ctxRegion    contextKey = "sigv4.region"
-	ctxAccessKey contextKey = "sigv4.accessKey"
-	ctxAction    contextKey = "sigv4.action"
-	ctxQueryArgs contextKey = "sigv4.queryArgs"
+	ctxIdentity       contextKey = "sigv4.identity"
+	ctxAccountID      contextKey = "sigv4.accountId"
+	ctxService        contextKey = "sigv4.service"
+	ctxRegion         contextKey = "sigv4.region"
+	ctxAccessKey      contextKey = "sigv4.accessKey"
+	ctxAction         contextKey = "sigv4.action"
+	ctxQueryArgs      contextKey = "sigv4.queryArgs"
+	ctxPrincipalType  contextKey = "sigv4.principalType"
+	ctxAssumedRoleARN contextKey = "sigv4.assumedRoleARN"
+	ctxAssumedRoleID  contextKey = "sigv4.assumedRoleID"
+	// ctxUnderlyingRoleARN carries the IAM role ARN backing an assumed-role session.
+	// Policy enforcement resolves the role name from this, never from ctxIdentity
+	// (attacker-influenced RoleSessionName).
+	ctxUnderlyingRoleARN contextKey = "sigv4.underlyingRoleARN"
+
+	// ctxTargetAccount carries the accountID parsed from a registry host
+	// ({accountID}.dkr.ecr.{region}.{suffix}) by the host-routing middleware.
+	ctxTargetAccount contextKey = "host.targetAccount"
+	// ctxTargetRegion carries the region parsed from the same registry host.
+	ctxTargetRegion contextKey = "host.targetRegion"
+
+	// ctxAuthPrincipal carries the verified ECR token subject (principal ARN).
+	// The resolved account is stashed via gateway_ecr.WithAuthAccount so the
+	// registry package can read it without sharing this package's key type.
+	ctxAuthPrincipal contextKey = "ecr.authPrincipal"
+)
+
+// Values stored under ctxPrincipalType. Downstream handlers that interpret
+// ctxIdentity as an IAM user name MUST gate on principalTypeUser; otherwise a
+// session whose SessionName collides with a user name inherits that user's policies.
+const (
+	principalTypeUser        = "user"
+	principalTypeAssumedRole = "assumed-role"
+	principalTypeRoot        = "root"
 )
 
 type GatewayConfig struct {
@@ -45,37 +76,62 @@ type GatewayConfig struct {
 	Config         string     // Shared AWS Gateway config for S3 auth
 	ExpectedNodes  int        // Number of expected spinifex nodes for multi-node operations
 	Region         string     // Region this gateway is running in
-	AZ             string     // Availability zone this gateway is running in
-	IAMService     handlers_iam.IAMService
-	RateLimiter    *AuthRateLimiter     // Per-IP auth failure rate limiter
-	Throttler      *ratelimit.Throttler // Per-account+action API request throttler
-	Version        string               // Build-time version string (set from cmd.Version)
-	Commit         string               // Build-time commit hash (set from cmd.Commit)
+	InternalSuffix string     // Internal DNS suffix for AWS-parity endpoints (e.g. spinifex.internal)
+	// RegistryPort is the gateway's advertised port, appended to the ECR
+	// registry host so docker login/tag/push dial the right port. Empty or
+	// "443" renders a port-less host (standard HTTPS parity).
+	RegistryPort string
+	// RegistryHost is the gateway's advertised registry host. When set, ECR URIs
+	// use it (account comes from the auth token), so docker needs no DNS — it is
+	// the same reachable, cert-covered host clients use for the AWS API. Empty
+	// falls back to the per-account <acct>.dkr.ecr.<region>.<suffix> name.
+	RegistryHost string
+	AZ           string // Availability zone this gateway is running in
+	IAMService   handlers_iam.IAMService
+	STSService   handlers_sts.STSService
+	RateLimiter  *AuthRateLimiter     // Per-IP auth failure rate limiter
+	Throttler    *ratelimit.Throttler // Per-account+action API request throttler
+	Version      string               // Build-time version string (set from cmd.Version)
+	Commit       string               // Build-time commit hash (set from cmd.Commit)
+	// ECRRegistry serves the OCI Distribution v2 (/v2/*) surface. Nil falls back
+	// to the 501 stub (e.g. in unit tests of unrelated routes).
+	ECRRegistry *gateway_ecr.Registry
+	// ECRTokenIssuer mints GetAuthorizationToken JWTs; ECRTokenVerifier validates
+	// them on /v2/*. Both nil disables the auth bridge (registry mounts open, as
+	// in unit tests of unrelated routes).
+	ECRTokenIssuer   *gateway_ecrauth.Issuer
+	ECRTokenVerifier *gateway_ecrauth.Verifier
 }
 
 var supportedServices = map[string]bool{
 	"ec2":                  true,
 	"iam":                  true,
+	"sts":                  true,
 	"account":              true,
 	"elasticloadbalancing": true,
+	"eks":                  true,
+	"ecr":                  true,
+	"acm":                  true,
+	"tagging":              true,
 	"spinifex":             true,
 }
 
-const xmlnsEC2 = "http://ec2.amazonaws.com/doc/2016-11-15/"
-
-type ErrorResponse struct {
-	XMLName   xml.Name `xml:"http://ec2.amazonaws.com/doc/2016-11-15/ ErrorResponse"`
-	Errors    Errors   `xml:"Errors"`
-	RequestID string   `xml:"RequestID"`
+// EC2ErrorResponse is the EC2 query-API error envelope.
+// aws-sdk-go v1's ec2query handler rejects the IAM-style <ErrorResponse> envelope
+// with SerializationError, so EC2 errors must use <Response><Errors>...</Errors></Response>.
+type EC2ErrorResponse struct {
+	XMLName   xml.Name  `xml:"Response"`
+	Errors    EC2Errors `xml:"Errors"`
+	RequestID string    `xml:"RequestID"`
 }
 
-type Errors struct {
+type EC2Errors struct {
 	Error ErrorDetail `xml:"Error"`
 }
 
 type ErrorDetail struct {
 	Code    string `xml:"Code"`
-	Message error  `xml:"Message"`
+	Message string `xml:"Message"`
 }
 
 func (gw *GatewayConfig) SetupRoutes() http.Handler {
@@ -93,13 +149,9 @@ func (gw *GatewayConfig) SetupRoutes() http.Handler {
 		Level: logLevel,
 	})
 
-	// Create a new logger with the custom handler
 	slogger := slog.New(handler)
-
-	// Set it as the default logger
 	slog.SetDefault(slogger)
 
-	// Initialize auth rate limiter if not already set.
 	if gw.RateLimiter == nil {
 		gw.RateLimiter = NewAuthRateLimiter()
 	}
@@ -110,26 +162,40 @@ func (gw *GatewayConfig) SetupRoutes() http.Handler {
 		r.Use(slogRequestLogger)
 	}
 
-	// AWS SigV4 authentication middleware
-	r.Use(gw.SigV4AuthMiddleware())
+	// Anonymous STS (AssumeRoleWithWebIdentity) is dispatched ahead of SigV4 —
+	// these calls carry a web-identity JWT, not AWS credentials.
+	r.Use(gw.anonymousSTSInterceptor)
 
-	// API request throttling (post-auth, per-account+action token bucket)
-	if gw.Throttler != nil {
-		r.Use(gw.Throttler.Middleware(
-			gw.throttleKeyFuncs(),
-			gw.writeThrottleError,
-		))
-	}
+	// Unauthenticated OIDC discovery endpoints (IRSA) bypass auth and throttle.
+	r.Group(func(pub chi.Router) {
+		pub.Get("/oidc/eks/{region}/{accountID}/{clusterName}/.well-known/openid-configuration", gw.OIDCDiscoveryDocument)
+		pub.Get("/oidc/eks/{region}/{accountID}/{clusterName}/keys", gw.OIDCJWKS)
+	})
 
-	// Catch-all routes
-	r.HandleFunc("/*", gw.Request)
+	// OCI Distribution registry (/v2/*). Token/host-authenticated rather than
+	// SigV4-credential-scoped, so it mounts outside the SigV4 group.
+	gw.mountOCIRegistry(r)
+
+	// Authenticated AWS API surface.
+	r.Group(func(auth chi.Router) {
+		auth.Use(gw.SigV4AuthMiddleware())
+
+		// Post-auth, per-account+action token bucket throttle.
+		if gw.Throttler != nil {
+			auth.Use(gw.Throttler.Middleware(
+				gw.throttleKeyFuncs(),
+				gw.writeThrottleError,
+			))
+		}
+
+		auth.HandleFunc("/*", gw.Request)
+	})
 
 	return r
 }
 
-// throttleKeyFuncs returns the KeyFunc slice for the API throttle middleware.
-// The first func extracts the account-id (set by SigV4 auth), the second
-// extracts the action from context (set by SigV4 auth from the request body).
+// throttleKeyFuncs returns the KeyFunc slice for the API throttle middleware,
+// keyed by account-id and action from the SigV4 auth context.
 func (gw *GatewayConfig) throttleKeyFuncs() []ratelimit.KeyFunc {
 	return []ratelimit.KeyFunc{
 		func(r *http.Request) (string, error) {
@@ -149,21 +215,86 @@ func (gw *GatewayConfig) throttleKeyFuncs() []ratelimit.KeyFunc {
 	}
 }
 
+// eksJSONContentType is the AWS REST-JSON 1.1 content type EKS clients expect.
+const eksJSONContentType = "application/x-amz-json-1.1"
+
+// clusterUnavailableMsg is the 503 body when NATS is disconnected. Points
+// operators at /local/status rather than leaving the AWS CLI hanging on timeouts.
+const clusterUnavailableMsg = "cluster unavailable: NATS disconnected — check daemon /local/status"
+
+// writeClusterUnavailable writes a 503 ServiceUnavailable in the service-appropriate
+// format. It emits XML directly (not via GenerateEC2ErrorResponse) to ensure the
+// /local/status hint is preserved in <Message>.
+func (gw *GatewayConfig) writeClusterUnavailable(w http.ResponseWriter, _ *http.Request, svc string) {
+	requestID := uuid.NewString()
+
+	// EKS uses AWS REST-JSON 1.1.
+	if svc == "eks" {
+		body := GenerateEKSErrorResponse(awserrors.ErrorServiceUnavailable, clusterUnavailableMsg, requestID)
+		w.Header().Set("Content-Type", eksJSONContentType)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if _, err := w.Write(body); err != nil {
+			slog.Error("Failed to write EKS cluster-unavailable response", "err", err)
+		}
+		return
+	}
+
+	var xmlBody string
+	if svc == "iam" || svc == "sts" {
+		iam := IAMErrorResponse{
+			Error: IAMErrorDetail{
+				Type:    "Sender",
+				Code:    awserrors.ErrorServiceUnavailable,
+				Message: clusterUnavailableMsg,
+			},
+			RequestID: requestID,
+		}
+		out, err := xml.MarshalIndent(iam, "", "  ")
+		if err != nil {
+			slog.Error("Failed to marshal IAM cluster-unavailable XML", "err", err)
+			out = []byte(`<ErrorResponse><Error><Type>Sender</Type><Code>ServiceUnavailable</Code><Message>` + clusterUnavailableMsg + `</Message></Error><RequestId>` + requestID + `</RequestId></ErrorResponse>`)
+		}
+		xmlBody = xml.Header + string(out)
+	} else {
+		// ec2, elasticloadbalancing, account, spinifex all share the EC2 envelope.
+		xmlBody = xml.Header + `<Response><Errors><Error><Code>` + awserrors.ErrorServiceUnavailable +
+			`</Code><Message>` + clusterUnavailableMsg + `</Message></Error></Errors><RequestID>` +
+			requestID + `</RequestID></Response>`
+	}
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	if _, err := w.Write([]byte(xmlBody)); err != nil {
+		slog.Error("Failed to write cluster-unavailable response", "err", err)
+	}
+}
+
 // writeThrottleError writes the service-appropriate throttle rejection response.
 func (gw *GatewayConfig) writeThrottleError(w http.ResponseWriter, r *http.Request) {
 	requestID := uuid.NewString()
 	svc, _ := r.Context().Value(ctxService).(string)
 
 	errorCode := awserrors.ErrorRequestLimitExceeded
-	if svc == "iam" {
+	if svc == "iam" || svc == "sts" || svc == "eks" {
 		errorCode = awserrors.ErrorThrottling
 	}
 	errorMsg := awserrors.ErrorLookup[errorCode]
 
+	// EKS uses AWS REST-JSON 1.1.
+	if svc == "eks" {
+		body := GenerateEKSErrorResponse(errorCode, errorMsg.Message, requestID)
+		w.Header().Set("Content-Type", eksJSONContentType)
+		w.WriteHeader(errorMsg.HTTPCode)
+		if _, err := w.Write(body); err != nil {
+			slog.Error("Failed to write EKS throttle error response", "err", err)
+		}
+		return
+	}
+
 	var xmlErr []byte
-	if svc == "iam" {
+	if svc == "iam" || svc == "sts" || svc == "elasticloadbalancing" {
 		xmlErr = GenerateIAMErrorResponse(errorCode, errorMsg.Message, requestID)
-	} else { // ec2, elasticloadbalancing, account, spinifex
+	} else { // ec2, account, spinifex
 		xmlErr = GenerateEC2ErrorResponse(errorCode, errorMsg.Message, requestID)
 	}
 
@@ -174,19 +305,20 @@ func (gw *GatewayConfig) writeThrottleError(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-// Note, custom endpoints can be configured via ENV vars to the AWS SDK/CLI tool, with individual endpoints depending the service
-// AWS_ENDPOINT_URL_EC2=https://localhost:9999/ aws  --no-verify-ssl ec2 describe-instances
-// aws --endpoint-url https://localhost:9999/  --no-verify-ssl eks list-clusters
-// AWS_ENDPOINT_URL=https://localhost:9999/ aws  --no-verify-ssl ec2 describe-instances
-
 func (gw *GatewayConfig) Request(w http.ResponseWriter, r *http.Request) {
-	// Route the request to the appropriate endpoint (e.g EC2, IAM, etc)
 	svc, err := gw.GetService(r)
 	slog.Info("Request", "service", svc, "method", r.Method, "path", r.URL.Path)
 
 	if err != nil {
 		slog.Error("GetService error", "error", err)
 		gw.ErrorHandler(w, r, err)
+		return
+	}
+
+	// Fail fast when NATS is down; every NATS-bound handler would otherwise hang
+	// until per-call timeout. Account is a local stub exempt from NATS.
+	if svc != "account" && (gw.NATSConn == nil || !gw.NATSConn.IsConnected()) {
+		gw.writeClusterUnavailable(w, r, svc)
 		return
 	}
 
@@ -197,8 +329,18 @@ func (gw *GatewayConfig) Request(w http.ResponseWriter, r *http.Request) {
 		err = gw.Account_Request(w, r)
 	case "iam":
 		err = gw.IAM_Request(w, r)
+	case "sts":
+		err = gw.STS_Request(w, r)
 	case "elasticloadbalancing":
 		err = gw.ELBv2_Request(w, r)
+	case "eks":
+		err = gw.EKS_Request(w, r)
+	case "ecr":
+		err = gw.ECR_Request(w, r)
+	case "acm":
+		err = gw.ACM_Request(w, r)
+	case "tagging":
+		err = gw.Tagging_Request(w, r)
 	case "spinifex":
 		err = gw.Spinifex_Request(w, r)
 	default:
@@ -233,11 +375,16 @@ func isNATSTransient(err error) bool {
 		errors.Is(err, nats.ErrNoStreamResponse))
 }
 
-// checkPolicy evaluates IAM policies for the current request. Returns nil
-// if access is allowed, or an ErrorAccessDenied error if denied.
-// Root users bypass evaluation entirely. If the IAM service is unavailable,
-// access is allowed (pre-IAM compatibility).
+// checkPolicy evaluates IAM policies against resource "*".
+// Shorthand for checkPolicyResource(r, service, action, "*").
 func (gw *GatewayConfig) checkPolicy(r *http.Request, service, action string) error {
+	return gw.checkPolicyResource(r, service, action, "*")
+}
+
+// checkPolicyResource evaluates IAM policies against a specific resource ARN.
+// Root users bypass evaluation. Nil IAMService allows (pre-IAM compatibility).
+// Used by EC2 paths that enforce iam:PassRole before attaching an instance profile.
+func (gw *GatewayConfig) checkPolicyResource(r *http.Request, service, action, resource string) error {
 	if gw.IAMService == nil {
 		slog.Warn("checkPolicy: IAM service not available, skipping policy check",
 			"service", service, "action", action)
@@ -254,41 +401,75 @@ func (gw *GatewayConfig) checkPolicy(r *http.Request, service, action string) er
 		slog.Error("checkPolicy: identity has unexpected type", "type", fmt.Sprintf("%T", identityVal))
 		return errors.New(awserrors.ErrorInternalError)
 	}
-	// Extract account ID from auth context
 	accountID, _ := r.Context().Value(ctxAccountID).(string)
 	if accountID == "" {
 		slog.Error("checkPolicy: no account ID in auth context", "user", identity)
 		return errors.New(awserrors.ErrorInternalError)
 	}
 
-	if identity == "" || (identity == "root" && accountID == utils.GlobalAccountID) {
-		return nil
-	}
-
-	// Resolve the IAM action string (e.g. "ec2:RunInstances")
 	iamAction := policy.IAMAction(service, action)
 
-	// Retry on transient NATS errors (e.g. during node failure / leader election).
+	// Each branch resolves the policy resolver and log identity for its principal
+	// type. Identity-sensitive decisions (root bypass, resolver selection) are
+	// fully inside their branch so an assumed-role SessionName of "root" cannot
+	// reach the user-branch root short-circuit.
+	var resolve func() ([]handlers_iam.PolicyDocument, error)
+	var logIdentity string
+
+	principalType, _ := r.Context().Value(ctxPrincipalType).(string)
+	switch principalType {
+	case principalTypeUser:
+		if identity == "" || (identity == "root" && accountID == utils.GlobalAccountID) {
+			// root / pre-IAM bypass — user branch only.
+			return nil
+		}
+		resolve = func() ([]handlers_iam.PolicyDocument, error) {
+			return gw.IAMService.GetUserPolicies(accountID, identity)
+		}
+		logIdentity = identity
+	case principalTypeAssumedRole:
+		// Resolve by the session's underlying role, never by SessionName (attacker-influenced).
+		// A missing/legacy, cross-account, or malformed ARN fails closed with AccessDenied.
+		underlyingRoleARN, _ := r.Context().Value(ctxUnderlyingRoleARN).(string)
+		roleAcct, roleName, perr := auth.ParseRoleARN(underlyingRoleARN)
+		if perr != nil || roleAcct != accountID {
+			slog.Warn("checkPolicy: unresolvable or cross-account assumed-role principal denied",
+				"underlyingRoleARN", underlyingRoleARN,
+				"accountID", accountID,
+				"action", iamAction,
+				"err", perr)
+			return errors.New(awserrors.ErrorAccessDenied)
+		}
+		resolve = func() ([]handlers_iam.PolicyDocument, error) {
+			return gw.IAMService.GetRolePolicies(accountID, roleName)
+		}
+		logIdentity, _ = r.Context().Value(ctxAssumedRoleARN).(string)
+	default:
+		slog.Error("checkPolicy: unknown principal type", "principalType", principalType)
+		return errors.New(awserrors.ErrorInternalError)
+	}
+
+	// Resolve policies, retrying transient NATS errors. Fail-closed on non-transient errors.
 	var policies []handlers_iam.PolicyDocument
 	var err error
 	for attempt := range 3 {
-		policies, err = gw.IAMService.GetUserPolicies(accountID, identity)
+		policies, err = resolve()
 		if err == nil || !isNATSTransient(err) {
 			break
 		}
 		if attempt < 2 {
 			slog.Debug("checkPolicy: transient NATS error, retrying",
-				"user", identity, "attempt", attempt+1, "err", err)
+				"identity", logIdentity, "attempt", attempt+1, "err", err)
 			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
 		}
 	}
 	if err != nil {
-		slog.Error("checkPolicy: failed to get user policies", "user", identity, "err", err)
+		slog.Error("checkPolicy: failed to resolve policies", "identity", logIdentity, "err", err)
 		return errors.New(awserrors.ErrorInternalError)
 	}
 
-	if policy.EvaluateAccess(identity, iamAction, "*", policies) == policy.Deny {
-		slog.Info("checkPolicy: access denied", "user", identity, "action", iamAction)
+	if policy.EvaluateAccess(logIdentity, iamAction, resource, policies) == policy.Deny {
+		slog.Info("checkPolicy: access denied", "identity", logIdentity, "action", iamAction, "resource", resource)
 		return errors.New(awserrors.ErrorAccessDenied)
 	}
 
@@ -299,12 +480,9 @@ func (gw *GatewayConfig) ErrorHandler(w http.ResponseWriter, r *http.Request, er
 	svc, _ := gw.GetService(r)
 	slog.Debug("ErrorHandler", "service", svc, "error", err.Error())
 
-	// Generate a server-side request ID — never trust client-provided values
 	var requestId = uuid.NewString()
-
 	var errorMsg = awserrors.ErrorMessage{}
 
-	// Check if the error lookup exists
 	if _, exists := awserrors.ErrorLookup[err.Error()]; !exists {
 		slog.Warn("Unknown error code", "error", err.Error())
 		err = errors.New(awserrors.ErrorInternalError)
@@ -312,19 +490,30 @@ func (gw *GatewayConfig) ErrorHandler(w http.ResponseWriter, r *http.Request, er
 
 	errorMsg = awserrors.ErrorLookup[err.Error()]
 
-	// IAM uses a different error XML format than EC2
+	if errorMsg.HTTPCode == 0 {
+		errorMsg.HTTPCode = 500
+	}
+
+	// EKS, ECR, ACM, and tagging use AWS JSON 1.1; query/XML services fall through.
+	if svc == "eks" || svc == "ecr" || svc == "acm" || svc == "tagging" {
+		body := GenerateEKSErrorResponse(err.Error(), errorMsg.Message, requestId)
+		slog.Debug("Generated JSON error response", "service", svc, "error", err.Error(), "json", string(body), "requestId", requestId)
+		w.Header().Set("Content-Type", eksJSONContentType)
+		w.WriteHeader(errorMsg.HTTPCode)
+		if _, err := w.Write(body); err != nil {
+			slog.Error("Failed to write EKS error response", "err", err)
+		}
+		return
+	}
+
 	var xmlError []byte
-	if svc == "iam" {
+	if svc == "iam" || svc == "sts" || svc == "elasticloadbalancing" {
 		xmlError = GenerateIAMErrorResponse(err.Error(), errorMsg.Message, requestId)
 	} else {
 		xmlError = GenerateEC2ErrorResponse(err.Error(), errorMsg.Message, requestId)
 	}
 
 	slog.Debug("Generated error response", "error", err.Error(), "xml", string(xmlError), "requestId", requestId)
-
-	if errorMsg.HTTPCode == 0 {
-		errorMsg.HTTPCode = 500
-	}
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(errorMsg.HTTPCode)
@@ -333,8 +522,8 @@ func (gw *GatewayConfig) ErrorHandler(w http.ResponseWriter, r *http.Request, er
 	}
 }
 
-// readQueryArgs returns parsed query args from context (set by SigV4) or
-// parses the body. The fallback only fires for unauthenticated/test paths.
+// readQueryArgs returns parsed query args from context (set by SigV4) or falls
+// back to parsing the body (unauthenticated/test paths only).
 func readQueryArgs(r *http.Request) (map[string]string, error) {
 	if args, ok := r.Context().Value(ctxQueryArgs).(map[string]string); ok {
 		return args, nil
@@ -371,11 +560,11 @@ func ParseAWSQueryArgs(query string) (map[string]string, error) {
 }
 
 func GenerateEC2ErrorResponse(code, message, requestID string) (output []byte) {
-	errorXml := ErrorResponse{
-		Errors: Errors{
+	errorXml := EC2ErrorResponse{
+		Errors: EC2Errors{
 			Error: ErrorDetail{
 				Code:    code,
-				Message: errors.New(message),
+				Message: message,
 			},
 		},
 		RequestID: requestID,
@@ -385,7 +574,7 @@ func GenerateEC2ErrorResponse(code, message, requestID string) (output []byte) {
 
 	if err != nil {
 		slog.Error("Failed to build XML", "error", err)
-		return []byte(xml.Header + `<ErrorResponse xmlns="` + xmlnsEC2 + `"><Errors><Error><Code>InternalError</Code><Message>Internal error</Message></Error></Errors><RequestID>` + requestID + `</RequestID></ErrorResponse>`)
+		return []byte(xml.Header + `<Response><Errors><Error><Code>InternalError</Code><Message>Internal error</Message></Error></Errors><RequestID>` + requestID + `</RequestID></Response>`)
 	}
 
 	// Add XML header
@@ -394,8 +583,7 @@ func GenerateEC2ErrorResponse(code, message, requestID string) (output []byte) {
 	return output
 }
 
-// IAMErrorResponse represents the IAM-style error XML format:
-// <ErrorResponse><Error><Type>Sender</Type><Code>...</Code><Message>...</Message></Error><RequestId>...</RequestId></ErrorResponse>
+// IAMErrorResponse is the IAM/STS error XML envelope.
 type IAMErrorResponse struct {
 	XMLName   xml.Name       `xml:"ErrorResponse"`
 	Error     IAMErrorDetail `xml:"Error"`
@@ -448,56 +636,25 @@ func (gw *GatewayConfig) DiscoverActiveNodes() int {
 		return gw.ExpectedNodes
 	}
 
-	// Create an inbox for collecting responses from all nodes
-	inbox := nats.NewInbox()
-	sub, err := gw.NATSConn.SubscribeSync(inbox)
+	frames, _, err := utils.Gather(gw.NATSConn, "spinifex.nodes.discover", []byte("{}"),
+		utils.GatherOpts{Timeout: 500 * time.Millisecond})
 	if err != nil {
-		slog.Error("DiscoverActiveNodes: Failed to create inbox subscription", "err", err)
+		slog.Error("DiscoverActiveNodes: fan-out failed, using ExpectedNodes fallback", "err", err, "fallback", gw.ExpectedNodes)
 		return gw.ExpectedNodes
 	}
-	defer sub.Unsubscribe()
-
-	// Publish discovery request to all nodes
-	err = gw.NATSConn.PublishRequest("spinifex.nodes.discover", inbox, []byte("{}"))
-	if err != nil {
-		slog.Error("DiscoverActiveNodes: Failed to publish request", "err", err)
-		return gw.ExpectedNodes
-	}
-
-	// Collect responses with a short timeout
-	// We use a short timeout since discovery should be fast
-	timeout := 500 * time.Millisecond
-	deadline := time.Now().Add(timeout)
 
 	nodesSeen := make(map[string]bool)
-
-	for time.Now().Before(deadline) {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
-		}
-
-		msg, err := sub.NextMsg(remaining)
-		if err != nil {
-			if err == nats.ErrTimeout {
-				break
-			}
-			slog.Debug("DiscoverActiveNodes: Error receiving message", "err", err)
-			break
-		}
-
+	for _, frame := range frames {
 		var response types.NodeDiscoverResponse
-		if err := json.Unmarshal(msg.Data, &response); err != nil {
+		if err := json.Unmarshal(frame, &response); err != nil {
 			slog.Debug("DiscoverActiveNodes: Failed to unmarshal response", "err", err)
 			continue
 		}
-
 		nodesSeen[response.Node] = true
 	}
 
 	activeNodes := len(nodesSeen)
 	if activeNodes == 0 {
-		// Fallback to configured value if no responses
 		slog.Warn("DiscoverActiveNodes: No nodes responded, using ExpectedNodes fallback", "fallback", gw.ExpectedNodes)
 		return gw.ExpectedNodes
 	}
@@ -506,7 +663,7 @@ func (gw *GatewayConfig) DiscoverActiveNodes() int {
 	return activeNodes
 }
 
-// statusWriter wraps http.ResponseWriter to capture the status code.
+// statusWriter wraps http.ResponseWriter to capture the written status code.
 type statusWriter struct {
 	http.ResponseWriter
 
@@ -518,7 +675,7 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
-// SlogRequestLogger is a middleware that logs each request using slog.
+// slogRequestLogger is a middleware that logs each request via slog.
 func slogRequestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

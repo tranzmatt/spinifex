@@ -1,12 +1,13 @@
 import type { Listener } from "@aws-sdk/client-elastic-load-balancing-v2"
 import { zodResolver } from "@hookform/resolvers/zod"
 import { useSuspenseQuery } from "@tanstack/react-query"
-import { Trash2 } from "lucide-react"
-import { useEffect, useState } from "react"
+import { Pencil, Trash2 } from "lucide-react"
+import { Fragment, useEffect, useState } from "react"
 import { useForm } from "react-hook-form"
 
 import { DeleteConfirmationDialog } from "@/components/delete-confirmation-dialog"
 import { ListenerForm } from "@/components/elbv2/listener-form"
+import { ListenerRulesTab } from "@/components/elbv2/listener-rules-tab"
 import { ErrorBanner } from "@/components/error-banner"
 import {
   AlertDialog,
@@ -19,36 +20,83 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
-import { useCreateListener, useDeleteListener } from "@/mutations/elbv2"
+import {
+  useCreateListener,
+  useDeleteListener,
+  useModifyListener,
+} from "@/mutations/elbv2"
+import { acmCertificatesQueryOptions } from "@/queries/acm"
 import {
   elbv2ListenersQueryOptions,
+  elbv2SslPoliciesQueryOptions,
   elbv2TargetGroupsQueryOptions,
 } from "@/queries/elbv2"
 import {
   type CreateListenerFormData,
   createListenerSchema,
+  defaultProtocolForType,
+  isSecureProtocol,
+  type LbType,
+  type ListenerProtocolValue,
+  protocolsForType,
 } from "@/types/elbv2"
 
 interface ListenersTabProps {
   loadBalancerArn: string
   vpcId: string | undefined
+  lbType: LbType
 }
 
-export function ListenersTab({ loadBalancerArn, vpcId }: ListenersTabProps) {
+// NLB listeners default to TCP, ALB to HTTP — both on port 80.
+function listenerDefaults(lbType: LbType): CreateListenerFormData {
+  return {
+    protocol: defaultProtocolForType(lbType),
+    port: 80,
+    defaultTargetGroupArn: "",
+  }
+}
+
+function formatTls(listener: Listener): string {
+  if (listener.Protocol !== "HTTPS") {
+    return "—"
+  }
+  const certId = listener.Certificates?.[0]?.CertificateArn?.split("/").pop()
+  const policy = listener.SslPolicy
+  if (certId && policy) {
+    return `${policy} · ${certId}`
+  }
+  return policy ?? certId ?? "—"
+}
+
+export function ListenersTab({
+  loadBalancerArn,
+  vpcId,
+  lbType,
+}: ListenersTabProps) {
+  const protocols = protocolsForType(lbType)
   const { data: listenersData } = useSuspenseQuery(
     elbv2ListenersQueryOptions(loadBalancerArn),
   )
   const { data: tgsData } = useSuspenseQuery(elbv2TargetGroupsQueryOptions)
+  const { data: certsData } = useSuspenseQuery(acmCertificatesQueryOptions)
+  const { data: sslPoliciesData } = useSuspenseQuery(
+    elbv2SslPoliciesQueryOptions,
+  )
 
   const createMutation = useCreateListener()
   const deleteMutation = useDeleteListener()
+  const modifyMutation = useModifyListener()
 
   const [addOpen, setAddOpen] = useState(false)
+  const [editTarget, setEditTarget] = useState<Listener | undefined>()
   const [deleteTarget, setDeleteTarget] = useState<Listener | undefined>()
+  const [rulesOpenArn, setRulesOpenArn] = useState<string | undefined>()
 
   const listeners = listenersData.Listeners ?? []
   const allTgs = tgsData.TargetGroups ?? []
   const vpcTgs = allTgs.filter((tg) => tg.VpcId === vpcId)
+  const certificates = certsData.CertificateSummaryList ?? []
+  const sslPolicies = sslPoliciesData.SslPolicies ?? []
 
   const tgNameByArn = new Map<string, string>()
   for (const tg of allTgs) {
@@ -76,8 +124,30 @@ export function ListenersTab({ loadBalancerArn, vpcId }: ListenersTabProps) {
         protocol: data.protocol,
         port: data.port,
         defaultTargetGroupArn: data.defaultTargetGroupArn,
+        certificateArn: data.certificateArn,
+        sslPolicy: data.sslPolicy,
       })
       setAddOpen(false)
+    } catch {
+      // surfaced via mutation.error
+    }
+  }
+
+  const handleEdit = async (data: CreateListenerFormData) => {
+    if (!editTarget?.ListenerArn) {
+      return
+    }
+    try {
+      await modifyMutation.mutateAsync({
+        listenerArn: editTarget.ListenerArn,
+        loadBalancerArn,
+        protocol: data.protocol,
+        port: data.port,
+        defaultTargetGroupArn: data.defaultTargetGroupArn,
+        certificateArn: data.certificateArn,
+        sslPolicy: data.sslPolicy,
+      })
+      setEditTarget(undefined)
     } catch {
       // surfaced via mutation.error
     }
@@ -96,14 +166,16 @@ export function ListenersTab({ loadBalancerArn, vpcId }: ListenersTabProps) {
 
   return (
     <div className="space-y-3">
-      <p className="text-sm text-muted-foreground">
-        Listeners cannot be edited. Delete and re-add to change.
-      </p>
-
       {createMutation.error && (
         <ErrorBanner
           error={createMutation.error}
           msg="Failed to create listener"
+        />
+      )}
+      {modifyMutation.error && (
+        <ErrorBanner
+          error={modifyMutation.error}
+          msg="Failed to modify listener"
         />
       )}
       {deleteMutation.error && (
@@ -131,47 +203,99 @@ export function ListenersTab({ loadBalancerArn, vpcId }: ListenersTabProps) {
               <tr className="border-b text-left text-muted-foreground">
                 <th className="px-4 py-2 font-medium">Protocol</th>
                 <th className="px-4 py-2 font-medium">Port</th>
+                <th className="px-4 py-2 font-medium">TLS</th>
                 <th className="px-4 py-2 font-medium">Default action</th>
                 <th className="px-4 py-2 font-medium">Listener ARN</th>
-                <th className="px-4 py-2 font-medium" />
+                <th className="px-4 py-2 font-medium">
+                  <span className="sr-only">Actions</span>
+                </th>
               </tr>
             </thead>
             <tbody>
-              {listeners.map((listener) => (
-                <tr
-                  className="border-b last:border-0"
-                  key={listener.ListenerArn ?? ""}
-                >
-                  <td className="px-4 py-2">{listener.Protocol}</td>
-                  <td className="px-4 py-2">{listener.Port}</td>
-                  <td className="px-4 py-2 text-xs">
-                    {formatDefaultAction(listener)}
-                  </td>
-                  <td className="px-4 py-2 font-mono text-xs">
-                    {listener.ListenerArn}
-                  </td>
-                  <td className="px-4 py-2 text-right">
-                    <Button
-                      aria-label={`Delete listener ${listener.Protocol}:${listener.Port}`}
-                      onClick={() => setDeleteTarget(listener)}
-                      size="sm"
-                      variant="ghost"
-                    >
-                      <Trash2 className="size-4" />
-                    </Button>
-                  </td>
-                </tr>
-              ))}
+              {listeners.map((listener) => {
+                const arn = listener.ListenerArn ?? ""
+                const rulesOpen = rulesOpenArn === arn
+                return (
+                  <Fragment key={arn}>
+                    <tr className="border-b last:border-0">
+                      <td className="px-4 py-2">{listener.Protocol}</td>
+                      <td className="px-4 py-2">{listener.Port}</td>
+                      <td className="px-4 py-2 text-xs">
+                        {formatTls(listener)}
+                      </td>
+                      <td className="px-4 py-2 text-xs">
+                        {formatDefaultAction(listener)}
+                      </td>
+                      <td className="px-4 py-2 font-mono text-xs">{arn}</td>
+                      <td className="px-4 py-2 text-right">
+                        <div className="flex justify-end gap-1">
+                          <Button
+                            aria-label={`${rulesOpen ? "Hide" : "Show"} rules for listener ${listener.Protocol}:${listener.Port}`}
+                            onClick={() =>
+                              setRulesOpenArn(rulesOpen ? undefined : arn)
+                            }
+                            size="sm"
+                            variant="ghost"
+                          >
+                            {rulesOpen ? "Hide rules" : "Rules"}
+                          </Button>
+                          <Button
+                            aria-label={`Edit listener ${listener.Protocol}:${listener.Port}`}
+                            onClick={() => setEditTarget(listener)}
+                            size="sm"
+                            variant="ghost"
+                          >
+                            <Pencil className="size-4" />
+                          </Button>
+                          <Button
+                            aria-label={`Delete listener ${listener.Protocol}:${listener.Port}`}
+                            onClick={() => setDeleteTarget(listener)}
+                            size="sm"
+                            variant="ghost"
+                          >
+                            <Trash2 className="size-4" />
+                          </Button>
+                        </div>
+                      </td>
+                    </tr>
+                    {rulesOpen && arn && (
+                      <tr className="border-b bg-muted/30 last:border-0">
+                        <td className="px-4 py-3" colSpan={6}>
+                          <ListenerRulesTab
+                            listenerArn={arn}
+                            targetGroups={vpcTgs}
+                          />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                )
+              })}
             </tbody>
           </table>
         </div>
       )}
 
       <AddListenerDialog
+        certificates={certificates}
         isPending={createMutation.isPending}
+        lbType={lbType}
         onOpenChange={setAddOpen}
         onSubmit={handleCreate}
         open={addOpen}
+        protocols={protocols}
+        sslPolicies={sslPolicies}
+        targetGroups={vpcTgs}
+      />
+
+      <EditListenerDialog
+        certificates={certificates}
+        isPending={modifyMutation.isPending}
+        listener={editTarget}
+        onOpenChange={(open) => !open && setEditTarget(undefined)}
+        onSubmit={handleEdit}
+        protocols={protocols}
+        sslPolicies={sslPolicies}
         targetGroups={vpcTgs}
       />
 
@@ -194,7 +318,11 @@ export function ListenersTab({ loadBalancerArn, vpcId }: ListenersTabProps) {
 interface AddListenerDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  lbType: LbType
+  protocols: readonly ListenerProtocolValue[]
   targetGroups: React.ComponentProps<typeof ListenerForm>["targetGroups"]
+  certificates: React.ComponentProps<typeof ListenerForm>["certificates"]
+  sslPolicies: React.ComponentProps<typeof ListenerForm>["sslPolicies"]
   isPending: boolean
   onSubmit: (data: CreateListenerFormData) => void
 }
@@ -202,10 +330,90 @@ interface AddListenerDialogProps {
 function AddListenerDialog({
   open,
   onOpenChange,
+  lbType,
+  protocols,
   targetGroups,
+  certificates,
+  sslPolicies,
   isPending,
   onSubmit,
 }: AddListenerDialogProps) {
+  const form = useForm<CreateListenerFormData>({
+    resolver: zodResolver(createListenerSchema),
+    defaultValues: listenerDefaults(lbType),
+  })
+
+  useEffect(() => {
+    if (!open) {
+      form.reset(listenerDefaults(lbType))
+    }
+  }, [open, form, lbType])
+
+  const handleConfirm = form.handleSubmit(onSubmit)
+
+  return (
+    <AlertDialog onOpenChange={onOpenChange} open={open}>
+      <AlertDialogContent
+        className="grid-cols-[minmax(0,1fr)]"
+        style={{ maxWidth: "32rem", width: "calc(100vw - 2rem)" }}
+      >
+        <AlertDialogHeader>
+          <AlertDialogTitle>Add listener</AlertDialogTitle>
+          <AlertDialogDescription>
+            Listeners forward incoming traffic to a default target group.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+
+        <form
+          className="min-w-0 space-y-4"
+          onSubmit={(e) => {
+            e.preventDefault()
+            void handleConfirm()
+          }}
+        >
+          <ListenerForm
+            certificates={certificates}
+            form={form}
+            protocols={protocols}
+            sslPolicies={sslPolicies}
+            targetGroups={targetGroups}
+          />
+        </form>
+
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={isPending}>Cancel</AlertDialogCancel>
+          <AlertDialogAction disabled={isPending} onClick={handleConfirm}>
+            {isPending ? "Adding\u2026" : "Add listener"}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+}
+
+interface EditListenerDialogProps {
+  listener: Listener | undefined
+  onOpenChange: (open: boolean) => void
+  protocols: readonly ListenerProtocolValue[]
+  targetGroups: React.ComponentProps<typeof ListenerForm>["targetGroups"]
+  certificates: React.ComponentProps<typeof ListenerForm>["certificates"]
+  sslPolicies: React.ComponentProps<typeof ListenerForm>["sslPolicies"]
+  isPending: boolean
+  onSubmit: (data: CreateListenerFormData) => void
+}
+
+function EditListenerDialog({
+  listener,
+  onOpenChange,
+  protocols,
+  targetGroups,
+  certificates,
+  sslPolicies,
+  isPending,
+  onSubmit,
+}: EditListenerDialogProps) {
+  const open = listener !== undefined
+
   const form = useForm<CreateListenerFormData>({
     resolver: zodResolver(createListenerSchema),
     defaultValues: {
@@ -216,41 +424,59 @@ function AddListenerDialog({
   })
 
   useEffect(() => {
-    if (!open) {
-      form.reset({
-        protocol: "HTTP",
-        port: 80,
-        defaultTargetGroupArn: "",
-      })
+    if (!listener) {
+      return
     }
-  }, [open, form])
+    const protocol: ListenerProtocolValue =
+      protocols.find((p) => p === listener.Protocol) ?? protocols[0] ?? "HTTP"
+    const secure = isSecureProtocol(protocol)
+    form.reset({
+      protocol,
+      port: listener.Port ?? 80,
+      defaultTargetGroupArn: listener.DefaultActions?.[0]?.TargetGroupArn ?? "",
+      certificateArn: secure
+        ? listener.Certificates?.[0]?.CertificateArn
+        : undefined,
+      sslPolicy: protocol === "HTTPS" ? listener.SslPolicy : undefined,
+    })
+  }, [listener, form, protocols])
 
   const handleConfirm = form.handleSubmit(onSubmit)
 
   return (
     <AlertDialog onOpenChange={onOpenChange} open={open}>
-      <AlertDialogContent className="sm:max-w-lg">
+      <AlertDialogContent
+        className="grid-cols-[minmax(0,1fr)]"
+        style={{ maxWidth: "32rem", width: "calc(100vw - 2rem)" }}
+      >
         <AlertDialogHeader>
-          <AlertDialogTitle>Add listener</AlertDialogTitle>
+          <AlertDialogTitle>Edit listener</AlertDialogTitle>
           <AlertDialogDescription>
-            Listeners forward incoming traffic to a default target group.
+            Update port, protocol, or default target group. Changes apply
+            without dropping the listener.
           </AlertDialogDescription>
         </AlertDialogHeader>
 
         <form
-          className="space-y-4"
+          className="min-w-0 space-y-4"
           onSubmit={(e) => {
             e.preventDefault()
-            handleConfirm()
+            void handleConfirm()
           }}
         >
-          <ListenerForm form={form} targetGroups={targetGroups} />
+          <ListenerForm
+            certificates={certificates}
+            form={form}
+            protocols={protocols}
+            sslPolicies={sslPolicies}
+            targetGroups={targetGroups}
+          />
         </form>
 
         <AlertDialogFooter>
           <AlertDialogCancel disabled={isPending}>Cancel</AlertDialogCancel>
           <AlertDialogAction disabled={isPending} onClick={handleConfirm}>
-            {isPending ? "Adding\u2026" : "Add listener"}
+            {isPending ? "Saving\u2026" : "Save changes"}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

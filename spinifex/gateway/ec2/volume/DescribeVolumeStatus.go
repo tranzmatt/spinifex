@@ -10,13 +10,11 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// ValidateDescribeVolumeStatusInput validates the input parameters
 func ValidateDescribeVolumeStatusInput(input *ec2.DescribeVolumeStatusInput) error {
 	if input == nil {
 		return nil
 	}
 
-	// Validate VolumeId format if provided
 	for _, volumeId := range input.VolumeIds {
 		if volumeId != nil && !strings.HasPrefix(*volumeId, "vol-") {
 			return errors.New(awserrors.ErrorInvalidVolumeIDMalformed)

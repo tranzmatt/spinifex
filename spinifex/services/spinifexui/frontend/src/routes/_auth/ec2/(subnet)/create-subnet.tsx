@@ -1,7 +1,7 @@
 import { zodResolver } from "@hookform/resolvers/zod"
 import { useSuspenseQuery } from "@tanstack/react-query"
 import { createFileRoute, useNavigate } from "@tanstack/react-router"
-import { Controller, useForm } from "react-hook-form"
+import { Controller, useForm, useWatch } from "react-hook-form"
 
 import { BackLink } from "@/components/back-link"
 import {
@@ -58,22 +58,29 @@ function CreateSubnet() {
     control,
     handleSubmit,
     register,
-    watch,
     formState: { errors, isSubmitting },
   } = useForm<CreateSubnetFormData>({
     resolver: zodResolver(createSubnetSchema),
     defaultValues: {
       vpcId: vpcs[0]?.VpcId ?? "",
       cidrBlock: "10.0.1.0/24",
-      availabilityZone: "",
+      availabilityZone: undefined,
+      mapPublicIpOnLaunch: false,
     },
   })
+
+  const values = useWatch({ control })
+  const cliWatch = (name?: string): unknown =>
+    name ? (values as Record<string, unknown>)[name] : undefined
 
   const onSubmit = async (data: CreateSubnetFormData) => {
     const result = await createMutation.mutateAsync(data)
     const subnetId = result.Subnet?.SubnetId
     if (subnetId) {
-      navigate({ to: "/ec2/describe-subnets/$id", params: { id: subnetId } })
+      navigate({
+        to: "/ec2/describe-subnets/$id",
+        params: { id: subnetId },
+      })
     } else {
       navigate({ to: "/ec2/describe-subnets" })
     }
@@ -155,7 +162,7 @@ function CreateSubnet() {
             render={({ field }) => (
               <Select
                 onValueChange={(value) =>
-                  field.onChange(value === "none" ? "" : value)
+                  field.onChange(value === "none" ? undefined : value)
                 }
                 value={field.value ?? "none"}
               >
@@ -175,12 +182,31 @@ function CreateSubnet() {
           />
         </Field>
 
-        <CliCommandPanel commands={buildCreateSubnetCommands(watch)} />
+        <Field>
+          <FieldTitle>Auto-assign public IPv4</FieldTitle>
+          <Controller
+            control={control}
+            name="mapPublicIpOnLaunch"
+            render={({ field }) => (
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  aria-label="Enable auto-assign public IPv4 address"
+                  checked={field.value ?? false}
+                  onChange={(e) => field.onChange(e.target.checked)}
+                  type="checkbox"
+                />
+                Enable auto-assign public IPv4 address
+              </label>
+            )}
+          />
+        </Field>
+
+        <CliCommandPanel commands={buildCreateSubnetCommands(cliWatch)} />
 
         <FormActions
           isPending={createMutation.isPending}
           isSubmitting={isSubmitting}
-          onCancel={() => navigate({ to: "/ec2/describe-subnets" })}
+          onCancel={async () => await navigate({ to: "/ec2/describe-subnets" })}
           pendingLabel="Creating…"
           submitLabel="Create Subnet"
         />
@@ -217,5 +243,22 @@ function buildCreateSubnetCommands(
     )
   }
 
-  return [{ label: "Create Subnet", parts }]
+  const commands: CliCommand[] = [{ label: "Create Subnet", parts }]
+
+  if (watch("mapPublicIpOnLaunch") === true) {
+    commands.push({
+      label: "Enable auto-assign public IPv4",
+      parts: [
+        {
+          type: "bin" as const,
+          value: "AWS_PROFILE=spinifex aws ec2 modify-subnet-attribute",
+        },
+        { type: "flag" as const, value: " \\\n  --subnet-id" },
+        { type: "value" as const, value: " <SubnetId>" },
+        { type: "flag" as const, value: " \\\n  --map-public-ip-on-launch" },
+      ],
+    })
+  }
+
+  return commands
 }

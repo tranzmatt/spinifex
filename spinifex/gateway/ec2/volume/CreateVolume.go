@@ -9,7 +9,6 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// ValidateCreateVolumeInput validates the input parameters
 func ValidateCreateVolumeInput(input *ec2.CreateVolumeInput) error {
 	if input == nil {
 		return errors.New(awserrors.ErrorInvalidParameterValue)
@@ -23,7 +22,6 @@ func ValidateCreateVolumeInput(input *ec2.CreateVolumeInput) error {
 		return errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 
-	// Only gp3 or empty (defaults to gp3) allowed
 	if input.VolumeType != nil && *input.VolumeType != "" && *input.VolumeType != "gp3" {
 		return errors.New(awserrors.ErrorInvalidParameterValue)
 	}

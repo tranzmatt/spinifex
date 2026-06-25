@@ -562,11 +562,14 @@ func TestRemoveInstance_Success(t *testing.T) {
 	assert.Equal(t, []string{"i-bbb"}, record.NodeInstances["node-b"])
 }
 
+// TestRemoveInstance_NodeNotFound / _GroupNotFound pin the idempotency contract:
+// RemoveInstance must succeed when the node or group is missing (callers may race
+// with group deletion or have already moved the instance off the node).
+
 func TestRemoveInstance_NodeNotFound(t *testing.T) {
 	svc := setupTestService(t)
 	createTestGroup(t, svc, "remove-nonode-group", "spread")
 
-	// Removing from a non-existent node is a no-op
 	_, err := svc.RemoveInstance(&RemoveInstanceInput{
 		GroupName:  "remove-nonode-group",
 		NodeName:   "ghost-node",
@@ -578,7 +581,6 @@ func TestRemoveInstance_NodeNotFound(t *testing.T) {
 func TestRemoveInstance_GroupNotFound(t *testing.T) {
 	svc := setupTestService(t)
 
-	// Removing from a non-existent group is a no-op (group may have been deleted)
 	_, err := svc.RemoveInstance(&RemoveInstanceInput{
 		GroupName:  "deleted-group",
 		NodeName:   "node-a",

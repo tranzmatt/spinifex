@@ -13,7 +13,6 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// ValidateGetConsoleOutputInput validates the input parameters
 func ValidateGetConsoleOutputInput(input *ec2.GetConsoleOutputInput) error {
 	if input == nil {
 		return errors.New(awserrors.ErrorInvalidParameterValue)
@@ -42,8 +41,9 @@ func GetConsoleOutput(input *ec2.GetConsoleOutputInput, natsConn *nats.Conn, acc
 	reqMsg.Header.Set(utils.AccountIDHeader, accountID)
 	msg, err := natsConn.RequestMsg(reqMsg, 5*time.Second)
 	if err != nil {
-		if err == nats.ErrNoResponders || err == nats.ErrTimeout {
-			return nil, fmt.Errorf("instance %s not found or not running", *input.InstanceId)
+		// No daemon subscription or timeout: stopped/terminated/non-existent instances all surface as NotFound.
+		if errors.Is(err, nats.ErrNoResponders) || errors.Is(err, nats.ErrTimeout) {
+			return nil, errors.New(awserrors.ErrorInvalidInstanceIDNotFound)
 		}
 		return nil, fmt.Errorf("failed to get console output: %w", err)
 	}

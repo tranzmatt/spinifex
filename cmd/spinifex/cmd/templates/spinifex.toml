@@ -1,5 +1,5 @@
 # Domain configuration file in TOML format.
-version = "2"
+version = "3"
 epoch = 1
 node = "{{.Node}}"
 {{- if .OperatorEmail}}
@@ -7,24 +7,31 @@ node = "{{.Node}}"
 [operator]
 email = "{{.OperatorEmail}}"
 {{- end}}
-{{- if .ExternalMode}}
+
+[aws]
+region = "{{.Region}}"
+internal_suffix = "spinifex.internal"
 
 [network]
+ipsec_enabled = {{.IPSecEnabled}}
+{{- if .ExternalMode}}
 external_mode = "{{.ExternalMode}}"
-{{- if .ExternalDHCP}}
-external_dhcp = true
-{{- end}}
 
 [[network.external_pools]]
 name        = "{{.PoolName}}"
 {{- if .PoolSource}}
 source      = "{{.PoolSource}}"
 {{- end}}
+{{- if .PoolBindBridge}}
+bind_bridge = "{{.PoolBindBridge}}"
+{{- end}}
 {{- if .PoolStart}}
 range_start = "{{.PoolStart}}"
 range_end   = "{{.PoolEnd}}"
 {{- end}}
+{{- if .PoolGateway}}
 gateway     = "{{.PoolGateway}}"
+{{- end}}
 {{- if .PoolGatewayIP}}
 gateway_ip  = "{{.PoolGatewayIP}}"
 {{- end}}
@@ -52,6 +59,7 @@ advertise = "{{.AdvertiseIP}}"
 {{- end}}
 region = "{{.Region}}"
 az = "{{.Az}}"
+data_dir = "{{.DataDir}}"
 {{- if .Services}}
 services = [{{range $i, $s := .Services}}{{if $i}}, {{end}}"{{$s}}"{{end}}]
 {{- end}}
@@ -66,6 +74,9 @@ tlscert = "config/server.pem"
 dev_networking = false
 {{- else}}
 dev_networking = true
+{{- end}}
+{{- if .GPUPassthrough}}
+gpu_passthrough = true
 {{- end}}
 
 [nodes.{{.Node}}.awsgw]
@@ -86,21 +97,15 @@ token = "{{.NatsToken}}"
 
 [nodes.{{.Node}}.viperblock]
 shardwal = false
+{{- if .EncryptionKeyFile}}
+encryption_key_file = "{{.EncryptionKeyFile}}"
+{{- end}}
 
 [nodes.{{.Node}}.vpcd]
 ovn_nb_addr = "{{.OVNNBAddr}}"
 ovn_sb_addr = "{{.OVNSBAddr}}"
 {{- if .ExternalIface}}
 external_interface = "{{.ExternalIface}}"
-{{- end}}
-{{- if .DhcpBindBridge}}
-# dhcp_bind_bridge: the bridge where vpcd's DHCP client binds its AF_PACKET
-# socket. On Linux-bridge-WAN hosts (netplan default with the WAN NIC enslaved),
-# this is the Linux bridge name (e.g. "br-wan"). On direct-OVS hosts, this is
-# the OVS bridge holding the WAN NIC.
-# NEVER set this to "br-ext" — that is the OVN-side bridge and never sees LAN
-# DHCP traffic.
-dhcp_bind_bridge = "{{.DhcpBindBridge}}"
 {{- end}}
 
 [nodes.{{.Node}}.predastore]

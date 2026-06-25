@@ -2,6 +2,8 @@ import {
   DescribeListenersCommand,
   DescribeLoadBalancerAttributesCommand,
   DescribeLoadBalancersCommand,
+  DescribeRulesCommand,
+  DescribeSSLPoliciesCommand,
   DescribeTagsCommand,
   DescribeTargetGroupAttributesCommand,
   DescribeTargetGroupsCommand,
@@ -15,9 +17,9 @@ const PROVISIONING_POLL_MS = 5000
 
 export const elbv2LoadBalancersQueryOptions = queryOptions({
   queryKey: ["elbv2", "loadBalancers"],
-  queryFn: () => {
+  queryFn: async () => {
     const command = new DescribeLoadBalancersCommand({})
-    return getElbv2Client().send(command)
+    return await getElbv2Client().send(command)
   },
   refetchInterval: (query) => {
     const lbs = query.state.data?.LoadBalancers ?? []
@@ -29,11 +31,11 @@ export const elbv2LoadBalancersQueryOptions = queryOptions({
 export const elbv2LoadBalancerQueryOptions = (arn: string) =>
   queryOptions({
     queryKey: ["elbv2", "loadBalancers", arn],
-    queryFn: () => {
+    queryFn: async () => {
       const command = new DescribeLoadBalancersCommand({
         LoadBalancerArns: [arn],
       })
-      return getElbv2Client().send(command)
+      return await getElbv2Client().send(command)
     },
     refetchInterval: (query) => {
       const lb = query.state.data?.LoadBalancers?.[0]
@@ -44,52 +46,61 @@ export const elbv2LoadBalancerQueryOptions = (arn: string) =>
 export const elbv2LoadBalancerAttributesQueryOptions = (arn: string) =>
   queryOptions({
     queryKey: ["elbv2", "loadBalancers", arn, "attributes"],
-    queryFn: () => {
+    queryFn: async () => {
       const command = new DescribeLoadBalancerAttributesCommand({
         LoadBalancerArn: arn,
       })
-      return getElbv2Client().send(command)
+      return await getElbv2Client().send(command)
     },
   })
 
 export const elbv2TargetGroupsQueryOptions = queryOptions({
   queryKey: ["elbv2", "targetGroups"],
-  queryFn: () => {
+  queryFn: async () => {
     const command = new DescribeTargetGroupsCommand({})
-    return getElbv2Client().send(command)
+    return await getElbv2Client().send(command)
   },
 })
 
 export const elbv2TargetGroupQueryOptions = (arn: string) =>
   queryOptions({
     queryKey: ["elbv2", "targetGroups", arn],
-    queryFn: () => {
+    queryFn: async () => {
       const command = new DescribeTargetGroupsCommand({
         TargetGroupArns: [arn],
       })
-      return getElbv2Client().send(command)
+      return await getElbv2Client().send(command)
     },
   })
 
 export const elbv2TargetGroupAttributesQueryOptions = (arn: string) =>
   queryOptions({
     queryKey: ["elbv2", "targetGroups", arn, "attributes"],
-    queryFn: () => {
+    queryFn: async () => {
       const command = new DescribeTargetGroupAttributesCommand({
         TargetGroupArn: arn,
       })
-      return getElbv2Client().send(command)
+      return await getElbv2Client().send(command)
     },
   })
 
 export const elbv2ListenersQueryOptions = (loadBalancerArn: string) =>
   queryOptions({
     queryKey: ["elbv2", "listeners", loadBalancerArn],
-    queryFn: () => {
+    queryFn: async () => {
       const command = new DescribeListenersCommand({
         LoadBalancerArn: loadBalancerArn,
       })
-      return getElbv2Client().send(command)
+      return await getElbv2Client().send(command)
+    },
+  })
+
+export const elbv2ListenerRulesQueryOptions = (listenerArn: string) =>
+  queryOptions({
+    queryKey: ["elbv2", "listeners", listenerArn, "rules"],
+    queryFn: async () => {
+      const command = new DescribeRulesCommand({ ListenerArn: listenerArn })
+      return await getElbv2Client().send(command)
     },
   })
 
@@ -98,22 +109,33 @@ export const elbv2ListenersQueryOptions = (loadBalancerArn: string) =>
 export const elbv2TargetHealthQueryOptions = (targetGroupArn: string) =>
   queryOptions({
     queryKey: ["elbv2", "targetGroups", targetGroupArn, "health"],
-    queryFn: () => {
+    queryFn: async () => {
       const command = new DescribeTargetHealthCommand({
         TargetGroupArn: targetGroupArn,
       })
-      return getElbv2Client().send(command)
+      return await getElbv2Client().send(command)
     },
   })
+
+// Static catalog of named SSL policies the HTTPS listener form offers; the
+// backend serves a fixed set (no persistence), so this never needs polling.
+export const elbv2SslPoliciesQueryOptions = queryOptions({
+  queryKey: ["elbv2", "sslPolicies"],
+  queryFn: async () => {
+    const command = new DescribeSSLPoliciesCommand({})
+    return await getElbv2Client().send(command)
+  },
+  staleTime: Infinity,
+})
 
 export const elbv2TagsQueryOptions = (resourceArns: string[]) =>
   queryOptions({
     queryKey: ["elbv2", "tags", ...resourceArns],
-    queryFn: () => {
+    queryFn: async () => {
       const command = new DescribeTagsCommand({
         ResourceArns: resourceArns,
       })
-      return getElbv2Client().send(command)
+      return await getElbv2Client().send(command)
     },
     enabled: resourceArns.length > 0,
   })

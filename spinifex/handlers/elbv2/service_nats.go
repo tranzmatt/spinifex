@@ -10,12 +10,9 @@ import (
 
 const (
 	defaultTimeout = 30 * time.Second
-	// longRunningTimeout covers operations that synchronously launch or tear
-	// down ALB frontend VMs (DHCP lease + QEMU boot / QMP shutdown + QEMU exit).
-	// A healthy launch is ~45s on a warm box; shutdown can take tens of seconds
-	// if QMP is slow. Until CreateLoadBalancer is made fully async, we keep a
-	// wide margin so Terraform's AWS provider doesn't retry mid-flight and then
-	// hit DuplicateLoadBalancerName on the second attempt.
+	// longRunningTimeout covers synchronous ALB VM launch/teardown (~45 s on a warm
+	// box). Wide margin prevents Terraform retrying mid-flight and hitting
+	// DuplicateLoadBalancerName before CreateLoadBalancer is made async.
 	longRunningTimeout = 5 * time.Minute
 )
 
@@ -47,6 +44,10 @@ func (s *NATSELBv2Service) CreateTargetGroup(input *elbv2.CreateTargetGroupInput
 	return utils.NATSRequest[elbv2.CreateTargetGroupOutput](s.natsConn, "elbv2.CreateTargetGroup", input, defaultTimeout, accountID)
 }
 
+func (s *NATSELBv2Service) ModifyTargetGroup(input *elbv2.ModifyTargetGroupInput, accountID string) (*elbv2.ModifyTargetGroupOutput, error) {
+	return utils.NATSRequest[elbv2.ModifyTargetGroupOutput](s.natsConn, "elbv2.ModifyTargetGroup", input, defaultTimeout, accountID)
+}
+
 func (s *NATSELBv2Service) DeleteTargetGroup(input *elbv2.DeleteTargetGroupInput, accountID string) (*elbv2.DeleteTargetGroupOutput, error) {
 	return utils.NATSRequest[elbv2.DeleteTargetGroupOutput](s.natsConn, "elbv2.DeleteTargetGroup", input, defaultTimeout, accountID)
 }
@@ -75,12 +76,44 @@ func (s *NATSELBv2Service) DeleteListener(input *elbv2.DeleteListenerInput, acco
 	return utils.NATSRequest[elbv2.DeleteListenerOutput](s.natsConn, "elbv2.DeleteListener", input, defaultTimeout, accountID)
 }
 
+func (s *NATSELBv2Service) ModifyListener(input *elbv2.ModifyListenerInput, accountID string) (*elbv2.ModifyListenerOutput, error) {
+	return utils.NATSRequest[elbv2.ModifyListenerOutput](s.natsConn, "elbv2.ModifyListener", input, defaultTimeout, accountID)
+}
+
 func (s *NATSELBv2Service) DescribeListeners(input *elbv2.DescribeListenersInput, accountID string) (*elbv2.DescribeListenersOutput, error) {
 	return utils.NATSRequest[elbv2.DescribeListenersOutput](s.natsConn, "elbv2.DescribeListeners", input, defaultTimeout, accountID)
 }
 
+func (s *NATSELBv2Service) CreateRule(input *elbv2.CreateRuleInput, accountID string) (*elbv2.CreateRuleOutput, error) {
+	return utils.NATSRequest[elbv2.CreateRuleOutput](s.natsConn, "elbv2.CreateRule", input, defaultTimeout, accountID)
+}
+
+func (s *NATSELBv2Service) ModifyRule(input *elbv2.ModifyRuleInput, accountID string) (*elbv2.ModifyRuleOutput, error) {
+	return utils.NATSRequest[elbv2.ModifyRuleOutput](s.natsConn, "elbv2.ModifyRule", input, defaultTimeout, accountID)
+}
+
+func (s *NATSELBv2Service) DeleteRule(input *elbv2.DeleteRuleInput, accountID string) (*elbv2.DeleteRuleOutput, error) {
+	return utils.NATSRequest[elbv2.DeleteRuleOutput](s.natsConn, "elbv2.DeleteRule", input, defaultTimeout, accountID)
+}
+
+func (s *NATSELBv2Service) DescribeRules(input *elbv2.DescribeRulesInput, accountID string) (*elbv2.DescribeRulesOutput, error) {
+	return utils.NATSRequest[elbv2.DescribeRulesOutput](s.natsConn, "elbv2.DescribeRules", input, defaultTimeout, accountID)
+}
+
+func (s *NATSELBv2Service) SetRulePriorities(input *elbv2.SetRulePrioritiesInput, accountID string) (*elbv2.SetRulePrioritiesOutput, error) {
+	return utils.NATSRequest[elbv2.SetRulePrioritiesOutput](s.natsConn, "elbv2.SetRulePriorities", input, defaultTimeout, accountID)
+}
+
 func (s *NATSELBv2Service) DescribeTags(input *elbv2.DescribeTagsInput, accountID string) (*elbv2.DescribeTagsOutput, error) {
 	return utils.NATSRequest[elbv2.DescribeTagsOutput](s.natsConn, "elbv2.DescribeTags", input, defaultTimeout, accountID)
+}
+
+func (s *NATSELBv2Service) AddTags(input *elbv2.AddTagsInput, accountID string) (*elbv2.AddTagsOutput, error) {
+	return utils.NATSRequest[elbv2.AddTagsOutput](s.natsConn, "elbv2.AddTags", input, defaultTimeout, accountID)
+}
+
+func (s *NATSELBv2Service) RemoveTags(input *elbv2.RemoveTagsInput, accountID string) (*elbv2.RemoveTagsOutput, error) {
+	return utils.NATSRequest[elbv2.RemoveTagsOutput](s.natsConn, "elbv2.RemoveTags", input, defaultTimeout, accountID)
 }
 
 func (s *NATSELBv2Service) ModifyTargetGroupAttributes(input *elbv2.ModifyTargetGroupAttributesInput, accountID string) (*elbv2.ModifyTargetGroupAttributesOutput, error) {
@@ -97,6 +130,34 @@ func (s *NATSELBv2Service) ModifyLoadBalancerAttributes(input *elbv2.ModifyLoadB
 
 func (s *NATSELBv2Service) DescribeLoadBalancerAttributes(input *elbv2.DescribeLoadBalancerAttributesInput, accountID string) (*elbv2.DescribeLoadBalancerAttributesOutput, error) {
 	return utils.NATSRequest[elbv2.DescribeLoadBalancerAttributesOutput](s.natsConn, "elbv2.DescribeLoadBalancerAttributes", input, defaultTimeout, accountID)
+}
+
+func (s *NATSELBv2Service) SetSecurityGroups(input *elbv2.SetSecurityGroupsInput, accountID string) (*elbv2.SetSecurityGroupsOutput, error) {
+	return utils.NATSRequest[elbv2.SetSecurityGroupsOutput](s.natsConn, "elbv2.SetSecurityGroups", input, defaultTimeout, accountID)
+}
+
+func (s *NATSELBv2Service) SetIpAddressType(input *elbv2.SetIpAddressTypeInput, accountID string) (*elbv2.SetIpAddressTypeOutput, error) {
+	return utils.NATSRequest[elbv2.SetIpAddressTypeOutput](s.natsConn, "elbv2.SetIpAddressType", input, defaultTimeout, accountID)
+}
+
+func (s *NATSELBv2Service) SetSubnets(input *elbv2.SetSubnetsInput, accountID string) (*elbv2.SetSubnetsOutput, error) {
+	return utils.NATSRequest[elbv2.SetSubnetsOutput](s.natsConn, "elbv2.SetSubnets", input, defaultTimeout, accountID)
+}
+
+func (s *NATSELBv2Service) AddListenerCertificates(input *elbv2.AddListenerCertificatesInput, accountID string) (*elbv2.AddListenerCertificatesOutput, error) {
+	return utils.NATSRequest[elbv2.AddListenerCertificatesOutput](s.natsConn, "elbv2.AddListenerCertificates", input, defaultTimeout, accountID)
+}
+
+func (s *NATSELBv2Service) RemoveListenerCertificates(input *elbv2.RemoveListenerCertificatesInput, accountID string) (*elbv2.RemoveListenerCertificatesOutput, error) {
+	return utils.NATSRequest[elbv2.RemoveListenerCertificatesOutput](s.natsConn, "elbv2.RemoveListenerCertificates", input, defaultTimeout, accountID)
+}
+
+func (s *NATSELBv2Service) DescribeListenerCertificates(input *elbv2.DescribeListenerCertificatesInput, accountID string) (*elbv2.DescribeListenerCertificatesOutput, error) {
+	return utils.NATSRequest[elbv2.DescribeListenerCertificatesOutput](s.natsConn, "elbv2.DescribeListenerCertificates", input, defaultTimeout, accountID)
+}
+
+func (s *NATSELBv2Service) DescribeSSLPolicies(input *elbv2.DescribeSSLPoliciesInput, accountID string) (*elbv2.DescribeSSLPoliciesOutput, error) {
+	return utils.NATSRequest[elbv2.DescribeSSLPoliciesOutput](s.natsConn, "elbv2.DescribeSSLPolicies", input, defaultTimeout, accountID)
 }
 
 func (s *NATSELBv2Service) LBAgentHeartbeat(input *LBAgentHeartbeatInput, accountID string) (*LBAgentHeartbeatOutput, error) {

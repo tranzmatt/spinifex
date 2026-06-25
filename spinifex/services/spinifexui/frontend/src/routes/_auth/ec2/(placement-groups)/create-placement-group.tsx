@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod"
 import { createFileRoute, useNavigate } from "@tanstack/react-router"
-import { Controller, useForm } from "react-hook-form"
+import { Controller, useForm, useWatch } from "react-hook-form"
 
 import { BackLink } from "@/components/back-link"
 import {
@@ -46,7 +46,6 @@ function CreatePlacementGroup() {
     control,
     handleSubmit,
     register,
-    watch,
     formState: { errors, isSubmitting },
   } = useForm<CreatePlacementGroupFormData>({
     resolver: zodResolver(createPlacementGroupSchema),
@@ -55,6 +54,10 @@ function CreatePlacementGroup() {
       strategy: "spread",
     },
   })
+
+  const values = useWatch({ control })
+  const cliWatch = (name?: string): unknown =>
+    name ? (values as Record<string, unknown>)[name] : undefined
 
   const onSubmit = async (data: CreatePlacementGroupFormData) => {
     const result = await createMutation.mutateAsync(data)
@@ -122,18 +125,26 @@ function CreatePlacementGroup() {
           <FieldError errors={[errors.strategy]} />
         </Field>
 
-        <CliCommandPanel commands={buildCreatePlacementGroupCommands(watch)} />
+        <CliCommandPanel
+          commands={buildCreatePlacementGroupCommands(cliWatch)}
+        />
 
         <FormActions
           isPending={createMutation.isPending}
           isSubmitting={isSubmitting}
-          onCancel={() => navigate({ to: "/ec2/describe-placement-groups" })}
+          onCancel={async () =>
+            await navigate({ to: "/ec2/describe-placement-groups" })
+          }
           pendingLabel="Creating…"
           submitLabel="Create Placement Group"
         />
       </form>
     </>
   )
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`
 }
 
 function buildCreatePlacementGroupCommands(
@@ -143,6 +154,7 @@ function buildCreatePlacementGroupCommands(
   const name = typeof rawName === "string" ? rawName : ""
   const rawStrategy = watch("strategy")
   const strategy = typeof rawStrategy === "string" ? rawStrategy : ""
+  const nameValue = name ? shellSingleQuote(name) : "<GroupName>"
 
   return [
     {
@@ -153,7 +165,7 @@ function buildCreatePlacementGroupCommands(
           value: "AWS_PROFILE=spinifex aws ec2 create-placement-group",
         },
         { type: "flag", value: " \\\n  --group-name" },
-        { type: "value", value: ` ${name || "<GroupName>"}` },
+        { type: "value", value: ` ${nameValue}` },
         { type: "flag", value: " \\\n  --strategy" },
         { type: "value", value: ` ${strategy || "spread"}` },
       ],

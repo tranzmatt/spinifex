@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	s3 "github.com/mulgadc/predastore/s3"
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/formation"
 	"github.com/mulgadc/spinifex/spinifex/utils"
+	toml "github.com/pelletier/go-toml/v2"
+	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,7 +26,7 @@ import (
 func TestPrintChecksumError(t *testing.T) {
 	image := utils.Images{Checksum: "https://example.com/SUMS", ChecksumType: "sha512"}
 	const imageFile = "/var/lib/img.tar.xz"
-	const imageName = "debian-12-x86_64"
+	const imageName = "debian-13-x86_64"
 
 	errs := []error{
 		fmt.Errorf("%w: expected abc got def", utils.ErrChecksumMismatch),
@@ -142,49 +146,6 @@ func TestSpinifexTomlTemplate_AdvertiseOmittedWhenEmpty(t *testing.T) {
 	assert.NotContains(t, string(data), "advertise =")
 }
 
-// detectedDhcpBindBridge must return the default-route interface name verbatim
-// when it's a bridge (Linux or OVS, br-* prefix). The old detectedWanBridge()
-// returned hardcoded "br-ext" for Linux bridges — that value broke DHCP on
-// consumer-router LANs because br-ext never sees LAN DHCP traffic (mulga-998).
-func TestDetectedDhcpBindBridge(t *testing.T) {
-	tests := []struct {
-		name     string
-		detected *admin.DetectedNetwork
-		want     string
-	}{
-		{
-			name:     "Linux bridge default route returns bridge name (not 'br-ext')",
-			detected: &admin.DetectedNetwork{WAN: &admin.DetectedInterface{Name: "br-wan"}},
-			want:     "br-wan",
-		},
-		{
-			name:     "OVS bridge default route returned verbatim",
-			detected: &admin.DetectedNetwork{WAN: &admin.DetectedInterface{Name: "br-ext"}},
-			want:     "br-ext",
-		},
-		{
-			name:     "physical NIC defaults to 'br-wan' (bridge the installer creates)",
-			detected: &admin.DetectedNetwork{WAN: &admin.DetectedInterface{Name: "enp0s3"}},
-			want:     "br-wan",
-		},
-		{
-			name:     "nil DetectedNetwork",
-			detected: nil,
-			want:     "",
-		},
-		{
-			name:     "DetectedNetwork with nil WAN",
-			detected: &admin.DetectedNetwork{},
-			want:     "",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, detectedDhcpBindBridge(tt.detected))
-		})
-	}
-}
-
 // Legacy `wan_bridge` TOML key must fail-start vpcd with guidance, not silently
 // alias (per mulga-998 D3). Prevents the footgun where operators inherited the
 // old key pointing at 'br-ext' and got broken DHCP on veth-mode hosts.
@@ -206,8 +167,8 @@ wan_bridge = "br-ext"
 
 	err := checkLegacyWanBridgeKey("node1", cfgPath)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "dhcp_bind_bridge")
 	assert.Contains(t, err.Error(), "wan_bridge")
+	assert.Contains(t, err.Error(), "Remove")
 }
 
 func TestCheckLegacyWanBridgeKey_EnvVarRejected(t *testing.T) {
@@ -218,7 +179,7 @@ func TestCheckLegacyWanBridgeKey_EnvVarRejected(t *testing.T) {
 	err := checkLegacyWanBridgeKey("node1", "/tmp/unused.toml")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "SPINIFEX_VPCD_WAN_BRIDGE")
-	assert.Contains(t, err.Error(), "dhcp_bind_bridge")
+	assert.Contains(t, err.Error(), "Remove")
 }
 
 func TestCheckLegacyWanBridgeKey_CleanConfigPasses(t *testing.T) {
@@ -228,7 +189,7 @@ func TestCheckLegacyWanBridgeKey_CleanConfigPasses(t *testing.T) {
 node = "node1"
 [nodes.node1.vpcd]
 ovn_nb_addr = "tcp:127.0.0.1:6641"
-dhcp_bind_bridge = "br-wan"
+external_interface = "enp0s3"
 `), 0o644))
 
 	viper.Reset()
@@ -249,7 +210,7 @@ func TestPredastoreMultinodeTemplate_NatsURLLoopbackShim(t *testing.T) {
 		{ID: 3, Host: "10.0.0.3"},
 	}
 	content, err := admin.GenerateMultiNodePredastoreConfig(
-		predastoreMultiNodeTemplate, nodes, "AK", "SK", "ap-southeast-2", "token", "/tmp", "0.0.0.0",
+		predastoreMultiNodeTemplate, nodes, "AK", "SK", "ap-southeast-2", "token", "/tmp", "0.0.0.0", 0,
 	)
 	require.NoError(t, err)
 	assert.Contains(t, content, `nats_url = "nats://localhost:4222"`)
@@ -257,8 +218,321 @@ func TestPredastoreMultinodeTemplate_NatsURLLoopbackShim(t *testing.T) {
 
 	// Specific bind IP → stays as-is.
 	content2, err := admin.GenerateMultiNodePredastoreConfig(
-		predastoreMultiNodeTemplate, nodes, "AK", "SK", "ap-southeast-2", "token", "/tmp", "10.11.12.1",
+		predastoreMultiNodeTemplate, nodes, "AK", "SK", "ap-southeast-2", "token", "/tmp", "10.11.12.1", 0,
 	)
 	require.NoError(t, err)
 	assert.Contains(t, content2, `nats_url = "nats://10.11.12.1:4222"`)
+}
+
+// writePredastoreEncryptionKey is called from both `spx admin init` and `spx
+// admin join`; both depend on it producing a 32-byte file at 0600 in the
+// expected layout. Predastore's keyfile loader rejects anything that isn't
+// exactly that, so a regression here would break service startup on every
+// node.
+func TestWritePredastoreEncryptionKey(t *testing.T) {
+	configDir := t.TempDir()
+
+	keyPath, err := writePredastoreEncryptionKey(configDir)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(configDir, "predastore", "encryption.key"), keyPath)
+
+	info, err := os.Stat(keyPath)
+	require.NoError(t, err)
+	assert.Equal(t, int64(32), info.Size(), "predastore master key must be exactly 32 bytes")
+	assert.Equal(t, os.FileMode(0600), info.Mode().Perm(), "predastore master key must be mode 0600")
+
+	// Per-node invariant: two successive calls (on what would be two
+	// different nodes) must produce different key material. If they ever
+	// returned the same bytes we'd have silently lost the per-node
+	// blast-radius property.
+	configDir2 := t.TempDir()
+	keyPath2, err := writePredastoreEncryptionKey(configDir2)
+	require.NoError(t, err)
+
+	key1, err := os.ReadFile(keyPath)
+	require.NoError(t, err)
+	key2, err := os.ReadFile(keyPath2)
+	require.NoError(t, err)
+	assert.NotEqual(t, key1, key2, "per-node keys must differ")
+}
+
+// The viperblock key gates at-rest encryption for every volume on a fresh
+// install. masterkey.LoadShared rejects anything that isn't exactly 32 bytes at
+// 0640-or-stricter, so a regression in size/mode would silently fall back to
+// cleartext (empty path) or fail service startup.
+func TestWriteViperblockEncryptionKey(t *testing.T) {
+	configDir := t.TempDir()
+
+	keyPath, err := writeViperblockEncryptionKey(configDir)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(configDir, "viperblock", "encryption.key"), keyPath)
+
+	info, err := os.Stat(keyPath)
+	require.NoError(t, err)
+	assert.Equal(t, int64(32), info.Size(), "viperblock master key must be exactly 32 bytes")
+	assert.Equal(t, os.FileMode(0600), info.Mode().Perm(), "viperblock master key must be mode 0600")
+}
+
+// Joiners persist the leader's shared key via saveViperblockEncryptionKey
+// against a configDir with no viperblock/ subdir yet. The bytes round-trip
+// verbatim — the whole cluster shares one key, so any mutation would orphan
+// volumes sealed on other nodes.
+func TestSaveViperblockEncryptionKey_RoundTrip(t *testing.T) {
+	configDir := t.TempDir()
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+
+	keyPath, err := saveViperblockEncryptionKey(configDir, key)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(configDir, "viperblock", "encryption.key"), keyPath)
+
+	got, err := os.ReadFile(keyPath)
+	require.NoError(t, err)
+	assert.Equal(t, key, got, "shared key must be written verbatim")
+}
+
+// A fresh install must render encryption_key_file so viperblockd enables
+// at-rest encryption; an empty field (upgrade / legacy) must omit the line
+// entirely so the volume stays in cleartext legacy mode.
+func TestSpinifexTomlTemplate_EncryptionKeyFile(t *testing.T) {
+	base := admin.ConfigSettings{
+		Node: "node1", Az: "ap-southeast-2a", Port: "4432", Region: "ap-southeast-2",
+		BindIP: "0.0.0.0", AccessKey: "AKIATEST", SecretKey: "SECRET",
+		AccountID: "123456789012", NatsToken: "token",
+		OVNNBAddr: "tcp:127.0.0.1:6641", OVNSBAddr: "tcp:127.0.0.1:6642",
+	}
+
+	dir := t.TempDir()
+	withKey := base
+	withKey.ConfigDir = dir
+	withKey.EncryptionKeyFile = "/etc/spinifex/viperblock/encryption.key"
+	path := filepath.Join(dir, "spinifex.toml")
+	require.NoError(t, admin.GenerateConfigFile(path, spinifexTomlTemplate, withKey))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `encryption_key_file = "/etc/spinifex/viperblock/encryption.key"`)
+
+	dir2 := t.TempDir()
+	noKey := base
+	noKey.ConfigDir = dir2
+	path2 := filepath.Join(dir2, "spinifex.toml")
+	require.NoError(t, admin.GenerateConfigFile(path2, spinifexTomlTemplate, noKey))
+	data2, err := os.ReadFile(path2)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data2), "encryption_key_file", "blank key must omit the field")
+}
+
+// Joiners run `spx admin join` against a configDir that doesn't yet contain
+// a predastore/ subdir. The helper must create it (predastore subdir is
+// owned by spinifex-storage in prod, but the helper just needs the dir to
+// exist).
+func TestWritePredastoreEncryptionKey_CreatesMissingDir(t *testing.T) {
+	configDir := t.TempDir()
+	// Don't pre-create the predastore subdir — simulate a fresh joiner.
+
+	keyPath, err := writePredastoreEncryptionKey(configDir)
+	require.NoError(t, err)
+
+	dirInfo, err := os.Stat(filepath.Dir(keyPath))
+	require.NoError(t, err)
+	assert.True(t, dirInfo.IsDir())
+}
+
+// TestImagesRemoveCmd_FlagSchema guards the public flag surface for
+// `spx admin images remove`. --image-id is required so cobra rejects a bare
+// invocation; --force/--yes default to false.
+func TestImagesRemoveCmd_FlagSchema(t *testing.T) {
+	imageIDFlag := imagesRemoveCmd.Flags().Lookup("image-id")
+	require.NotNil(t, imageIDFlag, "--image-id must be defined")
+	assert.Equal(t, []string{"true"}, imageIDFlag.Annotations[cobraRequiredAnnotation],
+		"--image-id must be marked required")
+
+	forceFlag := imagesRemoveCmd.Flags().Lookup("force")
+	require.NotNil(t, forceFlag)
+	assert.Equal(t, "false", forceFlag.DefValue)
+
+	yesFlag := imagesRemoveCmd.Flags().Lookup("yes")
+	require.NotNil(t, yesFlag)
+	assert.Equal(t, "false", yesFlag.DefValue)
+}
+
+// cobraRequiredAnnotation is the annotation key cobra uses to mark required flags.
+const cobraRequiredAnnotation = "cobra_annotation_bash_completion_one_required_flag"
+
+// `spx admin init` must expose --external-source and --external-bind-bridge so
+// operators can pick the DHCP path for [[network.external_pools]].
+func TestAdminInitCmd_ExternalDHCPFlagSchema(t *testing.T) {
+	sourceFlag := adminInitCmd.Flags().Lookup("external-source")
+	require.NotNil(t, sourceFlag, "--external-source must be defined")
+	assert.Equal(t, "", sourceFlag.DefValue)
+
+	bindFlag := adminInitCmd.Flags().Lookup("external-bind-bridge")
+	require.NotNil(t, bindFlag, "--external-bind-bridge must be defined")
+	assert.Equal(t, "", bindFlag.DefValue)
+
+	poolFlag := adminInitCmd.Flags().Lookup("external-pool")
+	require.NotNil(t, poolFlag)
+	assert.Equal(t, "", poolFlag.DefValue)
+}
+
+// DHCP-sourced pool must emit source + bind_bridge into spinifex.toml so the
+// daemon's validator and vpcd's DHCPManager find the bridge they DORA on.
+func TestSpinifexTomlTemplate_ExternalPoolDHCPSource(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spinifex.toml")
+	settings := admin.ConfigSettings{
+		Node:           "node1",
+		Az:             "ap-southeast-2a",
+		Port:           "4432",
+		Region:         "ap-southeast-2",
+		BindIP:         "10.11.12.1",
+		ConfigDir:      dir,
+		OVNNBAddr:      "tcp:127.0.0.1:6641",
+		OVNSBAddr:      "tcp:127.0.0.1:6642",
+		ExternalMode:   "pool",
+		ExternalIface:  "eth0",
+		PoolName:       "wan",
+		PoolSource:     "dhcp",
+		PoolBindBridge: "br-wan",
+		PoolPrefixLen:  24,
+	}
+	require.NoError(t, admin.GenerateConfigFile(path, spinifexTomlTemplate, settings))
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	content := string(data)
+	assert.Contains(t, content, `source      = "dhcp"`)
+	assert.Contains(t, content, `bind_bridge = "br-wan"`)
+	assert.NotContains(t, content, "range_start", "dhcp pool must not emit range_start")
+	assert.NotContains(t, content, "range_end", "dhcp pool must not emit range_end")
+	assert.NotContains(t, content, "gateway     =", "gateway omitted for dhcp pool (discovered from OFFER)")
+}
+
+// Static-sourced pool must not emit bind_bridge — the validator rejects it.
+func TestSpinifexTomlTemplate_ExternalPoolStaticSource(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spinifex.toml")
+	settings := admin.ConfigSettings{
+		Node:          "node1",
+		Az:            "ap-southeast-2a",
+		Port:          "4432",
+		Region:        "ap-southeast-2",
+		BindIP:        "10.11.12.1",
+		ConfigDir:     dir,
+		OVNNBAddr:     "tcp:127.0.0.1:6641",
+		OVNSBAddr:     "tcp:127.0.0.1:6642",
+		ExternalMode:  "pool",
+		ExternalIface: "eth0",
+		PoolName:      "wan",
+		PoolSource:    "static",
+		PoolStart:     "192.168.1.150",
+		PoolEnd:       "192.168.1.250",
+		PoolGateway:   "192.168.1.1",
+		PoolPrefixLen: 24,
+	}
+	require.NoError(t, admin.GenerateConfigFile(path, spinifexTomlTemplate, settings))
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	content := string(data)
+	assert.Contains(t, content, `source      = "static"`)
+	assert.NotContains(t, content, "bind_bridge", "static pool must not emit bind_bridge")
+	assert.Contains(t, content, `range_start = "192.168.1.150"`)
+	assert.Contains(t, content, `gateway     = "192.168.1.1"`)
+}
+
+// Formation joiners must receive PoolBindBridge from the init node so the
+// cluster-wide config reaches every chassis intact.
+func TestApplyNetworkConfig_PropagatesPoolBindBridge(t *testing.T) {
+	settings := &admin.ConfigSettings{}
+	nc := &formation.NetworkConfig{
+		ExternalMode:   "pool",
+		PoolName:       "wan",
+		PoolSource:     "dhcp",
+		PoolBindBridge: "br-wan",
+		PoolPrefixLen:  24,
+	}
+	applyNetworkConfig(settings, nc)
+	assert.Equal(t, "dhcp", settings.PoolSource)
+	assert.Equal(t, "br-wan", settings.PoolBindBridge)
+}
+
+func renderSingleNodePredastore(t *testing.T, settings admin.ConfigSettings) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "predastore.toml")
+	require.NoError(t, admin.GenerateConfigFile(path, predastoreTomlTemplate, settings))
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return string(b)
+}
+
+func predastoreMultinodeNodes() []admin.PredastoreNodeConfig {
+	return []admin.PredastoreNodeConfig{
+		{ID: 1, Host: "10.0.0.1"}, {ID: 2, Host: "10.0.0.2"}, {ID: 3, Host: "10.0.0.3"},
+	}
+}
+
+// Unset knob must leave production config byte-identical: no [compaction] block
+// and the original trailing bytes unchanged (single-node has no trailing
+// newline, multinode keeps one).
+func TestPredastoreTemplates_UnsetCompactionEmitsNoBlock(t *testing.T) {
+	single := renderSingleNodePredastore(t, admin.ConfigSettings{
+		Region: "ap-southeast-2", BindIP: "0.0.0.0", ConfigDir: "/cfg",
+		AccessKey: "AK", SecretKey: "SK", NatsToken: "tok",
+	})
+	assert.NotContains(t, single, "[compaction]")
+	assert.True(t, strings.HasSuffix(single, `access_keys_bucket = "spinifex-iam-access-keys"`),
+		"unset single-node tail changed: %q", single[len(single)-40:])
+
+	multi, err := admin.GenerateMultiNodePredastoreConfig(
+		predastoreMultiNodeTemplate, predastoreMultinodeNodes(), "AK", "SK", "ap-southeast-2", "tok", "/cfg", "10.0.0.1", 0,
+	)
+	require.NoError(t, err)
+	assert.NotContains(t, multi, "[compaction]")
+	assert.True(t, strings.HasSuffix(multi, "access_keys_bucket = \"spinifex-iam-access-keys\"\n"),
+		"unset multinode tail changed: %q", multi[len(multi)-40:])
+}
+
+func TestPredastoreTemplates_SetCompactionEmitsParseableBlock(t *testing.T) {
+	const interval = 30
+
+	single := renderSingleNodePredastore(t, admin.ConfigSettings{
+		Region: "ap-southeast-2", BindIP: "0.0.0.0", ConfigDir: "/cfg",
+		AccessKey: "AK", SecretKey: "SK", NatsToken: "tok", CompactionIntervalSeconds: interval,
+	})
+	assert.Contains(t, single, "[compaction]")
+	var singleCfg s3.Config
+	require.NoError(t, toml.Unmarshal([]byte(single), &singleCfg))
+	assert.Equal(t, interval, singleCfg.Compaction.IntervalSeconds)
+
+	multi, err := admin.GenerateMultiNodePredastoreConfig(
+		predastoreMultiNodeTemplate, predastoreMultinodeNodes(), "AK", "SK", "ap-southeast-2", "tok", "/cfg", "10.0.0.1", interval,
+	)
+	require.NoError(t, err)
+	var multiCfg s3.Config
+	require.NoError(t, toml.Unmarshal([]byte(multi), &multiCfg))
+	assert.Equal(t, interval, multiCfg.Compaction.IntervalSeconds)
+}
+
+// The init/join flag must register with an unset (0) default and flow into the
+// rendered config via ConfigSettings.
+func TestAdminInitFlag_CompactionIntervalReachesRenderedConfig(t *testing.T) {
+	for _, c := range []*cobra.Command{adminInitCmd, adminJoinCmd} {
+		f := c.Flags().Lookup("predastore-compaction-interval")
+		require.NotNil(t, f, "%s missing --predastore-compaction-interval", c.Name())
+		assert.Equal(t, "0", f.DefValue)
+	}
+
+	require.NoError(t, adminInitCmd.Flags().Set("predastore-compaction-interval", "45"))
+	defer func() { _ = adminInitCmd.Flags().Set("predastore-compaction-interval", "0") }()
+
+	v, _ := adminInitCmd.Flags().GetInt("predastore-compaction-interval")
+	require.Equal(t, 45, v)
+
+	out := renderSingleNodePredastore(t, admin.ConfigSettings{
+		Region: "ap-southeast-2", BindIP: "0.0.0.0", CompactionIntervalSeconds: v,
+	})
+	assert.Contains(t, out, "interval_seconds = 45")
 }

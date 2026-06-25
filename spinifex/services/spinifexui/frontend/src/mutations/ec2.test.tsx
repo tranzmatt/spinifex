@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { renderHook, waitFor } from "@testing-library/react"
 import type { ReactNode } from "react"
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 const mockSend = vi.fn().mockResolvedValue({})
 
@@ -12,6 +12,7 @@ vi.mock("@/lib/awsClient", () => ({
 import type { CreateVpcWizardFormData } from "@/types/ec2"
 
 import {
+  useAssociateIamInstanceProfile,
   useAttachVolume,
   useAuthorizeSecurityGroupEgress,
   useAuthorizeSecurityGroupIngress,
@@ -27,6 +28,7 @@ import {
   useCreateVpc,
   useCreateVpcWizard,
   useDeleteKeyPair,
+  useDisassociateIamInstanceProfile,
   useDeletePlacementGroup,
   useDeleteSecurityGroup,
   useDeleteSnapshot,
@@ -54,10 +56,6 @@ function wrapper({ children }: { children: ReactNode }) {
   )
 }
 
-afterEach(() => {
-  mockSend.mockClear()
-})
-
 function createQueryClient() {
   queryClient = new QueryClient({
     defaultOptions: {
@@ -75,11 +73,11 @@ describe("useStartInstance", () => {
 
     result.current.mutate("i-abc123")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(mockSend).toHaveBeenCalledOnce()
 
     const command = mockSend.mock.calls[0]?.[0]
-    expect(command.input).toEqual({ InstanceIds: ["i-abc123"] })
+    expect(command.input).toStrictEqual({ InstanceIds: ["i-abc123"] })
   })
 
   it("invalidates instances query on success", async () => {
@@ -89,7 +87,7 @@ describe("useStartInstance", () => {
 
     result.current.mutate("i-abc123")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(spy).toHaveBeenCalledWith({ queryKey: ["ec2", "instances"] })
   })
 })
@@ -101,8 +99,8 @@ describe("useStopInstance", () => {
 
     result.current.mutate("i-abc123")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       InstanceIds: ["i-abc123"],
     })
   })
@@ -115,8 +113,8 @@ describe("useTerminateInstance", () => {
 
     result.current.mutate("i-abc123")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       InstanceIds: ["i-abc123"],
     })
   })
@@ -135,8 +133,8 @@ describe("useCreateInstance", () => {
       subnetId: "subnet-1",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toMatchObject({
       ImageId: "ami-123",
       InstanceType: "t2.micro",
       KeyName: "my-key",
@@ -158,7 +156,7 @@ describe("useCreateInstance", () => {
       subnetId: "",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(mockSend.mock.calls[0]?.[0].input.SubnetId).toBeUndefined()
   })
 
@@ -174,8 +172,8 @@ describe("useCreateInstance", () => {
       placementGroupName: "my-group",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input.Placement).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input.Placement).toStrictEqual({
       GroupName: "my-group",
     })
   })
@@ -192,8 +190,82 @@ describe("useCreateInstance", () => {
       placementGroupName: "",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(mockSend.mock.calls[0]?.[0].input.Placement).toBeUndefined()
+  })
+
+  it("omits BlockDeviceMappings when no storage fields are set", async () => {
+    createQueryClient()
+    const { result } = renderHook(() => useCreateInstance(), { wrapper })
+
+    result.current.mutate({
+      imageId: "ami-123",
+      instanceType: "t2.micro",
+      keyName: "my-key",
+      count: 1,
+      rootDeviceName: "/dev/sda1",
+    })
+
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(
+      mockSend.mock.calls[0]?.[0].input.BlockDeviceMappings,
+    ).toBeUndefined()
+  })
+
+  it("includes BlockDeviceMappings when root volume size is set", async () => {
+    createQueryClient()
+    const { result } = renderHook(() => useCreateInstance(), { wrapper })
+
+    result.current.mutate({
+      imageId: "ami-123",
+      instanceType: "t2.micro",
+      keyName: "my-key",
+      count: 1,
+      rootDeviceName: "/dev/sda1",
+      rootVolumeSize: 100,
+      rootVolumeType: "gp3",
+      rootDeleteOnTermination: true,
+    })
+
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input.BlockDeviceMappings).toStrictEqual(
+      [
+        {
+          DeviceName: "/dev/sda1",
+          Ebs: {
+            VolumeSize: 100,
+            VolumeType: "gp3",
+            DeleteOnTermination: true,
+          },
+        },
+      ],
+    )
+  })
+
+  it("includes only the storage fields the user set", async () => {
+    createQueryClient()
+    const { result } = renderHook(() => useCreateInstance(), { wrapper })
+
+    result.current.mutate({
+      imageId: "ami-123",
+      instanceType: "t2.micro",
+      keyName: "my-key",
+      count: 1,
+      rootDeviceName: "/dev/sda1",
+      rootDeleteOnTermination: false,
+    })
+
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input.BlockDeviceMappings).toStrictEqual(
+      [
+        {
+          DeviceName: "/dev/sda1",
+          Ebs: {
+            DeleteOnTermination: false,
+          },
+        },
+      ],
+    )
   })
 })
 
@@ -207,7 +279,7 @@ describe("useImportKeyPair", () => {
       publicKeyMaterial: "ssh-rsa AAAAB3Nza... user@host",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     const input = mockSend.mock.calls[0]?.[0].input
     expect(input.KeyName).toBe("my-key")
 
@@ -225,7 +297,7 @@ describe("useImportKeyPair", () => {
       publicKeyMaterial: "ssh-rsa AAAAB3Nza...",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     const decoded = new TextDecoder().decode(
       mockSend.mock.calls[0]?.[0].input.PublicKeyMaterial,
     )
@@ -241,7 +313,7 @@ describe("useImportKeyPair", () => {
       publicKeyMaterial: "  ssh-rsa   AAAAB3Nza...   user@host  ",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     const decoded = new TextDecoder().decode(
       mockSend.mock.calls[0]?.[0].input.PublicKeyMaterial,
     )
@@ -256,8 +328,8 @@ describe("useRebootInstance", () => {
 
     result.current.mutate("i-abc123")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       InstanceIds: ["i-abc123"],
     })
   })
@@ -266,15 +338,27 @@ describe("useRebootInstance", () => {
 describe("useCreateKeyPair", () => {
   it("sends CreateKeyPairCommand with key name and rsa type", async () => {
     createQueryClient()
+    mockSend.mockResolvedValueOnce({ KeyMaterial: "-----BEGIN RSA-----" })
     const { result } = renderHook(() => useCreateKeyPair(), { wrapper })
 
     result.current.mutate({ keyName: "my-key" })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       KeyName: "my-key",
       KeyType: "rsa",
     })
+  })
+
+  it("fails when the API omits the private key material", async () => {
+    createQueryClient()
+    mockSend.mockResolvedValueOnce({})
+    const { result } = renderHook(() => useCreateKeyPair(), { wrapper })
+
+    result.current.mutate({ keyName: "my-key" })
+
+    await waitFor(() => expect(result.current.isError).toBeTruthy())
+    expect(result.current.error?.message).toContain("no private key")
   })
 })
 
@@ -285,8 +369,8 @@ describe("useDeleteKeyPair", () => {
 
     result.current.mutate("kp-abc123")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       KeyPairId: "kp-abc123",
     })
   })
@@ -299,8 +383,8 @@ describe("useCreateVolume", () => {
 
     result.current.mutate({ size: 100, availabilityZone: "us-east-1a" })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       Size: 100,
       AvailabilityZone: "us-east-1a",
       VolumeType: "gp3",
@@ -315,8 +399,8 @@ describe("useModifyVolume", () => {
 
     result.current.mutate({ volumeId: "vol-123", size: 200 })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       VolumeId: "vol-123",
       Size: 200,
     })
@@ -330,8 +414,8 @@ describe("useDeleteVolume", () => {
 
     result.current.mutate("vol-123")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       VolumeId: "vol-123",
     })
   })
@@ -344,8 +428,8 @@ describe("useCreateSnapshot", () => {
 
     result.current.mutate({ volumeId: "vol-123", description: "backup" })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       VolumeId: "vol-123",
       Description: "backup",
     })
@@ -357,7 +441,7 @@ describe("useCreateSnapshot", () => {
 
     result.current.mutate({ volumeId: "vol-123", description: "" })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(mockSend.mock.calls[0]?.[0].input.Description).toBeUndefined()
   })
 })
@@ -369,8 +453,8 @@ describe("useDeleteSnapshot", () => {
 
     result.current.mutate("snap-123")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       SnapshotId: "snap-123",
     })
   })
@@ -387,8 +471,8 @@ describe("useCopySnapshot", () => {
       description: "copy",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       SourceSnapshotId: "snap-123",
       SourceRegion: "us-east-1",
       Description: "copy",
@@ -407,8 +491,8 @@ describe("useAttachVolume", () => {
       device: "/dev/sdf",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       VolumeId: "vol-123",
       InstanceId: "i-abc",
       Device: "/dev/sdf",
@@ -427,8 +511,8 @@ describe("useDetachVolume", () => {
       force: true,
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       VolumeId: "vol-123",
       InstanceId: "i-abc",
       Force: true,
@@ -448,8 +532,8 @@ describe("useModifyInstanceAttribute", () => {
       instanceType: "t3.large",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       InstanceId: "i-abc",
       InstanceType: { Value: "t3.large" },
     })
@@ -463,8 +547,8 @@ describe("useGetConsoleOutput", () => {
 
     result.current.mutate("i-abc123")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       InstanceId: "i-abc123",
     })
   })
@@ -481,8 +565,8 @@ describe("useCreateImage", () => {
       description: "test image",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       InstanceId: "i-abc",
       Name: "my-image",
       Description: "test image",
@@ -497,8 +581,8 @@ describe("useCreateVpc", () => {
 
     result.current.mutate({ cidrBlock: "10.0.0.0/16", name: "my-vpc" })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       CidrBlock: "10.0.0.0/16",
       TagSpecifications: [
         {
@@ -515,7 +599,7 @@ describe("useCreateVpc", () => {
 
     result.current.mutate({ cidrBlock: "10.0.0.0/16", name: "" })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(mockSend.mock.calls[0]?.[0].input.TagSpecifications).toBeUndefined()
   })
 })
@@ -527,8 +611,8 @@ describe("useDeleteVpc", () => {
 
     result.current.mutate("vpc-123")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       VpcId: "vpc-123",
     })
   })
@@ -545,12 +629,46 @@ describe("useCreateSubnet", () => {
       availabilityZone: "us-east-1a",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       VpcId: "vpc-123",
       CidrBlock: "10.0.1.0/24",
       AvailabilityZone: "us-east-1a",
     })
+  })
+
+  it("calls ModifySubnetAttribute when mapPublicIpOnLaunch is set", async () => {
+    createQueryClient()
+    mockSend.mockResolvedValueOnce({ Subnet: { SubnetId: "subnet-abc" } })
+    const { result } = renderHook(() => useCreateSubnet(), { wrapper })
+
+    result.current.mutate({
+      vpcId: "vpc-123",
+      cidrBlock: "10.0.1.0/24",
+      mapPublicIpOnLaunch: true,
+    })
+
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend).toHaveBeenCalledTimes(2)
+    expect(mockSend.mock.calls[1]?.[0].input).toStrictEqual({
+      SubnetId: "subnet-abc",
+      MapPublicIpOnLaunch: { Value: true },
+    })
+  })
+
+  it("skips ModifySubnetAttribute when mapPublicIpOnLaunch is false", async () => {
+    createQueryClient()
+    mockSend.mockResolvedValueOnce({ Subnet: { SubnetId: "subnet-abc" } })
+    const { result } = renderHook(() => useCreateSubnet(), { wrapper })
+
+    result.current.mutate({
+      vpcId: "vpc-123",
+      cidrBlock: "10.0.1.0/24",
+      mapPublicIpOnLaunch: false,
+    })
+
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend).toHaveBeenCalledOnce()
   })
 })
 
@@ -561,8 +679,8 @@ describe("useDeleteSubnet", () => {
 
     result.current.mutate("subnet-123")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       SubnetId: "subnet-123",
     })
   })
@@ -575,8 +693,8 @@ describe("useCreatePlacementGroup", () => {
 
     result.current.mutate({ groupName: "my-group", strategy: "spread" })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       GroupName: "my-group",
       Strategy: "spread",
     })
@@ -589,7 +707,7 @@ describe("useCreatePlacementGroup", () => {
 
     result.current.mutate({ groupName: "my-group", strategy: "cluster" })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(spy).toHaveBeenCalledWith({
       queryKey: ["ec2", "placementGroups"],
     })
@@ -603,8 +721,8 @@ describe("useDeletePlacementGroup", () => {
 
     result.current.mutate("my-group")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       GroupName: "my-group",
     })
   })
@@ -616,7 +734,7 @@ describe("useDeletePlacementGroup", () => {
 
     result.current.mutate("my-group")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(spy).toHaveBeenCalledWith({
       queryKey: ["ec2", "placementGroups"],
     })
@@ -634,8 +752,8 @@ describe("useCreateSecurityGroup", () => {
       vpcId: "vpc-123",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       GroupName: "web-sg",
       Description: "Allow web traffic",
       VpcId: "vpc-123",
@@ -653,7 +771,7 @@ describe("useCreateSecurityGroup", () => {
       vpcId: "vpc-123",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(spy).toHaveBeenCalledWith({
       queryKey: ["ec2", "securityGroups"],
     })
@@ -667,8 +785,8 @@ describe("useDeleteSecurityGroup", () => {
 
     result.current.mutate("sg-123")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       GroupId: "sg-123",
     })
   })
@@ -680,7 +798,7 @@ describe("useDeleteSecurityGroup", () => {
 
     result.current.mutate("sg-123")
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(spy).toHaveBeenCalledWith({
       queryKey: ["ec2", "securityGroups"],
     })
@@ -704,8 +822,8 @@ describe("useAuthorizeSecurityGroupIngress", () => {
 
     result.current.mutate(ruleParams)
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       GroupId: "sg-123",
       IpPermissions: [
         {
@@ -727,7 +845,7 @@ describe("useAuthorizeSecurityGroupIngress", () => {
 
     result.current.mutate(ruleParams)
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(spy).toHaveBeenCalledWith({
       queryKey: ["ec2", "securityGroups"],
     })
@@ -752,8 +870,8 @@ describe("useAuthorizeSecurityGroupEgress", () => {
       cidrIp: "0.0.0.0/0",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       GroupId: "sg-456",
       IpPermissions: [
         {
@@ -782,8 +900,8 @@ describe("useRevokeSecurityGroupIngress", () => {
       cidrIp: "10.0.0.0/16",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       GroupId: "sg-123",
       IpPermissions: [
         {
@@ -791,6 +909,34 @@ describe("useRevokeSecurityGroupIngress", () => {
           FromPort: 22,
           ToPort: 22,
           IpRanges: [{ CidrIp: "10.0.0.0/16" }],
+        },
+      ],
+    })
+  })
+
+  it("uses UserIdGroupPairs when sourceGroupId is given", async () => {
+    createQueryClient()
+    const { result } = renderHook(() => useRevokeSecurityGroupIngress(), {
+      wrapper,
+    })
+
+    result.current.mutate({
+      groupId: "sg-123",
+      ipProtocol: "-1",
+      fromPort: 0,
+      toPort: 0,
+      sourceGroupId: "sg-123",
+    })
+
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
+      GroupId: "sg-123",
+      IpPermissions: [
+        {
+          IpProtocol: "-1",
+          FromPort: 0,
+          ToPort: 0,
+          UserIdGroupPairs: [{ GroupId: "sg-123" }],
         },
       ],
     })
@@ -811,7 +957,7 @@ describe("useRevokeSecurityGroupIngress", () => {
       cidrIp: "10.0.0.0/16",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(spy).toHaveBeenCalledWith({
       queryKey: ["ec2", "securityGroups"],
     })
@@ -836,8 +982,8 @@ describe("useRevokeSecurityGroupEgress", () => {
       cidrIp: "0.0.0.0/0",
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       GroupId: "sg-456",
       IpPermissions: [
         {
@@ -874,7 +1020,7 @@ describe("useCreateVpcWizard", () => {
 
     result.current.mutate(baseParams)
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(mockSend).toHaveBeenCalledOnce()
     expect(mockSend.mock.calls[0]?.[0].input.CidrBlock).toBe("10.0.0.0/16")
     expect(result.current.data?.vpcId).toBe("vpc-111")
@@ -894,7 +1040,7 @@ describe("useCreateVpcWizard", () => {
       autoGenerateNames: true,
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     const tags = mockSend.mock.calls[0]?.[0].input.TagSpecifications
     expect(tags?.[0]?.Tags).toContainEqual({
       Key: "Name",
@@ -907,6 +1053,8 @@ describe("useCreateVpcWizard", () => {
     mockSend
       .mockResolvedValueOnce({ Vpc: { VpcId: "vpc-111" } })
       .mockResolvedValueOnce({ Subnet: { SubnetId: "subnet-pub-1" } })
+      // ModifySubnetAttribute (MapPublicIpOnLaunch) for the public subnet
+      .mockResolvedValueOnce({})
       .mockResolvedValueOnce({ Subnet: { SubnetId: "subnet-priv-1" } })
       .mockResolvedValueOnce({
         InternetGateway: { InternetGatewayId: "igw-111" },
@@ -935,10 +1083,54 @@ describe("useCreateVpcWizard", () => {
       privateSubnetCount: 1,
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(mockSend).toHaveBeenCalledTimes(10)
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend).toHaveBeenCalledTimes(11)
     expect(result.current.data?.vpcId).toBe("vpc-111")
     expect(result.current.data?.created).toHaveLength(6)
+    expect(result.current.data?.error).toBeUndefined()
+  })
+
+  it("provisions a NAT gateway when natGateway is single", async () => {
+    createQueryClient()
+    mockSend
+      .mockResolvedValueOnce({ Vpc: { VpcId: "vpc-111" } })
+      .mockResolvedValueOnce({ Subnet: { SubnetId: "subnet-pub-1" } })
+      // ModifySubnetAttribute (public)
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ Subnet: { SubnetId: "subnet-priv-1" } })
+      .mockResolvedValueOnce({
+        InternetGateway: { InternetGatewayId: "igw-111" },
+      })
+      // AttachInternetGateway
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ RouteTable: { RouteTableId: "rtb-pub-1" } })
+      // CreateRoute (igw) + AssociateRouteTable (public)
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ RouteTable: { RouteTableId: "rtb-priv-1" } })
+      // AssociateRouteTable (private)
+      .mockResolvedValueOnce({})
+      // AllocateAddress -> CreateNatGateway -> CreateRoute (nat)
+      .mockResolvedValueOnce({ AllocationId: "eipalloc-1" })
+      .mockResolvedValueOnce({ NatGateway: { NatGatewayId: "nat-1" } })
+      .mockResolvedValueOnce({})
+
+    const { result } = renderHook(() => useCreateVpcWizard(), { wrapper })
+
+    result.current.mutate({
+      ...baseParams,
+      mode: "vpc-and-more",
+      publicSubnetCount: 1,
+      privateSubnetCount: 1,
+      natGateway: "single",
+    })
+
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend).toHaveBeenCalledTimes(14)
+    const types = result.current.data?.created.map((r) => r.type)
+    expect(types).toContain("Elastic IP")
+    expect(types).toContain("NAT Gateway")
+    expect(result.current.data?.created).toHaveLength(8)
     expect(result.current.data?.error).toBeUndefined()
   })
 
@@ -962,7 +1154,7 @@ describe("useCreateVpcWizard", () => {
       privateSubnetCount: 1,
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(mockSend).toHaveBeenCalledTimes(4)
     const types = result.current.data?.created.map((r) => r.type)
     expect(types).not.toContain("Internet Gateway")
@@ -974,6 +1166,8 @@ describe("useCreateVpcWizard", () => {
     mockSend
       .mockResolvedValueOnce({ Vpc: { VpcId: "vpc-111" } })
       .mockResolvedValueOnce({ Subnet: { SubnetId: "subnet-pub-1" } })
+      // ModifySubnetAttribute (MapPublicIpOnLaunch) for the public subnet
+      .mockResolvedValueOnce({})
       .mockRejectedValueOnce(new Error("CIDR conflict"))
 
     const { result } = renderHook(() => useCreateVpcWizard(), { wrapper })
@@ -985,7 +1179,7 @@ describe("useCreateVpcWizard", () => {
       privateSubnetCount: 1,
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(result.current.data?.error?.message).toBe("CIDR conflict")
     expect(result.current.data?.failedStep).toBe(
       "Failed while creating private subnets",
@@ -1002,7 +1196,7 @@ describe("useCreateVpcWizard", () => {
 
     result.current.mutate(baseParams)
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(result.current.data?.error?.message).toBe("Access denied")
     expect(result.current.data?.failedStep).toBe("Failed while creating VPC")
     expect(result.current.data?.vpcId).toBeUndefined()
@@ -1017,7 +1211,7 @@ describe("useCreateVpcWizard", () => {
 
     result.current.mutate(baseParams)
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(result.current.data?.error?.message).toContain(
       "no VPC ID was returned",
     )
@@ -1032,7 +1226,7 @@ describe("useCreateVpcWizard", () => {
 
     result.current.mutate(baseParams)
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     expect(spy).toHaveBeenCalledWith({ queryKey: ["ec2", "vpcs"] })
     expect(spy).toHaveBeenCalledWith({ queryKey: ["ec2", "subnets"] })
     expect(spy).toHaveBeenCalledWith({
@@ -1052,8 +1246,66 @@ describe("useCreateVpcWizard", () => {
       tags: [{ key: "Env", value: "prod" }],
     })
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
     const tags = mockSend.mock.calls[0]?.[0].input.TagSpecifications?.[0]?.Tags
     expect(tags).toContainEqual({ Key: "Env", Value: "prod" })
+  })
+})
+
+describe("useAssociateIamInstanceProfile", () => {
+  it("sends AssociateIamInstanceProfileCommand with instance and profile", async () => {
+    createQueryClient()
+    const { result } = renderHook(() => useAssociateIamInstanceProfile(), {
+      wrapper,
+    })
+
+    result.current.mutate({
+      instanceId: "i-abc123",
+      instanceProfileName: "my-profile",
+    })
+
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
+      InstanceId: "i-abc123",
+      IamInstanceProfile: { Name: "my-profile" },
+    })
+  })
+
+  it("invalidates associations and instances on success", async () => {
+    createQueryClient()
+    const spy = vi.spyOn(queryClient, "invalidateQueries")
+    const { result } = renderHook(() => useAssociateIamInstanceProfile(), {
+      wrapper,
+    })
+
+    result.current.mutate({
+      instanceId: "i-abc123",
+      instanceProfileName: "my-profile",
+    })
+
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(spy).toHaveBeenCalledWith({
+      queryKey: ["ec2", "iam-instance-profile-associations", "i-abc123"],
+    })
+    expect(spy).toHaveBeenCalledWith({ queryKey: ["ec2", "instances"] })
+  })
+})
+
+describe("useDisassociateIamInstanceProfile", () => {
+  it("sends DisassociateIamInstanceProfileCommand with associationId", async () => {
+    createQueryClient()
+    const { result } = renderHook(() => useDisassociateIamInstanceProfile(), {
+      wrapper,
+    })
+
+    result.current.mutate({
+      associationId: "iip-assoc-1",
+      instanceId: "i-abc123",
+    })
+
+    await waitFor(() => expect(result.current.isSuccess).toBeTruthy())
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
+      AssociationId: "iip-assoc-1",
+    })
   })
 })

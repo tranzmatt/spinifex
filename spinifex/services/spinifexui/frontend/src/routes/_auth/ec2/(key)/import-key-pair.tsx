@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod"
 import { createFileRoute, useNavigate } from "@tanstack/react-router"
-import { useForm } from "react-hook-form"
+import { useForm, useWatch } from "react-hook-form"
 
 import { BackLink } from "@/components/back-link"
 import {
@@ -34,11 +34,15 @@ function ImportKeyPair() {
   const {
     handleSubmit,
     register,
-    watch,
+    control,
     formState: { errors, isSubmitting },
   } = useForm({
     resolver: zodResolver(importKeyPairSchema),
   })
+
+  const values = useWatch({ control })
+  const cliWatch = (name?: string): unknown =>
+    name ? (values as Record<string, unknown>)[name] : undefined
 
   const onSubmit = async (data: ImportKeyPairData) => {
     await importMutation.mutateAsync(data)
@@ -94,13 +98,15 @@ function ImportKeyPair() {
           <FieldError errors={[errors.publicKeyMaterial]} />
         </Field>
 
-        <CliCommandPanel commands={buildImportKeyPairCommands(watch)} />
+        <CliCommandPanel commands={buildImportKeyPairCommands(cliWatch)} />
 
         {/* Actions */}
         <FormActions
           isPending={importMutation.isPending}
           isSubmitting={isSubmitting}
-          onCancel={() => navigate({ to: "/ec2/describe-key-pairs" })}
+          onCancel={async () =>
+            await navigate({ to: "/ec2/describe-key-pairs" })
+          }
           pendingLabel="Importing…"
           submitLabel="Import Key Pair"
         />

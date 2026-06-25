@@ -1,12 +1,15 @@
 import { createFileRoute } from "@tanstack/react-router"
 
+import { acmCertificatesQueryOptions } from "@/queries/acm"
 import {
-  ec2ImagesQueryOptions,
   ec2SecurityGroupsQueryOptions,
   ec2SubnetsQueryOptions,
   ec2VpcsQueryOptions,
 } from "@/queries/ec2"
-import { elbv2TargetGroupsQueryOptions } from "@/queries/elbv2"
+import {
+  elbv2SslPoliciesQueryOptions,
+  elbv2TargetGroupsQueryOptions,
+} from "@/queries/elbv2"
 
 import { CreateLoadBalancerPage } from "./-components/create-load-balancer-page"
 
@@ -19,7 +22,8 @@ export const Route = createFileRoute(
       context.queryClient.ensureQueryData(ec2SubnetsQueryOptions),
       context.queryClient.ensureQueryData(ec2SecurityGroupsQueryOptions),
       context.queryClient.ensureQueryData(elbv2TargetGroupsQueryOptions),
-      context.queryClient.ensureQueryData(ec2ImagesQueryOptions),
+      context.queryClient.ensureQueryData(acmCertificatesQueryOptions),
+      context.queryClient.ensureQueryData(elbv2SslPoliciesQueryOptions),
     ])
   },
   head: () => ({

@@ -3,34 +3,31 @@ import { Link, useLocation, useNavigate } from "@tanstack/react-router"
 import {
   Activity,
   BookOpen,
+  Boxes,
   Camera,
   Crosshair,
+  Globe,
   HardDrive,
   Home,
+  IdCard,
   Image,
   Key,
   Layers,
   LayoutGrid,
   LogOut,
+  MapPin,
   Network,
+  Package,
+  Route,
+  Router,
   Server,
   Shield,
   ShieldCheck,
+  UserCog,
   Users,
   Waypoints,
 } from "lucide-react"
 
-// import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
-// import {
-//   ChevronsUpDown,
-// } from "lucide-react"
-// import {
-//   DropdownMenu,
-//   DropdownMenuContent,
-//   DropdownMenuGroup,
-//   DropdownMenuItem,
-//   DropdownMenuTrigger,
-// } from "@/components/ui/dropdown-menu"
 import {
   Sidebar,
   SidebarContent,
@@ -116,7 +113,7 @@ export function SidebarLayout() {
                     pathname.startsWith("/ec2/describe-instances") ||
                     pathname.startsWith("/ec2/run-instances")
                   }
-                  tooltip="EC2 Instances"
+                  tooltip="Instances"
                 >
                   <Server className="size-4" />
                   <span>Instances</span>
@@ -144,6 +141,21 @@ export function SidebarLayout() {
                 >
                   <Key className="size-4" />
                   <span>Key Pairs</span>
+                </SidebarMenuButton>
+              </Link>
+            </SidebarMenuItem>
+
+            <SidebarMenuItem>
+              <Link to="/ec2/describe-addresses">
+                <SidebarMenuButton
+                  isActive={
+                    pathname.startsWith("/ec2/describe-addresses") ||
+                    pathname.startsWith("/ec2/allocate-address")
+                  }
+                  tooltip="Elastic IPs"
+                >
+                  <MapPin className="size-4" />
+                  <span>Elastic IPs</span>
                 </SidebarMenuButton>
               </Link>
             </SidebarMenuItem>
@@ -274,11 +286,13 @@ export function SidebarLayout() {
               </Link>
             </SidebarMenuItem>
 
-            {/* uncomment when route pages are created
             <SidebarMenuItem>
               <Link to="/ec2/describe-route-tables">
                 <SidebarMenuButton
-                  isActive={pathname.startsWith("/ec2/describe-route-tables")}
+                  isActive={
+                    pathname.startsWith("/ec2/describe-route-tables") ||
+                    pathname.startsWith("/ec2/create-route-table")
+                  }
                   tooltip="Route Tables"
                 >
                   <Route className="size-4" />
@@ -300,7 +314,52 @@ export function SidebarLayout() {
                 </SidebarMenuButton>
               </Link>
             </SidebarMenuItem>
-            */}
+
+            <SidebarMenuItem>
+              <Link to="/ec2/describe-nat-gateways">
+                <SidebarMenuButton
+                  isActive={
+                    pathname.startsWith("/ec2/describe-nat-gateways") ||
+                    pathname.startsWith("/ec2/create-nat-gateway")
+                  }
+                  tooltip="NAT Gateways"
+                >
+                  <Router className="size-4" />
+                  <span>NAT Gateways</span>
+                </SidebarMenuButton>
+              </Link>
+            </SidebarMenuItem>
+          </SidebarMenu>
+        </SidebarGroup>
+
+        <SidebarGroup>
+          <SidebarGroupLabel>Containers</SidebarGroupLabel>
+          <SidebarMenu>
+            <SidebarMenuItem>
+              <Link to="/eks/list-clusters">
+                <SidebarMenuButton
+                  isActive={
+                    pathname.startsWith("/eks/list-clusters") ||
+                    pathname.startsWith("/eks/create-cluster")
+                  }
+                  tooltip="EKS clusters"
+                >
+                  <Boxes className="size-4" />
+                  <span>EKS</span>
+                </SidebarMenuButton>
+              </Link>
+            </SidebarMenuItem>
+            <SidebarMenuItem>
+              <Link to="/ecr/list-repositories">
+                <SidebarMenuButton
+                  isActive={pathname.startsWith("/ecr/list-repositories")}
+                  tooltip="ECR repositories"
+                >
+                  <Package className="size-4" />
+                  <span>ECR</span>
+                </SidebarMenuButton>
+              </Link>
+            </SidebarMenuItem>
           </SidebarMenu>
         </SidebarGroup>
 
@@ -333,6 +392,36 @@ export function SidebarLayout() {
                 >
                   <Shield className="size-4" />
                   <span>Policies</span>
+                </SidebarMenuButton>
+              </Link>
+            </SidebarMenuItem>
+
+            <SidebarMenuItem>
+              <Link to="/iam/list-roles">
+                <SidebarMenuButton
+                  isActive={
+                    pathname.startsWith("/iam/list-roles") ||
+                    pathname.startsWith("/iam/create-role")
+                  }
+                  tooltip="Roles"
+                >
+                  <UserCog className="size-4" />
+                  <span>Roles</span>
+                </SidebarMenuButton>
+              </Link>
+            </SidebarMenuItem>
+
+            <SidebarMenuItem>
+              <Link to="/iam/list-instance-profiles">
+                <SidebarMenuButton
+                  isActive={
+                    pathname.startsWith("/iam/list-instance-profiles") ||
+                    pathname.startsWith("/iam/create-instance-profile")
+                  }
+                  tooltip="Instance Profiles"
+                >
+                  <IdCard className="size-4" />
+                  <span>Instance Profiles</span>
                 </SidebarMenuButton>
               </Link>
             </SidebarMenuItem>
@@ -401,48 +490,6 @@ export function SidebarLayout() {
         </SidebarMenu>
       </SidebarFooter>
 
-      {/* Old avatar dropdown menu - commented out
-      <SidebarFooter>
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <DropdownMenu>
-              <DropdownMenuTrigger
-                render={(props) => (
-                  <SidebarMenuButton
-                    className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
-                    size="lg"
-                    {...props}
-                  >
-                    <Avatar className="h-8 w-8 rounded-lg">
-                      <AvatarImage alt="Mulga Spinifex" src="/favicon.ico" />
-                      <AvatarFallback className="rounded-lg">MH</AvatarFallback>
-                    </Avatar>
-                    <div className="grid flex-1 text-left text-sm leading-tight">
-                      <span className="truncate font-semibold">Mulga Spinifex</span>
-                      <span className="truncate text-xs">spinifex@mulgadc.com</span>
-                    </div>
-                    <ChevronsUpDown className="ml-auto size-4" />
-                  </SidebarMenuButton>
-                )}
-              />
-              <DropdownMenuContent
-                align="end"
-                className="w-(--radix-dropdown-menu-trigger-width) min-w-56 rounded-lg"
-                side={isMobile ? "bottom" : "right"}
-                sideOffset={4}
-              >
-                <DropdownMenuGroup>
-                  <DropdownMenuItem>
-                    <LogOut className="size-4" />
-                    Sign out
-                  </DropdownMenuItem>
-                </DropdownMenuGroup>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </SidebarMenuItem>
-        </SidebarMenu>
-      </SidebarFooter>
-      */}
       <SidebarRail />
     </Sidebar>
   )

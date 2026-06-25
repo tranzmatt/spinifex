@@ -59,6 +59,7 @@ export function PrivateKeyModal({
 
         <div className="space-y-3">
           <textarea
+            aria-label={`Private key material for ${keyName}`}
             className="w-full resize-none overflow-y-auto rounded-md border border-input bg-input/20 px-2 py-2 font-mono text-xs"
             readOnly
             rows={4}
@@ -68,7 +69,7 @@ export function PrivateKeyModal({
           <div className="flex gap-2">
             <Button
               className="flex-1"
-              onClick={() => copy(keyMaterial)}
+              onClick={async () => await copy(keyMaterial)}
               type="button"
               variant="outline"
             >

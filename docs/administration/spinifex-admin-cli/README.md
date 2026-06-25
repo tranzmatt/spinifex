@@ -77,11 +77,23 @@ Prints per-node CPU/memory usage and cluster-wide instance type availability.
 
 ```bash
 spx admin images list
-spx admin images import --name debian-12-arm64
+spx admin images import --name debian-13-arm64
 ```
 
 Catalog imports verify the image against the catalog-declared SHA-256/SHA-512 digest before extraction. Use `--file` to import operator-supplied media (verification skipped — operator is responsible for integrity), or `--force` to re-download after a checksum mismatch.
 
+### EKS node image
+
+To run EKS, import the prebuilt node image from the catalog:
+
+```bash
+spx admin images import --name spinifex-eks-node
+```
+
+This pulls the Alpine + K3s node AMI from `iso.mulgadc.com`, verifies its
+checksum, and registers it tagged `spinifex:managed-by=eks`. `eks create-cluster`
+and `eks create-nodegroup` resolve the boot AMI by that tag, so no further
+configuration is needed.
 
 ## Cluster Shutdown
 

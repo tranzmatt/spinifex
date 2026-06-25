@@ -2,16 +2,19 @@ package viperblockd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/nbd"
 	"github.com/mulgadc/spinifex/spinifex/types"
@@ -21,6 +24,47 @@ import (
 
 	"github.com/nats-io/nats.go"
 )
+
+// loadStateRetryAttempts / loadStateRetryBaseDelay tune the mount-time retry
+// loop (5 attempts at 200ms * 1.5^n ≈ 3.7s; well under the 30s NATS timeout).
+const (
+	loadStateRetryAttempts  = 5
+	loadStateRetryBaseDelay = 200 * time.Millisecond
+)
+
+// retryLoadState invokes loadFn with exponential backoff (delay * 3/2 each step)
+// on ErrStateBackendUnavailable only; other errors return immediately.
+func retryLoadState(volume string, attempts int, baseDelay time.Duration, sleep func(time.Duration), loadFn func() error) error {
+	delay := baseDelay
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err = loadFn()
+		if err == nil {
+			if attempt > 1 {
+				slog.Info("LoadState succeeded after retry",
+					"volume", volume, "attempt", attempt)
+			}
+			return nil
+		}
+		if !errors.Is(err, viperblock.ErrStateBackendUnavailable) {
+			return err
+		}
+		if attempt == attempts {
+			break
+		}
+		slog.Warn("LoadState transient failure, retrying",
+			"volume", volume, "attempt", attempt, "delay", delay, "err", err)
+		sleep(delay)
+		delay = delay * 3 / 2
+	}
+	return fmt.Errorf("LoadState exhausted %d retries: %w", attempts, err)
+}
+
+// loadStateWithRetry calls vb.LoadState with the production retry budget
+// (loadStateRetryAttempts / loadStateRetryBaseDelay).
+func loadStateWithRetry(vb *viperblock.VB, volume string) error {
+	return retryLoadState(volume, loadStateRetryAttempts, loadStateRetryBaseDelay, time.Sleep, vb.LoadState)
+}
 
 var serviceName = "viperblock"
 
@@ -32,6 +76,7 @@ type MountedVolume struct {
 	PID         int
 	VB          *viperblock.VB     // Reference to viperblock instance for state sync/flush
 	SnapshotSub *nats.Subscription // Per-volume snapshot subscription (ebs.snapshot.{volumeID})
+	ConfigSub   *nats.Subscription // Per-volume config-update subscription (ebs.config.{volumeID})
 }
 
 type Config struct {
@@ -60,6 +105,12 @@ type Config struct {
 
 	// ShardWAL enables sharded WAL for mounted volumes (default false)
 	ShardWAL bool
+
+	// EncryptionKeyFile is the path to the shared AES-256 master key for at-rest
+	// encryption. Empty → cleartext mode (legacy).
+	EncryptionKeyFile string
+
+	masterKey *masterkey.Key
 
 	mu sync.Mutex
 }
@@ -106,6 +157,145 @@ func makeSnapshotHandler(vb *viperblock.VB, volumeName string) nats.MsgHandler {
 
 		respondJSON(msg, snapResponse)
 	}
+}
+
+// applyConfigUpdate writes a control-plane VolumeConfig onto a viperblock
+// instance and reseals its state. For encrypted volumes SaveState recomputes the
+// AES-GCM tag under the volume's current StateSeqNum, so the caller MUST own the
+// volume exclusively (live mounted VB, or a freshly opened detached one) to keep
+// the GCM nonce unique.
+func applyConfigUpdate(vb *viperblock.VB, req types.EBSConfigUpdateRequest) error {
+	var vc viperblock.VolumeConfig
+	if err := json.Unmarshal(req.VolumeConfig, &vc); err != nil {
+		return fmt.Errorf("unmarshal VolumeConfig: %w", err)
+	}
+	vb.VolumeConfig = vc
+	// Reconcile grow-only volume size (mirrors the EC2 handler merge path).
+	if sz := vc.VolumeMetadata.SizeGiB * 1024 * 1024 * 1024; sz > vb.VolumeSize {
+		vb.VolumeSize = sz
+	}
+	return vb.SaveState()
+}
+
+// makeConfigUpdateHandler returns a NATS handler for volume-specific config
+// updates (ebs.config.{volumeID}). It runs against the live mounted VB, which is
+// the single writer that owns the volume's StateSeqNum.
+func makeConfigUpdateHandler(vb *viperblock.VB, volumeName string) nats.MsgHandler {
+	return func(msg *nats.Msg) {
+		var req types.EBSConfigUpdateRequest
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			slog.Error("Failed to unmarshal ebs.config message", "volume", volumeName, "err", err)
+			respondJSON(msg, types.EBSConfigUpdateResponse{Volume: volumeName, Error: fmt.Sprintf("bad request: %v", err)})
+			return
+		}
+		if err := applyConfigUpdate(vb, req); err != nil {
+			slog.Error("ebs.config: live VB update failed", "volume", volumeName, "err", err)
+			respondJSON(msg, types.EBSConfigUpdateResponse{Volume: volumeName, Error: err.Error()})
+			return
+		}
+		slog.Info("ebs.config: live VB state updated", "volume", volumeName)
+		respondJSON(msg, types.EBSConfigUpdateResponse{Volume: volumeName, Success: true})
+	}
+}
+
+// openVolumeVB constructs and opens an existing viperblock volume with its
+// config state loaded (LoadState) but NOT its block map. Construction mirrors
+// the ebs.mount path so encrypted volumes open with the master key and matching
+// encryption state. Callers that Close() the VB MUST go through
+// openLoadedVolumeVB instead, so the block map is restored before Close()
+// flushes it back to predastore.
+func openVolumeVB(cfg *Config, volumeName string) (*viperblock.VB, error) {
+	s3cfg := s3.S3Config{
+		VolumeName: volumeName,
+		Bucket:     cfg.Bucket,
+		Region:     cfg.Region,
+		AccessKey:  cfg.AccessKey,
+		SecretKey:  cfg.SecretKey,
+		Host:       admin.DialTarget(cfg.S3Host),
+	}
+	vbconfig := viperblock.VB{
+		VolumeName:        volumeName,
+		VolumeSize:        1, // Recalculated on LoadState.
+		BaseDir:           cfg.BaseDir,
+		VolumeConfig:      viperblock.VolumeConfig{},
+		MasterKey:         cfg.masterKey,
+		EncryptionEnabled: cfg.masterKey != nil,
+	}
+	vb, err := viperblock.New(&vbconfig, "s3", s3cfg)
+	if err != nil {
+		return nil, fmt.Errorf("new viperblock: %w", err)
+	}
+	if err := vb.Backend.Init(); err != nil {
+		return nil, fmt.Errorf("backend init: %w", err)
+	}
+	if err := loadStateWithRetry(vb, volumeName); err != nil {
+		return nil, fmt.Errorf("load state: %w", err)
+	}
+	return vb, nil
+}
+
+// isAuxVolume reports whether a volume is an -efi/-cloudinit auxiliary volume.
+// Auxiliary volumes are recreated on launch and carry no durable guest data, so
+// they never need sealing to predastore.
+func isAuxVolume(volumeName string) bool {
+	return strings.HasSuffix(volumeName, "-efi") || strings.HasSuffix(volumeName, "-cloudinit")
+}
+
+// volumeNeedsSeal reports whether an unmounted volume must be sealed to
+// predastore on this node: it carries durable guest data (not an auxiliary
+// volume) and has local viperblock state under baseDir/<volume> to flush. A
+// node that never held the local WAL has nothing to seal.
+func volumeNeedsSeal(volumeName, baseDir string) bool {
+	if isAuxVolume(volumeName) {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(baseDir, volumeName))
+	return err == nil
+}
+
+// openLoadedVolumeVB opens a detached volume and fully restores its state for a
+// short-lived operation that ends in Close(): LoadState + LoadBlockState +
+// RecoverLocalWALs. Skipping LoadBlockState would leave an empty in-memory block
+// map that Close() then flushes over the good checkpoint in predastore — silent
+// data loss (a reattach then finds an empty map, bad superblock). The caller
+// MUST Close the returned VB; on error the WAL syncer is stopped and no VB is
+// returned. The caller MUST ensure no nbdkit process is writing the shared
+// BaseDir first (post-KillProcess, or volume detached).
+func openLoadedVolumeVB(cfg *Config, volumeName string) (*viperblock.VB, error) {
+	vb, err := openVolumeVB(cfg, volumeName)
+	if err != nil {
+		return nil, err
+	}
+	if err := vb.LoadBlockState(); err != nil {
+		vb.StopWALSyncer()
+		return nil, fmt.Errorf("load block state: %w", err)
+	}
+	// RecoverLocalWALs is fail-closed on integrity errors and persists recovered
+	// state itself; on failure retain the local WAL (no Close) for retry.
+	if err := vb.RecoverLocalWALs(); err != nil {
+		vb.StopWALSyncer()
+		return nil, fmt.Errorf("recover local WALs: %w", err)
+	}
+	return vb, nil
+}
+
+// sealVolumeVB persists a detached volume's block->object map to predastore.
+// The runtime nbdkit plugin is the only path that flushes the map on close and
+// it does not reliably fire on detach, so without this seal a reattach on a
+// node lacking the local WAL finds no checkpoint (bad superblock). It mirrors
+// the plugin's recover sequence (LoadBlockState + RecoverLocalWALs replay
+// un-sealed chunk WALs) then Close()s to flush the map.
+func sealVolumeVB(cfg *Config, volumeName string) error {
+	vb, err := openLoadedVolumeVB(cfg, volumeName)
+	if err != nil {
+		return err
+	}
+	// Close removes local files only after the predastore writes succeed, so a
+	// failed seal leaves the WAL intact rather than losing data.
+	if err := vb.Close(); err != nil {
+		return fmt.Errorf("seal close: %w", err)
+	}
+	return nil
 }
 
 // respondJSON marshals data and sends it as a NATS response. On marshal
@@ -170,11 +360,21 @@ func (svc *Service) Reload() (err error) {
 }
 
 func launchService(cfg *Config) (err error) {
-	// Connect to NATS
 	nc, err := utils.ConnectNATSWithRetry(admin.DialTarget(cfg.NatsHost), cfg.NatsToken, cfg.NatsCACert)
 	if err != nil {
 		slog.Error("Failed to connect to NATS", "err", err)
 		return err
+	}
+
+	if cfg.EncryptionKeyFile != "" {
+		mkey, err := masterkey.LoadShared(cfg.EncryptionKeyFile)
+		if err != nil {
+			return fmt.Errorf("load viperblock encryption key %s: %w", cfg.EncryptionKeyFile, err)
+		}
+		cfg.masterKey = mkey
+		slog.Info("Viperblock at-rest encryption enabled", "key_fingerprint", mkey.Fingerprint)
+	} else {
+		slog.Warn("Viperblock at-rest encryption disabled (no EncryptionKeyFile configured)")
 	}
 
 	slog.Info("Viperblock config", "shardwal", cfg.ShardWAL)
@@ -218,6 +418,12 @@ func launchService(cfg *Config) (err error) {
 					slog.Error("Failed to unsubscribe snapshot topic", "volume", ebsRequest.Volume, "err", err)
 				}
 			}
+			// Unsubscribe from volume-specific config-update topic
+			if matched.ConfigSub != nil {
+				if err := matched.ConfigSub.Unsubscribe(); err != nil {
+					slog.Error("Failed to unsubscribe config topic", "volume", ebsRequest.Volume, "err", err)
+				}
+			}
 			// Stop WAL syncer and kill nbdkit process
 			if matched.VB != nil {
 				matched.VB.StopWALSyncer()
@@ -259,7 +465,6 @@ func launchService(cfg *Config) (err error) {
 	if _, err := unmountSubscribe(unmountTopic, func(msg *nats.Msg) {
 		slog.Info("Received message", "data", string(msg.Data))
 
-		// Parse the message
 		var ebsRequest types.EBSRequest
 		if err := json.Unmarshal(msg.Data, &ebsRequest); err != nil {
 			slog.Error("Failed to unmarshal ebs.unmount message", "err", err)
@@ -297,6 +502,13 @@ func launchService(cfg *Config) (err error) {
 				}
 			}
 
+			// Unsubscribe from volume-specific config-update topic
+			if matched.ConfigSub != nil {
+				if err := matched.ConfigSub.Unsubscribe(); err != nil {
+					slog.Error("Failed to unsubscribe config topic", "volume", ebsRequest.Name, "err", err)
+				}
+			}
+
 			// Clean up the VB instance's background goroutine.
 			// This VB is state-only (LoadState/sync) — actual I/O is in the nbdkit plugin process.
 			if matched.VB != nil {
@@ -305,6 +517,24 @@ func launchService(cfg *Config) (err error) {
 
 			if err := utils.KillProcess(matched.PID); err != nil {
 				slog.Error("Failed to kill nbdkit process", "pid", matched.PID, "err", err)
+			}
+
+			// nbdkit is now dead, so no process writes the shared BaseDir: seal
+			// the block map to predastore for volumes that hold local state to
+			// flush (see volumeNeedsSeal).
+			if volumeNeedsSeal(matched.Name, cfg.BaseDir) {
+				if err := sealVolumeVB(cfg, matched.Name); err != nil {
+					slog.Error("ebs.unmount: failed to seal volume to predastore", "volume", matched.Name, "err", err)
+					ebsResponse.Error = fmt.Sprintf("seal volume: %v", err)
+				} else {
+					slog.Info("ebs.unmount: volume sealed to predastore", "volume", matched.Name)
+				}
+			} else if !isAuxVolume(matched.Name) {
+				// A durable volume reached unmount with no local WAL under
+				// BaseDir: this node never held its state, so there is nothing to
+				// seal. WARN since a missing local WAL for a volume we expected to
+				// seal can mask the durability gap the seal closes.
+				slog.Warn("ebs.unmount: no local viperblock state for volume, skipping seal", "volume", matched.Name, "baseDir", cfg.BaseDir)
 			}
 
 			// Remove the socket file if using socket transport
@@ -368,6 +598,61 @@ func launchService(cfg *Config) (err error) {
 		return fmt.Errorf("failed to subscribe to ebs.sync: %w", err)
 	}
 
+	// ebs.config is the fallback for encrypted-volume config updates whose
+	// per-volume ebs.config.{volumeID} topic had no responder (volume not
+	// mounted anywhere). A detached volume has no live writer, so any worker may
+	// open it exclusively and reseal. A mount that raced in is still handled by
+	// preferring the live VB when this node happens to own it.
+	if _, err := nc.QueueSubscribe("ebs.config", "spinifex-workers", func(msg *nats.Msg) {
+		var req types.EBSConfigUpdateRequest
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			slog.Error("Failed to unmarshal ebs.config message", "err", err)
+			respondJSON(msg, types.EBSConfigUpdateResponse{Error: fmt.Sprintf("bad request: %v", err)})
+			return
+		}
+
+		cfg.mu.Lock()
+		var live *viperblock.VB
+		for _, volume := range cfg.MountedVolumes {
+			if volume.Name == req.Volume && volume.VB != nil {
+				live = volume.VB
+				break
+			}
+		}
+		cfg.mu.Unlock()
+
+		if live != nil {
+			if err := applyConfigUpdate(live, req); err != nil {
+				slog.Error("ebs.config: live VB update failed", "volume", req.Volume, "err", err)
+				respondJSON(msg, types.EBSConfigUpdateResponse{Volume: req.Volume, Error: err.Error()})
+				return
+			}
+			slog.Info("ebs.config: live VB state updated (fallback path)", "volume", req.Volume)
+			respondJSON(msg, types.EBSConfigUpdateResponse{Volume: req.Volume, Success: true})
+			return
+		}
+
+		vb, err := openLoadedVolumeVB(cfg, req.Volume)
+		if err != nil {
+			slog.Error("ebs.config: failed to open detached volume", "volume", req.Volume, "err", err)
+			respondJSON(msg, types.EBSConfigUpdateResponse{Volume: req.Volume, Error: fmt.Sprintf("open volume: %v", err)})
+			return
+		}
+		applyErr := applyConfigUpdate(vb, req)
+		if closeErr := vb.Close(); closeErr != nil {
+			slog.Error("ebs.config: VB close failed", "volume", req.Volume, "err", closeErr)
+		}
+		if applyErr != nil {
+			slog.Error("ebs.config: detached volume update failed", "volume", req.Volume, "err", applyErr)
+			respondJSON(msg, types.EBSConfigUpdateResponse{Volume: req.Volume, Error: applyErr.Error()})
+			return
+		}
+		slog.Info("ebs.config: detached volume state updated", "volume", req.Volume)
+		respondJSON(msg, types.EBSConfigUpdateResponse{Volume: req.Volume, Success: true})
+	}); err != nil {
+		return fmt.Errorf("failed to subscribe to ebs.config: %w", err)
+	}
+
 	// Note: ebs.snapshot is handled per-volume via ebs.snapshot.{volumeID} topics,
 	// subscribed at mount time and unsubscribed at unmount time. This ensures
 	// snapshot requests are routed to the node that owns the volume.
@@ -386,7 +671,6 @@ func launchService(cfg *Config) (err error) {
 	if _, err := mountSubscribe(mountTopic, func(msg *nats.Msg) {
 		slog.Info("Received message:", "data", string(msg.Data))
 
-		// Parse the message
 		var ebsRequest types.EBSRequest
 		if err := json.Unmarshal(msg.Data, &ebsRequest); err != nil {
 			slog.Error("Failed to unmarshal ebs.mount message", "err", err)
@@ -421,7 +705,9 @@ func launchService(cfg *Config) (err error) {
 					Size: defaultCache,
 				},
 			},
-			VolumeConfig: viperblock.VolumeConfig{},
+			VolumeConfig:      viperblock.VolumeConfig{},
+			MasterKey:         cfg.masterKey,
+			EncryptionEnabled: cfg.masterKey != nil,
 		}
 
 		vb, err := viperblock.New(&vbconfig, "s3", s3cfg)
@@ -462,9 +748,8 @@ func launchService(cfg *Config) (err error) {
 			return
 		}
 
-		// Next, connect to the volume and confirm the state
-		// First, fetch the state from the remote backend
-		err = vb.LoadState()
+		// Retry on transient backend errors so daemon recovery doesn't tip a healthy volume into cleanup.
+		err = loadStateWithRetry(vb, ebsRequest.Name)
 
 		if err != nil {
 			ebsResponse.Error = err.Error()
@@ -472,9 +757,6 @@ func launchService(cfg *Config) (err error) {
 			return
 		}
 
-		// Next, mount the volume using nbdkit
-
-		// Determine transport type (default to socket)
 		useTCP := cfg.NBDTransport == types.NBDTransportTCP
 
 		var nbdURI string
@@ -541,6 +823,8 @@ func launchService(cfg *Config) (err error) {
 			SecretKey:  cfg.SecretKey,
 			CacheSize:  nbdCacheSize,
 			ShardWAL:   cfg.ShardWAL,
+
+			EncryptionKeyFile: cfg.EncryptionKeyFile,
 		}
 
 		// Create a unique error channel for this specific mount request
@@ -578,7 +862,6 @@ func launchService(cfg *Config) (err error) {
 			slog.Error("NBDKit exited", "code", exitCode)
 		}()
 
-		// Wait for startup result
 		pid := <-processChan
 
 		if pid == 0 {
@@ -590,14 +873,12 @@ func launchService(cfg *Config) (err error) {
 		// Wait for 1 second to confirm nbdkit is running
 		time.Sleep(1 * time.Second)
 
-		// Check if nbdkit exited immediately with an error
+		// Any exit within the first second means NBDKit failed to stay up.
 		select {
 		case exitErr := <-exitChan:
-			if exitErr != 0 {
-				ebsResponse.Error = fmt.Sprintf("nbdkit failed: %v", exitErr)
-				respondAndPublish(msg, nc, "ebs.mount.response", ebsResponse)
-				return
-			}
+			ebsResponse.Error = fmt.Sprintf("nbdkit exited unexpectedly (code=%d)", exitErr)
+			respondAndPublish(msg, nc, "ebs.mount.response", ebsResponse)
+			return
 		default:
 			// nbdkit is still running after 1 second, which means it started successfully
 			slog.Info("NBDKit started successfully and is running")
@@ -620,6 +901,13 @@ func launchService(cfg *Config) (err error) {
 			slog.Error("Failed to subscribe to volume snapshot topic", "volume", ebsRequest.Name, "err", err)
 		}
 
+		// Subscribe to volume-specific config-update topic so encrypted-volume
+		// metadata writes route to this node's live VB (the StateSeqNum owner).
+		configSub, err := nc.Subscribe(fmt.Sprintf("ebs.config.%s", ebsRequest.Name), makeConfigUpdateHandler(vb, ebsRequest.Name))
+		if err != nil {
+			slog.Error("Failed to subscribe to volume config topic", "volume", ebsRequest.Name, "err", err)
+		}
+
 		cfg.mu.Lock()
 		cfg.MountedVolumes = append(cfg.MountedVolumes, MountedVolume{
 			Name:        ebsRequest.Name,
@@ -629,6 +917,7 @@ func launchService(cfg *Config) (err error) {
 			PID:         pid,
 			VB:          vb,
 			SnapshotSub: snapSub,
+			ConfigSub:   configSub,
 		})
 		cfg.mu.Unlock()
 

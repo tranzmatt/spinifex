@@ -1,9 +1,11 @@
 package awsgw
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,10 +13,16 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/ratelimit"
+	"github.com/mulgadc/spinifex/internal/tlsconfig"
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/mulgadc/spinifex/spinifex/gateway"
+	gateway_ecr "github.com/mulgadc/spinifex/spinifex/gateway/ecr"
+	gateway_ecrauth "github.com/mulgadc/spinifex/spinifex/gateway/ecrauth"
+	"github.com/mulgadc/spinifex/spinifex/handlers/ecr"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
+	handlers_sts "github.com/mulgadc/spinifex/spinifex/handlers/sts"
+	"github.com/mulgadc/spinifex/spinifex/objectstore"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go"
 	toml "github.com/pelletier/go-toml/v2"
@@ -101,8 +109,6 @@ func loadThrottleConfig(path string) (ratelimit.Config, error) {
 func launchService(config *config.ClusterConfig) error {
 	nodeConfig := config.Nodes[config.Node]
 
-	// Connect to NATS for service communication. On concurrent startup the
-	// local NATS server may not be listening yet, so retry with backoff.
 	natsConn, err := utils.ConnectNATSWithRetry(admin.DialTarget(nodeConfig.NATS.Host), nodeConfig.NATS.ACL.Token, nodeConfig.NATS.CACert)
 	if err != nil {
 		return err
@@ -128,6 +134,43 @@ func launchService(config *config.ClusterConfig) error {
 	if err != nil {
 		return fmt.Errorf("initialize IAM service: %w", err)
 	}
+
+	// STS service shares the IAM master key (single envelope for at-rest
+	// secrets + session-token HMACs) and resolves roles via IAMService.
+	stsService, err := handlers_sts.NewSTSServiceImpl(natsConn, iamService, masterKey, len(config.Nodes))
+	if err != nil {
+		return fmt.Errorf("initialize STS service: %w", err)
+	}
+
+	// Janitor sweeps expired session credentials. Bound to the process
+	// lifetime — the server below blocks until exit, so cancelling on return
+	// is sufficient to let the goroutine drain.
+	janitorCtx, cancelJanitor := context.WithCancel(context.Background())
+	defer cancelJanitor()
+	go stsService.RunJanitor(janitorCtx)
+
+	// IMDS serves 169.254.169.254 to guest VMs from vpcd, which holds the network
+	// capabilities the hardened awsgw sandbox can't grant. awsgw stays the home of
+	// STS + IAM, answering the IMDS handler's control-plane RPCs over NATS.
+	if _, err := stsService.SubscribeIMDSResponder(natsConn); err != nil {
+		return fmt.Errorf("subscribe IMDS STS responder: %w", err)
+	}
+	if _, err := iamService.SubscribeIMDSResponders(natsConn); err != nil {
+		return fmt.Errorf("subscribe IMDS IAM responders: %w", err)
+	}
+
+	// Expose the in-process STS presigned-URL verify over NATS for the
+	// in-cluster eks-token-webhook (STS is gateway-local, not otherwise on the
+	// bus). Bound to the process lifetime via natsConn.Close on return.
+	tokenVerifySub, err := registerEKSTokenVerify(natsConn, stsService)
+	if err != nil {
+		return fmt.Errorf("subscribe EKS token verify: %w", err)
+	}
+	defer func() {
+		if err := tokenVerifySub.Unsubscribe(); err != nil {
+			slog.Warn("EKS token verify: unsubscribe failed", "err", err)
+		}
+	}()
 
 	// First boot: consume bootstrap.json → seed IAM users into NATS KV → delete file.
 	// Check data directory first (production: /var/lib/spinifex/awsgw/), then
@@ -158,19 +201,84 @@ func launchService(config *config.ClusterConfig) error {
 		slog.Warn("Failed to load throttle config, throttling disabled", "err", err)
 	}
 
-	// Create gateway with NATS connection
-	gw := gateway.GatewayConfig{
-		Debug:          nodeConfig.AWSGW.Debug,
-		DisableLogging: false,
-		NATSConn:       natsConn,
-		Config:         nodeConfig.AWSGW.Config,
-		ExpectedNodes:  len(config.Nodes),
-		Region:         nodeConfig.Region,
-		AZ:             nodeConfig.AZ,
-		IAMService:     iamService,
-		Version:        version,
-		Commit:         commit,
+	// OCI Distribution v2 registry: blob/manifest bytes stream straight to
+	// predastore from the gateway; repo/tag/manifest metadata and in-progress
+	// uploads are owned by the daemon and reached over NATS request/reply. The
+	// /v2 auth bridge resolves the per-request account from a verified token.
+	ecrStore := objectstore.NewS3ObjectStoreFromConfig(
+		admin.DialTarget(nodeConfig.Predastore.Host),
+		nodeConfig.Predastore.Region,
+		nodeConfig.Predastore.AccessKey,
+		nodeConfig.Predastore.SecretKey,
+	)
+	ecrRegistry := gateway_ecr.NewRegistry(ecrStore, ecr.NewNATSMetaStore(natsConn), config.Bootstrap.AccountID)
+
+	// Lifecycle expiry sweep applies each repo's stored lifecycle policy and
+	// deletes the expired set via the registry GC path. It runs here (not the
+	// daemon) because only the gateway holds the object store. Bound to the same
+	// lifetime context as the STS janitor.
+	lifecycleSweeper := gateway_ecr.NewLifecycleSweeper(
+		ecrRegistry, activeAccountIDs(iamService), gateway_ecr.DefaultLifecycleSweepInterval)
+	go lifecycleSweeper.Run(janitorCtx)
+
+	// ECR auth bridge: load (or first-run create) the ES256 signing key from the
+	// cluster-replicated awsgw-keys KV bucket, then build the token issuer
+	// (GetAuthorizationToken) and verifier (/v2 Authorization).
+	js, err := natsConn.JetStream()
+	if err != nil {
+		return fmt.Errorf("ECR auth bridge: JetStream context: %w", err)
 	}
+	signingKey, verifyKeys, err := gateway_ecrauth.LoadOrCreateSigningKey(js, masterKey, len(config.Nodes))
+	if err != nil {
+		return fmt.Errorf("ECR auth bridge: load signing key: %w", err)
+	}
+	ecrAudience := "ecr." + nodeConfig.Region + "." + config.AWS.InternalSuffix
+
+	// The ECR registry is served on this gateway's own host:port; advertise both so
+	// docker login/tag/push reach it without DNS — the account comes from the auth
+	// token. Prefer a concrete AWSGW bind host; when it is unspecified (0.0.0.0/::)
+	// fall back to AdvertiseIP, the off-host dial target carried in the server cert
+	// SANs (the same host EKS workers dial), so the returned URI resolves without
+	// DNS. Only when neither is concrete does the per-account parity name apply.
+	registryHost, registryPort := "", ""
+	if host, port, err := net.SplitHostPort(nodeConfig.AWSGW.Host); err == nil {
+		registryPort = port
+		if isConcreteRegistryHost(host) {
+			registryHost = host
+		}
+	}
+	if registryHost == "" && isConcreteRegistryHost(nodeConfig.AdvertiseIP) {
+		registryHost = nodeConfig.AdvertiseIP
+	}
+
+	gw := gateway.GatewayConfig{
+		Debug:            nodeConfig.AWSGW.Debug,
+		DisableLogging:   false,
+		NATSConn:         natsConn,
+		Config:           nodeConfig.AWSGW.Config,
+		ExpectedNodes:    len(config.Nodes),
+		Region:           nodeConfig.Region,
+		InternalSuffix:   config.AWS.InternalSuffix,
+		RegistryPort:     registryPort,
+		RegistryHost:     registryHost,
+		AZ:               nodeConfig.AZ,
+		IAMService:       iamService,
+		STSService:       stsService,
+		Version:          version,
+		Commit:           commit,
+		ECRRegistry:      ecrRegistry,
+		ECRTokenIssuer:   gateway_ecrauth.NewIssuer(signingKey, ecrAudience),
+		ECRTokenVerifier: gateway_ecrauth.NewVerifier(verifyKeys, ecrAudience),
+	}
+
+	// Rotate the ECR signing key on a 30-day cadence, retaining the previous keys
+	// until their tokens expire. The rotator keeps the issuer/verifier current as
+	// keys roll. Bound to the same lifetime context as the STS janitor.
+	keyRotator, err := gateway_ecrauth.NewRotator(js, masterKey, len(config.Nodes), gw.ECRTokenIssuer, gw.ECRTokenVerifier)
+	if err != nil {
+		return fmt.Errorf("ECR auth bridge: signing-key rotator: %w", err)
+	}
+	go keyRotator.Run(janitorCtx)
 
 	if throttleCfg.Enabled {
 		gw.Throttler = ratelimit.New(throttleCfg)
@@ -190,8 +298,10 @@ func launchService(config *config.ClusterConfig) error {
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			NextProtos:   []string{"h2", "http/1.1"},
+			Certificates:     []tls.Certificate{cert},
+			NextProtos:       []string{"h2", "http/1.1"},
+			MinVersion:       tls.VersionTLS13,
+			CurvePreferences: tlsconfig.Curves,
 		},
 	}
 
@@ -234,10 +344,31 @@ func initIAMService(natsConn *nats.Conn, masterKey []byte, clusterSize int) (*ha
 	}
 }
 
-// findBootstrapFile returns the path to bootstrap.json, checking the data
-// directory first (production), then the awsgw subdir (dev mode), then the
-// legacy config dir. Returns the first path that exists, or the primary
-// location if none exist (so the caller gets a clean "not found" error).
+// accountLister is the slice of IAMService the lifecycle sweeper needs.
+type accountLister interface {
+	ListAccounts() ([]*handlers_iam.Account, error)
+}
+
+// activeAccountIDs adapts IAMService.ListAccounts into the account-ID enumerator
+// the ECR lifecycle sweeper expects, including only ACTIVE accounts.
+func activeAccountIDs(iam accountLister) func() ([]string, error) {
+	return func() ([]string, error) {
+		accounts, err := iam.ListAccounts()
+		if err != nil {
+			return nil, err
+		}
+		ids := make([]string, 0, len(accounts))
+		for _, acct := range accounts {
+			if acct.Status == handlers_iam.AccountStatusActive {
+				ids = append(ids, acct.AccountID)
+			}
+		}
+		return ids, nil
+	}
+}
+
+// findBootstrapFile returns the first existing bootstrap.json candidate path,
+// or the primary path if none exist.
 func findBootstrapFile(baseDir string) string {
 	candidates := []string{
 		filepath.Join(baseDir, "bootstrap.json"),
@@ -250,4 +381,11 @@ func findBootstrapFile(baseDir string) string {
 		}
 	}
 	return candidates[0]
+}
+
+// isConcreteRegistryHost reports whether host is a dialable address to advertise
+// as the ECR registry host — a non-empty, non-unspecified literal. The wildcard
+// bind addresses are rejected so the registry URI never hands back 0.0.0.0/::.
+func isConcreteRegistryHost(host string) bool {
+	return host != "" && host != "0.0.0.0" && host != "::"
 }

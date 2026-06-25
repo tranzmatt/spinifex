@@ -77,7 +77,7 @@ export function CreateTargetGroupPage() {
         Back to target groups
       </BackLink>
 
-      <PageHeading title="Create target group" />
+      <PageHeading title="Create Target Group" />
 
       {createMutation.error && (
         <ErrorBanner
@@ -94,9 +94,11 @@ export function CreateTargetGroupPage() {
         <FormActions
           isPending={createMutation.isPending}
           isSubmitting={isSubmitting}
-          onCancel={() => navigate({ to: "/ec2/describe-target-groups" })}
+          onCancel={async () =>
+            await navigate({ to: "/ec2/describe-target-groups" })
+          }
           pendingLabel="Creating…"
-          submitLabel="Create target group"
+          submitLabel="Create Target Group"
         />
       </form>
     </>
@@ -119,6 +121,7 @@ function buildCreateTargetGroupCommands(
   const protocol = asString("protocol") || "HTTP"
   const port = asNumber("port")
   const vpcId = asString("vpcId")
+  const hcProtocol = asString("healthCheck.protocol") || "HTTP"
   const hcPath = asString("healthCheck.path") || "/"
   const hcPort = asString("healthCheck.port") || "traffic-port"
   const hcInterval = asNumber("healthCheck.intervalSeconds")
@@ -147,11 +150,18 @@ function buildCreateTargetGroupCommands(
       { type: "value", value: ` ${vpcId}` },
     )
   }
+  const httpHealthCheck = hcProtocol === "HTTP"
   parts.push(
     { type: "flag", value: " \\\n  --health-check-protocol" },
-    { type: "value", value: " HTTP" },
-    { type: "flag", value: " \\\n  --health-check-path" },
-    { type: "value", value: ` ${hcPath}` },
+    { type: "value", value: ` ${hcProtocol}` },
+  )
+  if (httpHealthCheck) {
+    parts.push(
+      { type: "flag", value: " \\\n  --health-check-path" },
+      { type: "value", value: ` ${hcPath}` },
+    )
+  }
+  parts.push(
     { type: "flag", value: " \\\n  --health-check-port" },
     { type: "value", value: ` ${hcPort}` },
     { type: "flag", value: " \\\n  --health-check-interval-seconds" },
@@ -162,9 +172,13 @@ function buildCreateTargetGroupCommands(
     { type: "value", value: ` ${hcHealthy ?? 5}` },
     { type: "flag", value: " \\\n  --unhealthy-threshold-count" },
     { type: "value", value: ` ${hcUnhealthy ?? 2}` },
-    { type: "flag", value: " \\\n  --matcher" },
-    { type: "value", value: ` HttpCode=${hcMatcher}` },
   )
+  if (httpHealthCheck) {
+    parts.push(
+      { type: "flag", value: " \\\n  --matcher" },
+      { type: "value", value: ` HttpCode=${hcMatcher}` },
+    )
+  }
 
   return [{ label: "Create Target Group", parts }]
 }

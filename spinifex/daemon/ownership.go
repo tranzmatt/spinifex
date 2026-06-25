@@ -8,16 +8,14 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// checkInstanceOwnership verifies the caller owns the instance.
-// Returns true if access is allowed, false if denied (error already sent).
-// Pre-Phase4 instances (empty AccountID) are only visible to root (GlobalAccountID).
+// checkInstanceOwnership verifies the caller owns the instance. Returns true if
+// allowed; false after sending an error. Empty ownerAccountID is root-only.
 func checkInstanceOwnership(msg *nats.Msg, instanceID, ownerAccountID string) bool {
 	callerAccountID := utils.AccountIDFromMsg(msg)
 
-	// Pre-Phase4 instance: only root can access
 	if ownerAccountID == "" {
 		if callerAccountID != utils.GlobalAccountID {
-			slog.Warn("Pre-Phase4 instance access denied (not root)",
+			slog.Warn("Untenanted instance access denied (not root)",
 				"instanceId", instanceID, "callerAccount", callerAccountID)
 			respondWithError(msg, awserrors.ErrorInvalidInstanceIDNotFound)
 			return false
@@ -25,7 +23,6 @@ func checkInstanceOwnership(msg *nats.Msg, instanceID, ownerAccountID string) bo
 		return true
 	}
 
-	// Normal ownership check
 	if callerAccountID != ownerAccountID {
 		slog.Warn("Account does not own instance",
 			"instanceId", instanceID, "callerAccount", callerAccountID, "ownerAccount", ownerAccountID)
@@ -35,8 +32,8 @@ func checkInstanceOwnership(msg *nats.Msg, instanceID, ownerAccountID string) bo
 	return true
 }
 
-// isInstanceVisible checks if the caller can see this instance (for Describe operations).
-// Pre-Phase4 instances (empty AccountID) are only visible to root (GlobalAccountID).
+// isInstanceVisible reports whether the caller may see this instance.
+// Empty ownerAccountID is root-only.
 func isInstanceVisible(callerAccountID, ownerAccountID string) bool {
 	if ownerAccountID == "" {
 		return callerAccountID == utils.GlobalAccountID
@@ -44,11 +41,8 @@ func isInstanceVisible(callerAccountID, ownerAccountID string) bool {
 	return callerAccountID == ownerAccountID
 }
 
-// volumeVisibleTo reports whether callerAccountID may operate on a volume with
-// the given tenantID. Pre-Phase4 volumes (empty tenantID) are root-only —
-// without this, the legacy short-circuit `tenantID != "" && tenantID != caller`
-// matched every caller and let any tenant attach a legacy/migration volume by
-// ID alone.
+// volumeVisibleTo reports whether callerAccountID may access a volume.
+// Empty tenantID is root-only to prevent untenanted volumes from leaking.
 func volumeVisibleTo(tenantID, callerAccountID string) bool {
 	if tenantID == "" {
 		return callerAccountID == utils.GlobalAccountID

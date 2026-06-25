@@ -29,7 +29,7 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/services/predastore"
 	"github.com/mulgadc/spinifex/spinifex/services/spinifexui"
 	"github.com/mulgadc/spinifex/spinifex/services/viperblockd"
-	"github.com/mulgadc/spinifex/spinifex/services/vpcd"
+	"github.com/mulgadc/spinifex/spinifex/vpcd"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -115,6 +115,13 @@ var predastoreStartCmd = &cobra.Command{
 			return
 		}
 
+		encryptionKeyFile := viper.GetString("encryption-key-file")
+
+		if encryptionKeyFile == "" {
+			fmt.Println("Encryption key file is not set")
+			return
+		}
+
 		nodeID := viper.GetInt("node-id")
 		pprofEnabled := viper.GetBool("pprof")
 		pprofOutput := viper.GetString("pprof-output")
@@ -127,6 +134,8 @@ var predastoreStartCmd = &cobra.Command{
 			Debug:      debug,
 			TlsCert:    tlsCert,
 			TlsKey:     tlsKey,
+
+			EncryptionKeyFile: encryptionKeyFile,
 
 			NodeID: nodeID,
 
@@ -274,19 +283,25 @@ var viperblockStartCmd = &cobra.Command{
 			shardWAL = *nodeConfig.Viperblock.ShardWAL
 		}
 
+		encryptionKeyFile := nodeConfig.Viperblock.EncryptionKeyFile
+		if envKey := viper.GetString("viperblock-encryption-key-file"); envKey != "" {
+			encryptionKeyFile = envKey
+		}
+
 		service, err := service.New("viperblock", &viperblockd.Config{
-			NatsHost:   nodeConfig.NATS.Host,
-			NatsToken:  nodeConfig.NATS.ACL.Token,
-			NatsCACert: nodeConfig.NATS.CACert,
-			PluginPath: pluginPath,
-			S3Host:     nodeConfig.Predastore.Host,
-			Bucket:     nodeConfig.Predastore.Bucket,
-			Region:     nodeConfig.Predastore.Region,
-			AccessKey:  nodeConfig.Predastore.AccessKey,
-			SecretKey:  nodeConfig.Predastore.SecretKey,
-			BaseDir:    nodeConfig.Predastore.BaseDir,
-			NodeName:   clusterConfig.Node,
-			ShardWAL:   shardWAL,
+			NatsHost:          nodeConfig.NATS.Host,
+			NatsToken:         nodeConfig.NATS.ACL.Token,
+			NatsCACert:        nodeConfig.NATS.CACert,
+			PluginPath:        pluginPath,
+			S3Host:            nodeConfig.Predastore.Host,
+			Bucket:            nodeConfig.Predastore.Bucket,
+			Region:            nodeConfig.Predastore.Region,
+			AccessKey:         nodeConfig.Predastore.AccessKey,
+			SecretKey:         nodeConfig.Predastore.SecretKey,
+			BaseDir:           nodeConfig.Predastore.BaseDir,
+			NodeName:          clusterConfig.Node,
+			ShardWAL:          shardWAL,
+			EncryptionKeyFile: encryptionKeyFile,
 		})
 
 		if err != nil {
@@ -523,7 +538,7 @@ var awsgwStartCmd = &cobra.Command{
 		awsgwHost := viper.GetString("host")
 		if awsgwHost != "" {
 			fmt.Println("Overwriting awsgw host to:", awsgwHost)
-			//nodeConfig.AWSGW.Host = awsgwHost
+			nodeConfig.AWSGW.Host = awsgwHost
 		}
 
 		awsgwTlsCert := viper.GetString("tls-cert")
@@ -669,11 +684,8 @@ var spinifexUIStatusCmd = &cobra.Command{
 }
 
 // checkLegacyWanBridgeKey fails vpcd startup if the deprecated `wan_bridge`
-// TOML key or `SPINIFEX_VPCD_WAN_BRIDGE` env-var is present. The key was
-// renamed to `dhcp_bind_bridge` (see mulga-998.a) because the old name misled
-// operators into pointing at the OVN-side bridge ("br-ext"), which never sees
-// LAN DHCP traffic. Per D3: no silent alias, no auto-rewrite — operator must
-// rename the key before vpcd will start.
+// TOML key or `SPINIFEX_VPCD_WAN_BRIDGE` env-var is present. Per D3: no silent
+// alias, no auto-rewrite — operator must remove the key before vpcd will start.
 func checkLegacyWanBridgeKey(node, cfgFile string) error {
 	legacyInTOML := viper.IsSet("nodes." + node + ".vpcd.wan_bridge")
 	legacyInEnv := os.Getenv("SPINIFEX_VPCD_WAN_BRIDGE") != ""
@@ -686,9 +698,7 @@ func checkLegacyWanBridgeKey(node, cfgFile string) error {
 	}
 	return fmt.Errorf(
 		"vpcd: deprecated 'wan_bridge' key found in %s. "+
-			"Rename 'wan_bridge' to 'dhcp_bind_bridge'. The value may also be wrong — verify it is "+
-			"the Linux bridge holding your WAN NIC (veth mode) or the OVS bridge holding your WAN NIC (direct mode); "+
-			"never 'br-ext'. Typical value on a consumer-router LAN: 'br-wan'. "+
+			"Remove the key entirely; vpcd auto-detects the WAN bridge (br-wan). "+
 			"Then: sudo systemctl restart spinifex-vpcd",
 		source,
 	)
@@ -725,6 +735,7 @@ var vpcdStartCmd = &cobra.Command{
 			extPools = append(extPools, vpcd.ExternalPoolConfig{
 				Name:            p.Name,
 				Source:          p.Source,
+				BindBridge:      p.BindBridge,
 				RangeStart:      p.RangeStart,
 				RangeEnd:        p.RangeEnd,
 				Gateway:         p.Gateway,
@@ -733,7 +744,6 @@ var vpcdStartCmd = &cobra.Command{
 				DNSServers:      p.DNSServers,
 				Region:          p.Region,
 				AZ:              p.AZ,
-				DhcpBindBridge:  nodeConfig.VPCD.DhcpBindBridge,
 				GwLrpRangeStart: p.GwLrpRangeStart,
 				GwLrpRangeEnd:   p.GwLrpRangeEnd,
 			})
@@ -769,8 +779,8 @@ var vpcdStartCmd = &cobra.Command{
 			ExternalPools:     extPools,
 			Bootstrap:         bootstrap,
 			ExternalInterface: nodeConfig.VPCD.ExternalInterface,
-			DhcpBindBridge:    nodeConfig.VPCD.DhcpBindBridge,
 			BridgeMode:        nodeConfig.VPCD.BridgeMode,
+			AZ:                nodeConfig.AZ,
 		})
 		if err != nil {
 			fmt.Println("Error starting vpcd service:", err)
@@ -858,13 +868,20 @@ func init() {
 	viper.BindEnv("tls-key", "SPINIFEX_PREDASTORE_TLS_KEY")
 	viper.BindPFlag("tls-key", predastoreCmd.PersistentFlags().Lookup("tls-key"))
 
+	// Predastore at-rest encryption master key (per node; mode 0600)
+	predastoreCmd.PersistentFlags().String("encryption-key-file", "", "Path to this node's 32-byte AES-256 master key file (required)")
+	viper.BindEnv("encryption-key-file", "SPINIFEX_PREDASTORE_ENCRYPTION_KEY_FILE")
+	viper.BindPFlag("encryption-key-file", predastoreCmd.PersistentFlags().Lookup("encryption-key-file"))
+
 	// Predastore Backend
 	predastoreCmd.PersistentFlags().String("backend", "distributed", "Predastore (S3) backend")
 	viper.BindEnv("backend", "SPINIFEX_PREDASTORE_BACKEND")
 	viper.BindPFlag("backend", predastoreCmd.PersistentFlags().Lookup("backend"))
 
-	// Predastore Node ID
-	predastoreCmd.PersistentFlags().Int("node-id", 0, "Predastore (S3) node ID")
+	// Predastore Node ID. Default -1 is dev mode (launch every configured
+	// QUIC node in-process). Production deployments set this to the node's
+	// real ID (>= 1) via SPINIFEX_PREDASTORE_NODE_ID or --node-id.
+	predastoreCmd.PersistentFlags().Int("node-id", -1, "Predastore (S3) node ID (-1 = dev mode, >= 1 = production)")
 	viper.BindEnv("node-id", "SPINIFEX_PREDASTORE_NODE_ID")
 	viper.BindPFlag("node-id", predastoreCmd.PersistentFlags().Lookup("node-id"))
 
@@ -899,6 +916,14 @@ func init() {
 	viperblockCmd.PersistentFlags().String("plugin-path", "/opt/spinifex/lib/nbdkit-viperblock-plugin.so", "Pathname to the nbdkit viperblockplugin")
 	viper.BindEnv("plugin-path", "SPINIFEX_VIPERBLOCK_PLUGIN_PATH")
 	viper.BindPFlag("plugin-path", predastoreCmd.PersistentFlags().Lookup("plugin-path"))
+
+	// Viperblock at-rest encryption master key (shared with other on-node
+	// services via group ownership; mode 0640 or stricter). Distinct viper
+	// key from predastore's encryption-key-file so the two BindPFlag calls
+	// don't collide globally.
+	viperblockCmd.PersistentFlags().String("encryption-key-file", "", "Path to the 32-byte AES-256 master key file for at-rest encryption (empty disables encryption)")
+	viper.BindEnv("viperblock-encryption-key-file", "SPINIFEX_VIPERBLOCK_ENCRYPTION_KEY_FILE")
+	viper.BindPFlag("viperblock-encryption-key-file", viperblockCmd.PersistentFlags().Lookup("encryption-key-file"))
 
 	viperblockCmd.AddCommand(viperblockStartCmd)
 	viperblockCmd.AddCommand(viperblockStopCmd)

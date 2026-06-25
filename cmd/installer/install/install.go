@@ -23,9 +23,11 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -77,6 +79,7 @@ func Run(cfg *Config) error {
 	}
 
 	slog.Info("installation complete")
+	fireInstallCallback()
 	promptRemoveUSB()
 	return reboot()
 }
@@ -172,6 +175,7 @@ func copyRootfs() error {
 		"--exclude=/etc/openvswitch/",
 		"--exclude=/var/lib/openvswitch/",
 		"--exclude=/var/lib/dhcpcd/",
+		"--exclude=/etc/ssh/ssh_host_*",
 		"--exclude=/lost+found",
 		"--exclude=/boot/efi",
 		"/", mountRoot+"/",
@@ -300,9 +304,10 @@ func installSpinifex(cfg *Config) error {
 		return err
 	}
 
-	// dhcpcd-base is present on the installed system (used by setup-ovn.sh for
-	// macvlan mode). Mask the standalone dhcpcd.service so it never auto-starts
-	// and races with systemd-networkd's built-in DHCP client on br-wan.
+	// dhcpcd-base is present on the installed system (used by setup-ovn.sh
+	// for WAN DHCP acquisition). Mask the standalone dhcpcd.service so it
+	// never auto-starts and races with systemd-networkd's built-in DHCP
+	// client on br-wan.
 	if err := maskSystemdUnit(mountRoot, "dhcpcd.service"); err != nil {
 		slog.Warn("installSpinifex: failed to mask dhcpcd.service", "err", err)
 	}
@@ -555,6 +560,11 @@ func installBootloader(disk string) error {
 		}
 		return biosErr
 	}
+	// Copy splash image and unicode font from the ISO (mounted at /cdrom) so the
+	// installed GRUB shows the same branded background as the installer GRUB.
+	// The font must be at /boot/grub/fonts/unicode.pf2 so update-grub finds it
+	// there and emits the same loadfont path as the ISO's grub.cfg — GRUB 2.12
+	// (trixie) needs the font in the boot partition, not just /usr/share/grub/.
 	copySplashImage(mountRoot)
 	copyGrubFont(mountRoot)
 
@@ -644,6 +654,26 @@ func promptRemoveUSB() {
 	}
 }
 
+// fireInstallCallback notifies the boot controller that installation is done
+// so it clears the PXE install flag before the node reboots. Without this,
+// a PXE-first boot order causes the node to reinstall on every reboot until
+// firstboot fires the callback — which it can never do if it never runs.
+// No-op when SPINIFEX_INSTALL_CALLBACK is not set (ISO/USB installs).
+func fireInstallCallback() {
+	url := strings.TrimSpace(os.Getenv("SPINIFEX_INSTALL_CALLBACK"))
+	if url == "" {
+		return
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url) //nolint:noctx // installer has no context; best-effort fire-and-forget
+	if err != nil {
+		slog.Warn("fireInstallCallback: request failed", "url", url, "err", err)
+		return
+	}
+	resp.Body.Close()
+	slog.Info("fireInstallCallback: notified boot controller", "url", url, "status", resp.StatusCode)
+}
+
 func reboot() error {
 	// sync filesystems before reboot so nothing is lost.
 	_ = run("sync")
@@ -662,11 +692,13 @@ func (c *Config) toFirstbootConfig() firstboot.Config {
 		encapIP = c.LANAddress
 	}
 	return firstboot.Config{
-		Hostname:    c.Hostname,
-		EncapIP:     encapIP,
-		ClusterRole: c.ClusterRole,
-		JoinAddr:    c.JoinAddr,
-		Email:       c.Email,
+		Hostname:        c.Hostname,
+		EncapIP:         encapIP,
+		ClusterRole:     c.ClusterRole,
+		JoinAddr:        c.JoinAddr,
+		Email:           c.Email,
+		InstallCallback: strings.TrimSpace(os.Getenv("SPINIFEX_INSTALL_CALLBACK")),
+		SkipFormation:   c.SkipFormation,
 	}
 }
 
@@ -712,9 +744,46 @@ func partitionPaths(disk string) (efi, root string) {
 	return disk + "2", disk + "3"
 }
 
-// copySplashImage copies the GRUB splash (embedded in the squashfs at build time by
-// inject-bins.sh) into the installed system so the post-install GRUB shows the same
-// branded background as the installer GRUB. Non-fatal — missing source is logged and skipped.
+// copyGrubFont copies the unicode.pf2 GRUB font into the installed system's
+// /boot/grub/fonts/ directory. This ensures update-grub finds the font at
+// /boot/grub/fonts/unicode.pf2 — the same path the ISO's grub.cfg uses —
+// so the generated grub.cfg enables gfxterm and the background image.
+// Without this, grub-mkconfig falls back to /usr/share/grub/unicode.pf2,
+// a path that GRUB 2.12 (trixie) may fail to resolve at boot time.
+// Non-fatal — a missing source is logged and skipped.
+func copyGrubFont(root string) {
+	candidates := []string{
+		"/cdrom/boot/grub/fonts/unicode.pf2", // ISO tree (preferred)
+		"/usr/share/grub/unicode.pf2",        // live system grub-common fallback
+	}
+	for _, src := range candidates {
+		in, err := os.Open(src)
+		if err != nil {
+			continue
+		}
+		defer in.Close()
+		dstDir := filepath.Join(root, "boot/grub/fonts")
+		if err := os.MkdirAll(dstDir, 0o755); err != nil {
+			slog.Warn("copyGrubFont: cannot create fonts dir", "err", err)
+			return
+		}
+		out, err := os.OpenFile(filepath.Join(dstDir, "unicode.pf2"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+		if err != nil {
+			slog.Warn("copyGrubFont: cannot open destination", "err", err)
+			return
+		}
+		defer out.Close()
+		if _, err := io.Copy(out, in); err != nil {
+			slog.Warn("copyGrubFont: copy failed", "err", err)
+		}
+		return
+	}
+	slog.Warn("copyGrubFont: no unicode.pf2 found, splash may not display")
+}
+
+// copySplashImage copies the GRUB splash from the live ISO (/cdrom/boot/grub/splash.png)
+// into the installed system so the post-install GRUB shows the same branded background
+// as the installer. Non-fatal — a missing or unreadable source is logged and skipped.
 func copySplashImage(root string) {
 	const src = "/usr/share/spinifex/grub-splash.png"
 	in, err := os.Open(src)
@@ -737,34 +806,6 @@ func copySplashImage(root string) {
 	defer out.Close()
 	if _, err := io.Copy(out, in); err != nil {
 		slog.Warn("copySplashImage: copy failed", "err", err)
-	}
-}
-
-// copyGrubFont copies the unicode font into the installed system's
-// /boot/grub/fonts/ so the loadfont path in 05_spinifex resolves at boot.
-// grub-install does not copy fonts; we mirror what build-iso.sh does.
-func copyGrubFont(root string) {
-	const src = "/usr/share/grub/unicode.pf2"
-	in, err := os.Open(src)
-	if err != nil {
-		slog.Warn("copyGrubFont: font not found, graphical GRUB may not work", "path", src)
-		return
-	}
-	defer in.Close()
-
-	dstDir := filepath.Join(root, "boot/grub/fonts")
-	if err := os.MkdirAll(dstDir, 0o755); err != nil {
-		slog.Warn("copyGrubFont: cannot create fonts dir", "err", err)
-		return
-	}
-	out, err := os.OpenFile(filepath.Join(dstDir, "unicode.pf2"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		slog.Warn("copyGrubFont: cannot open destination", "err", err)
-		return
-	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
-		slog.Warn("copyGrubFont: copy failed", "err", err)
 	}
 }
 
@@ -811,8 +852,8 @@ func bindChrootMounts() error {
 // unbindChrootMounts unmounts the virtual filesystems in reverse order.
 // Errors are logged but not returned — this is best-effort cleanup.
 func unbindChrootMounts() {
-	for i := len(chrootMountPaths) - 1; i >= 0; i-- {
-		_ = run("umount", filepath.Join(mountRoot, chrootMountPaths[i]))
+	for _, v := range slices.Backward(chrootMountPaths) {
+		_ = run("umount", filepath.Join(mountRoot, v))
 	}
 }
 

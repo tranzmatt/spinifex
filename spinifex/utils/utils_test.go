@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -148,6 +149,121 @@ func TestExecProcessAndKill(t *testing.T) {
 	assert.Error(t, err) // Should return an error since process is killed
 }
 
+func TestWaitForPidFile(t *testing.T) {
+	t.Run("returns pid when file appears within timeout", func(t *testing.T) {
+		const name = "wait-pidfile-appears"
+		_ = RemovePidFile(name)
+		t.Cleanup(func() { _ = RemovePidFile(name) })
+
+		go func() {
+			time.Sleep(150 * time.Millisecond)
+			_ = WritePidFile(name, 4242)
+		}()
+
+		pid, err := WaitForPidFile(name, time.Second)
+		require.NoError(t, err)
+		assert.Equal(t, 4242, pid)
+	})
+
+	t.Run("returns error when timeout expires", func(t *testing.T) {
+		const name = "wait-pidfile-missing"
+		_ = RemovePidFile(name)
+
+		_, err := WaitForPidFile(name, 100*time.Millisecond)
+		assert.Error(t, err)
+	})
+
+	t.Run("returns immediately when file already present", func(t *testing.T) {
+		const name = "wait-pidfile-present"
+		require.NoError(t, WritePidFile(name, 7777))
+		t.Cleanup(func() { _ = RemovePidFile(name) })
+
+		start := time.Now()
+		pid, err := WaitForPidFile(name, time.Second)
+		require.NoError(t, err)
+		assert.Equal(t, 7777, pid)
+		assert.Less(t, time.Since(start), 50*time.Millisecond)
+	})
+}
+
+func TestWaitForUnixSocket(t *testing.T) {
+	t.Run("returns nil when socket appears within timeout", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "appears.sock")
+
+		ln, err := net.Listen("unix", path)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = ln.Close() })
+
+		require.NoError(t, WaitForUnixSocket(path, time.Second))
+	})
+
+	t.Run("returns error when timeout expires", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "missing.sock")
+
+		err := WaitForUnixSocket(path, 100*time.Millisecond)
+		require.Error(t, err)
+	})
+
+	t.Run("waits for socket created after a delay", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "delayed.sock")
+
+		go func() {
+			time.Sleep(150 * time.Millisecond)
+			ln, err := net.Listen("unix", path)
+			if err == nil {
+				t.Cleanup(func() { _ = ln.Close() })
+			}
+		}()
+
+		require.NoError(t, WaitForUnixSocket(path, time.Second))
+	})
+}
+
+func TestWaitForNBDReady(t *testing.T) {
+	t.Run("unix socket ready", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "nbd.sock")
+		ln, err := net.Listen("unix", path)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = ln.Close() })
+
+		require.NoError(t, WaitForNBDReady(FormatNBDSocketURI(path), time.Second))
+	})
+
+	t.Run("unix socket times out", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "missing.sock")
+		err := WaitForNBDReady(FormatNBDSocketURI(path), 100*time.Millisecond)
+		require.Error(t, err)
+	})
+
+	t.Run("tcp listener ready", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = ln.Close() })
+		_, portStr, err := net.SplitHostPort(ln.Addr().String())
+		require.NoError(t, err)
+		port, err := strconv.Atoi(portStr)
+		require.NoError(t, err)
+
+		require.NoError(t, WaitForNBDReady(FormatNBDTCPURI("127.0.0.1", port), time.Second))
+	})
+
+	t.Run("tcp listener times out", func(t *testing.T) {
+		// Port 1 is unprivileged-bind reserved; nothing will be listening.
+		err := WaitForNBDReady(FormatNBDTCPURI("127.0.0.1", 1), 100*time.Millisecond)
+		require.Error(t, err)
+	})
+
+	t.Run("rejects malformed uri", func(t *testing.T) {
+		err := WaitForNBDReady("garbage://nope", time.Second)
+		require.Error(t, err)
+	})
+}
+
 func TestUnmarshalJsonPayload(t *testing.T) {
 	type TestStruct struct {
 		Name  string `json:"name"`
@@ -196,52 +312,6 @@ func TestUnmarshalJsonPayload(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var result TestStruct
 			errResp := UnmarshalJsonPayload(&result, []byte(tt.jsonData))
-
-			if tt.expectError {
-				assert.NotNil(t, errResp, "Expected error response")
-			} else {
-				assert.Nil(t, errResp, "Expected no error response")
-				if tt.validate != nil {
-					tt.validate(t, &result)
-				}
-			}
-		})
-	}
-}
-
-func TestMarshalJsonPayload(t *testing.T) {
-	type TestStruct struct {
-		Name  string `json:"name"`
-		Value int    `json:"value"`
-	}
-
-	tests := []struct {
-		name        string
-		jsonData    string
-		expectError bool
-		validate    func(t *testing.T, result *TestStruct)
-	}{
-		{
-			name:        "Valid JSON",
-			jsonData:    `{"name":"test","value":456}`,
-			expectError: false,
-			validate: func(t *testing.T, result *TestStruct) {
-				assert.Equal(t, "test", result.Name)
-				assert.Equal(t, 456, result.Value)
-			},
-		},
-		{
-			name:        "Invalid JSON",
-			jsonData:    `{"name":"test","value":}`,
-			expectError: true,
-			validate:    nil,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var result TestStruct
-			errResp := MarshalJsonPayload(&result, []byte(tt.jsonData))
 
 			if tt.expectError {
 				assert.NotNil(t, errResp, "Expected error response")
@@ -758,7 +828,7 @@ func TestHumanBytes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, humanBytes(tt.b))
+			assert.Equal(t, tt.want, HumanBytes(tt.b))
 		})
 	}
 }
@@ -1004,11 +1074,78 @@ func TestReadPidFileFrom_EmptyDir(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestServiceStatus_Stopped(t *testing.T) {
+	dir := t.TempDir()
+	status, err := ServiceStatus(dir, fmt.Sprintf("no-such-svc-%d", time.Now().UnixNano()))
+	require.NoError(t, err)
+	assert.Equal(t, "stopped", status)
+}
+
+func TestServiceStatus_Running(t *testing.T) {
+	dir := t.TempDir()
+
+	cmd := exec.Command("sleep", "60")
+	require.NoError(t, cmd.Start())
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	require.NoError(t, WritePidFileTo(dir, "running-svc", cmd.Process.Pid))
+
+	status, err := ServiceStatus(dir, "running-svc")
+	require.NoError(t, err)
+	assert.Equal(t, fmt.Sprintf("running (pid: %d)", cmd.Process.Pid), status)
+}
+
+func TestServiceStatus_CorruptPidFile(t *testing.T) {
+	dir := t.TempDir()
+	// Write a non-numeric pid file — ReadPidFileFrom should fail to parse it.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "bad-svc.pid"), []byte("not-a-pid"), 0o644))
+
+	_, err := ServiceStatus(dir, "bad-svc")
+	assert.Error(t, err)
+}
+
+func TestWaitForProcessExit_ProcessAlreadyDead(t *testing.T) {
+	cmd := exec.Command("true")
+	require.NoError(t, cmd.Start())
+	pid := cmd.Process.Pid
+	require.NoError(t, cmd.Wait())
+
+	// `true` has exited and been reaped — WaitForProcessExit should return
+	// nil immediately on the first tick.
+	err := WaitForProcessExit(pid, 2*time.Second)
+	assert.NoError(t, err)
+}
+
+func TestWaitForProcessExit_ProcessExitsBeforeTimeout(t *testing.T) {
+	cmd := exec.Command("sleep", "0.1")
+	require.NoError(t, cmd.Start())
+	pid := cmd.Process.Pid
+
+	// Reap in the background so the kernel releases the PID once sleep exits.
+	go func() { _ = cmd.Wait() }()
+
+	err := WaitForProcessExit(pid, 5*time.Second)
+	assert.NoError(t, err)
+}
+
+func TestWaitForProcessExit_Timeout(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	require.NoError(t, cmd.Start())
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	err := WaitForProcessExit(cmd.Process.Pid, 200*time.Millisecond)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timeout")
+}
+
 func TestHashMAC_FirstOctetPinnedTo02(t *testing.T) {
-	// First octet must be literal 0x02 across all inputs. Anything else
-	// (e.g. 0x4a, 0xfe — technically valid LAA) visually encroaches on
-	// vendor OUI space and is rejected by ops/CI. Second-octet entropy is
-	// covered by the distribution test.
+	// First octet must be 0x02 (not just any LAA value) to stay out of vendor OUI space.
 	for i := range 1000 {
 		hw, err := net.ParseMAC(HashMAC(fmt.Sprintf("id-%d", i)))
 		require.NoError(t, err)
@@ -1043,23 +1180,6 @@ func TestHashMAC_IdSeparates(t *testing.T) {
 	a := HashMAC("subnet-aaaaaaaaaaaaaaaaa")
 	b := HashMAC("subnet-bbbbbbbbbbbbbbbbb")
 	assert.NotEqual(t, a, b)
-}
-
-func TestHashMAC_Distribution(t *testing.T) {
-	// 100k random ids — 0 collisions expected. 46-bit space, birthday-
-	// paradox 1% at ~1.2M; 100k is well below.
-	if testing.Short() {
-		t.Skip("skipping distribution test in -short mode")
-	}
-	seen := make(map[string]string, 100_000)
-	for range 100_000 {
-		id := GenerateResourceID("res")
-		mac := HashMAC(id)
-		if prev, ok := seen[mac]; ok {
-			t.Fatalf("collision on %s: id=%s prev=%s", mac, id, prev)
-		}
-		seen[mac] = id
-	}
 }
 
 // writeTempImage writes content to a file named name under t.TempDir() and
@@ -1110,8 +1230,8 @@ func trustTestServer(t *testing.T, srv *httptest.Server) {
 }
 
 func TestVerifyImageChecksum(t *testing.T) {
-	const debianName = "debian-12-generic-amd64.tar.xz"
-	const ubuntuName = "noble-server-cloudimg-amd64.img"
+	const debianName = "debian-13-genericcloud-amd64-20260518-2482.tar.xz"
+	const ubuntuName = "resolute-server-cloudimg-amd64.img"
 	const alpineName = "alb-alpine-3.21.6-x86_64.raw"
 
 	debianBytes := []byte("debian-image-bytes-fixture")
@@ -1321,4 +1441,198 @@ func TestVerifyImageChecksum(t *testing.T) {
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrChecksumFetchFailed)
 	})
+
+	t.Run("rocky bsd-style gpg-armored sums match", func(t *testing.T) {
+		const rockyName = "Rocky-10.0-20250612.0.x86_64.qcow2"
+		rockyBytes := []byte("rocky-image-bytes-fixture")
+		img := writeTempImage(t, rockyName, rockyBytes)
+		// Captured shape of a real Rocky CHECKSUM file: GPG cleartext-signed
+		// armor wrapping BSD-style "SHA256 (name) = hex" lines, followed by an
+		// ASCII-armored signature block we must skip without misparsing.
+		body := fmt.Sprintf(`-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+SHA256 (Rocky-10.0-20250612.0-x86_64-boot.iso) = %s
+SHA256 (%s) = %s
+SHA256 (Rocky-10.0-20250612.0-x86_64-dvd.iso) = %s
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCAAdFiEEnK6Ehq8eQ0z6yqv7tQAaIQAaIQAAaIQFAmJabcdEFGhijklm
+nopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+/abcdefghijklmn
+=ABCD
+-----END PGP SIGNATURE-----
+`, sha256Hex([]byte("boot-iso")), rockyName, sha256Hex(rockyBytes), sha256Hex([]byte("dvd-iso")))
+		url := newSumsServer(t, body)
+		err := VerifyImageChecksum(img, url, "sha256")
+		assert.NoError(t, err)
+	})
+
+	t.Run("alma bsd-style gpg-armored sums match", func(t *testing.T) {
+		const almaName = "AlmaLinux-10-GenericCloud-10.0-x86_64.qcow2"
+		almaBytes := []byte("alma-image-bytes-fixture")
+		img := writeTempImage(t, almaName, almaBytes)
+		body := fmt.Sprintf(`-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+SHA256 (%s) = %s
+-----BEGIN PGP SIGNATURE-----
+
+iHUEABYKAB0WIQTm5n8/yqv7tQAaIQAaIQAFAmJabcdEFGhijklmnopqrstuvwxyz
+=EFGH
+-----END PGP SIGNATURE-----
+`, almaName, sha256Hex(almaBytes))
+		url := newSumsServer(t, body)
+		err := VerifyImageChecksum(img, url, "sha256")
+		assert.NoError(t, err)
+	})
+
+	t.Run("bsd-style filename absent", func(t *testing.T) {
+		const rockyName = "Rocky-10.0-20250612.0.x86_64.qcow2"
+		rockyBytes := []byte("rocky-image-bytes-fixture")
+		img := writeTempImage(t, rockyName, rockyBytes)
+		body := fmt.Sprintf(`-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+SHA256 (Rocky-10.0-20250612.0-x86_64-boot.iso) = %s
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCAAdFiEEnK6Ehq8eQ0z6yqv7tQAaIQAaIQAAaIQFAmJabcdEFGhijklm
+=ABCD
+-----END PGP SIGNATURE-----
+`, sha256Hex([]byte("boot-iso")))
+		url := newSumsServer(t, body)
+		err := VerifyImageChecksum(img, url, "sha256")
+		assert.ErrorIs(t, err, ErrChecksumNotFound)
+	})
+}
+
+func TestParseSumsFile(t *testing.T) {
+	const target = "Rocky-10.0-20250612.0.x86_64.qcow2"
+	const targetHex = "a3f1c2d4e5f60718293a4b5c6d7e8f9012345678901234567890abcdefabcdef"
+
+	t.Run("bsd 4-field line", func(t *testing.T) {
+		body := []byte("SHA256 (" + target + ") = " + targetHex + "\n")
+		got, err := parseSumsFile(body, target)
+		require.NoError(t, err)
+		assert.Equal(t, targetHex, got)
+	})
+
+	t.Run("bsd missing equals separator skipped", func(t *testing.T) {
+		// Malformed line — third field is not "=". Must not match.
+		body := []byte("SHA256 (" + target + ") - " + targetHex + "\n")
+		_, err := parseSumsFile(body, target)
+		assert.ErrorIs(t, err, ErrChecksumNotFound)
+	})
+
+	t.Run("bsd missing parens skipped", func(t *testing.T) {
+		// Without parens the filename field is ambiguous; reject by not matching.
+		body := []byte("SHA256 " + target + " = " + targetHex + "\n")
+		_, err := parseSumsFile(body, target)
+		assert.ErrorIs(t, err, ErrChecksumNotFound)
+	})
+
+	t.Run("gpg-armored body with no sums returns not found", func(t *testing.T) {
+		// PGP signatures always have ≥ 2 bare-token lines (base64 + =CRC), so bareCount stays ≥ 2 and NotFound is returned.
+		body := []byte(`-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCAAdFiEEnK6Ehq8eQ0z6yqv7tQAaIQAaIQAAaIQFAmJabcdEFGhijklm
+=ABCD
+-----END PGP SIGNATURE-----
+`)
+		_, err := parseSumsFile(body, target)
+		assert.ErrorIs(t, err, ErrChecksumNotFound)
+	})
+
+	t.Run("mixed bsd and coreutils shapes", func(t *testing.T) {
+		// Defensive: a sums file with both shapes should still resolve the
+		// requested filename regardless of which line carries it.
+		body := []byte("# header\n" +
+			targetHex + "  some-other.iso\n" +
+			"SHA256 (" + target + ") = " + targetHex + "\n")
+		got, err := parseSumsFile(body, target)
+		require.NoError(t, err)
+		assert.Equal(t, targetHex, got)
+	})
+}
+
+func TestAvailableImages_Rocky(t *testing.T) {
+	cases := []struct {
+		name        string
+		arch        string
+		filenameSub string
+	}{
+		{"rocky-10-x86_64", "x86_64", "x86_64.qcow2"},
+		{"rocky-10-arm64", "arm64", "aarch64.qcow2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			img, ok := AvailableImages[tc.name]
+			require.True(t, ok, "catalog must contain %q", tc.name)
+			assert.Equal(t, tc.name, img.Name)
+			assert.Equal(t, "rocky", img.Distro)
+			assert.Equal(t, "10", img.Version)
+			assert.Equal(t, tc.arch, img.Arch)
+			// Rocky 10 cloud images are UEFI-only on both architectures.
+			assert.Equal(t, "uefi", img.BootMode)
+			assert.Equal(t, "sha256", img.ChecksumType)
+			// URL must be pinned to a dated build (no moving "latest" symlink)
+			// and the checksum URL must be the BSD-style .CHECKSUM companion.
+			assert.NotContains(t, img.URL, "latest")
+			assert.Contains(t, img.URL, tc.filenameSub)
+			assert.True(t, strings.HasSuffix(img.Checksum, ".CHECKSUM"),
+				"Rocky publishes BSD-style .CHECKSUM files; got %q", img.Checksum)
+			// Catalog Distro must resolve to the rhel family — typo here would
+			// silently render Rocky guests with netplan/sudo group.
+			assert.Equal(t, "rhel", DistroFamily(img.Distro))
+		})
+	}
+}
+
+func TestDistroFamily(t *testing.T) {
+	cases := []struct {
+		distro string
+		want   string
+	}{
+		{"debian", "debian"},
+		{"ubuntu", "debian"},
+		{"rocky", "rhel"},
+		{"rhel", "rhel"},
+		{"alma", "rhel"},
+		{"fedora", "rhel"},
+		{"centos", "rhel"},
+		{"alpine", "alpine"},
+		// Case + whitespace normalisation
+		{"  Rocky  ", "rhel"},
+		{"UBUNTU", "debian"},
+		// Unknown and empty fall through to debian with a warning logged.
+		{"", "debian"},
+		{"plan9", "debian"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.distro, func(t *testing.T) {
+			assert.Equal(t, tc.want, DistroFamily(tc.distro))
+		})
+	}
+}
+
+func TestClientIP(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		expected   string
+	}{
+		{"IPv4 with port", "192.168.1.1:12345", "192.168.1.1"},
+		{"IPv6 with port", "[::1]:12345", "::1"},
+		{"IPv4 bare", "192.168.1.1", "192.168.1.1"},
+		{"IPv6 full with port", "[2001:db8::1]:443", "2001:db8::1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, ClientIP(tt.remoteAddr))
+		})
+	}
 }

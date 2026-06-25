@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod"
 import { createFileRoute, useNavigate } from "@tanstack/react-router"
-import { useForm } from "react-hook-form"
+import { Controller, useForm, useWatch } from "react-hook-form"
 
 import { BackLink } from "@/components/back-link"
 import {
@@ -12,7 +12,7 @@ import { FormActions } from "@/components/form-actions"
 import { PageHeading } from "@/components/page-heading"
 import { Field, FieldError, FieldTitle } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import { Textarea } from "@/components/ui/textarea"
+import { JsonEditor } from "@/components/ui/json-editor"
 import { useCreatePolicy } from "@/mutations/iam"
 import { type CreatePolicyFormData, createPolicySchema } from "@/types/iam"
 
@@ -45,7 +45,7 @@ function CreatePolicy() {
   const {
     handleSubmit,
     register,
-    watch,
+    control,
     formState: { errors, isSubmitting },
   } = useForm({
     resolver: zodResolver(createPolicySchema),
@@ -53,6 +53,10 @@ function CreatePolicy() {
       policyDocument: DEFAULT_POLICY_DOCUMENT,
     },
   })
+
+  const values = useWatch({ control })
+  const cliWatch = (name?: string): unknown =>
+    name ? (values as Record<string, unknown>)[name] : undefined
 
   const onSubmit = async (data: CreatePolicyFormData) => {
     await createMutation.mutateAsync(data)
@@ -101,22 +105,30 @@ function CreatePolicy() {
           <FieldTitle>
             <label htmlFor="policyDocument">Policy Document (JSON)</label>
           </FieldTitle>
-          <Textarea
-            aria-invalid={!!errors.policyDocument}
-            className="font-mono text-sm"
-            id="policyDocument"
-            rows={15}
-            {...register("policyDocument")}
+          <Controller
+            control={control}
+            name="policyDocument"
+            render={({ field: { onBlur, onChange, ref, value } }) => (
+              <JsonEditor
+                error={!!errors.policyDocument}
+                id="policyDocument"
+                onBlur={onBlur}
+                onChange={onChange}
+                ref={ref}
+                rows={15}
+                value={value}
+              />
+            )}
           />
           <FieldError errors={[errors.policyDocument]} />
         </Field>
 
-        <CliCommandPanel commands={buildCreatePolicyCommands(watch)} />
+        <CliCommandPanel commands={buildCreatePolicyCommands(cliWatch)} />
 
         <FormActions
           isPending={createMutation.isPending}
           isSubmitting={isSubmitting}
-          onCancel={() => navigate({ to: "/iam/list-policies" })}
+          onCancel={async () => await navigate({ to: "/iam/list-policies" })}
           pendingLabel="Creating..."
           submitLabel="Create Policy"
         />

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 
 	"github.com/mulgadc/spinifex/spinifex/migrate"
@@ -20,6 +21,14 @@ const (
 	KeyPrefixLB       = "lb."
 	KeyPrefixTG       = "tg."
 	KeyPrefixListener = "listener."
+	KeyPrefixRule     = "rule."
+	// KeyPrefixLBName is the per-account LB-name claim key that makes the LB
+	// name an atomically claimable identity, preventing concurrent same-name
+	// creates from both launching a VM.
+	KeyPrefixLBName = "lbname."
+
+	// maxLBNameClaimRetries bounds the crash-orphan CAS-reclaim loop in ClaimLBName.
+	maxLBNameClaimRetries = 5
 )
 
 // Store provides CRUD operations for ELBv2 resources backed by JetStream KV.
@@ -48,6 +57,61 @@ func NewStore(nc *nats.Conn) (*Store, error) {
 }
 
 // --- Load Balancer CRUD ---
+
+// LBNameKey returns the per-account name-claim key for an LB name.
+func LBNameKey(name, accountID string) string {
+	return KeyPrefixLBName + accountID + "." + name
+}
+
+// ClaimLBName atomically claims the LB name; ok=true means this caller owns it,
+// dup=true means a live LB already holds it. An orphaned claim (owner resolves to
+// no record) is reclaimed via CAS. Idempotency barrier for CreateLoadBalancer.
+func (s *Store) ClaimLBName(name, accountID, lbID string) (ok bool, dup bool, err error) {
+	key := LBNameKey(name, accountID)
+	for range maxLBNameClaimRetries {
+		if _, cerr := s.kv.Create(key, []byte(lbID)); cerr == nil {
+			return true, false, nil
+		} else if !errors.Is(cerr, nats.ErrKeyExists) {
+			return false, false, fmt.Errorf("kv create %s: %w", key, cerr)
+		}
+		entry, gerr := s.kv.Get(key)
+		if gerr != nil {
+			if errors.Is(gerr, nats.ErrKeyNotFound) {
+				continue // raced vanish; retry the create
+			}
+			return false, false, fmt.Errorf("kv get %s: %w", key, gerr)
+		}
+		ownerID := string(entry.Value())
+		if ownerID != "" && ownerID != lbID {
+			rec, rerr := s.GetLoadBalancer(ownerID)
+			if rerr != nil {
+				return false, false, fmt.Errorf("resolve LB name owner %s: %w", ownerID, rerr)
+			}
+			if rec != nil {
+				return false, true, nil // live LB holds the name
+			}
+		}
+		// Orphaned (crashed prior create) or already ours: CAS-take the claim.
+		if _, uerr := s.kv.Update(key, []byte(lbID), entry.Revision()); uerr != nil {
+			if errors.Is(uerr, nats.ErrKeyExists) {
+				continue // lost the CAS race; re-read
+			}
+			return false, false, fmt.Errorf("kv update %s: %w", key, uerr)
+		}
+		return true, false, nil
+	}
+	return false, false, fmt.Errorf("elbv2: claim LB name %s exhausted retries", name)
+}
+
+// ReleaseLBName deletes the name claim. A missing key is success (idempotent),
+// so create-rollback paths and DeleteLoadBalancer can call it unconditionally.
+func (s *Store) ReleaseLBName(name, accountID string) error {
+	key := LBNameKey(name, accountID)
+	if err := s.kv.Delete(key); err != nil && !errors.Is(err, nats.ErrKeyNotFound) {
+		return fmt.Errorf("kv delete %s: %w", key, err)
+	}
+	return nil
+}
 
 // PutLoadBalancer stores a load balancer record.
 func (s *Store) PutLoadBalancer(lb *LoadBalancerRecord) error {
@@ -89,10 +153,9 @@ func (s *Store) ListLoadBalancers() ([]*LoadBalancerRecord, error) {
 	return listByPrefix[LoadBalancerRecord](s.kv, KeyPrefixLB)
 }
 
-// GetLoadBalancerByArn finds a load balancer by its ARN via a direct KV lookup
-// on the short ID embedded in the ARN's final path segment. Falls back to a
-// linear scan only if the ARN can't be parsed. Terraform hits Describe*Attributes
-// on every plan/refresh so this must be O(1), not O(n).
+// GetLoadBalancerByArn finds a load balancer by the short ID in the ARN's final
+// path segment. Returns (nil, nil) if unparseable or not found. O(1) — Terraform
+// hits Describe*Attributes on every plan/refresh.
 func (s *Store) GetLoadBalancerByArn(arn string) (*LoadBalancerRecord, error) {
 	// ELBv2 LB ARN: arn:aws:elasticloadbalancing:{region}:{account}:loadbalancer/{app,net}/{name}/{lbID}
 	idx := strings.LastIndex(arn, "/")
@@ -104,11 +167,13 @@ func (s *Store) GetLoadBalancerByArn(arn string) (*LoadBalancerRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Defence-in-depth: ensure the record actually belongs to this ARN.
-	// Short IDs are random hex, so collisions are effectively impossible, but
-	// a mismatch here would indicate KV corruption and must not be silently
-	// served as a successful lookup.
-	if lb == nil || lb.LoadBalancerArn != arn {
+	if lb == nil {
+		return nil, nil
+	}
+	// Defence-in-depth: ARN mismatch indicates KV corruption; never serve it silently.
+	if lb.LoadBalancerArn != arn {
+		slog.Error("load balancer KV record ARN mismatch",
+			"requested_arn", arn, "stored_arn", lb.LoadBalancerArn, "lb_id", lbID)
 		return nil, nil
 	}
 	return lb, nil
@@ -170,10 +235,8 @@ func (s *Store) ListTargetGroups() ([]*TargetGroupRecord, error) {
 	return listByPrefix[TargetGroupRecord](s.kv, KeyPrefixTG)
 }
 
-// GetTargetGroupByArn finds a target group by its ARN via a direct KV lookup
-// on the short ID embedded in the ARN's final path segment. See
-// GetLoadBalancerByArn for the motivation — Terraform's per-plan
-// DescribeTargetGroupAttributes storm must be O(1).
+// GetTargetGroupByArn finds a target group by the short ID in the ARN's final
+// path segment. O(1) — see GetLoadBalancerByArn for motivation.
 func (s *Store) GetTargetGroupByArn(arn string) (*TargetGroupRecord, error) {
 	// ELBv2 TG ARN: arn:aws:elasticloadbalancing:{region}:{account}:targetgroup/{name}/{tgID}
 	idx := strings.LastIndex(arn, "/")
@@ -185,7 +248,12 @@ func (s *Store) GetTargetGroupByArn(arn string) (*TargetGroupRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	if tg == nil || tg.TargetGroupArn != arn {
+	if tg == nil {
+		return nil, nil
+	}
+	if tg.TargetGroupArn != arn {
+		slog.Error("target group KV record ARN mismatch",
+			"requested_arn", arn, "stored_arn", tg.TargetGroupArn, "tg_id", tgID)
 		return nil, nil
 	}
 	return tg, nil
@@ -207,16 +275,29 @@ func (s *Store) TargetGroupsForLB(lbID string) ([]*TargetGroupRecord, error) {
 		return nil, fmt.Errorf("list listeners for %s: %w", lbID, err)
 	}
 
-	// Collect unique TG IDs from listener actions.
+	// Collect unique TG IDs from default actions and rule actions; rule TGs must
+	// be included so the health checker can update state for all probed backends.
 	seen := make(map[string]struct{})
+	collect := func(tgArn string) {
+		if tgArn == "" {
+			return
+		}
+		// TG ARN format: arn:aws:elasticloadbalancing:{region}:{account}:targetgroup/{name}/{tgID}
+		if idx := strings.LastIndex(tgArn, "/"); idx >= 0 {
+			seen[tgArn[idx+1:]] = struct{}{}
+		}
+	}
 	for _, l := range listeners {
 		for _, a := range l.DefaultActions {
-			if a.TargetGroupArn == "" {
-				continue
-			}
-			// TG ARN format: arn:aws:elasticloadbalancing:{region}:{account}:targetgroup/{name}/{tgID}
-			if idx := strings.LastIndex(a.TargetGroupArn, "/"); idx >= 0 {
-				seen[a.TargetGroupArn[idx+1:]] = struct{}{}
+			collect(a.TargetGroupArn)
+		}
+		rules, err := s.ListRulesByListener(l.ListenerArn)
+		if err != nil {
+			return nil, fmt.Errorf("list rules for listener %s: %w", l.ListenerArn, err)
+		}
+		for _, r := range rules {
+			for _, a := range r.Actions {
+				collect(a.TargetGroupArn)
 			}
 		}
 	}
@@ -305,15 +386,95 @@ func (s *Store) ListListenersByLB(lbArn string) ([]*ListenerRecord, error) {
 	return result, nil
 }
 
-// GetListenerByArn finds a listener by its ARN.
+// GetListenerByArn finds a listener by the short ID in the ARN's final path segment.
+// O(1) per ARN — Terraform calls DescribeTags for every listener on every plan.
 func (s *Store) GetListenerByArn(arn string) (*ListenerRecord, error) {
-	listeners, err := s.ListListeners()
+	// ELBv2 listener ARN: arn:aws:elasticloadbalancing:{region}:{account}:listener/{app,net}/{name}/{lbID}/{listenerID}
+	idx := strings.LastIndex(arn, "/")
+	if idx < 0 || idx == len(arn)-1 {
+		return nil, nil
+	}
+	listenerID := arn[idx+1:]
+	l, err := s.GetListener(listenerID)
 	if err != nil {
 		return nil, err
 	}
-	for _, l := range listeners {
-		if l.ListenerArn == arn {
-			return l, nil
+	if l == nil || l.ListenerArn != arn {
+		return nil, nil
+	}
+	return l, nil
+}
+
+// --- Rule CRUD ---
+
+// PutRule stores a rule record.
+func (s *Store) PutRule(r *RuleRecord) error {
+	data, err := json.Marshal(r)
+	if err != nil {
+		return fmt.Errorf("marshal rule: %w", err)
+	}
+	_, err = s.kv.Put(KeyPrefixRule+r.RuleID, data)
+	return err
+}
+
+// GetRule retrieves a rule by its short ID.
+func (s *Store) GetRule(ruleID string) (*RuleRecord, error) {
+	entry, err := s.kv.Get(KeyPrefixRule + ruleID)
+	if err != nil {
+		if errors.Is(err, nats.ErrKeyNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var r RuleRecord
+	if err := json.Unmarshal(entry.Value(), &r); err != nil {
+		return nil, fmt.Errorf("unmarshal rule: %w", err)
+	}
+	return &r, nil
+}
+
+// DeleteRule removes a rule by its short ID.
+func (s *Store) DeleteRule(ruleID string) error {
+	err := s.kv.Delete(KeyPrefixRule + ruleID)
+	if err != nil && !errors.Is(err, nats.ErrKeyNotFound) {
+		return err
+	}
+	return nil
+}
+
+// ListRules returns all rule records.
+func (s *Store) ListRules() ([]*RuleRecord, error) {
+	return listByPrefix[RuleRecord](s.kv, KeyPrefixRule)
+}
+
+// ListRulesByListener returns all rules attached to a listener ARN, sorted by
+// ascending priority. Callers downstream of this method (HAProxy renderer,
+// SetRulePriorities) rely on the sort.
+func (s *Store) ListRulesByListener(listenerArn string) ([]*RuleRecord, error) {
+	all, err := s.ListRules()
+	if err != nil {
+		return nil, err
+	}
+	var result []*RuleRecord
+	for _, r := range all {
+		if r.ListenerArn == listenerArn {
+			result = append(result, r)
+		}
+	}
+	sort.SliceStable(result, func(i, j int) bool { return result[i].Priority < result[j].Priority })
+	return result, nil
+}
+
+// GetRuleByArn finds a rule by its ARN via linear scan; the rule short ID is
+// embedded after several listener-specific segments, making direct parsing brittle.
+func (s *Store) GetRuleByArn(arn string) (*RuleRecord, error) {
+	rules, err := s.ListRules()
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rules {
+		if r.RuleArn == arn {
+			return r, nil
 		}
 	}
 	return nil, nil

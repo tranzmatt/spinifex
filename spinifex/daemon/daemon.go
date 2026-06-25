@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -10,13 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,9 +28,12 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/go-chi/chi/v5"
+	"github.com/mulgadc/spinifex/internal/tlsconfig"
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/config"
+	"github.com/mulgadc/spinifex/spinifex/gpu"
+	handlers_acm "github.com/mulgadc/spinifex/spinifex/handlers/acm"
 	handlers_ec2_account "github.com/mulgadc/spinifex/spinifex/handlers/ec2/account"
 	handlers_ec2_eigw "github.com/mulgadc/spinifex/spinifex/handlers/ec2/eigw"
 	handlers_ec2_eip "github.com/mulgadc/spinifex/spinifex/handlers/ec2/eip"
@@ -46,15 +48,17 @@ import (
 	handlers_ec2_tags "github.com/mulgadc/spinifex/spinifex/handlers/ec2/tags"
 	handlers_ec2_volume "github.com/mulgadc/spinifex/spinifex/handlers/ec2/volume"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
+	handlers_ecr "github.com/mulgadc/spinifex/spinifex/handlers/ecr"
+	handlers_eks "github.com/mulgadc/spinifex/spinifex/handlers/eks"
 	handlers_elbv2 "github.com/mulgadc/spinifex/spinifex/handlers/elbv2"
+	handlers_imds "github.com/mulgadc/spinifex/spinifex/handlers/imds"
 	"github.com/mulgadc/spinifex/spinifex/instancetypes"
+	"github.com/mulgadc/spinifex/spinifex/network/external/dhcp"
+	"github.com/mulgadc/spinifex/spinifex/network/host"
 	"github.com/mulgadc/spinifex/spinifex/objectstore"
-	"github.com/mulgadc/spinifex/spinifex/qmp"
-	"github.com/mulgadc/spinifex/spinifex/tags"
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/spinifex/spinifex/vm"
-	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/nats-io/nats.go"
 )
 
@@ -82,27 +86,48 @@ type EBS struct {
 // when full, it unsubscribes so NATS routes requests to other nodes.
 type ResourceManager struct {
 	mu sync.RWMutex
-	// hostVCPU / hostMemGB are the raw figures reported by the host
-	// (runtime.NumCPU, /proc/meminfo). Schedulable capacity for guest VMs
-	// is host - reserved - allocated.
+	// hostVCPU / hostMemGB: physical cores (not SMT threads) and total RAM.
+	// Schedulable capacity = host - reserved - allocated.
 	hostVCPU  int
 	hostMemGB float64
-	// reservedVCPU / reservedMem are held back from guest scheduling for
-	// the spinifex daemon and co-located services (NATS, predastore,
-	// viperblock, vpcd, awsgw, ui). See hostReserve / defaultHostReserve.
+	// reservedVCPU / reservedMem: resources held back for the daemon and
+	// co-located services. See hostReserve / defaultHostReserve.
 	reservedVCPU  int
 	reservedMem   float64
 	allocatedVCPU int
 	allocatedMem  float64
+	// reservedCRVCPU / reservedCRMem: compute held by capacity reservations
+	// pinned to this node. Subtracted from schedulable capacity exactly like
+	// the host reserve. In-memory only — lost on daemon restart.
+	reservedCRVCPU int
+	reservedCRMem  float64
+	// reservations: in-memory capacity reservations owned by this node, keyed
+	// by id. Mutated together with reservedCR* under mu.
+	reservations map[string]*capacityReservation
+	// nbdkitMainMiB / nbdkitAuxMiB: per-volume nbdkit memory charged at
+	// admission so nbdkit backing a guest's volumes is accounted explicitly.
+	nbdkitMainMiB int
+	nbdkitAuxMiB  int
 	instanceTypes map[string]*ec2.InstanceTypeInfo
+	gpuManager    *gpu.Manager // nil if GPU passthrough is disabled or no GPUs present
+
+	// readMemAvailableGB is the live second admission gate (MemAvailable from
+	// /proc/meminfo). Catches real overcommit the static -m accounting misses.
+	// nil disables it (SPINIFEX_ADMISSION_LIVE_MEM=0); read failure fails open.
+	readMemAvailableGB func() (float64, bool)
 
 	// Dynamic instance-type subscription management
-	subsMu       sync.Mutex
-	natsConn     *nats.Conn
-	instanceSubs map[string]*nats.Subscription
-	handler      nats.MsgHandler
-	nodeID       string // node identifier for node-specific topic subscriptions
+	subsMu        sync.Mutex
+	natsConn      *nats.Conn
+	instanceSubs  map[string]*nats.Subscription
+	handler       nats.MsgHandler
+	systemHandler nats.MsgHandler // handles system.LaunchInstance.* requests (ALB-VM fan-out)
+	nodeID        string          // node identifier for node-specific topic subscriptions
 }
+
+// Compile-time guarantee that the RouteTable service satisfies the IGW
+// handler's GatePublisher hook — the two services are wired together below.
+var _ handlers_ec2_igw.GatePublisher = (*handlers_ec2_routetable.RouteTableServiceImpl)(nil)
 
 // Daemon represents the main daemon service
 type Daemon struct {
@@ -124,6 +149,9 @@ type Daemon struct {
 	vpcService            *handlers_ec2_vpc.VPCServiceImpl
 	eipService            *handlers_ec2_eip.EIPServiceImpl
 	elbv2Service          *handlers_elbv2.ELBv2ServiceImpl
+	eksService            *handlers_eks.EKSServiceImpl
+	acmService            *handlers_acm.ACMServiceImpl
+	ecrMetaService        *handlers_ecr.MetaServiceImpl
 	routeTableService     *handlers_ec2_routetable.RouteTableServiceImpl
 	natGatewayService     *handlers_ec2_natgw.NatGatewayServiceImpl
 	externalIPAM          *handlers_ec2_vpc.ExternalIPAM
@@ -131,8 +159,13 @@ type Daemon struct {
 	cancel                context.CancelFunc
 	shutdownWg            sync.WaitGroup
 
-	// Local VM Instances
-	Instances vm.Instances
+	// systemDispatchWg tracks in-flight system.LaunchInstance / TerminateInstance
+	// handlers. Each runs in its own goroutine so a slow VM boot never blocks
+	// the NATS subscription. Used by tests to await dispatch completion.
+	systemDispatchWg sync.WaitGroup
+
+	// vmMgr owns the in-memory map of VMs running on this node.
+	vmMgr *vm.Manager
 
 	// NAT Subscriptions
 	natsSubscriptions map[string]*nats.Subscription
@@ -149,41 +182,172 @@ type Daemon struct {
 	// JetStream manager for KV state storage (nil if JetStream disabled)
 	jsManager *JetStreamManager
 
+	// stateStore is the vm.StateStore view over jsManager, initialized after
+	// initJetStream succeeds.
+	stateStore vm.StateStore
+
 	// Delay after QMP device_del before blockdev-del (default 1s, 0 in tests)
 	detachDelay time.Duration
 
 	// NATS connect retry options (nil uses defaults: 5min max, 500ms initial delay)
 	natsRetryOpts []utils.RetryOption
 
-	// NetworkPlumber handles tap device lifecycle for VPC networking
-	networkPlumber NetworkPlumber
+	// requireNATSTimeout caps the first connectNATS attempt under
+	// SPINIFEX_REQUIRE_NATS=1. Default 30s; tests use a shorter value.
+	requireNATSTimeout time.Duration
 
-	// Management NIC infrastructure: bridge IP + IP allocator for system instances.
-	// Populated at startup when br-mgmt is detected; nil/empty otherwise.
+	// exitFunc is called when SPINIFEX_REQUIRE_NATS=1 and the first connect
+	// times out. Defaults to os.Exit; tests override to avoid killing the process.
+	exitFunc func(int)
+
+	// networkPlumber handles tap device lifecycle for VPC and management networking
+	networkPlumber vm.NetworkPlumber
+
+	// mgmtBridgeIP / mgmtIPAllocator: management NIC infrastructure for system
+	// instances. Populated at startup when br-mgmt is detected.
 	mgmtBridgeIP    string
 	mgmtIPAllocator *MgmtIPAllocator
-	// mgmtRouteVia is the AWSGW bind IP that system instances must route via the
-	// management NIC. Set when AWSGW binds to a specific IP (multi-node).
+	// mgmtRouteVia: AWSGW bind IP system instances route via br-mgmt (multi-node).
 	mgmtRouteVia string
 
-	// shuttingDown is set to true during coordinated cluster shutdown (GATE phase)
-	// or during SIGTERM-based shutdown. When true, the daemon rejects new work,
-	// crash handlers bail out, and setupShutdown skips redundant VM stops.
+	// gpuProbe: startup GPU hardware probe result, always populated.
+	gpuProbe gpuProbeResult
+
+	// gpuManager: VFIO bind/unbind for GPU passthrough. Nil when disabled or no GPUs found.
+	gpuManager *gpu.Manager
+
+	// shuttingDown: set during GATE or SIGTERM; daemon rejects new work and
+	// crash handlers bail out.
 	shuttingDown atomic.Bool
 
-	// ready is set to true once NATS connection, JetStream, and all services
-	// are fully initialized. The health endpoint reports "starting" until ready.
+	// ready: set once NATS, JetStream, and all services are initialized.
+	// /health reports "starting" until true.
 	ready atomic.Bool
+
+	// natsConnected: true when the NATS TCP connection is live.
+	natsConnected atomic.Bool
+	// peersReachable: true when at least one peer /health responded in the
+	// last probe cycle. Pinned true on single-node clusters.
+	peersReachable atomic.Bool
+
+	// natsRetryCount: disconnect→reconnect cycles since process start.
+	natsRetryCount atomic.Int64
+
+	// stateRevision: incremented on each successful WriteState.
+	stateRevision atomic.Uint64
+
+	// kvSyncFailures: best-effort JetStream KV sync failures since start.
+	kvSyncFailures atomic.Int64
+	// lastKVSyncAt: unix-nano timestamp of the last successful KV sync.
+	lastKVSyncAt atomic.Int64
+	// lastKVSyncError: most recent KV sync error message; "" on success.
+	lastKVSyncError atomic.Value
+
+	// reconciling: coalesces concurrent reconcileOnHeal calls.
+	reconciling atomic.Bool
+	// stateWriteMu: serialises WriteState to prevent races on the .tmp staging file.
+	stateWriteMu sync.Mutex
 
 	mu sync.Mutex
 }
+
+// Daemon connectivity modes derived by Mode().
+const (
+	DaemonModeStandalone = "standalone"
+	DaemonModeCluster    = "cluster"
+)
+
+// Mode returns "cluster" iff both natsConnected and peersReachable are true;
+// otherwise "standalone". Two signals are required so a NATS-up partition
+// (DDIL Scenario C) still reports standalone when no peer responds.
+func (d *Daemon) Mode() string {
+	if d.natsConnected.Load() && d.peersReachable.Load() {
+		return DaemonModeCluster
+	}
+	return DaemonModeStandalone
+}
+
+// NATSRetryCount returns the number of disconnect→reconnect cycles observed
+// since process start.
+func (d *Daemon) NATSRetryCount() int64 {
+	return d.natsRetryCount.Load()
+}
+
+// Revision returns the local-state revision counter. Bumped on every successful
+// WriteState; observers can detect changes without diffing the full payload.
+func (d *Daemon) Revision() uint64 {
+	return d.stateRevision.Load()
+}
+
+// KVSyncFailures returns the number of best-effort JetStream KV sync failures
+// (timeout or put error) observed since process start.
+func (d *Daemon) KVSyncFailures() int64 {
+	return d.kvSyncFailures.Load()
+}
+
+// LastKVSyncAt returns the timestamp of the most recent successful best-effort
+// KV sync. Zero time means "never synced since process start".
+func (d *Daemon) LastKVSyncAt() time.Time {
+	n := d.lastKVSyncAt.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
+
+// LastKVSyncError returns the most recent best-effort KV sync error message.
+// Empty string means the last attempt succeeded (or no attempt has been made).
+func (d *Daemon) LastKVSyncError() string {
+	v := d.lastKVSyncError.Load()
+	if v == nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+// RecordKVSyncSuccess implements KVSyncObserver. The JetStream manager calls
+// this from its best-effort write path on a successful Put.
+func (d *Daemon) RecordKVSyncSuccess(_ string) {
+	d.lastKVSyncAt.Store(time.Now().UnixNano())
+	d.lastKVSyncError.Store("")
+}
+
+// RecordKVSyncFailure implements KVSyncObserver. Bumps the failure counter and
+// records the error message for /local/status.
+func (d *Daemon) RecordKVSyncFailure(_ string, err error) {
+	d.kvSyncFailures.Add(1)
+	if err != nil {
+		d.lastKVSyncError.Store(err.Error())
+	}
+}
+
+// onNATSDisconnect runs when the NATS client loses its connection. Flips
+// natsConnected to false so Mode() reports standalone and scatter-gather
+// bailouts react immediately. Must not block — runs on a NATS client goroutine.
+func (d *Daemon) onNATSDisconnect(_ *nats.Conn, _ error) {
+	d.natsConnected.Store(false)
+}
+
+// onNATSReconnect runs when the NATS client reattaches to a server. Marks
+// NATS connected, bumps the retry counter, and dispatches reconcileOnHeal
+// in a goroutine to keep this NATS client callback non-blocking.
+func (d *Daemon) onNATSReconnect(_ *nats.Conn) {
+	d.natsConnected.Store(true)
+	d.natsRetryCount.Add(1)
+
+	go d.reconcileOnHeal("nats-reconnect")
+}
+
+// execCommand wraps exec.Command so tests can substitute a fake implementation.
+var execCommand = exec.Command
 
 // getSystemMemory returns the total system memory in GB
 func getSystemMemory() (float64, error) {
 	switch runtime.GOOS {
 	case "darwin":
 		// macOS: use sysctl
-		cmd := exec.Command("sysctl", "-n", "hw.memsize")
+		cmd := execCommand("sysctl", "-n", "hw.memsize")
 		output, err := cmd.Output()
 		if err != nil {
 			return 0, fmt.Errorf("failed to get system memory on macOS: %w", err)
@@ -196,7 +360,7 @@ func getSystemMemory() (float64, error) {
 
 	case "linux":
 		// Linux: read from /proc/meminfo
-		cmd := exec.Command("grep", "MemTotal", "/proc/meminfo")
+		cmd := execCommand("grep", "MemTotal", "/proc/meminfo")
 		output, err := cmd.Output()
 		if err != nil {
 			return 0, fmt.Errorf("failed to read /proc/meminfo: %w", err)
@@ -221,51 +385,117 @@ func getSystemMemory() (float64, error) {
 	}
 }
 
-// NewResourceManager creates a new resource manager with system capabilities.
-// Returns an error if system memory cannot be detected, since an incorrect
-// default would either under-provision (large servers) or over-commit (small devices).
-// Also returns an error if the host is too small to satisfy the daemon's
-// reserve — clamping silently would defeat the reserve and look like a
-// runtime bug.
-func NewResourceManager() (*ResourceManager, error) {
-	// Get system CPU cores
-	numCPU := runtime.NumCPU()
+// physicalCoreCount returns the number of physical CPU cores by parsing
+// distinct (physical id, core id) pairs from /proc/cpuinfo. Falls back to
+// runtime.NumCPU() on non-Linux or when topology fields are absent.
+func physicalCoreCount() int {
+	logical := runtime.NumCPU()
+	if runtime.GOOS != "linux" {
+		return logical
+	}
+	data, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		slog.Warn("physical core detection failed, scheduling against logical CPUs",
+			"err", err, "logicalCPU", logical)
+		return logical
+	}
+	if n, ok := parsePhysicalCores(data); ok {
+		return n
+	}
+	return logical
+}
 
-	// Get system memory (in GB)
+// parsePhysicalCores counts distinct (physical id, core id) pairs in
+// /proc/cpuinfo, collapsing SMT siblings. Returns ok=false when topology
+// fields are absent so the caller can fall back to the logical CPU count.
+func parsePhysicalCores(data []byte) (int, bool) {
+	cores := make(map[string]struct{})
+	var phys, core string
+	sawCore := false
+	flush := func() {
+		if core != "" {
+			cores[phys+":"+core] = struct{}{}
+		}
+		phys, core = "", ""
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if strings.TrimSpace(line) == "" {
+			flush()
+			continue
+		}
+		key, val, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "physical id":
+			phys = strings.TrimSpace(val)
+		case "core id":
+			core = strings.TrimSpace(val)
+			sawCore = true
+		}
+	}
+	flush()
+	if !sawCore || len(cores) == 0 {
+		return 0, false
+	}
+	return len(cores), true
+}
+
+// NewResourceManager creates a new ResourceManager. Errors if memory detection
+// fails or if the host is too small to satisfy the daemon's reserve.
+func NewResourceManager(gpuModels []instancetypes.GPUModel, migProfiles []instancetypes.MIGProfileSpec, gpuMgr *gpu.Manager) (*ResourceManager, error) {
+	// Use physical cores (not SMT threads); SPINIFEX_HOST_VCPU overrides.
+	hostVCPU := resolveHostVCPU(os.Getenv, physicalCoreCount())
+
 	totalMemGB, err := getSystemMemory()
 	if err != nil {
 		return nil, fmt.Errorf("detect system memory: %w", err)
 	}
 
-	reservedVCPU, reservedMem, err := applyHostReserve(defaultHostReserve, numCPU, totalMemGB)
+	reserve := resolveHostReserve(os.Getenv)
+	reservedVCPU, reservedMem, err := applyHostReserve(reserve, hostVCPU, totalMemGB)
 	if err != nil {
 		slog.Error("host below minimum reserve — daemon refuses to start",
-			"err", err, "hostVCPU", numCPU, "hostMemGB", totalMemGB,
-			"reserveVCPU", defaultHostReserve.vCPU, "reserveMemGB", defaultHostReserve.memGB)
+			"err", err, "hostVCPU", hostVCPU, "hostMemGB", totalMemGB,
+			"reserveVCPU", reserve.vCPU, "reserveMemGB", reserve.memGB)
 		return nil, fmt.Errorf("validate host reserve: %w", err)
 	}
 
-	// Determine architecture
 	arch := "x86_64"
 	if runtime.GOARCH == "arm64" {
 		arch = "arm64"
 	}
 
-	// Detect CPU generation and generate matching instance types
-	instanceTypes := instancetypes.DetectAndGenerate(instancetypes.HostCPU{}, arch)
+	instanceTypes := instancetypes.DetectAndGenerate(instancetypes.HostCPU{}, arch, gpuModels)
+	if len(migProfiles) > 0 {
+		maps.Copy(instanceTypes, instancetypes.GenerateMIGTypes(migProfiles, arch))
+	}
 
 	slog.Info("System resources detected",
-		"hostVCPU", numCPU, "hostMemGB", totalMemGB,
+		"hostVCPU", hostVCPU, "logicalCPU", runtime.NumCPU(), "hostMemGB", totalMemGB,
 		"reservedVCPU", reservedVCPU, "reservedMemGB", reservedMem,
-		"schedulableVCPU", numCPU-reservedVCPU, "schedulableMemGB", totalMemGB-reservedMem,
+		"schedulableVCPU", hostVCPU-reservedVCPU, "schedulableMemGB", totalMemGB-reservedMem,
 		"instanceTypes", len(instanceTypes))
 
+	var memReader func() (float64, bool)
+	if liveMemAdmissionEnabled(os.Getenv) {
+		memReader = readMemAvailableGB
+	}
+
+	nbdkitMainMiB, nbdkitAuxMiB := resolveNbdkitCharge(os.Getenv)
+
 	return &ResourceManager{
-		hostVCPU:      numCPU,
-		hostMemGB:     totalMemGB,
-		reservedVCPU:  reservedVCPU,
-		reservedMem:   reservedMem,
-		instanceTypes: instanceTypes,
+		hostVCPU:           hostVCPU,
+		hostMemGB:          totalMemGB,
+		reservedVCPU:       reservedVCPU,
+		reservedMem:        reservedMem,
+		nbdkitMainMiB:      nbdkitMainMiB,
+		nbdkitAuxMiB:       nbdkitAuxMiB,
+		instanceTypes:      instanceTypes,
+		gpuManager:         gpuMgr,
+		readMemAvailableGB: memReader,
+		reservations:       make(map[string]*capacityReservation),
 	}, nil
 }
 
@@ -283,6 +513,13 @@ func instanceTypeMemoryMiB(it *ec2.InstanceTypeInfo) int64 {
 		return *it.MemoryInfo.SizeInMiB
 	}
 	return 0
+}
+
+// instanceMemChargeMiB is the full per-instance memory charge: guest -m plus
+// nbdkit processes for its volumes. All admission gates use this value.
+func (rm *ResourceManager) instanceMemChargeMiB(it *ec2.InstanceTypeInfo) int64 {
+	return instanceTypeMemoryMiB(it) +
+		nbdkitChargeMiB(defaultMainVolumes, defaultAuxVolumes, rm.nbdkitMainMiB, rm.nbdkitAuxMiB)
 }
 
 // GetInstanceTypeInfos returns all instance types as ec2.InstanceTypeInfo for AWS API compatibility
@@ -321,11 +558,34 @@ func (rm *ResourceManager) GetAvailableInstanceTypeInfos(showCapacity bool) []*e
 			continue
 		}
 
+		// GPU types are capacity-gated by GPU pool size, not host CPU/memory.
+		// The GPU is the scarce resource; CPU/memory on GPU-class hardware is abundant.
+		if instancetypes.IsGPUType(it) {
+			availGPU := 0
+			if rm.gpuManager != nil {
+				availGPU = rm.gpuManager.Available()
+			}
+			gpusNeeded := instancetypes.GPUCountForType(name)
+			count := 0
+			if gpusNeeded > 0 {
+				count = availGPU / gpusNeeded
+			}
+			if showCapacity {
+				for range count {
+					infos = append(infos, it)
+				}
+			} else if count > 0 {
+				infos = append(infos, it)
+			}
+			continue
+		}
+
 		count := canAllocateCount(
-			rm.hostVCPU-rm.reservedVCPU, rm.allocatedVCPU,
-			rm.hostMemGB-rm.reservedMem, rm.allocatedMem,
-			vCPUs, memMiB,
+			rm.hostVCPU-rm.reservedVCPU-rm.reservedCRVCPU, rm.allocatedVCPU,
+			rm.hostMemGB-rm.reservedMem-rm.reservedCRMem, rm.allocatedMem,
+			vCPUs, rm.instanceMemChargeMiB(it),
 			1<<30, // effectively unlimited — let resources be the constraint
+			0, false,
 		)
 
 		if showCapacity {
@@ -340,32 +600,55 @@ func (rm *ResourceManager) GetAvailableInstanceTypeInfos(showCapacity bool) []*e
 	slog.Info("GetAvailableInstanceTypeInfos", "total_types", len(rm.instanceTypes), "total_available_slots", len(infos),
 		"hostVCPU", rm.hostVCPU, "hostMem", rm.hostMemGB,
 		"reservedVCPU", rm.reservedVCPU, "reservedMem", rm.reservedMem,
+		"reservedCRVCPU", rm.reservedCRVCPU, "reservedCRMem", rm.reservedCRMem,
 		"showCapacity", showCapacity)
 
 	return infos
 }
 
-// GetResourceStats returns current resource allocation stats for the node status response.
-// totalVCPU / totalMemGB are the raw host figures; reservedVCPU / reservedMemGB are
-// held back from guest scheduling. Per-type caps reflect host - reserved - allocated,
-// matching what the admission path will actually permit.
+// GetSupportedInstanceTypeInfos returns every supported instance type regardless
+// of current capacity, mirroring AWS DescribeInstanceTypes semantics. System
+// types and entries with incomplete metadata are skipped.
+func (rm *ResourceManager) GetSupportedInstanceTypeInfos() []*ec2.InstanceTypeInfo {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+
+	var infos []*ec2.InstanceTypeInfo
+	for name, it := range rm.instanceTypes {
+		if instancetypes.IsSystemType(name) {
+			continue
+		}
+		if instanceTypeVCPUs(it) == 0 || instanceTypeMemoryMiB(it) == 0 {
+			continue
+		}
+		infos = append(infos, it)
+	}
+
+	slog.Info("GetSupportedInstanceTypeInfos", "total_types", len(rm.instanceTypes), "supported", len(infos))
+	return infos
+}
+
+// GetResourceStats returns host resource figures, reservation, allocation, and
+// per-type capacity caps for the node status response.
 func (rm *ResourceManager) GetResourceStats() (totalVCPU int, totalMemGB float64, reservedVCPU int, reservedMemGB float64, allocVCPU int, allocMemGB float64, caps []types.InstanceTypeCap) {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 
 	totalVCPU = rm.hostVCPU
 	totalMemGB = rm.hostMemGB
-	reservedVCPU = rm.reservedVCPU
-	reservedMemGB = rm.reservedMem
+	// Fold the capacity-reservation carve-out into the reported reserve figures;
+	// Phase 1 has no separate status field for it.
+	reservedVCPU = rm.reservedVCPU + rm.reservedCRVCPU
+	reservedMemGB = rm.reservedMem + rm.reservedCRMem
 	allocVCPU = rm.allocatedVCPU
 	allocMemGB = rm.allocatedMem
 
-	remainingVCPU := rm.hostVCPU - rm.reservedVCPU - rm.allocatedVCPU
-	remainingMem := rm.hostMemGB - rm.reservedMem - rm.allocatedMem
+	remainingVCPU := rm.hostVCPU - reservedVCPU - rm.allocatedVCPU
+	remainingMem := rm.hostMemGB - reservedMemGB - rm.allocatedMem
 	if remainingVCPU < 0 || remainingMem < 0 {
 		slog.Error("schedulable capacity negative — reserve misconfigured or allocation drift",
-			"hostVCPU", rm.hostVCPU, "reservedVCPU", rm.reservedVCPU, "allocatedVCPU", rm.allocatedVCPU,
-			"hostMemGB", rm.hostMemGB, "reservedMem", rm.reservedMem, "allocatedMem", rm.allocatedMem,
+			"hostVCPU", rm.hostVCPU, "reservedVCPU", reservedVCPU, "allocatedVCPU", rm.allocatedVCPU,
+			"hostMemGB", rm.hostMemGB, "reservedMem", reservedMemGB, "allocatedMem", rm.allocatedMem,
 			"remainingVCPU", remainingVCPU, "remainingMem", remainingMem)
 	}
 
@@ -392,31 +675,59 @@ func NewDaemon(cfg *config.ClusterConfig) (*Daemon, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// If WalDir is not set, use BaseDir
-	config := cfg.Nodes[cfg.Node]
+	nodeCfg := cfg.Nodes[cfg.Node]
 	if cfg.Nodes[cfg.Node].WalDir == "" {
-		config.WalDir = config.BaseDir
-
-		cfg.Nodes[cfg.Node] = config
+		nodeCfg.WalDir = nodeCfg.BaseDir
+		cfg.Nodes[cfg.Node] = nodeCfg
 	}
 
-	rm, err := NewResourceManager()
+	// Phase 1: always probe GPU hardware (no side effects, no config required).
+	gpuProbe := probeGPU()
+
+	// Phase 2: activate GPU passthrough only when the operator has opted in.
+	var gpuModels []instancetypes.GPUModel
+	var gpuMigProfiles []instancetypes.MIGProfileSpec
+	var gpuMgr *gpu.Manager
+	if nodeCfg.Daemon.GPUPassthrough {
+		if !gpuProbe.Capable {
+			slog.Warn("GPU passthrough enabled in config but prerequisites not met",
+				"iommu", gpuProbe.IOMMUActive, "vfio", gpuProbe.VFIOPresent,
+				"gpus", len(gpuProbe.Devices))
+		} else {
+			gpuMgr, gpuModels, gpuMigProfiles = buildGPUPool(gpuProbe.Devices, nodeCfg.Daemon)
+		}
+	} else if gpuProbe.Capable {
+		slog.Info("GPU hardware detected, passthrough not enabled",
+			"gpus", len(gpuProbe.Devices), "hint", "run 'spx admin gpu enable' to activate")
+	}
+
+	rm, err := NewResourceManager(gpuModels, gpuMigProfiles, gpuMgr)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("initialize resource manager: %w", err)
 	}
 
-	return &Daemon{
-		node:              cfg.Node,
-		clusterConfig:     cfg,
-		config:            &config,
-		resourceMgr:       rm,
-		ctx:               ctx,
-		cancel:            cancel,
-		Instances:         vm.Instances{VMS: make(map[string]*vm.VM)},
-		natsSubscriptions: make(map[string]*nats.Subscription),
-		startTime:         time.Now(),
-		detachDelay:       1 * time.Second,
-	}, nil
+	d := &Daemon{
+		node:               cfg.Node,
+		clusterConfig:      cfg,
+		config:             &nodeCfg,
+		resourceMgr:        rm,
+		gpuProbe:           gpuProbe,
+		gpuManager:         gpuMgr,
+		ctx:                ctx,
+		cancel:             cancel,
+		vmMgr:              vm.NewManager(),
+		natsSubscriptions:  make(map[string]*nats.Subscription),
+		startTime:          time.Now(),
+		detachDelay:        1 * time.Second,
+		requireNATSTimeout: 30 * time.Second,
+		exitFunc:           os.Exit,
+	}
+	// Initialise peersReachable true so the first probe tick never fires a
+	// spurious reconcileOnHeal at startup. Mode() still requires natsConnected
+	// (starts false), so this can't falsely report cluster mode.
+	d.peersReachable.Store(true)
+	return d, nil
 }
 
 // natsSub defines a single NATS subscription entry for the table-driven setup.
@@ -435,6 +746,7 @@ func (d *Daemon) subscribeAll() error {
 		{"ec2.DeleteKeyPair", d.handleEC2DeleteKeyPair, "spinifex-workers"},
 		{"ec2.DescribeKeyPairs", d.handleEC2DescribeKeyPairs, "spinifex-workers"},
 		{"ec2.ImportKeyPair", d.handleEC2ImportKeyPair, "spinifex-workers"},
+		{"imds.ec2.get_public_key", d.handleIMDSGetPublicKey, "spinifex-workers"},
 		{"ec2.DescribeImages", d.handleEC2DescribeImages, "spinifex-workers"},
 		{"ec2.CreateImage", d.handleEC2CreateImage, ""},
 		{"ec2.DeregisterImage", d.handleEC2DeregisterImage, "spinifex-workers"},
@@ -473,6 +785,11 @@ func (d *Daemon) subscribeAll() error {
 		{"ec2.RemoveInstanceFromPlacementGroup", d.handleEC2RemoveInstanceFromPlacementGroup, "spinifex-workers"},
 		{"ec2.ReserveClusterNode", d.handleEC2ReserveClusterNode, "spinifex-workers"},
 		{"ec2.FinalizeClusterInstances", d.handleEC2FinalizeClusterInstances, "spinifex-workers"},
+		// Capacity reservations: Create is node-targeted (gateway pins one node);
+		// Describe fans out and Cancel broadcasts, so both use plain Subscribe.
+		{fmt.Sprintf("ec2.CreateCapacityReservation.%s", d.node), d.handleEC2CreateCapacityReservation, ""},
+		{"ec2.DescribeCapacityReservations", d.handleEC2DescribeCapacityReservations, ""},
+		{"ec2.CancelCapacityReservation", d.handleEC2CancelCapacityReservation, ""},
 		{"ec2.CreateNatGateway", d.handleEC2CreateNatGateway, "spinifex-workers"},
 		{"ec2.DeleteNatGateway", d.handleEC2DeleteNatGateway, "spinifex-workers"},
 		{"ec2.DescribeNatGateways", d.handleEC2DescribeNatGateways, "spinifex-workers"},
@@ -501,45 +818,36 @@ func (d *Daemon) subscribeAll() error {
 		{"ec2.CreateSecurityGroup", d.handleEC2CreateSecurityGroup, "spinifex-workers"},
 		{"ec2.DeleteSecurityGroup", d.handleEC2DeleteSecurityGroup, "spinifex-workers"},
 		{"ec2.DescribeSecurityGroups", d.handleEC2DescribeSecurityGroups, "spinifex-workers"},
+		{"ec2.DescribeSecurityGroupRules", d.handleEC2DescribeSecurityGroupRules, "spinifex-workers"},
 		{"ec2.AuthorizeSecurityGroupIngress", d.handleEC2AuthorizeSecurityGroupIngress, "spinifex-workers"},
 		{"ec2.AuthorizeSecurityGroupEgress", d.handleEC2AuthorizeSecurityGroupEgress, "spinifex-workers"},
 		{"ec2.RevokeSecurityGroupIngress", d.handleEC2RevokeSecurityGroupIngress, "spinifex-workers"},
 		{"ec2.RevokeSecurityGroupEgress", d.handleEC2RevokeSecurityGroupEgress, "spinifex-workers"},
 		{"ec2.ModifyInstanceAttribute", d.handleEC2ModifyInstanceAttribute, "spinifex-workers"},
-		{"ec2.DescribeInstanceAttribute", d.handleEC2DescribeInstanceAttribute, "spinifex-workers"},
 		{"ec2.start", d.handleEC2StartStoppedInstance, "spinifex-workers"},
+		{fmt.Sprintf("ec2.start.%s", d.node), d.handleEC2StartStoppedInstanceDirect, ""},
 		{"ec2.terminate", d.handleEC2TerminateStoppedInstance, "spinifex-workers"},
 		{"ec2.DescribeStoppedInstances", d.handleEC2DescribeStoppedInstances, "spinifex-workers"},
 		{"ec2.DescribeTerminatedInstances", d.handleEC2DescribeTerminatedInstances, "spinifex-workers"},
-		// these 2 fan out to all nodes and gateway aggregates the results
+		// these fan out to all nodes and gateway aggregates the results. The
+		// handler only sees per-daemon local state (vmMgr/stoppedStore), so
+		// any queue-grouped routing produces 1/N false NotFound responses.
 		{"ec2.DescribeInstances", d.handleEC2DescribeInstances, ""},
+		{"ec2.DescribeInstanceStatus", d.handleEC2DescribeInstanceStatus, ""},
 		{"ec2.DescribeInstanceTypes", d.handleEC2DescribeInstanceTypes, ""},
+		{"ec2.DescribeInstanceAttribute", d.handleEC2DescribeInstanceAttribute, ""},
+		// IAM instance profile associations: Disassociate/Replace mutate the
+		// owning daemon's vm.VM (non-owners NoOp with Found=false); Describe
+		// returns per-daemon matches that the gateway concatenates.
+		{"ec2.IamProfileAssociation.disassociate", d.handleIamProfileDisassociate, ""},
+		{"ec2.IamProfileAssociation.replace", d.handleIamProfileReplace, ""},
+		{"ec2.IamProfileAssociation.describe", d.handleIamProfileDescribe, ""},
 		{"ec2.EnableEbsEncryptionByDefault", d.handleEC2EnableEbsEncryptionByDefault, "spinifex-workers"},
 		{"ec2.DisableEbsEncryptionByDefault", d.handleEC2DisableEbsEncryptionByDefault, "spinifex-workers"},
 		{"ec2.GetEbsEncryptionByDefault", d.handleEC2GetEbsEncryptionByDefault, "spinifex-workers"},
 		{"ec2.GetSerialConsoleAccessStatus", d.handleEC2GetSerialConsoleAccessStatus, "spinifex-workers"},
 		{"ec2.EnableSerialConsoleAccess", d.handleEC2EnableSerialConsoleAccess, "spinifex-workers"},
 		{"ec2.DisableSerialConsoleAccess", d.handleEC2DisableSerialConsoleAccess, "spinifex-workers"},
-		// ELBv2 operations
-		{"elbv2.CreateLoadBalancer", d.handleELBv2CreateLoadBalancer, "spinifex-workers"},
-		{"elbv2.DeleteLoadBalancer", d.handleELBv2DeleteLoadBalancer, "spinifex-workers"},
-		{"elbv2.DescribeLoadBalancers", d.handleELBv2DescribeLoadBalancers, "spinifex-workers"},
-		{"elbv2.CreateTargetGroup", d.handleELBv2CreateTargetGroup, "spinifex-workers"},
-		{"elbv2.DeleteTargetGroup", d.handleELBv2DeleteTargetGroup, "spinifex-workers"},
-		{"elbv2.DescribeTargetGroups", d.handleELBv2DescribeTargetGroups, "spinifex-workers"},
-		{"elbv2.RegisterTargets", d.handleELBv2RegisterTargets, "spinifex-workers"},
-		{"elbv2.DeregisterTargets", d.handleELBv2DeregisterTargets, "spinifex-workers"},
-		{"elbv2.DescribeTargetHealth", d.handleELBv2DescribeTargetHealth, "spinifex-workers"},
-		{"elbv2.CreateListener", d.handleELBv2CreateListener, "spinifex-workers"},
-		{"elbv2.DeleteListener", d.handleELBv2DeleteListener, "spinifex-workers"},
-		{"elbv2.DescribeListeners", d.handleELBv2DescribeListeners, "spinifex-workers"},
-		{"elbv2.DescribeTags", d.handleELBv2DescribeTags, "spinifex-workers"},
-		{"elbv2.LBAgentHeartbeat", d.handleELBv2LBAgentHeartbeat, "spinifex-workers"},
-		{"elbv2.GetLBConfig", d.handleELBv2GetLBConfig, "spinifex-workers"},
-		{"elbv2.ModifyTargetGroupAttributes", d.handleELBv2ModifyTargetGroupAttributes, "spinifex-workers"},
-		{"elbv2.DescribeTargetGroupAttributes", d.handleELBv2DescribeTargetGroupAttributes, "spinifex-workers"},
-		{"elbv2.ModifyLoadBalancerAttributes", d.handleELBv2ModifyLoadBalancerAttributes, "spinifex-workers"},
-		{"elbv2.DescribeLoadBalancerAttributes", d.handleELBv2DescribeLoadBalancerAttributes, "spinifex-workers"},
 		{fmt.Sprintf("spinifex.admin.%s.health", d.node), d.handleHealthCheck, ""},
 		{"spinifex.nodes.discover", d.handleNodeDiscover, ""},
 		{"spinifex.node.status", d.handleNodeStatus, ""},
@@ -553,6 +861,133 @@ func (d *Daemon) subscribeAll() error {
 		{"spinifex.cluster.shutdown.storage", d.handleShutdownStorage, ""},
 		{"spinifex.cluster.shutdown.persist", d.handleShutdownPersist, ""},
 		{"spinifex.cluster.shutdown.infra", d.handleShutdownInfra, ""},
+	}
+
+	// ELBv2 operations require a resolved gateway URL.
+	// Without a subscriber the gateway returns nats.ErrNoResponders → ServiceUnavailable.
+	if d.elbv2Service.GatewayURL != "" {
+		subs = append(subs,
+			natsSub{"elbv2.CreateLoadBalancer", d.handleELBv2CreateLoadBalancer, "spinifex-workers"},
+			natsSub{"elbv2.DeleteLoadBalancer", d.handleELBv2DeleteLoadBalancer, "spinifex-workers"},
+			natsSub{"elbv2.DescribeLoadBalancers", d.handleELBv2DescribeLoadBalancers, "spinifex-workers"},
+			natsSub{"elbv2.CreateTargetGroup", d.handleELBv2CreateTargetGroup, "spinifex-workers"},
+			natsSub{"elbv2.ModifyTargetGroup", d.handleELBv2ModifyTargetGroup, "spinifex-workers"},
+			natsSub{"elbv2.DeleteTargetGroup", d.handleELBv2DeleteTargetGroup, "spinifex-workers"},
+			natsSub{"elbv2.DescribeTargetGroups", d.handleELBv2DescribeTargetGroups, "spinifex-workers"},
+			natsSub{"elbv2.RegisterTargets", d.handleELBv2RegisterTargets, "spinifex-workers"},
+			natsSub{"elbv2.DeregisterTargets", d.handleELBv2DeregisterTargets, "spinifex-workers"},
+			natsSub{"elbv2.DescribeTargetHealth", d.handleELBv2DescribeTargetHealth, "spinifex-workers"},
+			natsSub{"elbv2.CreateListener", d.handleELBv2CreateListener, "spinifex-workers"},
+			natsSub{"elbv2.DeleteListener", d.handleELBv2DeleteListener, "spinifex-workers"},
+			natsSub{"elbv2.ModifyListener", d.handleELBv2ModifyListener, "spinifex-workers"},
+			natsSub{"elbv2.DescribeListeners", d.handleELBv2DescribeListeners, "spinifex-workers"},
+			natsSub{"elbv2.CreateRule", d.handleELBv2CreateRule, "spinifex-workers"},
+			natsSub{"elbv2.ModifyRule", d.handleELBv2ModifyRule, "spinifex-workers"},
+			natsSub{"elbv2.DeleteRule", d.handleELBv2DeleteRule, "spinifex-workers"},
+			natsSub{"elbv2.DescribeRules", d.handleELBv2DescribeRules, "spinifex-workers"},
+			natsSub{"elbv2.SetRulePriorities", d.handleELBv2SetRulePriorities, "spinifex-workers"},
+			natsSub{"elbv2.DescribeTags", d.handleELBv2DescribeTags, "spinifex-workers"},
+			natsSub{"elbv2.AddTags", d.handleELBv2AddTags, "spinifex-workers"},
+			natsSub{"elbv2.RemoveTags", d.handleELBv2RemoveTags, "spinifex-workers"},
+			natsSub{"elbv2.LBAgentHeartbeat", d.handleELBv2LBAgentHeartbeat, "spinifex-workers"},
+			natsSub{"elbv2.GetLBConfig", d.handleELBv2GetLBConfig, "spinifex-workers"},
+			natsSub{"elbv2.ModifyTargetGroupAttributes", d.handleELBv2ModifyTargetGroupAttributes, "spinifex-workers"},
+			natsSub{"elbv2.DescribeTargetGroupAttributes", d.handleELBv2DescribeTargetGroupAttributes, "spinifex-workers"},
+			natsSub{"elbv2.ModifyLoadBalancerAttributes", d.handleELBv2ModifyLoadBalancerAttributes, "spinifex-workers"},
+			natsSub{"elbv2.DescribeLoadBalancerAttributes", d.handleELBv2DescribeLoadBalancerAttributes, "spinifex-workers"},
+			natsSub{"elbv2.SetSecurityGroups", d.handleELBv2SetSecurityGroups, "spinifex-workers"},
+			natsSub{"elbv2.SetIpAddressType", d.handleELBv2SetIpAddressType, "spinifex-workers"},
+			natsSub{"elbv2.SetSubnets", d.handleELBv2SetSubnets, "spinifex-workers"},
+			natsSub{"elbv2.AddListenerCertificates", d.handleELBv2AddListenerCertificates, "spinifex-workers"},
+			natsSub{"elbv2.RemoveListenerCertificates", d.handleELBv2RemoveListenerCertificates, "spinifex-workers"},
+			natsSub{"elbv2.DescribeListenerCertificates", d.handleELBv2DescribeListenerCertificates, "spinifex-workers"},
+			natsSub{"elbv2.DescribeSSLPolicies", d.handleELBv2DescribeSSLPolicies, "spinifex-workers"},
+		)
+	}
+
+	// EKS gateway → daemon subscriptions. Every handler currently returns
+	// NotImplemented; topics are subscribed up-front so the wiring layer is
+	// stable while real bodies land.
+	if d.eksService != nil {
+		subs = append(subs,
+			natsSub{"eks.CreateCluster", d.handleEKSCreateCluster, "spinifex-workers"},
+			natsSub{"eks.DescribeCluster", d.handleEKSDescribeCluster, "spinifex-workers"},
+			natsSub{"eks.ListClusters", d.handleEKSListClusters, "spinifex-workers"},
+			natsSub{"eks.UpdateClusterConfig", d.handleEKSUpdateClusterConfig, "spinifex-workers"},
+			natsSub{"eks.UpdateClusterVersion", d.handleEKSUpdateClusterVersion, "spinifex-workers"},
+			natsSub{"eks.DeleteCluster", d.handleEKSDeleteCluster, "spinifex-workers"},
+			natsSub{"eks.CreateNodegroup", d.handleEKSCreateNodegroup, "spinifex-workers"},
+			natsSub{"eks.DescribeNodegroup", d.handleEKSDescribeNodegroup, "spinifex-workers"},
+			natsSub{"eks.ListNodegroups", d.handleEKSListNodegroups, "spinifex-workers"},
+			natsSub{"eks.UpdateNodegroupConfig", d.handleEKSUpdateNodegroupConfig, "spinifex-workers"},
+			natsSub{"eks.UpdateNodegroupVersion", d.handleEKSUpdateNodegroupVersion, "spinifex-workers"},
+			natsSub{"eks.DeleteNodegroup", d.handleEKSDeleteNodegroup, "spinifex-workers"},
+			natsSub{"eks.CreateAccessEntry", d.handleEKSCreateAccessEntry, "spinifex-workers"},
+			natsSub{"eks.DescribeAccessEntry", d.handleEKSDescribeAccessEntry, "spinifex-workers"},
+			natsSub{"eks.ListAccessEntries", d.handleEKSListAccessEntries, "spinifex-workers"},
+			natsSub{"eks.UpdateAccessEntry", d.handleEKSUpdateAccessEntry, "spinifex-workers"},
+			natsSub{"eks.DeleteAccessEntry", d.handleEKSDeleteAccessEntry, "spinifex-workers"},
+			natsSub{"eks.AssociateAccessPolicy", d.handleEKSAssociateAccessPolicy, "spinifex-workers"},
+			natsSub{"eks.DisassociateAccessPolicy", d.handleEKSDisassociateAccessPolicy, "spinifex-workers"},
+			natsSub{"eks.ListAssociatedAccessPolicies", d.handleEKSListAssociatedAccessPolicies, "spinifex-workers"},
+			natsSub{"eks.ListAccessPolicies", d.handleEKSListAccessPolicies, "spinifex-workers"},
+			natsSub{"eks.ListAddons", d.handleEKSListAddons, "spinifex-workers"},
+			natsSub{"eks.DescribeAddonVersions", d.handleEKSDescribeAddonVersions, "spinifex-workers"},
+			natsSub{"eks.CreateAddon", d.handleEKSCreateAddon, "spinifex-workers"},
+			natsSub{"eks.DeleteAddon", d.handleEKSDeleteAddon, "spinifex-workers"},
+			natsSub{"eks.DescribeAddon", d.handleEKSDescribeAddon, "spinifex-workers"},
+			natsSub{"eks.UpdateAddon", d.handleEKSUpdateAddon, "spinifex-workers"},
+			natsSub{"eks.ListStagedAddonManifests", d.handleEKSListStagedAddonManifests, "spinifex-workers"},
+			natsSub{"eks.AssociateIdentityProviderConfig", d.handleEKSAssociateIdentityProviderConfig, "spinifex-workers"},
+			natsSub{"eks.DescribeIdentityProviderConfig", d.handleEKSDescribeIdentityProviderConfig, "spinifex-workers"},
+			natsSub{"eks.ListIdentityProviderConfigs", d.handleEKSListIdentityProviderConfigs, "spinifex-workers"},
+			natsSub{"eks.DisassociateIdentityProviderConfig", d.handleEKSDisassociateIdentityProviderConfig, "spinifex-workers"},
+			natsSub{"eks.TagResource", d.handleEKSTagResource, "spinifex-workers"},
+			natsSub{"eks.UntagResource", d.handleEKSUntagResource, "spinifex-workers"},
+			natsSub{"eks.ListTagsForResource", d.handleEKSListTagsForResource, "spinifex-workers"},
+		)
+	}
+
+	// ACM gateway → daemon subscriptions (minimal certificate store).
+	if d.acmService != nil {
+		subs = append(subs,
+			natsSub{"acm.ImportCertificate", d.handleACMImportCertificate, "spinifex-workers"},
+			natsSub{"acm.DescribeCertificate", d.handleACMDescribeCertificate, "spinifex-workers"},
+			natsSub{"acm.ListCertificates", d.handleACMListCertificates, "spinifex-workers"},
+			natsSub{"acm.DeleteCertificate", d.handleACMDeleteCertificate, "spinifex-workers"},
+			natsSub{"acm.ListTagsForCertificate", d.handleACMListTagsForCertificate, "spinifex-workers"},
+			natsSub{"acm.AddTagsToCertificate", d.handleACMAddTagsToCertificate, "spinifex-workers"},
+			natsSub{"acm.RemoveTagsFromCertificate", d.handleACMRemoveTagsFromCertificate, "spinifex-workers"},
+		)
+	}
+
+	// ECR gateway → daemon subscriptions. The daemon owns the per-account
+	// JetStream KV metadata; blob/manifest bytes never traverse these subjects.
+	if d.ecrMetaService != nil {
+		subs = append(subs,
+			natsSub{handlers_ecr.SubjectRepoCreate, d.handleECRRepoCreate, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectRepoDescribe, d.handleECRRepoDescribe, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectRepoList, d.handleECRRepoList, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectRepoDelete, d.handleECRRepoDelete, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectPolicyPut, d.handleECRPolicyPut, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectPolicyGet, d.handleECRPolicyGet, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectPolicyDelete, d.handleECRPolicyDelete, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectLifecyclePut, d.handleECRLifecyclePut, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectLifecycleGet, d.handleECRLifecycleGet, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectLifecycleDelete, d.handleECRLifecycleDelete, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectTagPut, d.handleECRTagPut, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectTagGet, d.handleECRTagGet, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectTagList, d.handleECRTagList, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectTagDelete, d.handleECRTagDelete, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectManifestPut, d.handleECRManifestPut, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectManifestDescribe, d.handleECRManifestDescribe, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectManifestList, d.handleECRManifestList, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectManifestDelete, d.handleECRManifestDelete, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectUploadCreate, d.handleECRUploadCreate, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectUploadGet, d.handleECRUploadGet, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectUploadUpdate, d.handleECRUploadUpdate, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectUploadDelete, d.handleECRUploadDelete, "spinifex-workers"},
+		)
 	}
 
 	// EIP operations require external IPAM (pool mode). Only subscribe when available;
@@ -585,20 +1020,170 @@ func (d *Daemon) subscribeAll() error {
 	return nil
 }
 
-// Start initializes and starts the daemon
+// Start bootstraps the daemon in two phases (DDIL Tier 1): startLocal brings
+// up HTTPS + local state without NATS, then startCluster retries NATS
+// indefinitely and joins the cluster once connected.
 func (d *Daemon) Start() error {
-	if err := d.connectNATS(); err != nil {
-		return fmt.Errorf("failed to connect to NATS: %w", err)
+	if err := d.startLocal(); err != nil {
+		return err
 	}
 
-	// ClusterManager must start before JetStream init so peers can reach
-	// /health during bootstrap.
+	d.setupShutdown()
+
+	d.shutdownWg.Go(func() {
+		if err := d.startCluster(); err != nil {
+			slog.Warn("Cluster bootstrap aborted", "err", err)
+		}
+	})
+
+	d.awaitShutdown()
+	return nil
+}
+
+// startLocal performs the no-NATS bootstrap. Failures here are fatal (local
+// config errors that retry cannot fix). The daemon is reachable via /local/*
+// and /health once this returns.
+//
+// DDIL §1e-audit: no JetStream KV must be touched here. All KV buckets are
+// initialised in startCluster. assertNoClusterServicesInitialised enforces this.
+func (d *Daemon) startLocal() error {
+	// ClusterManager serves /health and /local/* over HTTPS. NATS-independent.
 	if err := d.ClusterManager(); err != nil {
 		return fmt.Errorf("failed to start cluster manager: %w", err)
 	}
 
+	// Detect management bridge for system instance control plane NICs.
+	mgmtBridge := "br-mgmt"
+	if d.config.Daemon.MgmtBridge != "" {
+		mgmtBridge = d.config.Daemon.MgmtBridge
+	}
+	bridgeIP, bridgeErr := host.GetBridgeIPv4(mgmtBridge)
+	if bridgeErr != nil {
+		slog.Warn("Management bridge not detected, system instances will not get mgmt NIC", "bridge", mgmtBridge, "err", bridgeErr)
+	} else if bridgeIP == "" {
+		slog.Warn("Management bridge not found, system instances will not get mgmt NIC", "bridge", mgmtBridge)
+	} else {
+		d.mgmtBridgeIP = bridgeIP
+		alloc, allocErr := NewMgmtIPAllocator(bridgeIP)
+		if allocErr != nil {
+			slog.Error("Failed to create mgmt IP allocator", "bridgeIP", bridgeIP, "err", allocErr)
+		} else {
+			d.mgmtIPAllocator = alloc
+			slog.Info("Management bridge detected", "bridge", mgmtBridge, "ip", bridgeIP)
+		}
+	}
+
+	// Initialise OVS network plumber (no NATS dep).
+	if d.networkPlumber == nil {
+		d.networkPlumber = host.NewOVSPlumber()
+	}
+
+	// Protect daemon from OOM killer (prefer killing QEMU VMs instead).
+	if err := utils.SetOOMScore(os.Getpid(), -500); err != nil {
+		slog.Warn("Failed to set daemon OOM score", "err", err)
+	}
+
+	// Recover local instance state from disk. Fatal on corruption — orphaned VMs.
+	if err := d.LoadState(); err != nil {
+		return fmt.Errorf("load local instance state: %w", err)
+	}
+	slog.Info("Loaded local instance state", "instance count", d.vmMgr.Count())
+
+	// Rebuild mgmt IP allocator from restored VMs.
+	if d.mgmtIPAllocator != nil {
+		d.mgmtIPAllocator.Rebuild(d.vmMgr.SnapshotMap())
+		slog.Info("Rebuilt mgmt IP allocator from restored instances", "allocated", d.mgmtIPAllocator.AllocatedCount())
+	}
+
+	if err := d.assertNoClusterServicesInitialised(); err != nil {
+		return fmt.Errorf("startLocal Tier 1 invariant violated: %w", err)
+	}
+
+	// Peer-health probe is NATS-independent (dials /health directly) and must
+	// start here so Mode() can detect partitions even if NATS never connects.
+	d.shutdownWg.Go(d.monitorPeerReachability)
+
+	d.ready.Store(true)
+	slog.Info("Daemon local-bootstrap complete", "node", d.node, "elapsed", time.Since(d.startTime).Round(time.Second))
+	return nil
+}
+
+// assertNoClusterServicesInitialised enforces the DDIL §1e-audit invariant:
+// no NATS-dependent handle may exist at the end of startLocal.
+func (d *Daemon) assertNoClusterServicesInitialised() error {
+	switch {
+	case d.natsConn != nil:
+		return errors.New("d.natsConn must be nil before startCluster")
+	case d.jsManager != nil:
+		return errors.New("d.jsManager must be nil before startCluster")
+	case d.instanceService != nil:
+		return errors.New("d.instanceService must be nil before startCluster")
+	case d.imageService != nil:
+		return errors.New("d.imageService must be nil before startCluster")
+	case d.snapshotService != nil:
+		return errors.New("d.snapshotService must be nil before startCluster")
+	case d.volumeService != nil:
+		return errors.New("d.volumeService must be nil before startCluster")
+	case d.eigwService != nil:
+		return errors.New("d.eigwService must be nil before startCluster")
+	case d.igwService != nil:
+		return errors.New("d.igwService must be nil before startCluster")
+	case d.placementGroupService != nil:
+		return errors.New("d.placementGroupService must be nil before startCluster")
+	case d.vpcService != nil:
+		return errors.New("d.vpcService must be nil before startCluster")
+	case d.routeTableService != nil:
+		return errors.New("d.routeTableService must be nil before startCluster")
+	case d.natGatewayService != nil:
+		return errors.New("d.natGatewayService must be nil before startCluster")
+	case d.externalIPAM != nil:
+		return errors.New("d.externalIPAM must be nil before startCluster")
+	case d.eipService != nil:
+		return errors.New("d.eipService must be nil before startCluster")
+	case d.accountService != nil:
+		return errors.New("d.accountService must be nil before startCluster")
+	case d.elbv2Service != nil:
+		return errors.New("d.elbv2Service must be nil before startCluster")
+	case d.eksService != nil:
+		return errors.New("d.eksService must be nil before startCluster")
+	}
+	return nil
+}
+
+// startCluster retries NATS indefinitely and initialises all cluster-scoped
+// services. Errors are logged, not fatal. All JetStream KV buckets (DDIL
+// §1e-audit) must be initialised here, never in startLocal.
+func (d *Daemon) startCluster() error {
+	if os.Getenv("SPINIFEX_REQUIRE_NATS") == "1" {
+		// §1d-strict opt-in: bounded first connect, abort on timeout. Restores
+		// the pre-DDIL fail-fast UX for dev/test/single-node deploys without
+		// flipping the prod default (which would re-introduce the SPOF that 1d
+		// removed).
+		if err := d.connectNATS(utils.WithMaxWait(d.requireNATSTimeout)); err != nil {
+			slog.Error("SPINIFEX_REQUIRE_NATS=1 set, NATS connect failed within 30s, aborting", "err", err, "timeout", d.requireNATSTimeout)
+			d.exitFunc(1)
+			return fmt.Errorf("connect NATS (strict): %w", err)
+		}
+	} else if err := d.connectNATS(); err != nil {
+		return fmt.Errorf("connect NATS: %w", err)
+	}
+
 	if err := d.initJetStream(); err != nil {
-		return fmt.Errorf("failed to initialize JetStream: %w", err)
+		return fmt.Errorf("initialize JetStream: %w", err)
+	}
+
+	// Remove the obsolete spinifex-dhcp-leases bucket (idempotent).
+	if js, jsErr := d.natsConn.JetStream(); jsErr == nil {
+		if err := utils.DeleteKVBucketIfExists(js, "spinifex-dhcp-leases"); err != nil {
+			slog.Warn("Failed to delete obsolete spinifex-dhcp-leases KV bucket", "err", err)
+		}
+	}
+
+	// Enable OVN native IPsec when configured (idempotent).
+	if d.clusterConfig != nil && d.clusterConfig.Network.IPSecEnabled {
+		if err := host.EnableOVNIPSec(d.configPath, d.clusterConfig); err != nil {
+			slog.Warn("Failed to enable OVN native IPsec; intra-AZ Geneve will be plaintext", "err", err)
+		}
 	}
 
 	// Write service manifest so other nodes know what this node runs
@@ -615,7 +1200,7 @@ func (d *Daemon) Start() error {
 
 	// Create services before loading/launching instances, since LaunchInstance depends on them
 	store := objectstore.NewS3ObjectStoreFromConfig(admin.DialTarget(d.config.Predastore.Host), d.config.Predastore.Region, d.config.Predastore.AccessKey, d.config.Predastore.SecretKey)
-	d.instanceService = handlers_ec2_instance.NewInstanceServiceImpl(d.config, d.resourceMgr.instanceTypes, d.natsConn, &d.Instances, store)
+	d.instanceService = handlers_ec2_instance.NewInstanceServiceImpl(d.config, d.resourceMgr.instanceTypes, d.natsConn, store, d.vmMgr, d.resourceMgr, d.jsManager)
 	d.keyService = handlers_ec2_key.NewKeyServiceImpl(d.config)
 	d.imageService = handlers_ec2_image.NewImageServiceImpl(d.config, d.natsConn)
 
@@ -663,12 +1248,24 @@ func (d *Daemon) Start() error {
 		return fmt.Errorf("failed to initialize VPC service: %w", err)
 	}
 
+	// Wire eni-by-vpc-ip reverse index for IMDS source-IP→ENI lookup.
+	if vpcJS, jsErr := d.natsConn.JetStream(); jsErr != nil {
+		slog.Warn("Failed to get JetStream for eni-by-ip index", "err", jsErr)
+	} else if eniByIPKV, kvErr := handlers_imds.InitENIByIPBucket(vpcJS, 1); kvErr != nil {
+		slog.Warn("Failed to init eni-by-ip index bucket", "err", kvErr)
+	} else {
+		d.vpcService.SetENIByIPIndex(handlers_ec2_vpc.NewENIByIPIndex(eniByIPKV))
+	}
+
 	d.routeTableService, err = initServiceWithRetry("RouteTable service", func() (*handlers_ec2_routetable.RouteTableServiceImpl, error) {
 		return handlers_ec2_routetable.NewRouteTableServiceImplWithNATS(d.config, d.natsConn)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize RouteTable service: %w", err)
 	}
+
+	// Wire IGW attach/detach to RT-aware per-subnet egress gate fan-out.
+	d.igwService.SetGatePublisher(d.routeTableService)
 
 	d.natGatewayService, err = initServiceWithRetry("NatGateway service", func() (*handlers_ec2_natgw.NatGatewayServiceImpl, error) {
 		return handlers_ec2_natgw.NewNatGatewayServiceImplWithNATS(d.natsConn)
@@ -677,27 +1274,19 @@ func (d *Daemon) Start() error {
 		return fmt.Errorf("failed to initialize NatGateway service: %w", err)
 	}
 
-	// Initialize external IPAM if pool mode is configured (per-VM public IPs).
-	// NAT mode only uses SNAT via a shared gateway IP — no per-VM allocation needed.
+	// Initialize external IPAM for pool mode (per-VM public IPs).
 	if d.clusterConfig != nil && d.clusterConfig.Network.ExternalMode == "pool" {
 		js, jsErr := d.natsConn.JetStream()
 		if jsErr != nil {
 			slog.Warn("Failed to get JetStream for external IPAM", "err", jsErr)
 		} else {
 			var pools []handlers_ec2_vpc.ExternalPoolConfig
-			// Resolve DHCP bind bridge name for DHCP pools (where AF_PACKET binds).
-			dhcpBindBridge := ""
-			if node, ok := d.clusterConfig.Nodes[d.clusterConfig.Node]; ok {
-				dhcpBindBridge = node.VPCD.DhcpBindBridge
-			}
-			gwMAC := ""
-			if d.clusterConfig.Bootstrap.VpcId != "" {
-				gwMAC = utils.HashMAC("gw-" + d.clusterConfig.Bootstrap.VpcId)
-			}
+			anyDHCP := false
 			for _, p := range d.clusterConfig.Network.ExternalPools {
 				pools = append(pools, handlers_ec2_vpc.ExternalPoolConfig{
 					Name:            p.Name,
 					Source:          p.Source,
+					BindBridge:      p.BindBridge,
 					RangeStart:      p.RangeStart,
 					RangeEnd:        p.RangeEnd,
 					Gateway:         p.Gateway,
@@ -705,17 +1294,24 @@ func (d *Daemon) Start() error {
 					PrefixLen:       p.PrefixLen,
 					Region:          p.Region,
 					AZ:              p.AZ,
-					DhcpBindBridge:  dhcpBindBridge,
-					GatewayMAC:      gwMAC,
 					GwLrpRangeStart: p.GwLrpRangeStart,
 					GwLrpRangeEnd:   p.GwLrpRangeEnd,
 				})
+				if p.Source == "dhcp" {
+					anyDHCP = true
+				}
 			}
-			d.externalIPAM, err = handlers_ec2_vpc.NewExternalIPAM(d.natsConn, js, pools)
+			d.externalIPAM, err = handlers_ec2_vpc.NewExternalIPAM(js, pools)
 			if err != nil {
 				slog.Warn("Failed to initialize external IPAM", "err", err)
 			} else {
-				slog.Info("External IPAM initialized", "mode", d.clusterConfig.Network.ExternalMode, "pools", len(pools))
+				if anyDHCP {
+					dhcpClient := dhcp.NewNATSClient(d.natsConn, 0)
+					if dhcpErr := d.externalIPAM.EnableDHCP(dhcpClient); dhcpErr != nil {
+						slog.Warn("Failed to enable DHCP allocator on external IPAM", "err", dhcpErr)
+					}
+				}
+				slog.Info("External IPAM initialized", "mode", d.clusterConfig.Network.ExternalMode, "pools", len(pools), "dhcp", anyDHCP)
 			}
 		}
 	}
@@ -745,6 +1341,13 @@ func (d *Daemon) Start() error {
 		}
 	}
 
+	d.instanceService.SetTerminationDeps(d.volumeService, d.vpcService, d.externalIPAM)
+	d.instanceService.SetRunInstancesDeps(d.imageService, d.keyService, &daemonENICreator{d: d}, d.externalIPAM)
+
+	if d.gpuManager != nil {
+		d.instanceService.SetGPUClaimer(&daemonGPUClaimer{d: d})
+	}
+
 	d.accountService, err = initServiceWithRetry("account settings service", func() (*handlers_ec2_account.AccountSettingsServiceImpl, error) {
 		return handlers_ec2_account.NewAccountSettingsServiceImplWithNATS(d.config, d.natsConn)
 	})
@@ -762,65 +1365,52 @@ func (d *Daemon) Start() error {
 		d.elbv2Service.VPCService = d.vpcService
 	}
 
-	// Wire LB VM lifecycle: instance launcher for system VMs.
-	d.elbv2Service.InstanceLauncher = d
+	// Route system VM launches through NATS so they fan out across the cluster.
+	d.elbv2Service.InstanceLauncher = handlers_elbv2.NewNATSSystemInstanceLauncher(d.natsConn, 0)
 
-	// Detect management bridge for system instance control plane NICs.
-	// Must run before wireLBAgentConfig so the gateway URL uses br-mgmt IP.
-	mgmtBridge := "br-mgmt"
-	if d.config.Daemon.MgmtBridge != "" {
-		mgmtBridge = d.config.Daemon.MgmtBridge
-	}
-	bridgeIP, bridgeErr := GetBridgeIPv4(mgmtBridge)
-	if bridgeErr != nil {
-		slog.Warn("Management bridge not detected, system instances will not get mgmt NIC", "bridge", mgmtBridge, "err", bridgeErr)
-	} else if bridgeIP == "" {
-		slog.Warn("Management bridge not found, system instances will not get mgmt NIC", "bridge", mgmtBridge)
-	} else {
-		d.mgmtBridgeIP = bridgeIP
-		alloc, allocErr := NewMgmtIPAllocator(bridgeIP)
-		if allocErr != nil {
-			slog.Error("Failed to create mgmt IP allocator", "bridgeIP", bridgeIP, "err", allocErr)
-		} else {
-			d.mgmtIPAllocator = alloc
-			slog.Info("Management bridge detected", "bridge", mgmtBridge, "ip", bridgeIP)
-		}
-	}
-
-	// Wire system credentials + gateway URL for LB agent SigV4 auth.
 	d.wireLBAgentConfig()
 
-	// Set up lazy system AMI discovery for LB VMs. The image may not exist
-	// at daemon startup (imported later), so we resolve it at request time.
-	if d.imageService != nil {
-		imgSvc := d.imageService
-		d.elbv2Service.SetSystemAMIFunc(func() (string, error) {
-			imagesOut, imgErr := imgSvc.DescribeImages(&ec2.DescribeImagesInput{
-				Filters: []*ec2.Filter{{
-					Name:   aws.String("tag:" + tags.ManagedByKey),
-					Values: []*string{aws.String(tags.ManagedByELBv2)},
-				}},
-			}, utils.GlobalAccountID)
-			if imgErr != nil {
-				return "", fmt.Errorf("describe LB system images: %w", imgErr)
-			}
-			if len(imagesOut.Images) == 0 {
-				return "", errors.New("LB system image not imported; run: spx admin images import --name lb-alpine-3.21.6-x86_64")
-			}
-			amiID := aws.StringValue(imagesOut.Images[0].ImageId)
-			slog.Info("System AMI resolved for LB VMs", "amiId", amiID, "name", aws.StringValue(imagesOut.Images[0].Name))
-			return amiID, nil
-		})
-	}
-
-	// System VMs (LB, NAT GW) use the dedicated sys.micro instance type.
 	d.elbv2Service.SetSystemInstanceTypeFunc(func() string {
 		return "sys.micro"
 	})
 
+	// Invalidate stale "healthy" target state from before restart. Best-effort.
+	if err := d.elbv2Service.ResetTargetHealthOnStartup(context.Background()); err != nil {
+		slog.Warn("ELBv2: target-health reset failed; continuing with stale state",
+			"err", err)
+	}
+
+	d.eksService, err = initServiceWithRetry("EKS service", func() (*handlers_eks.EKSServiceImpl, error) {
+		return handlers_eks.NewEKSServiceImpl(d.buildEKSServiceDeps())
+	})
+	if err != nil {
+		return fmt.Errorf("failed to initialize EKS service: %w", err)
+	}
+
+	d.acmService, err = initServiceWithRetry("ACM service", func() (*handlers_acm.ACMServiceImpl, error) {
+		return handlers_acm.NewACMServiceImplWithNATS(d.config, d.natsConn)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to initialize ACM service: %w", err)
+	}
+
+	// ECR metadata service: owns per-account JetStream KV for repos, tags,
+	// manifest records and upload-state CAS. Disabled (gateway returns NATS
+	// timeouts) when JetStream is unavailable.
+	if js, jsErr := d.natsConn.JetStream(); jsErr != nil {
+		slog.Warn("ECR metadata service disabled: JetStream unavailable", "err", jsErr)
+	} else {
+		d.ecrMetaService = handlers_ecr.NewKVMetaService(js)
+	}
+
+	if err := d.eksService.SpawnRegisteredReconcilers(); err != nil {
+		slog.Warn("EKS: SpawnRegisteredReconcilers failed", "err", err)
+	}
+
 	// Ensure default VPC exists for system and admin accounts
 	// (matches AWS: every account has a default VPC with IGW + default SG)
 	if d.vpcService != nil {
+		failedDefaultVPCs := map[string]struct{}{}
 		for _, accountID := range []string{utils.GlobalAccountID, admin.DefaultAccountID()} {
 			// Pass bootstrap IDs for the admin account so EnsureDefaultVPC uses
 			// the same IDs that admin init wrote to [bootstrap] in spinifex.toml.
@@ -833,32 +1423,25 @@ func (d *Daemon) Start() error {
 			}
 			if _, err := d.vpcService.EnsureDefaultVPC(accountID, opts...); err != nil {
 				slog.Error("Failed to ensure default VPC", "accountID", accountID, "error", err)
+				failedDefaultVPCs[accountID] = struct{}{}
 			}
 		}
-		// Ensure default VPC has an IGW and default security group
-		d.ensureDefaultVPCInfrastructure()
+		// Skip IGW/route setup for accounts whose default VPC failed; otherwise
+		// we'd attach infrastructure to a half-built VPC (no default SG yet).
+		d.ensureDefaultVPCInfrastructure(failedDefaultVPCs)
 	}
 
-	// Initialize network plumber for VPC tap device management
-	if d.networkPlumber == nil {
-		d.networkPlumber = &OVSNetworkPlumber{}
-	}
-
-	// Protect daemon from OOM killer (prefer killing QEMU VMs instead)
-	if err := utils.SetOOMScore(os.Getpid(), -500); err != nil {
-		slog.Warn("Failed to set daemon OOM score", "err", err)
-	}
+	d.vmMgr.SetDeps(d.buildVMManagerDeps())
 
 	d.waitForClusterReady()
 	d.upgradeJetStreamReplicas()
-	d.restoreInstances()
+	if err := d.restoreInstances(); err != nil {
+		return fmt.Errorf("restore instances: %w", err)
+	}
 
-	// Rebuild mgmt IP allocator from restored VMs so we don't re-allocate IPs
-	// that are already in use by running system instances.
+	// Rebuild mgmt IP allocator so already-allocated IPs aren't reused.
 	if d.mgmtIPAllocator != nil {
-		d.Instances.Mu.Lock()
-		d.mgmtIPAllocator.Rebuild(d.Instances.VMS)
-		d.Instances.Mu.Unlock()
+		d.mgmtIPAllocator.Rebuild(d.vmMgr.SnapshotMap())
 		slog.Info("Rebuilt mgmt IP allocator from restored instances", "allocated", d.mgmtIPAllocator.AllocatedCount())
 	}
 
@@ -866,40 +1449,100 @@ func (d *Daemon) Start() error {
 		return fmt.Errorf("failed to subscribe to NATS topics: %w", err)
 	}
 
-	// Initialize dynamic per-instance-type subscriptions for capacity-aware routing.
-	// Each instance type gets its own NATS topic (ec2.RunInstances.{type}) so requests
-	// are only routed to nodes with available capacity.
-	d.resourceMgr.initSubscriptions(d.natsConn, d.handleEC2RunInstances, d.node)
+	// Initialize per-instance-type NATS subscriptions for capacity-aware routing.
+	d.resourceMgr.initSubscriptions(d.natsConn, d.handleEC2RunInstances, d.handleSystemLaunchInstance, d.node)
 
 	d.startHeartbeat()
-	d.startPendingWatchdog()
+	d.vmMgr.StartPendingWatchdog(d.ctx)
+
+	// Reality→desired GC backstop (ADR-0003 §3): finish teardown interrupted by
+	// a node-down mid-cascade and purge completed terminated records. The volume
+	// data-safety reaper (ADR-0005 §3) rides the same backstop but only marks +
+	// alarms — it never deletes volume data.
+	if d.jsManager != nil {
+		reapers := []vm.Reaper{d.vmMgr.NewTerminatedTeardownReaper()}
+		if d.volumeService != nil {
+			reapers = append(reapers, d.volumeService.NewVolumeLeakReaper(d.leakedVolumeInstances))
+		}
+		if d.eksService != nil {
+			reapers = append(reapers, d.eksService.NewBillableReaper(d.nodeRunningVMs))
+			reapers = append(reapers, d.eksService.NewDeletingReaper())
+		}
+		gc := vm.NewGarbageCollector(d.jsManager.KVHealthy, reapers...)
+		gc.Start(d.ctx)
+	}
 
 	d.ready.Store(true)
 	slog.Info("Daemon fully initialized", "node", d.node, "startupTime", time.Since(d.startTime).Round(time.Second))
 
+	d.setupReload()
 	d.setupShutdown()
 	d.awaitShutdown()
 
 	return nil
 }
 
-// connectNATS establishes a connection to the NATS server with retry and
-// exponential backoff. On multi-node clusters, the local NATS server may not
-// be ready immediately after daemon start (e.g. if start-dev.sh is still
-// launching services). This retries for up to 5 minutes before giving up.
-func (d *Daemon) connectNATS() error {
-	nc, err := utils.ConnectNATSWithRetry(admin.DialTarget(d.config.NATS.Host), d.config.NATS.ACL.Token, d.config.NATS.CACert, d.natsRetryOpts...)
+// leakedVolumeInstances returns the set of instance IDs this node owns whose
+// teardown leaked a volume — terminated here with a failed volumes-teardown.
+// The volume data-safety reaper marks (never deletes) volumes still attached to
+// these definitively-gone instances. Keying on this node's terminated set keeps
+// the shared-store scan from false-marking another node's live-instance volume.
+func (d *Daemon) leakedVolumeInstances() (map[string]bool, error) {
+	terminated, err := d.jsManager.ListTerminatedInstances()
+	if err != nil {
+		return nil, err
+	}
+	leaked := make(map[string]bool)
+	for _, v := range terminated {
+		if v.LastNode == d.node && v.Teardown[vm.TeardownVolumes] == string(vm.TeardownFailed) {
+			leaked[v.ID] = true
+		}
+	}
+	return leaked, nil
+}
+
+// nodeRunningVMs returns this node's running VMs for the EKS billable reaper to
+// scan. A nil stateStore (early init / test) yields an empty set.
+func (d *Daemon) nodeRunningVMs() ([]*vm.VM, error) {
+	if d.stateStore == nil {
+		return nil, nil
+	}
+	running, err := d.stateStore.LoadRunningState(d.node)
+	if err != nil {
+		return nil, err
+	}
+	vms := make([]*vm.VM, 0, len(running))
+	for _, v := range running {
+		vms = append(vms, v)
+	}
+	return vms, nil
+}
+
+// connectNATS connects to NATS with infinite retry (cap 60s backoff). Tests
+// override d.natsRetryOpts; extraOpts override any conflicting fields.
+func (d *Daemon) connectNATS(extraOpts ...utils.RetryOption) error {
+	opts := append([]utils.RetryOption{
+		utils.WithMaxWait(0), // infinite retry; cancelled via d.ctx
+		utils.WithMaxRetryDelay(60 * time.Second),
+		utils.WithContext(d.ctx),
+		utils.WithDisconnectHandler(d.onNATSDisconnect),
+		utils.WithReconnectHandler(d.onNATSReconnect),
+		utils.WithAttemptErrHandler(func(_ error, _ int) {
+			d.natsRetryCount.Add(1)
+		}),
+	}, d.natsRetryOpts...)
+	opts = append(opts, extraOpts...)
+	nc, err := utils.ConnectNATSWithRetry(admin.DialTarget(d.config.NATS.Host), d.config.NATS.ACL.Token, d.config.NATS.CACert, opts...)
 	if err != nil {
 		return err
 	}
 	d.natsConn = nc
+	d.natsConnected.Store(true)
 	return nil
 }
 
-// initJetStream initializes JetStream with retry/backoff and upgrades replicas
-// for multi-node clusters. On multi-node clusters, JetStream requires NATS
-// cluster quorum which may take several minutes if nodes start at different
-// times. This retries for up to 5 minutes to allow late-joining nodes.
+// initJetStream initialises JetStream KV stores, retrying up to 5 minutes to
+// allow late-joining nodes to reach quorum.
 func (d *Daemon) initJetStream() error {
 	const maxWait = 5 * time.Minute
 	retryDelay := 500 * time.Millisecond
@@ -923,6 +1566,7 @@ func (d *Daemon) initJetStream() error {
 		}
 
 		if err == nil {
+			d.jsManager.SetSyncObserver(d)
 			slog.Info("JetStream KV stores initialized successfully", "replicas", 1, "attempts", attempt, "elapsed", time.Since(start).Round(time.Second))
 			break
 		}
@@ -937,16 +1581,13 @@ func (d *Daemon) initJetStream() error {
 		retryDelay = min(retryDelay*2, 10*time.Second)
 	}
 
-	// Replica upgrade is deferred to after all services have created their
-	// KV buckets and the cluster is ready (see upgradeJetStreamReplicas).
+	d.stateStore = newStateStoreAdapter(d.jsManager)
 
 	return nil
 }
 
-// upgradeJetStreamReplicas bumps the replication factor on ALL KV_* streams
-// to match the cluster size. This runs after all services have created their
-// buckets and after waitForClusterReady so that enough NATS peers are online
-// to accept the new replica count.
+// upgradeJetStreamReplicas bumps KV_* stream replication to match the cluster
+// size. Runs after all buckets are created and the cluster is ready.
 func (d *Daemon) upgradeJetStreamReplicas() {
 	clusterSize := len(d.clusterConfig.Nodes)
 	if clusterSize <= 1 || d.jsManager == nil {
@@ -957,10 +1598,11 @@ func (d *Daemon) upgradeJetStreamReplicas() {
 	}
 }
 
-// initServiceWithRetry initializes a service using the provided init function,
-// retrying with exponential backoff (500ms→10s) for up to 5 minutes. During
-// cluster restarts, JetStream KV may be temporarily unavailable while NATS
-// routes re-establish and the cluster forms quorum.
+// initRetrySleep is the sleep seam used by initServiceWithRetry; tests override it.
+var initRetrySleep = time.Sleep
+
+// initServiceWithRetry initialises a service with exponential backoff (500ms→10s)
+// for up to 5 minutes, allowing time for JetStream quorum during cluster restarts.
 func initServiceWithRetry[T any](name string, initFn func() (T, error)) (T, error) {
 	const maxWait = 5 * time.Minute
 	retryDelay := 500 * time.Millisecond
@@ -984,14 +1626,13 @@ func initServiceWithRetry[T any](name string, initFn func() (T, error)) (T, erro
 		}
 
 		slog.Warn("Failed to init "+name, "error", err, "attempt", attempt, "elapsed", elapsed.Round(time.Second))
-		time.Sleep(retryDelay)
+		initRetrySleep(retryDelay)
 		retryDelay = min(retryDelay*2, 10*time.Second)
 	}
 }
 
-// waitForClusterReady waits until dependent infrastructure services are reachable
-// before starting VM recovery. This prevents races where VMs try to mount volumes
-// before viperblock/predastore are ready.
+// waitForClusterReady blocks until viperblock and predastore are reachable,
+// preventing races during VM recovery.
 func (d *Daemon) waitForClusterReady() {
 	slog.Info("Waiting for cluster readiness...")
 	maxWait := 2 * time.Minute
@@ -1026,8 +1667,7 @@ func (d *Daemon) waitForClusterReady() {
 	slog.Warn("Cluster readiness timeout, proceeding with recovery anyway", "maxWait", maxWait)
 }
 
-// checkViperblockReady checks if viperblock is reachable by verifying
-// the NATS connection is up (viperblock subscribes to ebs topics on NATS).
+// checkViperblockReady reports whether viperblock is reachable via NATS.
 func (d *Daemon) checkViperblockReady() bool {
 	if d.natsConn == nil {
 		return false
@@ -1049,335 +1689,34 @@ func (d *Daemon) checkPredastoreReady() bool {
 	return true
 }
 
-// migrateInstanceToKV writes an instance to the given KV write function and removes
-// it from the local instance map. Returns true if migration succeeded.
-func (d *Daemon) migrateInstanceToKV(instance *vm.VM, writeFn func(string, *vm.VM) error, label string) bool {
-	if d.jsManager == nil {
-		return false
-	}
-	instance.LastNode = d.node
-	if err := writeFn(instance.ID, instance); err != nil {
-		slog.Error("Failed to migrate instance to KV",
-			"instance", instance.ID, "bucket", label, "err", err)
-		return false
-	}
-	delete(d.Instances.VMS, instance.ID)
-	slog.Info("Migrated instance to KV", "instance", instance.ID, "bucket", label)
-	return true
-}
-
-func (d *Daemon) migrateStoppedToSharedKV(instance *vm.VM) bool {
-	return d.migrateInstanceToKV(instance, d.jsManager.WriteStoppedInstance, "stopped")
-}
-
-func (d *Daemon) migrateTerminatedToKV(instance *vm.VM) bool {
-	return d.migrateInstanceToKV(instance, d.jsManager.WriteTerminatedInstance, "terminated")
-}
-
-// maxConcurrentRecovery limits how many VMs are relaunched in parallel during recovery.
-const maxConcurrentRecovery = 2
-
-// restoreInstances loads persisted VM state and re-launches instances that are
-// neither terminated nor flagged as user-stopped.
-func (d *Daemon) restoreInstances() {
-	// Check for clean shutdown marker
-	cleanShutdown := false
-	if d.jsManager != nil {
-		if marker, err := d.jsManager.ReadShutdownMarker(d.node); err == nil {
-			cleanShutdown = marker
-			if marker {
-				slog.Info("Clean shutdown marker found, trusting KV state")
-				_ = d.jsManager.DeleteShutdownMarker(d.node)
-			}
-		}
-	}
-
-	if !cleanShutdown {
-		slog.Warn("No clean shutdown marker — possible crash recovery, validating QEMU PIDs carefully")
-		time.Sleep(3 * time.Second)
-	}
-
-	err := d.LoadState()
+// LoadState loads instance state from disk. Missing file → empty map (fresh
+// install). Corrupt or unknown-schema files are fatal.
+func (d *Daemon) LoadState() error {
+	path := d.localStatePath()
+	state, err := ReadLocalState(path)
 	if err != nil {
-		slog.Warn("Failed to load state, continuing with empty state", "error", err)
-		return
+		slog.Error("Local state load failed", "path", path, "error", err)
+		return fmt.Errorf("read local state: %w", err)
 	}
 
-	slog.Info("Loaded state", "instance count", len(d.Instances.VMS))
-
-	// Ensure mutexes and QMP clients are usable after deserialization
-	d.Instances.Mu = sync.Mutex{}
-
-	// Phase 1: Reconnect running QEMU, finalize transitional states, collect VMs to relaunch
-	var toLaunch []*vm.VM
-
-	for i := range d.Instances.VMS {
-		d.Instances.VMS[i].EBSRequests.Mu = sync.Mutex{}
-		d.Instances.VMS[i].QMPClient = &qmp.QMPClient{}
-
-		instance := d.Instances.VMS[i]
-
-		if instance.Status == vm.StateTerminated {
-			if !d.migrateTerminatedToKV(instance) {
-				// KV write failed — keep in local state so the next restart
-				// retries the migration. Deleting here would create a "void":
-				// the instance disappears from both local state and the
-				// terminated KV, making it invisible to DescribeInstances.
-				slog.Warn("Terminated instance KV migration failed, will retry on next restart",
-					"instance", instance.ID)
-			}
-			continue
-		}
-
-		if instance.Status == vm.StateStopped {
-			d.migrateStoppedToSharedKV(instance)
-			continue
-		}
-
-		instanceType, ok := d.resourceMgr.instanceTypes[instance.InstanceType]
-		if !ok && instance.InstanceType != "" {
-			slog.Warn("Instance type not available on this node, moving to stopped",
-				"instanceId", instance.ID, "instanceType", instance.InstanceType)
-			instance.Status = vm.StateStopped
-			if instance.Instance != nil {
-				instance.Instance.StateReason = &ec2.StateReason{}
-				instance.Instance.StateReason.SetCode("Server.InsufficientInstanceCapacity")
-				instance.Instance.StateReason.SetMessage(
-					fmt.Sprintf("instance type %s is not available on this node", instance.InstanceType))
-			}
-			d.migrateStoppedToSharedKV(instance)
-			continue
-		}
-
-		if ok {
-			slog.Info("Re-allocating resources for instance", "instanceId", instance.ID, "type", instance.InstanceType)
-			if err := d.resourceMgr.allocate(instanceType); err != nil {
-				slog.Error("Failed to re-allocate resources for instance on startup, moving to stopped",
-					"instanceId", instance.ID, "err", err)
-				instance.Status = vm.StateStopped
-				if instance.Instance != nil {
-					instance.Instance.StateReason = &ec2.StateReason{}
-					instance.Instance.StateReason.SetCode("Server.InsufficientInstanceCapacity")
-					instance.Instance.StateReason.SetMessage(
-						fmt.Sprintf("insufficient resources to restore instance: %v", err))
-				}
-				d.migrateStoppedToSharedKV(instance)
-				continue
-			}
-		}
-
-		// Check if QEMU process is still alive from before the restart
-		if d.isInstanceProcessRunning(instance) {
-			// Verify NBD sockets are still valid. After a viperblock restart,
-			// old sockets are gone and QEMU's block devices are broken. Kill
-			// the orphaned QEMU and relaunch from scratch instead of
-			// reconnecting to an instance with dead storage.
-			if !d.areVolumeSocketsValid(instance) {
-				slog.Warn("QEMU alive but NBD sockets are stale, killing orphaned process for relaunch",
-					"instance", instance.ID)
-				pid, pidErr := utils.ReadPidFile(instance.ID)
-				if pidErr != nil || pid <= 0 {
-					slog.Error("Cannot read PID for orphaned QEMU, skipping relaunch",
-						"instanceId", instance.ID, "err", pidErr)
-					continue
-				}
-				// SIGKILL directly — orphaned QEMU with dead storage has no
-				// state worth a graceful shutdown, and KillProcess's 120s
-				// SIGTERM timeout would block daemon startup.
-				if proc, err := os.FindProcess(pid); err == nil {
-					_ = proc.Signal(syscall.SIGKILL)
-				}
-				// Wait for the process to actually die, then remove the PID
-				// file ourselves. SIGKILL cannot be caught, so QEMU never
-				// runs its cleanup handler and the PID file stays on disk.
-				if err := utils.WaitForProcessExit(pid, 10*time.Second); err != nil {
-					slog.Error("Orphaned QEMU did not exit after SIGKILL, skipping relaunch",
-						"instanceId", instance.ID, "pid", pid, "err", err)
-					continue
-				}
-				_ = utils.RemovePidFile(instance.ID)
-			} else {
-				slog.Info("Instance QEMU process still alive, reconnecting", "instance", instance.ID)
-				if err := d.reconnectInstance(instance); err != nil {
-					slog.Error("Failed to reconnect to running instance", "instanceId", instance.ID, "err", err)
-				}
-				continue
-			}
-		}
-
-		// QEMU is not running -- resolve transitional states from interrupted operations
-		switch instance.Status {
-		case vm.StateStopping, vm.StateShuttingDown:
-			prevStatus := instance.Status
-			if instance.Status == vm.StateStopping {
-				instance.Status = vm.StateStopped
-			} else {
-				instance.Status = vm.StateTerminated
-			}
-			slog.Info("QEMU exited during transition, finalizing state",
-				"instance", instance.ID, "from", prevStatus, "to", instance.Status)
-
-			if instance.Status == vm.StateStopped && d.migrateStoppedToSharedKV(instance) {
-				continue
-			}
-
-			if instance.Status == vm.StateTerminated && d.migrateTerminatedToKV(instance) {
-				continue
-			}
-
-			if err := d.WriteState(); err != nil {
-				slog.Error("Failed to persist state, will retry on next restart",
-					"instance", instance.ID, "error", err)
-				instance.Status = prevStatus // revert so next restart retries
-			}
-			continue
-		case vm.StateRunning:
-			// Was running but QEMU died - reset to pending so LaunchInstance can transition to running
-			instance.Status = vm.StatePending
-			slog.Info("Instance was running but QEMU exited, relaunching", "instance", instance.ID)
-		}
-
-		// Reset LaunchTime so the pending watchdog gives a fresh timeout window.
-		// Without this, the stale LaunchTime from the original launch causes the
-		// watchdog to immediately mark the instance as failed after a prolonged outage.
-		now := time.Now()
-		if instance.Instance != nil {
-			instance.Instance.LaunchTime = &now
-		}
-		toLaunch = append(toLaunch, instance)
+	if state == nil {
+		d.vmMgr.Replace(map[string]*vm.VM{})
+		slog.Info("No local state file, starting with empty instance map", "path", path)
+		return nil
 	}
 
-	// Phase 2: Relaunch crashed VMs with semaphore-based throttling
-	if len(toLaunch) > 0 {
-		// Subscribe to per-instance NATS topics before launching so that
-		// terminate/stop commands can reach this daemon while instances are
-		// still being relaunched. Without this, pending instances are
-		// unreachable via ec2.cmd.<id> and TerminateInstances fails.
-		d.mu.Lock()
-		for _, instance := range toLaunch {
-			sub, subErr := d.natsConn.Subscribe(fmt.Sprintf("ec2.cmd.%s", instance.ID), d.handleEC2Events)
-			if subErr != nil {
-				slog.Error("Failed to early-subscribe during recovery", "instanceId", instance.ID, "err", subErr)
-			} else {
-				d.natsSubscriptions[instance.ID] = sub
-			}
-		}
-		d.mu.Unlock()
+	d.vmMgr.Replace(state.VMS)
+	slog.Info("Loaded local state", "path", path, "instances", len(state.VMS))
+	return nil
+}
 
-		slog.Info("Launching instances (recovery)", "count", len(toLaunch), "maxConcurrent", maxConcurrentRecovery)
-		sem := make(chan struct{}, maxConcurrentRecovery)
-		var wg sync.WaitGroup
-
-		for _, instance := range toLaunch {
-			sem <- struct{}{} // acquire
-			wg.Add(1)
-			go func(inst *vm.VM) {
-				defer wg.Done()
-				defer func() { <-sem }() // release
-				defer func() {
-					if r := recover(); r != nil {
-						slog.Error("Panic during instance recovery", "instanceId", inst.ID, "panic", r, "stack", string(debug.Stack()))
-					}
-				}()
-				// Skip if instance was terminated while waiting for semaphore
-				d.Instances.Mu.Lock()
-				status := inst.Status
-				d.Instances.Mu.Unlock()
-				if status != vm.StatePending && status != vm.StateProvisioning {
-					slog.Info("Instance state changed during recovery, skipping launch",
-						"instanceId", inst.ID, "status", string(status))
-					return
-				}
-				slog.Info("Launching instance (recovery)", "instance", inst.ID)
-				if err := d.LaunchInstance(inst); err != nil {
-					slog.Error("Failed to launch instance during recovery", "instanceId", inst.ID, "err", err)
-					d.markInstanceFailed(inst, "recovery_launch_failed")
-				}
-			}(instance)
-		}
-		wg.Wait()
-	}
-
-	// Persist state after any migrations/removals during restore
+// restoreInstances delegates to vm.Manager.Restore and syncs the local state
+// file so it matches in-memory state.
+func (d *Daemon) restoreInstances() error {
+	d.vmMgr.Restore()
 	if err := d.WriteState(); err != nil {
-		slog.Error("Failed to persist state after restore", "error", err)
+		slog.Error("Failed to persist local state after restore", "error", err)
 	}
-}
-
-// isInstanceProcessRunning checks if the QEMU process for an instance is still alive.
-func (d *Daemon) isInstanceProcessRunning(instance *vm.VM) bool {
-	pid, err := utils.ReadPidFile(instance.ID)
-	if err != nil || pid <= 0 {
-		return false
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	return process.Signal(syscall.Signal(0)) == nil
-}
-
-// areVolumeSocketsValid checks whether the NBD Unix sockets backing an
-// instance's volumes are reachable. A dial probe (not just os.Stat) is used
-// because viperblock may restart with sockets at the same paths — the file
-// exists but no process is listening on the old fd that QEMU holds.
-func (d *Daemon) areVolumeSocketsValid(instance *vm.VM) bool {
-	instance.EBSRequests.Mu.Lock()
-	defer instance.EBSRequests.Mu.Unlock()
-
-	for _, req := range instance.EBSRequests.Requests {
-		if req.NBDURI == "" {
-			continue
-		}
-		serverType, sockPath, _, _, err := utils.ParseNBDURI(req.NBDURI)
-		if err != nil || serverType != "unix" {
-			continue // TCP or unparseable — can't validate locally
-		}
-		conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
-		if err != nil {
-			slog.Debug("NBD socket unreachable", "volume", req.Name, "socket", sockPath, "err", err)
-			return false
-		}
-		_ = conn.Close()
-	}
-	return true
-}
-
-// reconnectInstance re-establishes QMP and NATS connections to a running QEMU instance
-// after a daemon restart. This bypasses the state machine since recovery is not a
-// normal state transition.
-func (d *Daemon) reconnectInstance(instance *vm.VM) error {
-	if err := d.CreateQMPClient(instance); err != nil {
-		return fmt.Errorf("failed to reconnect QMP: %w", err)
-	}
-
-	d.mu.Lock()
-	sub, err := d.natsConn.Subscribe(fmt.Sprintf("ec2.cmd.%s", instance.ID), d.handleEC2Events)
-	if err != nil {
-		d.mu.Unlock()
-		if instance.QMPClient != nil && instance.QMPClient.Conn != nil {
-			_ = instance.QMPClient.Conn.Close()
-			instance.QMPClient = nil
-		}
-		return fmt.Errorf("failed to subscribe to NATS: %w", err)
-	}
-	d.natsSubscriptions[instance.ID] = sub
-
-	consoleSub, err := d.natsConn.Subscribe(fmt.Sprintf("ec2.%s.GetConsoleOutput", instance.ID), d.handleEC2GetConsoleOutput)
-	if err != nil {
-		d.mu.Unlock()
-		return fmt.Errorf("failed to subscribe to console output NATS: %w", err)
-	}
-	d.natsSubscriptions[instance.ID+".console"] = consoleSub
-	d.mu.Unlock()
-
-	instance.Status = vm.StateRunning
-
-	if err := d.WriteState(); err != nil {
-		return fmt.Errorf("failed to persist reconnected instance state: %w", err)
-	}
-
-	slog.Info("Successfully reconnected to running instance", "instance", instance.ID)
 	return nil
 }
 
@@ -1391,9 +1730,8 @@ func (d *Daemon) awaitShutdown() {
 	<-done
 }
 
-// computeConfigHash computes SHA256 hash of the shared cluster config (excluding node-specific fields)
+// computeConfigHash computes a SHA256 hash of the shared cluster config.
 func (d *Daemon) computeConfigHash() (string, error) {
-	// Only hash the shared cluster data, not the node-specific top-level field
 	sharedData := types.SharedClusterData{
 		Epoch:   d.clusterConfig.Epoch,
 		Version: d.clusterConfig.Version,
@@ -1408,9 +1746,8 @@ func (d *Daemon) computeConfigHash() (string, error) {
 	return hex.EncodeToString(hash[:]), nil
 }
 
-// ClusterManager starts the HTTP cluster management server
+// ClusterManager starts the HTTPS cluster management server.
 func (d *Daemon) ClusterManager() error {
-	// Get daemon host from config
 	daemonHost := d.config.Daemon.Host
 	if daemonHost == "" {
 		return fmt.Errorf("daemon.host not configured")
@@ -1418,7 +1755,6 @@ func (d *Daemon) ClusterManager() error {
 
 	r := chi.NewRouter()
 
-	// Health endpoint - responds to HTTP and NATS
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		configHash, err := d.computeConfigHash()
 		if err != nil {
@@ -1432,7 +1768,6 @@ func (d *Daemon) ClusterManager() error {
 		for _, svc := range d.config.GetServices() {
 			serviceHealth[svc] = "ok"
 		}
-		// For remote dependencies, check connectivity
 		if !d.config.HasService("nats") {
 			if d.natsConn != nil && d.natsConn.IsConnected() {
 				serviceHealth["nats"] = "remote_ok"
@@ -1441,8 +1776,7 @@ func (d *Daemon) ClusterManager() error {
 			}
 		}
 
-		// Check OVN networking readiness
-		ovnHealth := CheckOVNHealth()
+		ovnHealth := host.HealthStatus()
 		if ovnHealth.BrIntExists {
 			serviceHealth["br-int"] = "ok"
 		} else {
@@ -1475,10 +1809,9 @@ func (d *Daemon) ClusterManager() error {
 		}
 	})
 
-	// Load TLS certificate (C-5: serve over HTTPS instead of plaintext HTTP)
-	// Resolve relative cert paths against config directory (cert lives alongside spinifex.toml).
-	// For binary installs, systemd sets absolute paths via env vars; for dev, the config
-	// stores relative paths like "config/server.pem" which need resolution.
+	d.registerLocalRoutes(r)
+
+	// Resolve relative cert paths against the config directory.
 	tlsCert := d.config.Daemon.TLSCert
 	tlsKey := d.config.Daemon.TLSKey
 	if tlsCert == "" || tlsKey == "" {
@@ -1499,8 +1832,9 @@ func (d *Daemon) ClusterManager() error {
 	}
 
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+		Certificates:     []tls.Certificate{cert},
+		MinVersion:       tls.VersionTLS13,
+		CurvePreferences: tlsconfig.Curves,
 	}
 
 	d.clusterServer = &http.Server{
@@ -1525,358 +1859,176 @@ func (d *Daemon) ClusterManager() error {
 	return nil
 }
 
-// WriteState writes the instance state to JetStream KV store (required).
-// It acquires d.Instances.Mu internally.
+// kvSyncTimeout caps the best-effort KV sync; 1s is above healthy Put latency.
+const kvSyncTimeout = time.Second
+
+// localStatePath returns the on-disk path to this daemon's instance state file.
+func (d *Daemon) localStatePath() string {
+	if d.config == nil {
+		return LocalStatePath("")
+	}
+	return LocalStatePath(d.config.DataDir)
+}
+
+// WriteState persists instance state. Local file is the source of truth; KV is
+// best-effort. Both forms are marshalled inside vmMgr.View to avoid data races.
 func (d *Daemon) WriteState() error {
-	if d.jsManager == nil {
-		return fmt.Errorf("JetStream manager not initialized - cannot write state")
+	d.stateWriteMu.Lock()
+	defer d.stateWriteMu.Unlock()
+
+	var (
+		localData, kvData []byte
+		marshalErr        error
+	)
+	d.vmMgr.View(func(vms map[string]*vm.VM) {
+		localData, marshalErr = MarshalLocalState(vms)
+		if marshalErr != nil {
+			return
+		}
+		kvData, marshalErr = marshalInstanceState(vms)
+	})
+	if marshalErr != nil {
+		return fmt.Errorf("marshal state: %w", marshalErr)
 	}
-	if err := d.jsManager.WriteState(d.node, &d.Instances); err != nil {
-		slog.Error("JetStream write failed", "error", err)
-		return fmt.Errorf("failed to write state to JetStream: %w", err)
+
+	path := d.localStatePath()
+	if err := WriteLocalStateBytes(path, localData); err != nil {
+		slog.Error("Local state write failed", "path", path, "error", err)
+		return fmt.Errorf("write local state: %w", err)
 	}
+	d.stateRevision.Add(1)
+
+	if d.jsManager != nil {
+		d.jsManager.WriteStateBytesBestEffort(d.node, kvData, kvSyncTimeout)
+	}
+
 	return nil
 }
 
-// LoadState loads the instance state from JetStream KV store (required)
-func (d *Daemon) LoadState() error {
-	if d.jsManager == nil {
-		return fmt.Errorf("JetStream manager not initialized - cannot load state")
-	}
+// setupReload registers a SIGHUP handler that reloads GPU config without restarting.
+func (d *Daemon) setupReload() {
+	d.shutdownWg.Go(func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGHUP)
+		defer signal.Stop(sigChan)
+		for {
+			select {
+			case <-d.ctx.Done():
+				return
+			case <-sigChan:
+				slog.Info("SIGHUP received — reloading GPU config")
+				d.reloadConfig()
+			}
+		}
+	})
+}
 
-	instances, err := d.jsManager.LoadState(d.node)
+// reloadConfig re-reads spinifex.toml and applies any GPU passthrough changes.
+func (d *Daemon) reloadConfig() {
+	if d.configPath == "" {
+		slog.Warn("SIGHUP: no config path set, cannot reload")
+		return
+	}
+	newCfg, err := config.LoadConfig(d.configPath)
 	if err != nil {
-		slog.Error("JetStream load failed", "error", err)
-		return fmt.Errorf("failed to load state from JetStream: %w", err)
+		slog.Error("SIGHUP: config reload failed", "err", err)
+		return
 	}
-
-	// Copy only the VMS map, not the mutex
-	d.Instances.VMS = instances.VMS
-	return nil
+	newNodeCfg := newCfg.Nodes[d.node]
+	d.applyGPUConfig(newNodeCfg.Daemon.GPUPassthrough)
 }
 
-func (d *Daemon) SendQMPCommand(q *qmp.QMPClient, cmd qmp.QMPCommand, instanceId string) (*qmp.QMPResponse, error) {
-	// Confirm QMP client is initialized
-	if q == nil || q.Encoder == nil || q.Decoder == nil {
-		return nil, fmt.Errorf("QMP client is not initialized")
+// applyGPUConfig activates or deactivates GPU passthrough at runtime.
+// Transition false→true: re-probes hardware, initialises gpuManager, adds g5 types.
+// Transition true→false: refused when GPU instances are running; otherwise tears down.
+func (d *Daemon) applyGPUConfig(enabled bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	wasEnabled := d.gpuManager != nil
+	if enabled == wasEnabled {
+		slog.Debug("GPU passthrough state unchanged on reload", "passthrough", enabled)
+		return
 	}
 
-	// Lock the QMP client
-	q.Mu.Lock()
-	defer q.Mu.Unlock()
-
-	// Set a read deadline so we don't block forever on a hung QEMU process
-	if err := q.Conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		return nil, fmt.Errorf("set read deadline: %w", err)
-	}
-	defer func() { _ = q.Conn.SetReadDeadline(time.Time{}) }() // clear deadline after command
-
-	if err := q.Encoder.Encode(cmd); err != nil {
-		return nil, fmt.Errorf("encode error: %w", err)
-	}
-
-	for {
-		var msg map[string]any
-		if err := q.Decoder.Decode(&msg); err != nil {
-			return nil, fmt.Errorf("decode error: %w", err)
+	if enabled {
+		probe := probeGPU()
+		d.gpuProbe = probe
+		if !probe.Capable {
+			slog.Warn("GPU passthrough enable failed: prerequisites not met",
+				"iommu", probe.IOMMUActive, "vfio", probe.VFIOPresent, "gpus", len(probe.Devices))
+			return
 		}
-
-		if _, ok := msg["event"]; ok {
-			// QMP events are informational only — state transitions are driven
-			// by the command handlers that initiate the action, avoiding races
-			// between event-driven and command-driven transitions.
-			slog.Info("QMP event", "event", msg["event"], "instanceId", instanceId)
-			// Extend deadline after receiving an event (QEMU is alive, just chatty)
-			if err := q.Conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
-				return nil, fmt.Errorf("set read deadline: %w", err)
-			}
-			continue
-		}
-		if errObj, ok := msg["error"].(map[string]any); ok {
-			return nil, fmt.Errorf("QMP error: %s: %s", errObj["class"], errObj["desc"])
-		}
-		if _, ok := msg["return"]; ok {
-			respBytes, err := json.Marshal(msg)
-			if err != nil {
-				return nil, fmt.Errorf("marshal QMP response: %w", err)
-			}
-			var resp qmp.QMPResponse
-			if err := json.Unmarshal(respBytes, &resp); err != nil {
-				return nil, fmt.Errorf("unmarshal error: %w", err)
-			}
-			return &resp, nil
-		}
-	}
-}
-
-func (d *Daemon) stopInstance(instances map[string]*vm.VM, deleteVolume bool) error {
-	// Signal to shutdown each VM
-	var wg sync.WaitGroup
-
-	// Run asynchronously within a worker group
-	for _, instance := range instances {
-		wg.Go(func() {
-			// Send shutdown command - if it fails, VM may already be dead, continue with cleanup
-			_, err := d.SendQMPCommand(instance.QMPClient, qmp.QMPCommand{Execute: "system_powerdown"}, instance.ID)
-			if err != nil {
-				slog.Warn("QMP system_powerdown failed (VM may already be stopped)", "id", instance.ID, "err", err)
-				// Don't return - continue with cleanup
-			}
-
-			// Wait for PID file removal (or check if already gone).
-			// 20s is enough for a graceful ACPI shutdown — if the guest hasn't
-			// responded to system_powerdown by then, it won't (e.g. still booting,
-			// no ACPI handler). Force-kill at that point rather than wasting 60s.
-			err = utils.WaitForPidFileRemoval(instance.ID, 20*time.Second)
-			if err != nil {
-				slog.Warn("Timeout waiting for PID file removal", "id", instance.ID, "err", err)
-
-				// Try force killing the process if it's still running
-				pid, readErr := utils.ReadPidFile(instance.ID)
-				if readErr != nil {
-					slog.Debug("No PID file found (VM likely already stopped)", "id", instance.ID)
-				} else {
-					slog.Info("Force killing process", "pid", pid, "id", instance.ID)
-					if err := utils.KillProcess(pid); err != nil {
-						slog.Error("Failed to kill process", "pid", pid, "id", instance.ID, "err", err)
-					}
-				}
-			}
-
-			// Unmount all EBS volumes
-			instance.EBSRequests.Mu.Lock()
-			defer instance.EBSRequests.Mu.Unlock()
-
-			for _, ebsRequest := range instance.EBSRequests.Requests {
-				// Send the volume payload as JSON
-				ebsUnMountRequest, err := json.Marshal(ebsRequest)
-
-				if err != nil {
-					slog.Error("Failed to marshal volume payload", "err", err)
-					continue
-				}
-
-				msg, err := d.natsConn.Request(d.ebsTopic("unmount"), ebsUnMountRequest, 30*time.Second)
-				if err != nil {
-					slog.Error("Failed to unmount volume", "name", ebsRequest.Name, "id", instance.ID, "err", err)
-				} else {
-					slog.Info("Unmounted Viperblock volume", "id", instance.ID, "data", string(msg.Data))
-				}
-
-				// Update volume state to "available" for all user-visible volumes (boot + hot-attached)
-				if !ebsRequest.EFI && !ebsRequest.CloudInit {
-					if err := d.volumeService.UpdateVolumeState(ebsRequest.Name, "available", "", ""); err != nil {
-						slog.Error("Failed to update volume state to available", "volumeId", ebsRequest.Name, "err", err)
-					}
-				}
-			}
-
-			// If flagged for termination, clean up volumes
-			if deleteVolume {
-				for _, ebsRequest := range instance.EBSRequests.Requests {
-					// Internal volumes (EFI, cloud-init) are always cleaned up via ebs.delete
-					// to stop viperblockd processes. S3 data cleanup happens via DeleteVolume
-					// on the parent root volume (which deletes -efi/ and -cloudinit/ prefixes).
-					if ebsRequest.EFI || ebsRequest.CloudInit {
-						ebsDeleteData, err := json.Marshal(types.EBSDeleteRequest{Volume: ebsRequest.Name})
-						if err != nil {
-							slog.Error("Failed to marshal ebs.delete request for internal volume", "name", ebsRequest.Name, "err", err)
-							continue
-						}
-						deleteMsg, err := d.natsConn.Request("ebs.delete", ebsDeleteData, 30*time.Second)
-						if err != nil {
-							slog.Warn("Failed to send ebs.delete for internal volume", "name", ebsRequest.Name, "id", instance.ID, "err", err)
-						} else {
-							slog.Info("Sent ebs.delete for internal volume", "name", ebsRequest.Name, "id", instance.ID, "data", string(deleteMsg.Data))
-						}
-						continue
-					}
-
-					// User-visible volumes: respect DeleteOnTermination flag
-					if !ebsRequest.DeleteOnTermination {
-						slog.Info("Volume has DeleteOnTermination=false, skipping deletion", "name", ebsRequest.Name, "id", instance.ID)
-						continue
-					}
-
-					// DeleteVolume handles: NATS ebs.delete notification + S3 cleanup
-					// (including -efi/ and -cloudinit/ sub-prefixes)
-					slog.Info("Deleting volume with DeleteOnTermination=true", "name", ebsRequest.Name, "id", instance.ID)
-					_, err := d.volumeService.DeleteVolume(&ec2.DeleteVolumeInput{
-						VolumeId: &ebsRequest.Name,
-					}, instance.AccountID)
-					if err != nil {
-						slog.Error("Failed to delete volume on termination", "name", ebsRequest.Name, "id", instance.ID, "err", err)
-					} else {
-						slog.Info("Deleted volume on termination", "name", ebsRequest.Name, "id", instance.ID)
-					}
-				}
-			}
-
-			// Clean up VPC tap device if present
-			if instance.ENIId != "" && d.networkPlumber != nil {
-				if err := d.networkPlumber.CleanupTapDevice(instance.ENIId); err != nil {
-					slog.Warn("Failed to clean up tap device", "eni", instance.ENIId, "err", err)
-				}
-				// Clean up any extra ENI tap devices (multi-subnet ALB VMs).
-				d.cleanupExtraENITaps(instance)
-			}
-
-			// Clean up management TAP and release IP. Derive the name from
-			// instance.ID rather than reading instance.MgmtTap — the field
-			// is set only after SetupMgmtTapDevice returns, so a terminate
-			// that races mid-launch would skip cleanup and leak the OVS
-			// port. CleanupMgmtTapDevice is idempotent for instances that
-			// never reached the setup step.
-			mgmtTap := MgmtTapName(instance.ID)
-			if err := CleanupMgmtTapDevice(mgmtTap); err != nil {
-				slog.Warn("Failed to clean up mgmt tap device", "tap", mgmtTap, "instanceId", instance.ID, "err", err)
-			}
-			if d.mgmtIPAllocator != nil {
-				d.mgmtIPAllocator.Release(instance.ID)
-			}
-
-			// Release public IP before deleting ENI
-			if deleteVolume && instance.PublicIP != "" && instance.PublicIPPool != "" && d.externalIPAM != nil {
-				// Publish vpc.delete-nat to remove dnat_and_snat rule
-				portName := "port-" + instance.ENIId
-				vpcId := ""
-				logicalIP := ""
-				if instance.Instance != nil {
-					if instance.Instance.VpcId != nil {
-						vpcId = *instance.Instance.VpcId
-					}
-					if instance.Instance.PrivateIpAddress != nil {
-						logicalIP = *instance.Instance.PrivateIpAddress
-					}
-				}
-				d.publishNATEvent("vpc.delete-nat", vpcId, instance.PublicIP, logicalIP, portName, "")
-
-				// Release IP back to pool
-				if err := d.externalIPAM.ReleaseIP(instance.PublicIPPool, instance.PublicIP); err != nil {
-					slog.Warn("Failed to release public IP on termination", "ip", instance.PublicIP, "pool", instance.PublicIPPool, "err", err)
-				} else {
-					slog.Info("Released public IP on termination", "ip", instance.PublicIP, "instanceId", instance.ID)
-				}
-			}
-
-			// On termination, detach and delete the auto-created ENI (releases IP
-			// back to IPAM, publishes vpc.delete-port for vpcd). On stop, ENI
-			// persists (AWS behavior). Must detach first to clear in-use status.
-			// Tolerate NotFound — ENI may have been cleaned up already.
-			// Other errors (KV failures, permission issues, in-use) are real
-			// failures that could leak IPAM addresses.
-			if deleteVolume && instance.ENIId != "" && d.vpcService != nil {
-				if detachErr := d.vpcService.DetachENI(instance.AccountID, instance.ENIId); detachErr != nil {
-					slog.Warn("Failed to detach ENI on termination", "eni", instance.ENIId, "instanceId", instance.ID, "err", detachErr)
-				}
-				if _, eniErr := d.vpcService.DeleteNetworkInterface(&ec2.DeleteNetworkInterfaceInput{
-					NetworkInterfaceId: &instance.ENIId,
-				}, instance.AccountID); eniErr != nil {
-					if strings.Contains(eniErr.Error(), awserrors.ErrorInvalidNetworkInterfaceIDNotFound) {
-						slog.Debug("ENI already cleaned up on termination", "eni", instance.ENIId)
-					} else {
-						slog.Error("Failed to delete ENI on termination", "eni", instance.ENIId, "instanceId", instance.ID, "err", eniErr)
-					}
-				} else {
-					slog.Info("Deleted ENI on termination", "eni", instance.ENIId, "instanceId", instance.ID)
-				}
-				// Extra ENIs (multi-subnet ALB VMs) are cleaned up by
-				// DeleteLoadBalancer via its own lb.ENIs loop — the daemon
-				// doesn't duplicate that teardown here.
-			}
-
-			// Deallocate resources
-			instanceType := d.resourceMgr.instanceTypes[instance.InstanceType]
-			if instanceType != nil {
-				slog.Info("Deallocating resources for stopped instance", "instanceId", instance.ID, "type", instance.InstanceType)
-				d.resourceMgr.deallocate(instanceType)
-			}
-		})
+		mgr, models, migProfiles := buildGPUPool(probe.Devices, d.config.Daemon)
+		d.gpuManager = mgr
+		d.resourceMgr.reloadGPUTypes(models, migProfiles, mgr)
+		d.instanceService.SetGPUClaimer(&daemonGPUClaimer{d: d})
+		slog.Info("GPU passthrough enabled via config reload", "gpus", len(probe.Devices))
+		return
 	}
 
-	// Wait for all shutdowns to finish
-	wg.Wait()
-
-	// Only unsubscribe from NATS subjects when terminating (deleteVolume=true)
-	// For stop operations, keep the subscription so we can receive start commands
-	if deleteVolume {
-		for _, instance := range instances {
-			d.mu.Lock()
-			if sub, ok := d.natsSubscriptions[instance.ID]; ok {
-				slog.Info("Unsubscribing from NATS subject", "instance", instance.ID)
-				if err := sub.Unsubscribe(); err != nil {
-					slog.Error("Failed to unsubscribe from NATS subject", "instance", instance.ID, "err", err)
-				}
-				delete(d.natsSubscriptions, instance.ID)
-			}
-			consoleSubKey := instance.ID + ".console"
-			if sub, ok := d.natsSubscriptions[consoleSubKey]; ok {
-				if err := sub.Unsubscribe(); err != nil {
-					slog.Error("Failed to unsubscribe from console NATS subject", "instance", instance.ID, "err", err)
-				}
-				delete(d.natsSubscriptions, consoleSubKey)
-			}
-			d.mu.Unlock()
-		}
+	// true → false: refuse if instances are running
+	if d.gpuManager.AllocatedCount() > 0 {
+		slog.Warn("GPU passthrough disable refused: GPU instances are running",
+			"allocated", d.gpuManager.AllocatedCount())
+		return
 	}
-	return nil
+	d.gpuManager = nil
+	d.instanceService.SetGPUClaimer(nil)
+	d.resourceMgr.reloadGPUTypes(nil, nil, nil)
+	slog.Info("GPU passthrough disabled via config reload")
 }
 
 func (d *Daemon) setupShutdown() {
 	d.shutdownWg.Go(func() {
 		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 		<-sigChan
 		slog.Info("Received shutdown signal, cleaning up...")
 
-		// Cancel context to stop heartbeat and other goroutines
 		d.cancel()
 
-		// If coordinated shutdown already handled VMs (DRAIN phase), skip stopInstance.
-		// Otherwise, set the flag now so crash handlers and restart schedulers
-		// know to bail out during SIGTERM-based shutdown.
+		// DDIL Tier 1: SIGTERM alone never stops VMs — the new daemon reattaches
+		// via the local state file. VMs stop only after coordinated DRAIN.
 		if d.shuttingDown.Load() {
 			slog.Info("Coordinated shutdown in progress, skipping VM stop (already handled by DRAIN phase)")
 		} else {
+			slog.Info("SIGTERM with no coordinated drain — leaving local VMs running for restart recovery")
 			d.shuttingDown.Store(true)
-			// Pass instances to terminate
-			if err := d.stopInstance(d.Instances.VMS, false); err != nil {
-				slog.Error("Failed to stop instances during shutdown", "err", err)
-			}
 		}
 
-		// Stop ELBv2 background goroutines
 		if d.elbv2Service != nil {
 			d.elbv2Service.Close()
 		}
 
-		// Final cleanup
+		if d.eksService != nil {
+			d.eksService.Shutdown()
+		}
+
 		for _, sub := range d.natsSubscriptions {
-			// Unsubscribe from each subscription
 			slog.Info("Unsubscribing from NATS", "subject", sub.Subject)
 			if err := sub.Unsubscribe(); err != nil {
 				slog.Error("Error unsubscribing from NATS", "err", err)
 			}
 		}
 
-		// Write shutdown marker to cluster state KV
 		if d.jsManager != nil {
 			if err := d.jsManager.WriteShutdownMarker(d.node); err != nil {
 				slog.Error("Failed to write shutdown marker", "err", err)
 			}
 		}
 
-		// Write state to JetStream before closing NATS connection
 		err := d.WriteState()
 		if err != nil {
 			slog.Error("Failed to write state", "err", err)
 		}
 
-		// Close NATS connection
-		d.natsConn.Close()
+		// natsConn is nil when NATS was unreachable at startup (DDIL Scenario B).
+		if d.natsConn != nil {
+			d.natsConn.Close()
+		}
 
-		// Shutdown cluster manager
 		if d.clusterServer != nil {
 			slog.Info("Shutting down cluster manager...")
 			if err := d.clusterServer.Shutdown(context.Background()); err != nil {
@@ -1886,783 +2038,6 @@ func (d *Daemon) setupShutdown() {
 
 		slog.Info("Shutdown complete")
 	})
-}
-
-func (d *Daemon) CreateQMPClient(instance *vm.VM) (err error) {
-	// Create a new QMP client to communicate with the instance
-	instance.QMPClient, err = qmp.NewQMPClient(instance.Config.QMPSocket)
-
-	if err != nil {
-		slog.Error("Could not connect to QMP")
-		return err
-	}
-
-	// Send qmp_capabilities handshake to init
-	_, err = d.SendQMPCommand(instance.QMPClient, qmp.QMPCommand{Execute: "qmp_capabilities"}, instance.ID)
-	if err != nil {
-		slog.Error("Failed QMP capabilities handshake", "err", err)
-		return err
-	}
-
-	// Simple heartbeat to confirm QMP and the instance is running / healthy
-	go func() {
-		for {
-			time.Sleep(30 * time.Second)
-
-			// Check if instance is in a terminal or transitional state - exit heartbeat
-			d.Instances.Mu.Lock()
-			status := instance.Status
-			d.Instances.Mu.Unlock()
-
-			if status == vm.StateStopping || status == vm.StateStopped || status == vm.StateShuttingDown || status == vm.StateTerminated || status == vm.StateError {
-				slog.Info("QMP heartbeat exiting - instance not running", "instance", instance.ID, "status", status)
-
-				// Close the QMP client connection if it exists
-				if instance.QMPClient != nil && instance.QMPClient.Conn != nil {
-					if err := instance.QMPClient.Conn.Close(); err != nil {
-						slog.Error("Failed to close QMP connection", "instance", instance.ID, "err", err)
-					}
-				}
-				return
-			}
-
-			slog.Debug("QMP heartbeat", "instance", instance.ID)
-			qmpStatus, err := d.SendQMPCommand(instance.QMPClient, qmp.QMPCommand{Execute: "query-status"}, instance.ID)
-
-			if err != nil {
-				slog.Warn("QMP heartbeat failed", "instance", instance.ID, "err", err)
-				// Don't exit on transient errors - let the status check above handle terminal states
-				continue
-			}
-
-			slog.Debug("QMP status", "instance", instance.ID, "status", string(qmpStatus.Return))
-		}
-	}()
-
-	return nil
-}
-
-// launchStillValid returns true while LaunchInstance may continue setting up
-// resources for instance. Returns false if a concurrent terminate has flipped
-// status out of pending/stopped/provisioning — at that point the terminate
-// goroutine owns cleanup and LaunchInstance must bail without further side
-// effects. Logs the abort reason at Info so it's visible without polluting
-// error logs (terminate-during-pending is an expected user-driven race).
-func (d *Daemon) launchStillValid(instance *vm.VM) bool {
-	d.Instances.Mu.Lock()
-	status := instance.Status
-	d.Instances.Mu.Unlock()
-	if status == vm.StatePending || status == vm.StateStopped || status == vm.StateProvisioning {
-		return true
-	}
-	slog.Info("Launch aborted by concurrent terminate", "instanceId", instance.ID, "status", string(status))
-	return false
-}
-
-func (d *Daemon) LaunchInstance(instance *vm.VM) (err error) {
-	// Abort if instance is no longer in a launchable state. A concurrent
-	// terminate request that flipped status to shutting-down/terminated
-	// owns the cleanup lifecycle; this path is an expected race outcome,
-	// not an error, so return nil to avoid the spurious
-	// "Failed to transition instance to running" ERROR log.
-	if !d.launchStillValid(instance) {
-		return nil
-	}
-
-	// First, confirm if the instance is already running
-	pid, _ := utils.ReadPidFile(instance.ID)
-
-	if pid > 0 {
-		process, err := os.FindProcess(pid)
-		if err != nil {
-			return err
-		}
-
-		// Send a 0 signal to confirm process is running
-		err = process.Signal(syscall.Signal(0))
-		if err == nil {
-			slog.Error("Instance is already running", "InstanceID", instance.ID, "pid", pid)
-			return errors.New("instance is already running")
-		}
-	}
-
-	// Loop through each volume in volumes
-	err = d.MountVolumes(instance)
-
-	if err != nil {
-		slog.Error("Failed to mount volumes", "err", err)
-		return err
-	}
-
-	// Re-check status — MountVolumes can take 30+s on cold AMIs (NBD
-	// clone), and a terminate can race in during that window. Skip the
-	// remaining setup so the concurrent terminate goroutine doesn't fight
-	// SetupTapDevice and leak resources. PR1b.1's idempotency safety net
-	// catches anything that does slip through.
-	if !d.launchStillValid(instance) {
-		return nil
-	}
-
-	// Step 6: Launch the instance via QEMU/KVM
-	err = d.StartInstance(instance)
-
-	if err != nil {
-		slog.Error("Failed to launch instance", "err", err)
-		return err
-	}
-
-	// Step 7: Create QMP client to communicate with the instance
-	err = d.CreateQMPClient(instance)
-
-	if err != nil {
-		slog.Error("Failed to create QMP client", "err", err)
-		return err
-	}
-
-	// Step 8: Subscribe to start/stop/shutdown events
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	// Unsubscribe any existing subscriptions (e.g. from restoreInstances for stopped instances)
-	if existing, ok := d.natsSubscriptions[instance.ID]; ok {
-		_ = existing.Unsubscribe()
-	}
-	consoleSubKey := instance.ID + ".console"
-	if existing, ok := d.natsSubscriptions[consoleSubKey]; ok {
-		_ = existing.Unsubscribe()
-	}
-
-	d.natsSubscriptions[instance.ID], err = d.natsConn.Subscribe(fmt.Sprintf("ec2.cmd.%s", instance.ID), d.handleEC2Events)
-	if err != nil {
-		slog.Error("failed to subscribe to NATS", "err", err)
-		return err
-	}
-
-	d.natsSubscriptions[consoleSubKey], err = d.natsConn.Subscribe(fmt.Sprintf("ec2.%s.GetConsoleOutput", instance.ID), d.handleEC2GetConsoleOutput)
-	if err != nil {
-		slog.Error("failed to subscribe to console output NATS topic", "err", err)
-		return err
-	}
-
-	// Step 9: Update the instance metadata for running state and volume attached
-	d.Instances.Mu.Lock()
-	d.Instances.VMS[instance.ID] = instance
-	d.Instances.Mu.Unlock()
-
-	// Final race check — QEMU is up, but if a terminate fired during
-	// StartInstance/CreateQMPClient, the concurrent goroutine has already
-	// transitioned status to shutting-down. Attempting StateRunning here
-	// would log a spurious error; let the terminate cleanup own teardown.
-	if !d.launchStillValid(instance) {
-		return nil
-	}
-
-	if err := d.TransitionState(instance, vm.StateRunning); err != nil {
-		slog.Error("Failed to transition instance to running", "instanceId", instance.ID, "err", err)
-		return err
-	}
-
-	// Step 10: Mark boot volumes as "in-use" now that instance is confirmed running
-	instance.EBSRequests.Mu.Lock()
-	for _, ebsReq := range instance.EBSRequests.Requests {
-		if ebsReq.Boot {
-			if err := d.volumeService.UpdateVolumeState(ebsReq.Name, "in-use", instance.ID, ""); err != nil {
-				slog.Error("Failed to update volume state to in-use", "volumeId", ebsReq.Name, "err", err)
-			}
-		}
-	}
-	instance.EBSRequests.Mu.Unlock()
-
-	return nil
-}
-
-// markInstanceFailed updates an instance status to indicate a failure during launch,
-// then completes the termination lifecycle in the background so the instance
-// reaches terminated state and doesn't get stuck in shutting-down.
-func (d *Daemon) markInstanceFailed(instance *vm.VM, reason string) {
-	// If the instance is already being cleaned up (e.g., a concurrent terminate
-	// request transitioned it to shutting-down while LaunchInstance was running),
-	// don't spawn a second finalizeTermination goroutine — the existing cleanup
-	// handler owns the lifecycle from here.
-	d.Instances.Mu.Lock()
-	if instance.Status == vm.StateShuttingDown || instance.Status == vm.StateTerminated {
-		d.Instances.Mu.Unlock()
-		slog.Info("markInstanceFailed: instance already in cleanup state, skipping",
-			"instanceId", instance.ID, "status", string(instance.Status), "reason", reason)
-		return
-	}
-
-	// Set state reason before transition
-	if instance.Instance != nil {
-		instance.Instance.StateReason = &ec2.StateReason{}
-		instance.Instance.StateReason.SetCode("Server.InternalError")
-		instance.Instance.StateReason.SetMessage(reason)
-	}
-	d.Instances.Mu.Unlock()
-
-	if err := d.TransitionState(instance, vm.StateShuttingDown); err != nil {
-		slog.Error("markInstanceFailed transition failed", "instanceId", instance.ID, "err", err)
-		// If the error was a write failure, the in-memory state is already
-		// shutting-down. Still proceed with finalization to avoid getting stuck.
-		if instance.Status != vm.StateShuttingDown {
-			return
-		}
-	}
-
-	slog.Info("Instance marked as failed", "instanceId", instance.ID, "reason", reason)
-
-	// Complete termination in the background — clean up any partially-created
-	// resources and transition to terminated so the instance doesn't get stuck
-	// in shutting-down indefinitely.
-	go d.finalizeTermination(instance)
-}
-
-// finalizeTermination completes the termination lifecycle for an instance already
-// in shutting-down state. It cleans up resources (processes, volumes, ENIs),
-// transitions to terminated, writes to the terminated KV bucket, and removes
-// the instance from local state.
-func (d *Daemon) finalizeTermination(instance *vm.VM) {
-	stopErr := d.stopInstance(map[string]*vm.VM{instance.ID: instance}, true)
-	if stopErr != nil {
-		slog.Error("Failed to cleanup failed instance", "err", stopErr, "id", instance.ID)
-		if err := d.TransitionState(instance, vm.StateError); err != nil {
-			slog.Error("Failed to transition to error state", "instanceId", instance.ID, "err", err)
-		}
-		return
-	}
-
-	d.Instances.Mu.Lock()
-	instance.LastNode = d.node
-	d.Instances.Mu.Unlock()
-
-	if err := d.TransitionState(instance, vm.StateTerminated); err != nil {
-		slog.Error("Failed to transition failed instance to terminated", "instanceId", instance.ID, "err", err)
-		return
-	}
-	slog.Info("Instance terminated (failed launch cleanup)", "id", instance.ID)
-
-	if d.jsManager != nil {
-		if err := d.jsManager.WriteTerminatedInstance(instance.ID, instance); err != nil {
-			slog.Error("Failed to write terminated instance to KV, keeping in local state for retry",
-				"instanceId", instance.ID, "err", err)
-			return
-		}
-	}
-
-	// Guard + delete: another handler may have reclaimed this instance.
-	d.Instances.Mu.Lock()
-	current, exists := d.Instances.VMS[instance.ID]
-	if !exists || current != instance {
-		d.Instances.Mu.Unlock()
-		slog.Info("Instance was reclaimed by another handler, skipping local cleanup",
-			"instanceId", instance.ID, "state", "terminated")
-		return
-	}
-	delete(d.Instances.VMS, instance.ID)
-	d.Instances.Mu.Unlock()
-
-	if err := d.WriteState(); err != nil {
-		slog.Error("Failed to persist state after terminating failed instance, re-adding to local map",
-			"instanceId", instance.ID, "err", err)
-		d.Instances.Mu.Lock()
-		if _, occupied := d.Instances.VMS[instance.ID]; !occupied {
-			d.Instances.VMS[instance.ID] = instance
-		}
-		d.Instances.Mu.Unlock()
-	} else {
-		slog.Info("Released failed instance ownership to KV",
-			"instanceId", instance.ID, "lastNode", d.node)
-	}
-}
-
-const pendingWatchdogInterval = 60 * time.Second
-const pendingWatchdogTimeout = 5 * time.Minute
-
-// startPendingWatchdog runs a background goroutine that periodically checks for
-// instances stuck in pending/provisioning beyond a timeout and marks them failed.
-func (d *Daemon) startPendingWatchdog() {
-	ticker := time.NewTicker(pendingWatchdogInterval)
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-d.ctx.Done():
-				return
-			case <-ticker.C:
-				d.Instances.Mu.Lock()
-				var stuck []*vm.VM
-				for _, instance := range d.Instances.VMS {
-					if (instance.Status == vm.StatePending || instance.Status == vm.StateProvisioning) &&
-						instance.Instance != nil && instance.Instance.LaunchTime != nil &&
-						time.Since(*instance.Instance.LaunchTime) > pendingWatchdogTimeout {
-						stuck = append(stuck, instance)
-					}
-				}
-				d.Instances.Mu.Unlock()
-
-				for _, instance := range stuck {
-					slog.Warn("Instance stuck in pending, marking failed",
-						"instanceId", instance.ID, "status", instance.Status,
-						"elapsed", time.Since(*instance.Instance.LaunchTime))
-					d.markInstanceFailed(instance, "launch_timeout")
-				}
-			}
-		}
-	}()
-}
-
-func (d *Daemon) StartInstance(instance *vm.VM) error {
-	pidFile, err := utils.GeneratePidFile(instance.ID)
-
-	if err != nil {
-		slog.Error("Failed to generate PID file", "err", err)
-		return err
-	}
-
-	instanceType := d.resourceMgr.instanceTypes[instance.InstanceType]
-	if instanceType == nil {
-		return fmt.Errorf("instance type %s not found", instance.InstanceType)
-	}
-
-	vCPUs := int(instanceTypeVCPUs(instanceType))
-	memoryMiB := instanceTypeMemoryMiB(instanceType)
-	architecture := "x86_64"
-	if instanceType.ProcessorInfo != nil && len(instanceType.ProcessorInfo.SupportedArchitectures) > 0 && instanceType.ProcessorInfo.SupportedArchitectures[0] != nil {
-		architecture = *instanceType.ProcessorInfo.SupportedArchitectures[0]
-	}
-
-	// Console log + serial socket paths (serial output capture + admin access via socat)
-	runtimeDir := utils.RuntimeDir()
-	consoleLogPath := filepath.Join(runtimeDir, fmt.Sprintf("console-%s.log", instance.ID))
-	serialSocket := filepath.Join(runtimeDir, fmt.Sprintf("serial-%s.sock", instance.ID))
-
-	instance.Config = buildBaseVMConfig(instance.ID, pidFile, consoleLogPath, serialSocket, architecture, vCPUs, int(memoryMiB))
-
-	// Build QEMU drives from EBS volume requests.
-	instance.EBSRequests.Mu.Lock()
-	drives, iothreads, devices, err := buildDrives(instance.EBSRequests.Requests, vCPUs)
-	instance.EBSRequests.Mu.Unlock()
-	if err != nil {
-		return err
-	}
-	instance.Config.Drives = append(instance.Config.Drives, drives...)
-	instance.Config.IOThreads = append(instance.Config.IOThreads, iothreads...)
-	instance.Config.Devices = append(instance.Config.Devices, devices...)
-
-	// VPC tap networking vs user-mode fallback
-	if instance.ENIId != "" && d.networkPlumber != nil {
-		// VPC mode: create tap device and add to OVS br-int
-		if err := d.networkPlumber.SetupTapDevice(instance.ENIId, instance.ENIMac); err != nil {
-			slog.Error("Failed to set up tap device", "eni", instance.ENIId, "err", err)
-			return fmt.Errorf("setup tap device: %w", err)
-		}
-
-		tapName := TapDeviceName(instance.ENIId)
-		instance.Config.NetDevs = append(instance.Config.NetDevs, vm.NetDev{
-			Value: fmt.Sprintf("tap,id=net0,ifname=%s,script=no,downscript=no", tapName),
-		})
-		instance.Config.Devices = append(instance.Config.Devices, vm.Device{
-			Value: fmt.Sprintf("virtio-net-pci,netdev=net0,mac=%s", instance.ENIMac),
-		})
-
-		slog.Info("VPC networking configured", "tap", tapName, "eni", instance.ENIId, "mac", instance.ENIMac)
-
-		// Additional VPC NICs for multi-subnet system VMs (e.g. ALBs with
-		// subnets across multiple AZs).
-		if err := d.setupExtraENINICs(instance); err != nil {
-			return err
-		}
-
-		// DEV_NETWORKING: add a second NIC with hostfwd for SSH dev access
-		if d.config.Daemon.DevNetworking {
-			sshDebugAddr, err := viperblock.FindFreePort()
-			if err != nil {
-				slog.Warn("DEV_NETWORKING: failed to find free port for dev NIC", "err", err)
-			} else {
-				_, sshDebugPort, err := net.SplitHostPort(sshDebugAddr)
-				if err != nil {
-					slog.Warn("DEV_NETWORKING: failed to parse port from address", "addr", sshDebugAddr, "err", err)
-				} else {
-					bindIP := d.config.Host
-					if bindIP == "" || bindIP == "0.0.0.0" {
-						bindIP = "127.0.0.1"
-					}
-					netdevVal := fmt.Sprintf("user,id=dev0,hostfwd=tcp:%s:%s-:22", bindIP, sshDebugPort)
-					// Add extra hostfwd rules for system instances (e.g. ALB VMs forwarding HTTP ports)
-					if instance.ExtraHostfwd != nil {
-						for guestPort := range instance.ExtraHostfwd {
-							fwdAddr, fwdErr := viperblock.FindFreePort()
-							if fwdErr != nil {
-								slog.Warn("DEV_NETWORKING: failed to find free port for extra hostfwd", "guestPort", guestPort, "err", fwdErr)
-								continue
-							}
-							_, hostPort, splitErr := net.SplitHostPort(fwdAddr)
-							if splitErr != nil {
-								slog.Warn("DEV_NETWORKING: failed to parse extra hostfwd address", "fwdAddr", fwdAddr, "err", splitErr)
-								continue
-							}
-							hostPortInt, convErr := strconv.Atoi(hostPort)
-							if convErr != nil {
-								slog.Warn("DEV_NETWORKING: failed to convert extra hostfwd port", "hostPort", hostPort, "err", convErr)
-								continue
-							}
-							netdevVal += fmt.Sprintf(",hostfwd=tcp:%s:%s-:%d", bindIP, hostPort, guestPort)
-							instance.ExtraHostfwd[guestPort] = hostPortInt
-							slog.Info("DEV_NETWORKING: extra hostfwd", "guestPort", guestPort, "hostPort", hostPort, "instanceId", instance.ID)
-						}
-					}
-					instance.Config.NetDevs = append(instance.Config.NetDevs, vm.NetDev{
-						Value: netdevVal,
-					})
-					devMac := generateDevMAC(instance.ID)
-					instance.Config.Devices = append(instance.Config.Devices, vm.Device{
-						Value: fmt.Sprintf("virtio-net-pci,netdev=dev0,mac=%s", devMac),
-					})
-					slog.Info("DEV_NETWORKING: added dev NIC with SSH hostfwd",
-						"bindIP", bindIP, "port", sshDebugPort, "mac", devMac, "instanceId", instance.ID)
-				}
-			}
-		}
-	} else {
-		// Non-VPC fallback: user-mode networking with SSH port forwarding
-		sshDebugAddr, err := viperblock.FindFreePort()
-		if err != nil {
-			slog.Error("Failed to find free port", "err", err)
-			return err
-		}
-		_, sshDebugPort, err := net.SplitHostPort(sshDebugAddr)
-		if err != nil {
-			slog.Error("Failed to parse port from address", "addr", sshDebugAddr, "err", err)
-			return fmt.Errorf("parse port from %s: %w", sshDebugAddr, err)
-		}
-
-		bindIP := d.config.Host
-		if bindIP == "" || bindIP == "0.0.0.0" {
-			bindIP = "127.0.0.1"
-		}
-		instance.Config.NetDevs = append(instance.Config.NetDevs, vm.NetDev{
-			Value: fmt.Sprintf("user,id=net0,hostfwd=tcp:%s:%s-:22", bindIP, sshDebugPort),
-		})
-		instance.Config.Devices = append(instance.Config.Devices, vm.Device{
-			Value: "virtio-net-pci,netdev=net0",
-		})
-	}
-
-	// Management NIC: system instances get a TAP on br-mgmt for control plane traffic.
-	if instance.MgmtMAC != "" && instance.MgmtTap != "" {
-		instance.Config.NetDevs = append(instance.Config.NetDevs, vm.NetDev{
-			Value: fmt.Sprintf("tap,id=mgmt0,ifname=%s,script=no,downscript=no", instance.MgmtTap),
-		})
-		instance.Config.Devices = append(instance.Config.Devices, vm.Device{
-			Value: fmt.Sprintf("virtio-net-pci,netdev=mgmt0,mac=%s", instance.MgmtMAC),
-		})
-		slog.Info("Management NIC configured", "tap", instance.MgmtTap, "mac", instance.MgmtMAC, "ip", instance.MgmtIP, "instanceId", instance.ID)
-	}
-
-	instance.Config.Devices = append(instance.Config.Devices, vm.Device{
-		Value: "virtio-rng-pci",
-	})
-
-	// QMP socket
-	qmpSocket, err := utils.GenerateSocketFile(fmt.Sprintf("qmp-%s", instance.ID))
-
-	if err != nil {
-		slog.Error("Failed to generate QMP socket", "err", err)
-		return err
-	}
-
-	instance.Config.QMPSocket = qmpSocket
-
-	// Temp, wait for nbdkit to start
-	// TODO: Improve, confirm nbdkit started for each volume
-	time.Sleep(2 * time.Second)
-
-	// Create a unique error channel for this specific mount request
-	processChan := make(chan int, 1)
-	exitChan := make(chan int, 1)
-	startupConfirmed := make(chan bool, 1)
-
-	go func() {
-		cmd, err := instance.Config.Execute()
-
-		if err != nil {
-			slog.Error("Failed to execute VM", "err", err)
-			processChan <- 0
-			return
-		}
-
-		VMstdout, err := cmd.StdoutPipe()
-		if err != nil {
-			slog.Error("Failed to pipe STDERR VM", "err", err)
-			processChan <- 0
-			return
-		}
-
-		VMstderr, err := cmd.StderrPipe()
-		if err != nil {
-			slog.Error("Failed to pipe STDERR VM", "err", err)
-			processChan <- 0
-			return
-		}
-
-		err = cmd.Start()
-
-		if err != nil {
-			slog.Error("Failed to start VM", "err", err)
-			processChan <- 0
-			return
-		}
-
-		slog.Info("VM started successfully", "pid", cmd.Process.Pid)
-
-		// Set OOM score for QEMU process (prefer killing VMs over system services)
-		if err := utils.SetOOMScore(cmd.Process.Pid, 500); err != nil {
-			slog.Warn("Failed to set QEMU OOM score", "pid", cmd.Process.Pid, "err", err)
-		}
-
-		// Log QEMU stdout (serial output is captured via chardev logfile, not stdout)
-		go func() {
-			scanner := bufio.NewScanner(VMstdout)
-			for scanner.Scan() {
-				slog.Info("[qemu]", "line", scanner.Text())
-			}
-		}()
-
-		// --- reader for STDERR ---
-		go func() {
-			scanner := bufio.NewScanner(VMstderr)
-			slog.Info("QEMU stderr reader started")
-
-			for scanner.Scan() {
-				line := scanner.Text()
-				slog.Error("[qemu-stderr]", "line", line)
-			}
-		}()
-
-		processChan <- cmd.Process.Pid
-
-		// Block until QEMU exits
-		waitErr := cmd.Wait()
-
-		if waitErr != nil {
-			slog.Error("VM process exited", "instance", instance.ID, "err", waitErr)
-		}
-
-		// Signal startup check (non-blocking)
-		select {
-		case exitChan <- 1:
-		default:
-		}
-
-		// Wait for startup phase to complete before deciding on crash handling
-		confirmed := <-startupConfirmed
-		if !confirmed {
-			return // Startup failed, LaunchInstance handles the error
-		}
-
-		// Handle exit: crash vs clean shutdown
-		if waitErr != nil {
-			d.handleInstanceCrash(instance, waitErr)
-		} else {
-			slog.Info("VM process exited cleanly", "instance", instance.ID)
-		}
-	}()
-
-	// Wait for startup result
-	pid := <-processChan
-
-	if pid == 0 {
-		return fmt.Errorf("failed to start qemu")
-	}
-
-	// Wait for 1 second to confirm nbdkit is running
-	time.Sleep(1 * time.Second)
-
-	// Check if QEMU exited immediately with an error
-	select {
-	case exitErr := <-exitChan:
-		startupConfirmed <- false // tell goroutine not to handle crash
-		if exitErr != 0 {
-			errorMsg := fmt.Errorf("failed: %v", exitErr)
-			slog.Error("Failed to launch qemu", "err", errorMsg)
-			return errorMsg
-		}
-	default:
-		startupConfirmed <- true // goroutine will handle future crashes
-		slog.Info("QEMU started successfully and is running",
-			"console_log", instance.Config.ConsoleLogPath,
-			"serial_socket", instance.Config.SerialSocket)
-	}
-
-	// Confirm the instance has booted
-	_, err = utils.ReadPidFile(instance.ID)
-
-	if err != nil {
-		slog.Error("Failed to read PID file", "err", err)
-		return err
-	}
-
-	return nil
-}
-
-// buildBaseVMConfig creates a vm.Config with base QEMU settings and PCIe
-// hotplug root ports. Architecture, vCPU, and memory come from the caller
-// (resolved from instance type info).
-func buildBaseVMConfig(instanceID, pidFile, consoleLogPath, serialSocket, architecture string, vCPUs, memoryMiB int) vm.Config {
-	cfg := vm.Config{
-		Name:           instanceID,
-		PIDFile:        pidFile,
-		EnableKVM:      true,
-		NoGraphic:      true,
-		MachineType:    "q35",
-		ConsoleLogPath: consoleLogPath,
-		SerialSocket:   serialSocket,
-		CPUType:        "host",
-		Memory:         memoryMiB,
-		CPUCount:       vCPUs,
-		Architecture:   architecture,
-	}
-
-	// Add PCIe root ports for volume hotplug (Q35 requires explicit root ports).
-	// 11 ports for /dev/sd[f-p] hotplug slots, starting at chassis 1.
-	for i := 1; i <= 11; i++ {
-		cfg.Devices = append(cfg.Devices, vm.Device{
-			Value: fmt.Sprintf("pcie-root-port,id=hotplug%d,chassis=%d,slot=0", i, i),
-		})
-	}
-
-	return cfg
-}
-
-// buildDrives converts EBS volume requests into QEMU drive, iothread, and device
-// configurations. Returns an error if any non-EFI volume is missing its NBDURI.
-func buildDrives(requests []types.EBSRequest, cpuCount int) ([]vm.Drive, []vm.IOThread, []vm.Device, error) {
-	var drives []vm.Drive
-	var iothreads []vm.IOThread
-	var devices []vm.Device
-
-	for _, v := range requests {
-		// TODO: Add EFI support
-		if v.EFI {
-			continue
-		}
-
-		if v.NBDURI == "" {
-			return nil, nil, nil, fmt.Errorf("NBDURI not set for volume %s - was volume mounted?", v.Name)
-		}
-
-		drive := vm.Drive{File: v.NBDURI}
-
-		if v.Boot {
-			drive.Format = "raw"
-			drive.If = "none"
-			drive.Media = "disk"
-			drive.ID = "os"
-			drive.Cache = "none"
-
-			iothreadID := "ioth-os"
-			iothreads = append(iothreads, vm.IOThread{ID: iothreadID})
-			devices = append(devices, vm.Device{
-				Value: fmt.Sprintf("virtio-blk-pci,drive=%s,iothread=%s,num-queues=%d,bootindex=1",
-					drive.ID, iothreadID, cpuCount),
-			})
-		}
-
-		if v.CloudInit {
-			drive.Format = "raw"
-			drive.If = "virtio"
-			drive.Media = "cdrom"
-			drive.ID = "cloudinit"
-		}
-
-		slog.Info("Using NBD URI for drive", "volume", v.Name, "uri", v.NBDURI)
-		drives = append(drives, drive)
-	}
-
-	return drives, iothreads, devices, nil
-}
-
-// ebsTopic returns a node-specific EBS NATS topic, e.g. "ebs.node1.mount".
-// This ensures mount/unmount requests are routed to the viperblock instance
-// running on the same node as the daemon (NBD sockets are local).
-func (d *Daemon) ebsTopic(action string) string {
-	return fmt.Sprintf("ebs.%s.%s", d.node, action)
-}
-
-// MountVolumes mounts the volumes for an instance
-func (d *Daemon) MountVolumes(instance *vm.VM) error {
-	instance.EBSRequests.Mu.Lock()
-	defer instance.EBSRequests.Mu.Unlock()
-
-	for k, v := range instance.EBSRequests.Requests {
-		// Send the volume payload as JSON
-		ebsMountRequest, err := json.Marshal(v)
-
-		if err != nil {
-			slog.Error("Failed to marshal volume payload", "err", err)
-			return err
-		}
-
-		reply, err := d.natsConn.Request(d.ebsTopic("mount"), ebsMountRequest, 30*time.Second)
-
-		slog.Info("Mounting volume", "Vol", v.Name, "NBDURI", v.NBDURI)
-
-		// TODO: Improve timeout handling
-		if err != nil {
-			slog.Error("Failed to request EBS mount", "err", err)
-			return err
-		}
-
-		// Unmarshal the response
-		var ebsMountResponse types.EBSMountResponse
-		err = json.Unmarshal(reply.Data, &ebsMountResponse)
-
-		if err != nil {
-			slog.Error("Failed to unmarshal volume response:", "err", err)
-			return err
-		}
-
-		if ebsMountResponse.Error == "" {
-			slog.Debug("Mounted volume successfully", "response", ebsMountResponse.URI)
-
-			// Append the NBD URI to the request
-			instance.EBSRequests.Requests[k].NBDURI = ebsMountResponse.URI
-		} else {
-			slog.Error("Failed to mount volume", "error", ebsMountResponse.Error)
-			return fmt.Errorf("failed to mount volume: %s", ebsMountResponse.Error)
-		}
-	}
-
-	return nil
-}
-
-// rollbackEBSMount sends an ebs.unmount request to undo a previously successful ebs.mount.
-// Rollback failures are logged but not propagated; callers treat this as best-effort cleanup.
-func (d *Daemon) rollbackEBSMount(req types.EBSRequest) {
-	data, err := json.Marshal(req)
-	if err != nil {
-		slog.Error("rollbackEBSMount: failed to marshal unmount request", "volume", req.Name, "err", err)
-		return
-	}
-	msg, err := d.natsConn.Request(d.ebsTopic("unmount"), data, 10*time.Second)
-	if err != nil {
-		slog.Error("rollbackEBSMount: ebs.unmount NATS request failed", "volume", req.Name, "err", err)
-		return
-	}
-	var resp types.EBSUnMountResponse
-	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		slog.Error("rollbackEBSMount: failed to unmarshal response", "volume", req.Name, "err", err)
-		return
-	}
-	if resp.Error != "" {
-		slog.Error("rollbackEBSMount: ebs.unmount returned error", "volume", req.Name, "err", resp.Error)
-		return
-	}
-	if resp.Mounted {
-		slog.Error("rollbackEBSMount: volume still mounted after unmount", "volume", req.Name)
-		return
-	}
-	slog.Info("rollbackEBSMount: volume unmounted successfully", "volume", req.Name)
 }
 
 // respondWithVolumeAttachment builds an ec2.VolumeAttachment, marshals it to JSON, and
@@ -2689,68 +2064,66 @@ func (d *Daemon) respondWithVolumeAttachment(msg *nats.Msg, volumeID, instanceID
 	}
 }
 
-// nextAvailableDevice finds the next available /dev/sd[f-p] device name for an instance.
-// It checks both EBSRequests and BlockDeviceMappings to avoid conflicts.
-func nextAvailableDevice(instance *vm.VM) string {
-	usedDevices := make(map[string]bool)
-
-	// Collect devices from existing BlockDeviceMappings
-	if instance.Instance != nil {
-		for _, bdm := range instance.Instance.BlockDeviceMappings {
-			if bdm.DeviceName != nil {
-				usedDevices[*bdm.DeviceName] = true
-			}
-		}
-	}
-
-	// Collect devices from EBSRequests (may not yet be in BlockDeviceMappings)
-	instance.EBSRequests.Mu.Lock()
-	for _, req := range instance.EBSRequests.Requests {
-		if req.DeviceName != "" {
-			usedDevices[req.DeviceName] = true
-		}
-	}
-	instance.EBSRequests.Mu.Unlock()
-
-	// AWS convention: /dev/sd[f-p] for attached volumes
-	for c := 'f'; c <= 'p'; c++ {
-		dev := fmt.Sprintf("/dev/sd%c", c)
-		if !usedDevices[dev] {
-			return dev
-		}
-	}
-
-	return ""
-}
-
 // canAllocate checks how many instances of the given type can be allocated.
 // Returns the count that can actually be allocated (0 to count).
 func (rm *ResourceManager) canAllocate(instanceType *ec2.InstanceTypeInfo, count int) int {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
-
-	return canAllocateCount(
-		rm.hostVCPU-rm.reservedVCPU, rm.allocatedVCPU,
-		rm.hostMemGB-rm.reservedMem, rm.allocatedMem,
-		instanceTypeVCPUs(instanceType),
-		instanceTypeMemoryMiB(instanceType),
-		count,
-	)
+	return rm.canAllocateLocked(instanceType, count)
 }
 
-// allocate reserves resources for an instance and updates NATS subscriptions
+// canAllocateLocked is the lock-free body of canAllocate. Caller must already
+// hold rm.mu for read or write. Extracted so allocate can re-check capacity
+// while holding the write lock without dropping it.
+func (rm *ResourceManager) canAllocateLocked(instanceType *ec2.InstanceTypeInfo, count int) int {
+	// GPU capacity is managed exclusively by gpuManager.Claim; don't double-gate
+	// on host CPU/memory which is always abundant on GPU-class hardware.
+	if instancetypes.IsGPUType(instanceType) {
+		return count
+	}
+
+	n := canAllocateCount(
+		rm.hostVCPU-rm.reservedVCPU-rm.reservedCRVCPU, rm.allocatedVCPU,
+		rm.hostMemGB-rm.reservedMem-rm.reservedCRMem, rm.allocatedMem,
+		instanceTypeVCPUs(instanceType),
+		rm.instanceMemChargeMiB(instanceType),
+		count,
+		0, false,
+	)
+	return rm.liveMemGate(n, instanceType)
+}
+
+// liveMemGate clamps n by current MemAvailable, catching overcommit that the
+// static -m budget misses. Returns n unchanged when disabled or on read error.
+func (rm *ResourceManager) liveMemGate(n int, instanceType *ec2.InstanceTypeInfo) int {
+	if rm.readMemAvailableGB == nil || n <= 0 {
+		return n
+	}
+	availGB, ok := rm.readMemAvailableGB()
+	if !ok {
+		return n
+	}
+	memGB := float64(rm.instanceMemChargeMiB(instanceType)) / 1024.0
+	return liveMemCount(n, availGB, rm.reservedMem+rm.reservedCRMem, memGB)
+}
+
+// allocate reserves resources for one instance and updates NATS subscriptions.
+// Check and commit run under a single write-lock acquisition; without this,
+// two concurrent callers could both observe free capacity through the read
+// lock and then both commit, overcommitting the host. Multi-instance launch
+// paths loop on allocate per VM, relying on this per-call atomicity.
 func (rm *ResourceManager) allocate(instanceType *ec2.InstanceTypeInfo) error {
-	if rm.canAllocate(instanceType, 1) < 1 {
+	rm.mu.Lock()
+	if rm.canAllocateLocked(instanceType, 1) < 1 {
+		rm.mu.Unlock()
 		instanceTypeName := ""
 		if instanceType.InstanceType != nil {
 			instanceTypeName = *instanceType.InstanceType
 		}
 		return fmt.Errorf("insufficient resources for instance type %s", instanceTypeName)
 	}
-
-	rm.mu.Lock()
 	vCPUs := instanceTypeVCPUs(instanceType)
-	memoryGB := float64(instanceTypeMemoryMiB(instanceType)) / 1024.0
+	memoryGB := float64(rm.instanceMemChargeMiB(instanceType)) / 1024.0
 	rm.allocatedVCPU += int(vCPUs)
 	rm.allocatedMem += memoryGB
 	rm.mu.Unlock()
@@ -2763,7 +2136,7 @@ func (rm *ResourceManager) allocate(instanceType *ec2.InstanceTypeInfo) error {
 func (rm *ResourceManager) deallocate(instanceType *ec2.InstanceTypeInfo) {
 	rm.mu.Lock()
 	vCPUs := instanceTypeVCPUs(instanceType)
-	memoryGB := float64(instanceTypeMemoryMiB(instanceType)) / 1024.0
+	memoryGB := float64(rm.instanceMemChargeMiB(instanceType)) / 1024.0
 	rm.allocatedVCPU -= int(vCPUs)
 	rm.allocatedMem -= memoryGB
 	rm.mu.Unlock()
@@ -2771,23 +2144,59 @@ func (rm *ResourceManager) deallocate(instanceType *ec2.InstanceTypeInfo) {
 	rm.updateInstanceSubscriptions()
 }
 
-// initSubscriptions sets up dynamic per-instance-type NATS subscriptions.
-// Called once during daemon startup after NATS is connected.
-func (rm *ResourceManager) initSubscriptions(nc *nats.Conn, handler nats.MsgHandler, nodeID string) {
+var _ handlers_ec2_instance.InstanceTypeAllocator = (*ResourceManager)(nil)
+
+// Allocate, Deallocate, CanAllocate satisfy handlers_ec2_instance.InstanceTypeAllocator.
+func (rm *ResourceManager) Allocate(it *ec2.InstanceTypeInfo) error { return rm.allocate(it) }
+func (rm *ResourceManager) Deallocate(it *ec2.InstanceTypeInfo)     { rm.deallocate(it) }
+func (rm *ResourceManager) CanAllocate(it *ec2.InstanceTypeInfo, count int) int {
+	return rm.canAllocate(it, count)
+}
+
+// InstanceTypes returns the shared instance-type map. Callers must not mutate
+// the returned map; reloadGPUTypes mutates it in place under rm.mu.
+func (rm *ResourceManager) InstanceTypes() map[string]*ec2.InstanceTypeInfo {
+	return rm.instanceTypes
+}
+
+// reloadGPUTypes replaces GPU instance types in the shared map (in-place, so
+// all holders see the update) and refreshes NATS subscriptions. Called on SIGHUP.
+func (rm *ResourceManager) reloadGPUTypes(models []instancetypes.GPUModel, migProfiles []instancetypes.MIGProfileSpec, mgr *gpu.Manager) {
+	arch := "x86_64"
+	if runtime.GOARCH == "arm64" {
+		arch = "arm64"
+	}
+
+	rm.mu.Lock()
+	for name, it := range rm.instanceTypes {
+		if instancetypes.IsGPUType(it) {
+			delete(rm.instanceTypes, name)
+		}
+	}
+	if len(models) > 0 {
+		maps.Copy(rm.instanceTypes, instancetypes.GenerateGPUTypes(models, arch))
+	}
+	if len(migProfiles) > 0 {
+		maps.Copy(rm.instanceTypes, instancetypes.GenerateMIGTypes(migProfiles, arch))
+	}
+	rm.gpuManager = mgr
+	rm.mu.Unlock()
+
+	rm.updateInstanceSubscriptions()
+}
+
+func (rm *ResourceManager) initSubscriptions(nc *nats.Conn, handler nats.MsgHandler, systemHandler nats.MsgHandler, nodeID string) {
 	rm.natsConn = nc
 	rm.handler = handler
+	rm.systemHandler = systemHandler
 	rm.nodeID = nodeID
 	rm.instanceSubs = make(map[string]*nats.Subscription)
 	rm.updateInstanceSubscriptions()
 }
 
-// updateInstanceSubscriptions recalculates which instance types can fit on this
-// node and subscribes/unsubscribes from the corresponding NATS topics. Each type
-// gets two topics:
-//   - ec2.RunInstances.{type} with spinifex-workers queue group (load-balanced, for single-instance launches)
-//   - ec2.RunInstances.{type}.{nodeId} without queue group (targeted, for multi-node distribution)
-//
-// Both use the same handler. NATS only routes requests to nodes with available capacity.
+// updateInstanceSubscriptions subscribes/unsubscribes per-type NATS topics
+// based on current capacity. Customer types use ec2.RunInstances.*; system
+// types use system.LaunchInstance.*. Each gets a queue-group and a node-targeted topic.
 func (rm *ResourceManager) updateInstanceSubscriptions() {
 	if rm.natsConn == nil {
 		return
@@ -2797,17 +2206,26 @@ func (rm *ResourceManager) updateInstanceSubscriptions() {
 	defer rm.subsMu.Unlock()
 
 	for typeName, typeInfo := range rm.instanceTypes {
-		// System types (sys.micro, etc.) are internal-only — not routable via customer API.
-		if instancetypes.IsSystemType(typeName) {
-			continue
-		}
-		queueTopic := fmt.Sprintf("ec2.RunInstances.%s", typeName)
 		canFit := rm.canAllocate(typeInfo, 1) >= 1
 
-		// Queue group subscription (load-balanced across nodes)
+		subjectRoot := "ec2.RunInstances"
+		handler := rm.handler
+		queueGroup := "spinifex-workers"
+		if instancetypes.IsSystemType(typeName) {
+			// System types (sys.micro, etc.) are internal-only — not exposed
+			// via the customer EC2 API and use a dedicated subject root so
+			// ELBv2 can fan out ALB-VM launches across the cluster.
+			if rm.systemHandler == nil {
+				continue
+			}
+			subjectRoot = "system.LaunchInstance"
+			handler = rm.systemHandler
+		}
+
+		queueTopic := fmt.Sprintf("%s.%s", subjectRoot, typeName)
 		_, subscribed := rm.instanceSubs[queueTopic]
 		if canFit && !subscribed {
-			sub, err := rm.natsConn.QueueSubscribe(queueTopic, "spinifex-workers", rm.handler)
+			sub, err := rm.natsConn.QueueSubscribe(queueTopic, queueGroup, handler)
 			if err != nil {
 				slog.Error("Failed to subscribe to instance type topic", "topic", queueTopic, "err", err)
 				continue
@@ -2822,37 +2240,27 @@ func (rm *ResourceManager) updateInstanceSubscriptions() {
 			slog.Info("Unsubscribed from instance type (capacity full)", "topic", queueTopic)
 		}
 
-		// Node-specific subscription (targeted routing for multi-node distribution)
 		if rm.nodeID != "" {
-			nodeTopic := fmt.Sprintf("ec2.RunInstances.%s.%s", typeName, rm.nodeID)
-			_, nodeSubscribed := rm.instanceSubs[nodeTopic]
-			if canFit && !nodeSubscribed {
-				sub, err := rm.natsConn.Subscribe(nodeTopic, rm.handler)
+			// Node-targeted topic stays subscribed even when capacity is full:
+			// a committed reservation (e.g. spread placement) must not fail with
+			// "no responders". Capacity is enforced at launch time by allocate().
+			nodeTopic := fmt.Sprintf("%s.%s.%s", subjectRoot, typeName, rm.nodeID)
+			if _, nodeSubscribed := rm.instanceSubs[nodeTopic]; canFit && !nodeSubscribed {
+				sub, err := rm.natsConn.Subscribe(nodeTopic, handler)
 				if err != nil {
 					slog.Error("Failed to subscribe to node-specific topic", "topic", nodeTopic, "err", err)
 					continue
 				}
 				rm.instanceSubs[nodeTopic] = sub
 				slog.Debug("Subscribed to node-specific instance type", "topic", nodeTopic)
-			} else if !canFit && nodeSubscribed {
-				if err := rm.instanceSubs[nodeTopic].Unsubscribe(); err != nil {
-					slog.Error("Failed to unsubscribe from node-specific topic", "topic", nodeTopic, "err", err)
-				}
-				delete(rm.instanceSubs, nodeTopic)
-				slog.Info("Unsubscribed from node-specific instance type (capacity full)", "topic", nodeTopic)
 			}
 		}
 	}
 }
 
 // wireLBAgentConfig loads system credentials, resolves the gateway URL,
-// reads the CA certificate, and wires them into the ELBv2 service so LB
-// VMs get SigV4 credentials and gateway URL injected via cloud-init.
+// and wires them into the ELBv2 service for LB VM cloud-init injection.
 func (d *Daemon) wireLBAgentConfig() {
-	// Use system credentials from spinifex.toml (predastore section).
-	// These are the same service-to-service credentials written by admin init
-	// into both spinifex.toml and system-credentials.json. Reading from the
-	// config avoids file permission issues with the separate JSON file.
 	if d.config.Predastore.AccessKey != "" && d.config.Predastore.SecretKey != "" {
 		d.systemAccessKey = d.config.Predastore.AccessKey
 		d.systemSecretKey = d.config.Predastore.SecretKey
@@ -2863,27 +2271,6 @@ func (d *Daemon) wireLBAgentConfig() {
 		slog.Warn("System credentials missing from spinifex.toml predastore section — LB VMs will not have SigV4 credentials for agent auth")
 	}
 
-	// Resolve gateway URL — the address LB VMs use to reach the AWS gateway.
-	// Precedence:
-	//   1. br-mgmt present + AWSGW on a dedicated IP distinct from AdvertiseIP
-	//      (multi-node: AWSGW on a mgmt-only IP, VPC path can't reach it) →
-	//      gateway URL is the AWSGW bind IP and lb-agent gets a bootcmd host
-	//      route via br-mgmt.
-	//   2. AdvertiseIP set (single-node, or multi-node where AWSGW binds to
-	//      the advertised IP) → AdvertiseIP. VMs reach it via VPC → external
-	//      (OVN's own dnat_and_snat SNATs their reply back to the ALB EIP).
-	//      Critically, we do NOT add the mgmt host route here: when host IPs
-	//      on the WAN share the advertiseIP, the /32 route would steal the
-	//      return path for host-initiated ALB connections — replies would
-	//      egress via mgmt with the VM's 10.x source IP, bypass OVN's SNAT,
-	//      and arrive at the host with a source that doesn't match the open
-	//      TCP socket (the client dialed the EIP, not the VM IP).
-	//   3. br-mgmt present + AWSGW on 0.0.0.0 → br-mgmt IP (both LB flavours
-	//      reach the daemon via mgmt).
-	//   4. DevNetworking shim → 10.0.2.2.
-	//   5. AWSGW bound to specific IP (no br-mgmt, no advertise) → that IP.
-	//   6. Else: error and skip assignment — no silent empty URL.
-	var gatewayHost string
 	awsgwBindIP := ""
 	if d.config.AWSGW.Host != "" {
 		if h, _, splitErr := net.SplitHostPort(d.config.AWSGW.Host); splitErr == nil {
@@ -2893,28 +2280,13 @@ func (d *Daemon) wireLBAgentConfig() {
 
 	advertiseIP := d.config.AdvertiseIP
 
-	switch {
-	case d.mgmtBridgeIP != "" && awsgwBindIP != "" && awsgwBindIP != "0.0.0.0" &&
-		!net.ParseIP(awsgwBindIP).IsLoopback() && awsgwBindIP != advertiseIP:
-		// Multi-node: AWSGW on a dedicated mgmt IP. VMs can't reach it via
-		// VPC → external, so add a bootcmd host route via br-mgmt.
-		gatewayHost = awsgwBindIP
+	gatewayHost := d.resolveGatewayHost()
+
+	// Set mgmtRouteVia when AWSGW is only reachable via br-mgmt (multi-node).
+	if gatewayHost != "" && gatewayHost == awsgwBindIP && d.mgmtBridgeIP != "" && awsgwBindIP != advertiseIP {
 		d.mgmtRouteVia = awsgwBindIP
-	case advertiseIP != "" && advertiseIP != "0.0.0.0":
-		// Single-node, or multi-node where AWSGW binds to AdvertiseIP: VMs
-		// reach AWSGW via the normal VPC → external path. No mgmt host route.
-		gatewayHost = advertiseIP
-	case d.mgmtBridgeIP != "":
-		// br-mgmt present + AWSGW on 0.0.0.0 and no advertiseIP — br-mgmt IP
-		// is the only reachable address.
-		gatewayHost = d.mgmtBridgeIP
-	case d.config.Daemon.DevNetworking:
-		gatewayHost = "10.0.2.2"
-	case awsgwBindIP != "" && awsgwBindIP != "0.0.0.0":
-		gatewayHost = awsgwBindIP
 	}
 
-	// Extract port from AWSGW host config (e.g. "0.0.0.0:9999" → "9999").
 	gatewayPort := "9999"
 	if d.config.AWSGW.Host != "" {
 		if _, port, splitErr := net.SplitHostPort(d.config.AWSGW.Host); splitErr == nil && port != "" {
@@ -2931,19 +2303,194 @@ func (d *Daemon) wireLBAgentConfig() {
 			"awsgwBindIP", awsgwBindIP, "mgmtBridgeIP", d.mgmtBridgeIP, "advertiseIP", advertiseIP)
 	}
 
-	// Pass mgmt route info so lbVMUserData can add a bootcmd route for
-	// internal LBs that reach the AWSGW via the management NIC.
 	if d.mgmtRouteVia != "" {
 		d.elbv2Service.MgmtRouteGateway = d.mgmtBridgeIP
 		d.elbv2Service.MgmtRouteTarget = d.mgmtRouteVia
 	}
 
-	// Always expose mgmtBridgeIP and advertiseIP so lbVMUserData can synthesize
-	// a mgmt-NIC fallback route for internal-scheme LBs on single-node setups
-	// (where MgmtRoute{Gateway,Target} stay empty because internet-facing LBs
-	// reach AWSGW via VPC + EIP SNAT). Internal LBs have no EIP, so without
-	// this fallback the agent has no return path and the LB stays in
-	// provisioning forever.
 	d.elbv2Service.MgmtBridgeIP = d.mgmtBridgeIP
 	d.elbv2Service.AdvertiseIP = advertiseIP
+
+	if d.config.NATS.CACert != "" {
+		if caBytes, err := os.ReadFile(d.config.NATS.CACert); err == nil {
+			d.elbv2Service.CACert = string(caBytes)
+			slog.Info("CA cert loaded for LB agent TLS", "path", d.config.NATS.CACert)
+		} else {
+			slog.Warn("Failed to read CA cert for LB agent TLS", "path", d.config.NATS.CACert, "err", err)
+		}
+	} else {
+		slog.Warn("NATS CACert not configured — direct-boot LB VMs will not verify AWSGW TLS")
+	}
+}
+
+// buildGPUPool partitions GPU devices into whole-GPU and MIG entries, constructs
+// a Manager, and returns models and MIG profile specs for instance-type generation.
+func buildGPUPool(devices []gpu.GPUDevice, cfg config.DaemonConfig) (*gpu.Manager, []instancetypes.GPUModel, []instancetypes.MIGProfileSpec) {
+	type migEntry struct {
+		dev      gpu.GPUDevice
+		existing []gpu.MIGInstance // non-nil = restart recovery; nil = fresh free GPU
+	}
+
+	var wholeGPU []gpu.GPUDevice
+	var migEntries []migEntry
+	var migProfiles []instancetypes.MIGProfileSpec
+	seenProfiles := make(map[string]bool)
+	recoveredSlices, freeMIGGPUs := 0, 0
+
+	for _, dev := range devices {
+		if !dev.MIGCapable || !dev.MIGEnabled {
+			if dev.MIGCapable && !dev.MIGEnabled {
+				slog.Warn("MIG-capable GPU but MIG mode not active; using whole-GPU passthrough",
+					"gpu", dev.PCIAddress, "hint", "run 'spx admin gpu mig enable'")
+			}
+			wholeGPU = append(wholeGPU, dev)
+			continue
+		}
+
+		// Collect available profiles for MIG instance-type generation.
+		profiles, err := gpu.ListProfiles(dev.PCIAddress)
+		if err != nil {
+			slog.Warn("Could not list MIG profiles; GPU will not advertise MIG types",
+				"gpu", dev.PCIAddress, "err", err)
+		}
+		for _, p := range profiles {
+			if !seenProfiles[p.Name] {
+				seenProfiles[p.Name] = true
+				migProfiles = append(migProfiles, instancetypes.MIGProfileSpec{
+					Name: p.Name, MemoryMiB: p.MemoryMiB,
+				})
+			}
+		}
+
+		// Re-discover existing instances from a previous daemon run.
+		existing, listErr := gpu.ListInstances(dev.PCIAddress)
+		if listErr != nil {
+			slog.Error("MIG list instances failed, falling back to whole-GPU passthrough",
+				"gpu", dev.PCIAddress, "err", listErr)
+			wholeGPU = append(wholeGPU, dev)
+			continue
+		}
+		migEntries = append(migEntries, migEntry{dev: dev, existing: existing})
+		if len(existing) > 0 {
+			recoveredSlices += len(existing)
+		} else {
+			freeMIGGPUs++
+		}
+	}
+
+	var models []instancetypes.GPUModel
+	for _, dev := range wholeGPU {
+		models = append(models, resolveGPUModel(dev, cfg.GPUModelOverrides))
+	}
+
+	mgr := gpu.NewManager(wholeGPU)
+	for _, me := range migEntries {
+		if len(me.existing) > 0 {
+			mgr.AddMIGInstances(me.dev, me.existing)
+		} else {
+			mgr.AddMIGGPU(me.dev)
+		}
+	}
+
+	slog.Info("GPU pool built",
+		"whole_gpu", len(wholeGPU), "mig_free", freeMIGGPUs,
+		"mig_slices_recovered", recoveredSlices, "mig_profiles", len(migProfiles))
+	return mgr, models, migProfiles
+}
+
+// resolveGPUModel maps a GPU device to an instance type model. Overrides take
+// priority, then the production model list, then a g5 default.
+func resolveGPUModel(dev gpu.GPUDevice, overrides []config.GPUModelOverride) instancetypes.GPUModel {
+	for i := range overrides {
+		o := &overrides[i]
+		if o.VendorID == dev.VendorID && o.DeviceID == dev.DeviceID {
+			return instancetypes.GPUModel{
+				VendorID:     o.VendorID,
+				DeviceID:     o.DeviceID,
+				Family:       o.Family,
+				Manufacturer: o.Manufacturer,
+				Name:         o.Name,
+				MemoryMiB:    o.MemoryMiB,
+			}
+		}
+	}
+	if m := instancetypes.GPUModelForVendorDevice(dev.VendorID, dev.DeviceID); m != nil {
+		return *m
+	}
+	name := dev.Model
+	if name == "" {
+		name = fmt.Sprintf("GPU %s:%s", dev.VendorID, dev.DeviceID)
+	}
+	return instancetypes.GPUModel{
+		VendorID:     dev.VendorID,
+		DeviceID:     dev.DeviceID,
+		Family:       "g5",
+		Manufacturer: gpuVendorDisplayName(dev.Vendor),
+		Name:         name,
+		MemoryMiB:    dev.MemoryMiB,
+	}
+}
+
+// gpuXVGAEnabled returns true when the QEMU device should include x-vga=on.
+// Consumer GPUs default to true; known datacenter/compute cards default to false.
+// A GPUModelOverride with XVGAOff=true forces false regardless of the model table.
+func gpuXVGAEnabled(dev *gpu.GPUDevice, overrides []config.GPUModelOverride) bool {
+	for _, o := range overrides {
+		if o.VendorID == dev.VendorID && o.DeviceID == dev.DeviceID {
+			return !o.XVGAOff
+		}
+	}
+	return !gpu.IsComputeGPU(dev.VendorID, dev.DeviceID)
+}
+
+func gpuVendorDisplayName(v gpu.Vendor) string {
+	switch v {
+	case gpu.VendorNVIDIA:
+		return "NVIDIA"
+	case gpu.VendorAMD:
+		return "AMD"
+	case gpu.VendorIntel:
+		return "Intel"
+	default:
+		return "Unknown"
+	}
+}
+
+// gpuProbeResult holds the outcome of the startup GPU hardware probe.
+type gpuProbeResult struct {
+	Capable     bool // true when Devices, IOMMUActive, and VFIOPresent are all satisfied
+	IOMMUActive bool
+	VFIOPresent bool
+	Devices     []gpu.GPUDevice
+}
+
+// probeGPU discovers GPU hardware and checks passthrough prerequisites (read-only).
+func probeGPU() gpuProbeResult {
+	var r gpuProbeResult
+
+	devices, err := gpu.Discover()
+	if err != nil {
+		slog.Debug("GPU probe: discover failed", "err", err)
+	}
+	r.Devices = devices
+
+	// IOMMU is active when the kernel has populated iommu_groups in sysfs.
+	groups, err := os.ReadDir("/sys/kernel/iommu_groups")
+	r.IOMMUActive = err == nil && len(groups) > 0
+
+	// vfio_pci module is present when its sysfs module directory exists.
+	_, err = os.Stat("/sys/module/vfio_pci")
+	r.VFIOPresent = err == nil
+
+	// MIG-enabled GPUs are capable without vfio-pci: the NVIDIA driver owns
+	// isolation via the mdev subsystem, so vfio-pci is not required.
+	hasMIG := false
+	for _, d := range r.Devices {
+		if d.MIGEnabled {
+			hasMIG = true
+			break
+		}
+	}
+	r.Capable = len(r.Devices) > 0 && ((r.IOMMUActive && r.VFIOPresent) || hasMIG)
+	return r
 }

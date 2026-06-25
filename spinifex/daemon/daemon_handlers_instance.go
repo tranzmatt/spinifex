@@ -1,8 +1,8 @@
 package daemon
 
 import (
-	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -12,20 +12,28 @@ import (
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/filterutil"
-	handlers_ec2_placementgroup "github.com/mulgadc/spinifex/spinifex/handlers/ec2/placementgroup"
-	"github.com/mulgadc/spinifex/spinifex/qmp"
-	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/spinifex/spinifex/vm"
 	"github.com/nats-io/nats.go"
 )
 
-// handleEC2RunInstances processes incoming EC2 RunInstances requests
+// startStoppedForwardTimeout bounds the wait for ec2.start.{nodeId} to respond.
+// StartStoppedInstance does volume rehydrate + QEMU launch + QMP handshake,
+// which can take 10-20s on a cold start. Match the awsgw upstream 30s budget
+// so a slow-but-alive target node never trips the fallback path — falling back
+// while the target is still launching causes a duplicate Run that collides on
+// the deterministic tap name (TUNSETIFF: Device or resource busy).
+const startStoppedForwardTimeout = 30 * time.Second
+
+// handleEC2RunInstances orchestrates the RunInstances flow across
+// InstanceService.PrepareRunInstances (validation + ENI creation),
+// daemon-local Insert/WriteState/per-instance subscribe, and
+// InstanceService.LaunchRunInstances (volumes + GPU + vmMgr.Run). The split
+// preserves the original respond-then-launch timing — AWS gets a reservation
+// before the launch loop starts.
 func (d *Daemon) handleEC2RunInstances(msg *nats.Msg) {
 	slog.Debug("Received message on subject", "subject", msg.Subject)
-	slog.Debug("Message data", "data", string(msg.Data))
 
-	// Extract account ID from NATS header
 	accountID := utils.AccountIDFromMsg(msg)
 	if accountID == "" {
 		slog.Error("handleEC2RunInstances: missing account ID in NATS header")
@@ -33,11 +41,8 @@ func (d *Daemon) handleEC2RunInstances(msg *nats.Msg) {
 		return
 	}
 
-	// Initialize runInstancesInput before unmarshaling into it
-	runInstancesInput := &ec2.RunInstancesInput{}
-	errResp := utils.UnmarshalJsonPayload(runInstancesInput, msg.Data)
-
-	if errResp != nil {
+	input := &ec2.RunInstancesInput{}
+	if errResp := utils.UnmarshalJsonPayload(input, msg.Data); errResp != nil {
 		if err := msg.Respond(errResp); err != nil {
 			slog.Error("Failed to respond to NATS request", "err", err)
 		}
@@ -45,272 +50,43 @@ func (d *Daemon) handleEC2RunInstances(msg *nats.Msg) {
 		return
 	}
 
-	slog.Info("Processing RunInstances request for instance type", "instanceType", *runInstancesInput.InstanceType)
-
-	// Check if instance type is supported
-	instanceType, exists := d.resourceMgr.instanceTypes[*runInstancesInput.InstanceType]
-	if !exists {
-		slog.Error("handleEC2RunInstances instance lookup", "err", awserrors.ErrorInvalidInstanceType, "InstanceType", *runInstancesInput.InstanceType)
-		respondWithError(msg, awserrors.ErrorInvalidInstanceType)
-		return
+	// Targeted launch: the gateway routes only when an explicit reservation id is
+	// present, but the id rides in the input either way. Validate semantics
+	// up-front (the per-instance atomic re-check under rm.mu covers the race);
+	// the count gate in PrepareRunInstances handles a full reservation.
+	reservationID := capacityReservationTargetID(input)
+	if reservationID != "" {
+		if it, ok := d.resourceMgr.instanceTypes[aws.StringValue(input.InstanceType)]; ok {
+			if vErr := d.resourceMgr.ValidateReservationTarget(reservationID, accountID, it); vErr != nil {
+				respondWithError(msg, awserrors.ValidErrorCode(vErr.Error()))
+				return
+			}
+		}
 	}
 
-	// Validate AMI exists before allocating resources
-	if runInstancesInput.ImageId == nil || *runInstancesInput.ImageId == "" {
-		slog.Error("handleEC2RunInstances missing ImageId")
-		respondWithError(msg, awserrors.ErrorMissingParameter)
-		return
-	}
-	if d.imageService == nil {
-		slog.Error("handleEC2RunInstances image service not initialized")
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-	amiMeta, err := d.imageService.GetAMIConfig(*runInstancesInput.ImageId)
+	reservation, instances, instanceType, err := d.instanceService.PrepareRunInstances(input, accountID, reservationID)
 	if err != nil {
-		slog.Error("handleEC2RunInstances AMI not found", "imageId", *runInstancesInput.ImageId, "err", err)
-		respondWithError(msg, awserrors.ErrorInvalidAMIIDNotFound)
-		return
-	}
-	// Verify the caller can use this AMI: must own it or it must be a system/pre-phase4 AMI.
-	// System AMIs have non-account-ID owner aliases (e.g. "self", "spinifex", empty).
-	amiOwner := amiMeta.ImageOwnerAlias
-	if amiOwner != "" && amiOwner != accountID {
-		if utils.IsAccountID(amiOwner) {
-			slog.Warn("handleEC2RunInstances AMI not owned by caller", "imageId", *runInstancesInput.ImageId, "amiOwner", amiOwner, "accountID", accountID)
-			respondWithError(msg, awserrors.ErrorInvalidAMIIDNotFound)
-			return
-		}
-	}
-
-	// Validate key pair exists (if specified)
-	if runInstancesInput.KeyName != nil && *runInstancesInput.KeyName != "" {
-		if err := d.keyService.ValidateKeyPairExists(accountID, *runInstancesInput.KeyName); err != nil {
-			slog.Error("handleEC2RunInstances key pair not found", "keyName", *runInstancesInput.KeyName, "err", err)
-			respondWithError(msg, awserrors.ErrorInvalidKeyPairNotFound)
-			return
-		}
-	}
-
-	// Determine how many instances to launch based on MinCount/MaxCount
-	minCount := int(*runInstancesInput.MinCount)
-	maxCount := int(*runInstancesInput.MaxCount)
-
-	// Check how many we can actually launch
-	allocatableCount := d.resourceMgr.canAllocate(instanceType, maxCount)
-
-	if allocatableCount < minCount {
-		// Cannot satisfy MinCount requirement - fail entirely
-		slog.Error("handleEC2RunInstances insufficient capacity", "requested", minCount, "available", allocatableCount, "InstanceType", *runInstancesInput.InstanceType)
-		respondWithError(msg, awserrors.ErrorInsufficientInstanceCapacity)
+		respondWithError(msg, awserrors.ValidErrorCode(err.Error()))
 		return
 	}
 
-	// Launch up to MaxCount, capped by available capacity
-	// Note: canAllocate() already caps at maxCount, so allocatableCount <= maxCount
-	launchCount := allocatableCount
-
-	slog.Info("Instance count determined", "min", minCount, "max", maxCount, "launching", launchCount)
-
-	// Allocate resources for all instances upfront
-	var allocatedCount int
-	for i := 0; i < launchCount; i++ {
-		if err := d.resourceMgr.allocate(instanceType); err != nil {
-			slog.Error("handleEC2RunInstances allocate failed mid-allocation", "allocated", allocatedCount, "err", err)
-			break
-		}
-		allocatedCount++
-	}
-
-	// Check if we still meet MinCount after allocation
-	if allocatedCount < minCount {
-		// Rollback allocations
-		for i := 0; i < allocatedCount; i++ {
-			d.resourceMgr.deallocate(instanceType)
-		}
-		slog.Error("handleEC2RunInstances insufficient capacity after allocation", "allocated", allocatedCount, "minCount", minCount)
-		respondWithError(msg, awserrors.ErrorInsufficientInstanceCapacity)
-		return
-	}
-
-	// Update launchCount to what we actually allocated
-	launchCount = allocatedCount
-
-	// Delegate to service for business logic (volume creation, cloud-init, etc.)
-	instanceTypeName := ""
-	if instanceType.InstanceType != nil {
-		instanceTypeName = *instanceType.InstanceType
-	}
-	slog.Info("Launching EC2 instances", "instanceType", instanceTypeName, "count", launchCount)
-
-	// Create all instances
-	var instances []*vm.VM
-	var allEC2Instances []*ec2.Instance
-	var lastRunErr error
-
-	for i := 0; i < launchCount; i++ {
-		instance, ec2Instance, err := d.instanceService.RunInstance(runInstancesInput)
-		if err != nil {
-			slog.Error("handleEC2RunInstances service.RunInstance failed", "index", i, "err", err)
-			lastRunErr = err
-			// Deallocate this instance's resources
-			d.resourceMgr.deallocate(instanceType)
-			continue
-		}
-
-		// When Terraform sets associate_public_ip_address, it sends the subnet
-		// and security groups inside NetworkInterfaces[0] instead of the top-level
-		// fields. Extract them so the rest of the handler works uniformly.
-		if (runInstancesInput.SubnetId == nil || *runInstancesInput.SubnetId == "") &&
-			len(runInstancesInput.NetworkInterfaces) > 0 && runInstancesInput.NetworkInterfaces[0] != nil {
-			nic := runInstancesInput.NetworkInterfaces[0]
-			if nic.SubnetId != nil && *nic.SubnetId != "" {
-				runInstancesInput.SubnetId = nic.SubnetId
-			}
-			if len(runInstancesInput.SecurityGroupIds) == 0 && len(nic.Groups) > 0 {
-				runInstancesInput.SecurityGroupIds = nic.Groups
-			}
-		}
-
-		// Resolve default subnet when none specified (matches AWS behavior)
-		if (runInstancesInput.SubnetId == nil || *runInstancesInput.SubnetId == "") && d.vpcService != nil {
-			defaultSubnet, dsErr := d.vpcService.GetDefaultSubnet(accountID)
-			if dsErr == nil {
-				runInstancesInput.SubnetId = aws.String(defaultSubnet.SubnetId)
-				slog.Info("Resolved default subnet for instance", "instanceId", instance.ID, "subnetId", defaultSubnet.SubnetId)
-			}
-		}
-
-		// Auto-create ENI when SubnetId is provided (matches AWS behavior)
-		if runInstancesInput.SubnetId != nil && *runInstancesInput.SubnetId != "" && d.vpcService != nil {
-			eniOut, eniErr := d.vpcService.CreateNetworkInterface(&ec2.CreateNetworkInterfaceInput{
-				SubnetId:    runInstancesInput.SubnetId,
-				Description: aws.String("Primary network interface for " + instance.ID),
-			}, accountID)
-			if eniErr != nil {
-				slog.Error("handleEC2RunInstances auto-create ENI failed", "instanceId", instance.ID, "subnetId", *runInstancesInput.SubnetId, "err", eniErr)
-				lastRunErr = eniErr
-				d.resourceMgr.deallocate(instanceType)
-				continue
-			}
-
-			eni := eniOut.NetworkInterface
-			instance.ENIId = *eni.NetworkInterfaceId
-			instance.ENIMac = *eni.MacAddress
-
-			// Mark ENI as attached to this instance so attachment.instance-id
-			// filter works (used by ELBv2 RegisterTargets to resolve target IPs).
-			if _, attachErr := d.vpcService.AttachENI(accountID, instance.ENIId, instance.ID, 0); attachErr != nil {
-				slog.Error("Failed to attach ENI to instance record — ELBv2 target IP resolution will fail", "eniId", instance.ENIId, "instanceId", instance.ID, "err", attachErr)
-			}
-			ec2Instance.SetPrivateIpAddress(*eni.PrivateIpAddress)
-			ec2Instance.SetSubnetId(*runInstancesInput.SubnetId)
-			ec2Instance.SetVpcId(*eni.VpcId)
-			ec2Instance.NetworkInterfaces = []*ec2.InstanceNetworkInterface{
-				{
-					NetworkInterfaceId: eni.NetworkInterfaceId,
-					PrivateIpAddress:   eni.PrivateIpAddress,
-					MacAddress:         eni.MacAddress,
-					SubnetId:           runInstancesInput.SubnetId,
-					VpcId:              eni.VpcId,
-					Status:             aws.String("in-use"),
-					Attachment: &ec2.InstanceNetworkInterfaceAttachment{
-						DeviceIndex: aws.Int64(0),
-						Status:      aws.String("attached"),
-					},
-				},
-			}
-
-			slog.Info("Auto-created ENI for VPC instance",
-				"instanceId", instance.ID,
-				"eniId", instance.ENIId,
-				"privateIp", *eni.PrivateIpAddress,
-				"mac", instance.ENIMac,
-			)
-
-			// Auto-assign public IP if subnet has MapPublicIpOnLaunch and external IPAM is available
-			if d.externalIPAM != nil {
-				subnet, subErr := d.vpcService.GetSubnet(accountID, *runInstancesInput.SubnetId)
-				if subErr == nil && subnet.MapPublicIpOnLaunch {
-					region := ""
-					az := ""
-					if d.config != nil {
-						region = d.config.Region
-						az = d.config.AZ
-					}
-					publicIP, poolName, allocErr := d.externalIPAM.AllocateIP(region, az, "auto_assign", "", *eni.NetworkInterfaceId, instance.ID)
-					if allocErr != nil {
-						slog.Warn("Failed to allocate public IP for instance", "instanceId", instance.ID, "err", allocErr)
-					} else {
-						// Update ENI record with public IP
-						if updateErr := d.vpcService.UpdateENIPublicIP(accountID, *eni.NetworkInterfaceId, publicIP, poolName); updateErr != nil {
-							slog.Warn("Failed to update ENI with public IP", "eniId", *eni.NetworkInterfaceId, "err", updateErr)
-						}
-						// Publish vpc.add-nat for dnat_and_snat rule
-						portName := "port-" + *eni.NetworkInterfaceId
-						d.publishNATEvent("vpc.add-nat", *eni.VpcId, publicIP, *eni.PrivateIpAddress, portName, *eni.MacAddress)
-						// Set on ec2Instance response
-						ec2Instance.PublicIpAddress = aws.String(publicIP)
-						instance.PublicIP = publicIP
-						instance.PublicIPPool = poolName
-						slog.Info("Auto-assigned public IP",
-							"instanceId", instance.ID,
-							"publicIp", publicIP,
-							"privateIp", *eni.PrivateIpAddress,
-							"pool", poolName,
-						)
-					}
-				}
-			}
-		}
-
-		instances = append(instances, instance)
-		allEC2Instances = append(allEC2Instances, ec2Instance)
-	}
-
-	// Check if we still have enough instances after creation errors
-	if len(instances) < minCount {
-		// Rollback: deallocate resources for successfully created instances
-		// (failed instances already deallocated their resources above)
-		for range instances {
-			d.resourceMgr.deallocate(instanceType)
-		}
-		// Propagate the service-layer error if it's a known AWS error code
-		errCode := awserrors.ErrorServerInternal
-		if lastRunErr != nil {
-			if _, ok := awserrors.ErrorLookup[lastRunErr.Error()]; ok {
-				errCode = lastRunErr.Error()
-			}
-		}
-		slog.Error("handleEC2RunInstances failed to create minimum instances", "created", len(instances), "minCount", minCount, "err", errCode)
-		respondWithError(msg, errCode)
-		return
-	}
-
-	// Build reservation with all instances
-	reservation := ec2.Reservation{}
-	reservation.SetReservationId(utils.GenerateResourceID("r"))
-	reservation.SetOwnerId(accountID)
-	reservation.Instances = allEC2Instances
-
-	// Store reservation reference, account ID, and placement group in all VMs
+	// PlacementGroupNode is daemon-local identity, set after prepare.
 	for _, instance := range instances {
-		instance.Reservation = &reservation
-		instance.AccountID = accountID
-		if runInstancesInput.Placement != nil && runInstancesInput.Placement.GroupName != nil && *runInstancesInput.Placement.GroupName != "" {
-			instance.PlacementGroupName = *runInstancesInput.Placement.GroupName
+		if instance.PlacementGroupName != "" {
 			instance.PlacementGroupNode = d.node
 		}
 	}
 
-	// Respond to NATS immediately with reservation (instances are provisioning)
 	jsonResponse, err := json.Marshal(reservation)
 	if err != nil {
 		slog.Error("handleEC2RunInstances failed to marshal reservation", "err", err)
 		respondWithError(msg, awserrors.ErrorServerInternal)
-		// Deallocate all resources
 		for range instances {
-			d.resourceMgr.deallocate(instanceType)
+			if reservationID == "" {
+				d.resourceMgr.deallocate(instanceType)
+			} else {
+				d.resourceMgr.ReleaseToReservation(reservationID, instanceType)
+			}
 		}
 		return
 	}
@@ -318,23 +94,16 @@ func (d *Daemon) handleEC2RunInstances(msg *nats.Msg) {
 		slog.Error("Failed to respond to NATS request", "err", err)
 	}
 
-	// Add all instances to state immediately so DescribeInstances can find them
-	// while volumes are being prepared and VMs are launching
-	d.Instances.Mu.Lock()
 	for _, instance := range instances {
-		d.Instances.VMS[instance.ID] = instance
+		d.vmMgr.Insert(instance)
 	}
-	d.Instances.Mu.Unlock()
-
 	if err := d.WriteState(); err != nil {
 		slog.Error("handleEC2RunInstances failed to write initial state", "err", err)
 	}
-
 	slog.Info("Instances added to state with pending status", "count", len(instances))
 
-	// Subscribe to per-instance NATS topics early so terminate/stop commands
-	// can reach this daemon while volumes are being prepared. LaunchInstance
-	// will replace these subscriptions when it completes.
+	// Subscribe per-instance NATS topics so terminate/stop reach this daemon
+	// while volumes prepare. LaunchInstance replaces these on success.
 	d.mu.Lock()
 	for _, instance := range instances {
 		sub, subErr := d.natsConn.Subscribe(fmt.Sprintf("ec2.cmd.%s", instance.ID), d.handleEC2Events)
@@ -346,291 +115,17 @@ func (d *Daemon) handleEC2RunInstances(msg *nats.Msg) {
 	}
 	d.mu.Unlock()
 
-	// Launch all instances (volumes and VMs)
-	var successCount int
-	for _, instance := range instances {
-		// Skip if instance was terminated by a concurrent request
-		d.Instances.Mu.Lock()
-		status := instance.Status
-		d.Instances.Mu.Unlock()
-		if status != vm.StatePending && status != vm.StateProvisioning {
-			slog.Info("Instance state changed during provisioning, skipping launch",
-				"instanceId", instance.ID, "status", string(status))
-			continue
-		}
-
-		// Pre-compute dev MAC so cloud-init can generate per-interface netplan
-		// that suppresses the default route on the dev/hostfwd NIC.
-		if d.config.Daemon.DevNetworking && instance.ENIId != "" {
-			instance.DevMAC = generateDevMAC(instance.ID)
-		}
-
-		// Prepare the root volume, cloud-init, EFI drives via NBD (AMI clone to new volume)
-		volumeInfos, err := d.instanceService.GenerateVolumes(runInstancesInput, instance)
-		if err != nil {
-			slog.Error("handleEC2RunInstances GenerateVolumes failed", "instanceId", instance.ID, "err", err)
-			d.markInstanceFailed(instance, "volume_preparation_failed")
-			continue
-		}
-
-		// Populate BlockDeviceMappings on the ec2.Instance
-		instance.Instance.BlockDeviceMappings = make([]*ec2.InstanceBlockDeviceMapping, 0, len(volumeInfos))
-		for _, vi := range volumeInfos {
-			mapping := &ec2.InstanceBlockDeviceMapping{}
-			mapping.SetDeviceName(vi.DeviceName)
-			mapping.Ebs = &ec2.EbsInstanceBlockDevice{}
-			mapping.Ebs.SetVolumeId(vi.VolumeId)
-			mapping.Ebs.SetAttachTime(vi.AttachTime)
-			mapping.Ebs.SetDeleteOnTermination(vi.DeleteOnTermination)
-			mapping.Ebs.SetStatus("attached")
-			instance.Instance.BlockDeviceMappings = append(instance.Instance.BlockDeviceMappings, mapping)
-		}
-
-		// Launch the instance infrastructure (QEMU, QMP, NATS subscriptions)
-		err = d.LaunchInstance(instance)
-		if err != nil {
-			slog.Error("handleEC2RunInstances LaunchInstance failed", "instanceId", instance.ID, "err", err)
-			d.markInstanceFailed(instance, "launch_failed")
-			continue
-		}
-
-		// Discover actual guest device names via QMP query-block
-		d.updateGuestDeviceNames(instance)
-
-		successCount++
-		slog.Info("handleEC2RunInstances launched instance", "instanceId", instance.ID)
-	}
-
-	slog.Info("handleEC2RunInstances completed", "requested", launchCount, "created", len(instances), "launched", successCount)
+	d.instanceService.LaunchRunInstances(instances, input, instanceType)
 }
 
-func (d *Daemon) handleRebootInstance(msg *nats.Msg, command types.EC2InstanceCommand, instance *vm.VM) {
-	slog.Info("Rebooting instance", "id", command.ID)
-
-	d.Instances.Mu.Lock()
-	status := instance.Status
-	d.Instances.Mu.Unlock()
-
-	if status != vm.StateRunning {
-		slog.Error("RebootInstance: instance not in running state", "instanceId", command.ID, "status", status)
-		respondWithError(msg, awserrors.ErrorIncorrectInstanceState)
-		return
+// capacityReservationTargetID returns the explicit targeted-launch reservation id
+// from the input, or "" when the launch is untargeted (general path).
+func capacityReservationTargetID(input *ec2.RunInstancesInput) string {
+	spec := input.CapacityReservationSpecification
+	if spec == nil || spec.CapacityReservationTarget == nil {
+		return ""
 	}
-
-	_, err := d.SendQMPCommand(instance.QMPClient, qmp.QMPCommand{Execute: "system_reset"}, command.ID)
-	if err != nil {
-		slog.Error("RebootInstance: QMP system_reset failed", "instanceId", command.ID, "err", err)
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-
-	slog.Info("Instance rebooted", "instanceId", command.ID)
-
-	if err := msg.Respond([]byte(`{}`)); err != nil {
-		slog.Error("Failed to respond to NATS request", "err", err)
-	}
-}
-
-func (d *Daemon) handleStartInstance(msg *nats.Msg, command types.EC2InstanceCommand, instance *vm.VM) {
-	slog.Info("Starting instance", "id", command.ID)
-
-	// Validate instance is in stopped state
-	d.Instances.Mu.Lock()
-	status := instance.Status
-	d.Instances.Mu.Unlock()
-
-	if status != vm.StateStopped {
-		slog.Error("StartInstance: instance not in stopped state", "instanceId", command.ID, "status", status)
-		respondWithError(msg, awserrors.ErrorIncorrectInstanceState)
-		return
-	}
-
-	// Allocate resources
-	instanceType, ok := d.resourceMgr.instanceTypes[instance.InstanceType]
-	if ok {
-		if err := d.resourceMgr.allocate(instanceType); err != nil {
-			slog.Error("Failed to allocate resources for start command", "id", command.ID, "err", err)
-			respondWithError(msg, awserrors.ErrorInsufficientInstanceCapacity)
-			return
-		}
-	}
-
-	// Clear stop attribute before launch so WriteState inside LaunchInstance
-	// persists the correct attributes. Without this, a daemon restart after
-	// a stop→start cycle would see StopInstance=true and skip reconnecting QEMU.
-	d.Instances.Mu.Lock()
-	instance.Attributes = command.Attributes
-	d.Instances.Mu.Unlock()
-
-	// Launch the instance infrastructure (QEMU, QMP, NATS subscriptions)
-	err := d.LaunchInstance(instance)
-
-	if err != nil {
-		slog.Error("handleEC2RunInstances LaunchInstance failed", "err", err)
-		// Free the resource on failure
-		if ok {
-			d.resourceMgr.deallocate(instanceType)
-		}
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-
-	// Discover actual guest device names via QMP query-block
-	d.updateGuestDeviceNames(instance)
-
-	slog.Info("Instance started", "instanceId", instance.ID)
-
-	if err := msg.Respond(fmt.Appendf(nil, `{"status":"running","instanceId":"%s"}`, instance.ID)); err != nil {
-		slog.Error("Failed to respond to NATS request", "err", err)
-	}
-}
-
-func (d *Daemon) handleStopOrTerminateInstance(msg *nats.Msg, command types.EC2InstanceCommand, instance *vm.VM) {
-	isTerminate := command.Attributes.TerminateInstance
-	action := "Stopping"
-	initialState := vm.StateStopping
-	finalState := vm.StateStopped
-	if isTerminate {
-		action = "Terminating"
-		initialState = vm.StateShuttingDown
-		finalState = vm.StateTerminated
-	}
-
-	slog.Info(action+" instance", "id", command.ID)
-
-	// Check state validity before attempting transition — return the correct
-	// AWS error code when the instance is already stopped/terminated/etc.
-	d.Instances.Mu.Lock()
-	currentState := instance.Status
-	d.Instances.Mu.Unlock()
-
-	// If instance is already shutting-down and we're asked to terminate, treat
-	// as idempotent — the finalizeTermination goroutine is already cleaning up.
-	if isTerminate && currentState == vm.StateShuttingDown {
-		slog.Info("Instance already shutting down, terminate is idempotent", "instanceId", instance.ID)
-		if err := msg.Respond([]byte(`{}`)); err != nil {
-			slog.Error("Failed to respond to NATS request", "err", err)
-		}
-		return
-	}
-
-	if !vm.IsValidTransition(currentState, initialState) {
-		slog.Warn("Instance in incorrect state for "+strings.ToLower(action),
-			"instanceId", instance.ID, "currentState", string(currentState))
-		respondWithError(msg, awserrors.ErrorIncorrectInstanceState)
-		return
-	}
-
-	// Transition to the initial transitional state
-	if err := d.TransitionState(instance, initialState); err != nil {
-		slog.Error("Failed to transition to "+string(initialState), "instanceId", instance.ID, "err", err)
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-
-	// Respond immediately - operation will complete in background
-	// stopInstance() handles the QMP shutdown command, so we don't send it here
-	if err := msg.Respond([]byte(`{}`)); err != nil {
-		slog.Error("Failed to respond to NATS request", "err", err)
-	}
-
-	// Run cleanup in goroutine to not block NATS
-	go func(inst *vm.VM, attrs types.EC2CommandAttributes) {
-		stopErr := d.stopInstance(map[string]*vm.VM{inst.ID: inst}, isTerminate)
-
-		if stopErr != nil {
-			slog.Error("Failed to "+strings.ToLower(action)+" instance", "err", stopErr, "id", inst.ID)
-			if err := d.TransitionState(inst, vm.StateError); err != nil {
-				slog.Error("Failed to transition to error state", "instanceId", inst.ID, "err", err)
-			}
-		} else {
-			d.Instances.Mu.Lock()
-			inst.Attributes = attrs
-			inst.LastNode = d.node
-			d.Instances.Mu.Unlock()
-
-			if err := d.TransitionState(inst, finalState); err != nil {
-				slog.Error("Failed to transition to final state", "instanceId", inst.ID, "err", err)
-			}
-			slog.Info("Instance "+string(finalState), "id", inst.ID)
-
-			// Remove instance from placement group on terminate
-			if isTerminate && inst.PlacementGroupName != "" && d.placementGroupService != nil {
-				if _, pgErr := d.placementGroupService.RemoveInstance(&handlers_ec2_placementgroup.RemoveInstanceInput{
-					GroupName:  inst.PlacementGroupName,
-					NodeName:   inst.PlacementGroupNode,
-					InstanceID: inst.ID,
-				}, inst.AccountID); pgErr != nil {
-					slog.Error("Failed to remove instance from placement group",
-						"instanceId", inst.ID, "groupName", inst.PlacementGroupName, "err", pgErr)
-				}
-			}
-
-			if d.jsManager != nil {
-				if isTerminate {
-					// Write to terminated KV bucket (auto-expires after 1 hour via TTL).
-					// If this fails, keep the instance in local state so DescribeInstances
-					// still sees it and restoreInstances can retry the KV migration.
-					if err := d.jsManager.WriteTerminatedInstance(inst.ID, inst); err != nil {
-						slog.Error("Failed to write terminated instance to KV, keeping in local state for retry",
-							"instanceId", inst.ID, "err", err)
-						return
-					}
-				} else {
-					// Write to shared KV first — if daemon crashes after this but
-					// before local cleanup, restoreInstances handles the overlap.
-					if err := d.jsManager.WriteStoppedInstance(inst.ID, inst); err != nil {
-						slog.Error("Failed to write stopped instance to shared KV, keeping local ownership",
-							"instanceId", inst.ID, "err", err)
-						return
-					}
-				}
-
-				// Guard + delete must be atomic under the same lock hold.
-				// A concurrent ec2.start handler may have loaded the instance
-				// from stopped KV, re-added it to VMS with a new pointer, and
-				// launched it. Deleting here would destroy the running instance's
-				// state — creating a "ghost instance" visible nowhere.
-				d.Instances.Mu.Lock()
-				current, exists := d.Instances.VMS[inst.ID]
-				if !exists || current != inst {
-					d.Instances.Mu.Unlock()
-					slog.Info("Instance was reclaimed by another handler, skipping local cleanup",
-						"instanceId", inst.ID, "state", string(finalState))
-					return
-				}
-				delete(d.Instances.VMS, inst.ID)
-				d.Instances.Mu.Unlock()
-
-				// Unsubscribe from per-instance NATS topic. Safe to do after
-				// the delete — LaunchInstance already unsubscribes stale entries
-				// before creating new ones (daemon.go:1658-1664).
-				d.mu.Lock()
-				if sub, ok := d.natsSubscriptions[inst.ID]; ok {
-					if err := sub.Unsubscribe(); err != nil {
-						slog.Error("Failed to unsubscribe instance", "instanceId", inst.ID, "err", err)
-					}
-					delete(d.natsSubscriptions, inst.ID)
-				}
-				d.mu.Unlock()
-
-				// Persist local state without the instance
-				if err := d.WriteState(); err != nil {
-					slog.Error("Failed to persist state after releasing instance, re-adding to local map for consistency",
-						"instanceId", inst.ID, "err", err)
-					// Only re-add if another handler hasn't claimed the slot
-					d.Instances.Mu.Lock()
-					if _, occupied := d.Instances.VMS[inst.ID]; !occupied {
-						d.Instances.VMS[inst.ID] = inst
-					}
-					d.Instances.Mu.Unlock()
-				} else {
-					slog.Info("Released instance ownership to KV",
-						"instanceId", inst.ID, "state", string(finalState), "lastNode", d.node)
-				}
-			}
-		}
-	}(instance, command.Attributes)
+	return aws.StringValue(spec.CapacityReservationTarget.CapacityReservationId)
 }
 
 // describeInstancesValidFilters defines the set of filter names accepted by DescribeInstances.
@@ -716,8 +211,7 @@ func matchTagValue(tags []*ec2.Tag, values []string) bool {
 	return false
 }
 
-// handleEC2DescribeInstances processes incoming EC2 DescribeInstances requests
-// This handler responds with instances running on this node owned by the caller's account
+// handleEC2DescribeInstances responds with instances running on this node visible to the caller.
 func (d *Daemon) handleEC2DescribeInstances(msg *nats.Msg) {
 	slog.Debug("Received message", "subject", msg.Subject, "data", string(msg.Data))
 
@@ -737,9 +231,6 @@ func (d *Daemon) handleEC2DescribeInstances(msg *nats.Msg) {
 	}
 
 	slog.Info("Processing DescribeInstances request from this node", "accountID", accountID)
-
-	d.Instances.Mu.Lock()
-	defer d.Instances.Mu.Unlock()
 
 	// Validate and filter instances if specific instance IDs were requested
 	instanceIDFilter := make(map[string]bool)
@@ -766,74 +257,107 @@ func (d *Daemon) handleEC2DescribeInstances(msg *nats.Msg) {
 	// Group instances by reservation ID (AWS returns instances grouped by reservation)
 	reservationMap := make(map[string]*ec2.Reservation)
 
-	// Iterate through all instances on this node
-	for _, instance := range d.Instances.VMS {
-		// Skip instances not owned by the caller's account.
-		// Pre-Phase4 instances (empty AccountID) are only visible to root.
-		if !isInstanceVisible(accountID, instance.AccountID) {
-			continue
-		}
-
-		// Skip if filtering by instance IDs and this instance is not in the filter
-		if len(instanceIDFilter) > 0 && !instanceIDFilter[instance.ID] {
-			continue
-		}
-
-		// Use stored reservation metadata if available
-		if instance.Reservation != nil && instance.Instance != nil {
-			resID := ""
-			if instance.Reservation.ReservationId != nil {
-				resID = *instance.Reservation.ReservationId
-			}
-
-			// Create reservation entry if it doesn't exist
-			if _, exists := reservationMap[resID]; !exists {
-				reservation := &ec2.Reservation{}
-				reservation.SetReservationId(resID)
-				if instance.Reservation.OwnerId != nil {
-					reservation.SetOwnerId(*instance.Reservation.OwnerId)
-				}
-				reservation.Instances = []*ec2.Instance{}
-				reservationMap[resID] = reservation
-			}
-
-			// Update the instance state to current state
-			instanceCopy := *instance.Instance
-			instanceCopy.State = &ec2.InstanceState{}
-
-			// Populate PublicIpAddress from VM if stored
-			if instance.PublicIP != "" && instanceCopy.PublicIpAddress == nil {
-				instanceCopy.PublicIpAddress = aws.String(instance.PublicIP)
-			}
-
-			// Map internal status to EC2 state codes using the centralized mapping
-			if info, ok := vm.EC2StateCodes[instance.Status]; ok {
-				instanceCopy.State.SetCode(info.Code)
-				instanceCopy.State.SetName(info.Name)
-			} else {
-				slog.Warn("Instance has unmapped status, reporting as pending",
-					"instanceId", instance.ID, "status", string(instance.Status))
-				instanceCopy.State.SetCode(0)
-				instanceCopy.State.SetName("pending")
-			}
-
-			// Populate Placement if instance belongs to a placement group
-			if instance.PlacementGroupName != "" {
-				instanceCopy.Placement = &ec2.Placement{
-					GroupName:        aws.String(instance.PlacementGroupName),
-					AvailabilityZone: aws.String(d.config.AZ),
-				}
-			}
-
-			// Apply filters against the fully-built instance copy
-			if len(parsedFilters) > 0 && !instanceMatchesFilters(instance, &instanceCopy, parsedFilters) {
+	// Iterate under the manager lock — VM fields (Status, Instance, Reservation,
+	// PublicIP, PlacementGroupName) are mutated through manager-locked
+	// Inspect/UpdateState elsewhere, so reading them lock-free would race.
+	d.vmMgr.View(func(vms map[string]*vm.VM) {
+		for _, instance := range vms {
+			// Skip instances not owned by the caller's account.
+			// Instances with an empty AccountID (legacy/migration data)
+			// are only visible to root.
+			if !isInstanceVisible(accountID, instance.AccountID) {
 				continue
 			}
 
-			// Add instance to its reservation
-			reservationMap[resID].Instances = append(reservationMap[resID].Instances, &instanceCopy)
+			// Skip if filtering by instance IDs and this instance is not in the filter
+			if len(instanceIDFilter) > 0 && !instanceIDFilter[instance.ID] {
+				continue
+			}
+
+			// Use stored reservation metadata if available
+			if instance.Reservation != nil && instance.Instance != nil {
+				resID := ""
+				if instance.Reservation.ReservationId != nil {
+					resID = *instance.Reservation.ReservationId
+				}
+
+				// Create reservation entry if it doesn't exist
+				if _, exists := reservationMap[resID]; !exists {
+					reservation := &ec2.Reservation{}
+					reservation.SetReservationId(resID)
+					if instance.Reservation.OwnerId != nil {
+						reservation.SetOwnerId(*instance.Reservation.OwnerId)
+					}
+					reservation.Instances = []*ec2.Instance{}
+					reservationMap[resID] = reservation
+				}
+
+				// Update the instance state to current state
+				instanceCopy := *instance.Instance
+				instanceCopy.State = &ec2.InstanceState{}
+
+				// Populate PublicIpAddress from VM if stored
+				if instance.PublicIP != "" && instanceCopy.PublicIpAddress == nil {
+					instanceCopy.PublicIpAddress = aws.String(instance.PublicIP)
+				}
+
+				// Map internal status to AWS state, projecting Spinifex-only states
+				// (e.g. error -> stopped) so SDK/UI clients see a valid label.
+				if info, ok := vm.EC2APIState(instance.Status); ok {
+					instanceCopy.State.SetCode(info.Code)
+					instanceCopy.State.SetName(info.Name)
+				} else {
+					slog.Warn("Instance has unmapped status, reporting as pending",
+						"instanceId", instance.ID, "status", string(instance.Status))
+					instanceCopy.State.SetCode(0)
+					instanceCopy.State.SetName("pending")
+				}
+
+				// Project IamInstanceProfile from vm.VM (single source of truth
+				// across Associate/Disassociate/Replace lifecycle). Id is left
+				// nil — the gateway resolves it via IAMService post-aggregation
+				// since daemons have no IAM access. Empty Arn clears any stale
+				// reference left on stored instance.Instance (e.g. after
+				// Disassociate or auto-clear on terminate).
+				if instance.IamInstanceProfileArn != "" {
+					instanceCopy.IamInstanceProfile = &ec2.IamInstanceProfile{
+						Arn: aws.String(instance.IamInstanceProfileArn),
+					}
+				} else {
+					instanceCopy.IamInstanceProfile = nil
+				}
+
+				// Populate Placement if instance belongs to a placement group
+				if instance.PlacementGroupName != "" {
+					instanceCopy.Placement = &ec2.Placement{
+						GroupName:        aws.String(instance.PlacementGroupName),
+						AvailabilityZone: aws.String(d.config.AZ),
+					}
+				}
+
+				// Echo the consumed capacity reservation so targeted-launch
+				// Terraform converges — without it the instance reports no
+				// reservation and the plan never settles.
+				if instance.CapacityReservationId != "" {
+					instanceCopy.CapacityReservationId = aws.String(instance.CapacityReservationId)
+					instanceCopy.CapacityReservationSpecification = &ec2.CapacityReservationSpecificationResponse{
+						CapacityReservationPreference: aws.String(ec2.CapacityReservationPreferenceOpen),
+						CapacityReservationTarget: &ec2.CapacityReservationTargetResponse{
+							CapacityReservationId: aws.String(instance.CapacityReservationId),
+						},
+					}
+				}
+
+				// Apply filters against the fully-built instance copy
+				if len(parsedFilters) > 0 && !instanceMatchesFilters(instance, &instanceCopy, parsedFilters) {
+					continue
+				}
+
+				// Add instance to its reservation
+				reservationMap[resID].Instances = append(reservationMap[resID].Instances, &instanceCopy)
+			}
 		}
-	}
+	})
 
 	// Convert map to slice
 	reservations := make([]*ec2.Reservation, 0, len(reservationMap))
@@ -850,325 +374,119 @@ func (d *Daemon) handleEC2DescribeInstances(msg *nats.Msg) {
 	slog.Info("handleEC2DescribeInstances completed", "count", len(reservations))
 }
 
-// handleEC2DescribeInstanceTypes processes incoming EC2 DescribeInstanceTypes requests
-// This handler responds with instance types that can currently be provisioned on this node
-// based on available resources (CPU and memory not already allocated to running instances)
+// handleEC2DescribeInstanceTypes responds with instance types provisionable on this node.
 func (d *Daemon) handleEC2DescribeInstanceTypes(msg *nats.Msg) {
-	slog.Debug("Received message", "subject", msg.Subject)
-
-	// Initialize input
-	describeInput := &ec2.DescribeInstanceTypesInput{}
-	errResp := utils.UnmarshalJsonPayload(describeInput, msg.Data)
-	if errResp != nil {
-		if err := msg.Respond(errResp); err != nil {
-			slog.Error("Failed to respond to NATS request", "err", err)
-		}
-		slog.Error("Request does not match DescribeInstanceTypesInput")
-		return
-	}
-
-	slog.Info("Processing DescribeInstanceTypes request from this node")
-
-	// Check if "capacity" filter is set to "true"
-	showCapacity := false
-	for _, f := range describeInput.Filters {
-		if f.Name != nil && *f.Name == "capacity" {
-			for _, v := range f.Values {
-				if v != nil && *v == "true" {
-					showCapacity = true
-					break
-				}
-			}
-		}
-	}
-
-	// Get instance types based on capacity and the showCapacity flag
-	filteredTypes := d.resourceMgr.GetAvailableInstanceTypeInfos(showCapacity)
-
-	// Create the response
-	output := &ec2.DescribeInstanceTypesOutput{
-		InstanceTypes: filteredTypes,
-	}
-
-	respondWithJSON(msg, output)
-	slog.Info("handleEC2DescribeInstanceTypes completed", "count", len(filteredTypes))
+	handleNATSRequest(msg, d.instanceService.DescribeInstanceTypes)
 }
 
-// startStoppedInstanceRequest is the payload for ec2.start topic
-type startStoppedInstanceRequest struct {
-	InstanceID string `json:"instance_id"`
+// handleEC2DescribeInstanceStatus responds with status entries for VMs on this node visible to the caller.
+func (d *Daemon) handleEC2DescribeInstanceStatus(msg *nats.Msg) {
+	handleNATSRequest(msg, d.instanceService.DescribeInstanceStatus)
 }
 
-// handleEC2StartStoppedInstance picks up a stopped instance from shared KV,
-// re-launches it on this daemon node, and removes it from shared KV.
+// handleEC2StartStoppedInstance handles the generic ec2.start queue-group topic.
+// It reads the stopped instance's LastNode from shared KV and forwards the
+// request to ec2.start.{lastNode} when the instance last ran on a different
+// node. This keeps instances on their original node so the per-node resource
+// manager sees the correct allocation. Local fallback fires only when the
+// targeted node has no active subscriber (ErrNoResponders — node down or not
+// yet recovered) or returns InsufficientInstanceCapacity. A timeout from a
+// reachable-but-slow target is surfaced as ServerInternal so the caller can
+// retry; falling back in that case races the still-running launch on the
+// target and collides on the deterministic tap name.
 func (d *Daemon) handleEC2StartStoppedInstance(msg *nats.Msg) {
-	var req startStoppedInstanceRequest
-	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		slog.Error("handleEC2StartStoppedInstance: failed to unmarshal request", "err", err)
-		respondWithError(msg, awserrors.ErrorServerInternal)
+	// Peek at the instance ID without full unmarshal — we only need it for the
+	// LastNode lookup. The full unmarshal happens inside StartStoppedInstance.
+	var peek struct {
+		InstanceID string `json:"instance_id"`
+	}
+	if err := json.Unmarshal(msg.Data, &peek); err != nil || peek.InstanceID == "" {
+		// Can't determine target node — fall through to local start which will
+		// return the appropriate error (missing parameter / unmarshal failure).
+		handleNATSRequest(msg, d.instanceService.StartStoppedInstance)
 		return
 	}
 
-	if req.InstanceID == "" {
-		slog.Error("handleEC2StartStoppedInstance: missing instance_id")
-		respondWithError(msg, awserrors.ErrorMissingParameter)
-		return
-	}
+	lastNode := d.instanceService.StoppedInstanceNode(peek.InstanceID)
+	if lastNode != "" && lastNode != d.node {
+		targetTopic := fmt.Sprintf("ec2.start.%s", lastNode)
+		forwardMsg := nats.NewMsg(targetTopic)
+		forwardMsg.Data = msg.Data
+		forwardMsg.Header.Set(utils.AccountIDHeader, utils.AccountIDFromMsg(msg))
 
-	if d.jsManager == nil {
-		slog.Error("handleEC2StartStoppedInstance: JetStream not available")
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
+		slog.Info("ec2.start: forwarding to original node",
+			"instanceId", peek.InstanceID, "lastNode", lastNode)
+		resp, err := d.natsConn.RequestMsg(forwardMsg, startStoppedForwardTimeout)
+		if err == nil {
+			// ValidateErrorPayload returns a non-nil error when the payload IS an
+			// AWS error response; nil means it is a success payload.
+			errPayload, isErrPayload := utils.ValidateErrorPayload(resp.Data)
+			isCapacity := isErrPayload != nil &&
+				errPayload.Code != nil &&
+				*errPayload.Code == awserrors.ErrorInsufficientInstanceCapacity
 
-	// Load instance from shared KV
-	instance, err := d.jsManager.LoadStoppedInstance(req.InstanceID)
-	if err != nil {
-		slog.Error("handleEC2StartStoppedInstance: failed to load stopped instance", "instanceId", req.InstanceID, "err", err)
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-	if instance == nil {
-		slog.Warn("handleEC2StartStoppedInstance: instance not found in shared KV", "instanceId", req.InstanceID)
-		respondWithError(msg, awserrors.ErrorInvalidInstanceIDNotFound)
-		return
-	}
-
-	if instance.Status != vm.StateStopped {
-		slog.Error("handleEC2StartStoppedInstance: instance not in stopped state", "instanceId", req.InstanceID, "status", instance.Status)
-		respondWithError(msg, awserrors.ErrorIncorrectInstanceState)
-		return
-	}
-
-	// Verify the caller owns this instance
-	if !checkInstanceOwnership(msg, req.InstanceID, instance.AccountID) {
-		return
-	}
-
-	// Reset node-local fields that are stale after cross-node migration
-	instance.ResetNodeLocalState()
-
-	// Allocate resources
-	instanceType, ok := d.resourceMgr.instanceTypes[instance.InstanceType]
-	if !ok {
-		slog.Error("handleEC2StartStoppedInstance: instance type not available on this node",
-			"instanceId", req.InstanceID, "instanceType", instance.InstanceType)
-		respondWithError(msg, awserrors.ErrorInsufficientInstanceCapacity)
-		return
-	}
-	if err := d.resourceMgr.allocate(instanceType); err != nil {
-		slog.Error("handleEC2StartStoppedInstance: failed to allocate resources", "instanceId", req.InstanceID, "err", err)
-		respondWithError(msg, awserrors.ErrorInsufficientInstanceCapacity)
-		return
-	}
-
-	// Add instance to local map and clear stop attribute before launch
-	d.Instances.Mu.Lock()
-	d.Instances.VMS[instance.ID] = instance
-	instance.Attributes = types.EC2CommandAttributes{StartInstance: true}
-	d.Instances.Mu.Unlock()
-
-	// Launch the instance infrastructure (QEMU, QMP, NATS subscriptions)
-	err = d.LaunchInstance(instance)
-	if err != nil {
-		slog.Error("handleEC2StartStoppedInstance: LaunchInstance failed", "instanceId", req.InstanceID, "err", err)
-		// Rollback: deallocate resources and remove from local map
-		if ok {
-			d.resourceMgr.deallocate(instanceType)
-		}
-		d.Instances.Mu.Lock()
-		delete(d.Instances.VMS, instance.ID)
-		d.Instances.Mu.Unlock()
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-
-	// Discover actual guest device names via QMP query-block
-	d.updateGuestDeviceNames(instance)
-
-	// Remove from shared KV now that it's running locally.
-	// Retry once on failure — a stale KV entry risks duplicate starts.
-	if err := d.jsManager.DeleteStoppedInstance(req.InstanceID); err != nil {
-		slog.Warn("handleEC2StartStoppedInstance: first KV delete failed, retrying",
-			"instanceId", req.InstanceID, "err", err)
-		if retryErr := d.jsManager.DeleteStoppedInstance(req.InstanceID); retryErr != nil {
-			slog.Error("handleEC2StartStoppedInstance: KV delete failed after retry, instance is running locally but stale entry remains in shared KV",
-				"instanceId", req.InstanceID, "err", retryErr)
+			if !isCapacity {
+				// Relay success or any non-capacity error as-is.
+				if relayErr := msg.Respond(resp.Data); relayErr != nil {
+					slog.Error("ec2.start: failed to relay response from original node",
+						"instanceId", peek.InstanceID, "lastNode", lastNode, "err", relayErr)
+				}
+				return
+			}
+			slog.Warn("ec2.start: original node at capacity, starting locally",
+				"instanceId", peek.InstanceID, "lastNode", lastNode)
+		} else if errors.Is(err, nats.ErrNoResponders) {
+			// Target node has no active subscription — down or restarting. Fall
+			// back to local start so the instance can resume somewhere.
+			slog.Warn("ec2.start: original node has no subscriber, starting locally",
+				"instanceId", peek.InstanceID, "lastNode", lastNode, "err", err)
+		} else {
+			// Timeout or other transport error from a node whose subscription
+			// did exist. Do NOT fall back — the target may still be launching
+			// the VM, and a duplicate Run here would collide on tap setup.
+			slog.Error("ec2.start: forward to original node failed, not falling back",
+				"instanceId", peek.InstanceID, "lastNode", lastNode, "err", err)
+			respondWithError(msg, awserrors.ErrorServerInternal)
+			return
 		}
 	}
 
-	slog.Info("Started stopped instance from shared KV", "instanceId", instance.ID, "node", d.node)
-
-	if err := msg.Respond(fmt.Appendf(nil, `{"status":"running","instanceId":"%s"}`, instance.ID)); err != nil {
-		slog.Error("Failed to respond to NATS request", "err", err)
-	}
+	handleNATSRequest(msg, d.instanceService.StartStoppedInstance)
 }
 
-// terminateStoppedInstanceRequest is the payload for ec2.terminate topic
-type terminateStoppedInstanceRequest struct {
-	InstanceID string `json:"instance_id"`
+// handleEC2StartStoppedInstanceDirect handles ec2.start.{nodeId} — the
+// node-targeted topic used by handleEC2StartStoppedInstance to forward start
+// requests back to the original node. Always starts locally; never forwards
+// further, preventing routing loops.
+func (d *Daemon) handleEC2StartStoppedInstanceDirect(msg *nats.Msg) {
+	handleNATSRequest(msg, d.instanceService.StartStoppedInstance)
 }
 
-// handleEC2TerminateStoppedInstance picks up a stopped instance from shared KV,
-// deletes its volumes, and removes it from shared KV.
 func (d *Daemon) handleEC2TerminateStoppedInstance(msg *nats.Msg) {
-	var req terminateStoppedInstanceRequest
-	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		slog.Error("handleEC2TerminateStoppedInstance: failed to unmarshal request", "err", err)
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-
-	if req.InstanceID == "" {
-		slog.Error("handleEC2TerminateStoppedInstance: missing instance_id")
-		respondWithError(msg, awserrors.ErrorMissingParameter)
-		return
-	}
-
-	if d.jsManager == nil {
-		slog.Error("handleEC2TerminateStoppedInstance: JetStream not available")
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-
-	// Load instance from shared KV
-	instance, err := d.jsManager.LoadStoppedInstance(req.InstanceID)
-	if err != nil {
-		slog.Error("handleEC2TerminateStoppedInstance: failed to load stopped instance", "instanceId", req.InstanceID, "err", err)
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-	if instance == nil {
-		slog.Warn("handleEC2TerminateStoppedInstance: instance not found in shared KV", "instanceId", req.InstanceID)
-		respondWithError(msg, awserrors.ErrorInvalidInstanceIDNotFound)
-		return
-	}
-
-	if instance.Status != vm.StateStopped {
-		slog.Error("handleEC2TerminateStoppedInstance: instance not in stopped state", "instanceId", req.InstanceID, "status", instance.Status)
-		respondWithError(msg, awserrors.ErrorIncorrectInstanceState)
-		return
-	}
-
-	// Verify the caller owns this instance
-	if !checkInstanceOwnership(msg, req.InstanceID, instance.AccountID) {
-		return
-	}
-
-	// Delete volumes — no QEMU shutdown or unmount needed (already done during stop)
-	instance.EBSRequests.Mu.Lock()
-	for _, ebsRequest := range instance.EBSRequests.Requests {
-		// Internal volumes (EFI, cloud-init) are always cleaned up via ebs.delete
-		if ebsRequest.EFI || ebsRequest.CloudInit {
-			ebsDeleteData, err := json.Marshal(types.EBSDeleteRequest{Volume: ebsRequest.Name})
-			if err != nil {
-				slog.Error("handleEC2TerminateStoppedInstance: failed to marshal ebs.delete request", "name", ebsRequest.Name, "err", err)
-				continue
-			}
-			deleteMsg, err := d.natsConn.Request("ebs.delete", ebsDeleteData, 30*time.Second)
-			if err != nil {
-				slog.Warn("handleEC2TerminateStoppedInstance: ebs.delete failed for internal volume", "name", ebsRequest.Name, "err", err)
-			} else {
-				slog.Info("handleEC2TerminateStoppedInstance: ebs.delete sent for internal volume", "name", ebsRequest.Name, "data", string(deleteMsg.Data))
-			}
-			continue
-		}
-
-		// User-visible volumes: respect DeleteOnTermination flag
-		if !ebsRequest.DeleteOnTermination {
-			slog.Info("handleEC2TerminateStoppedInstance: volume has DeleteOnTermination=false, skipping", "name", ebsRequest.Name)
-			continue
-		}
-
-		slog.Info("handleEC2TerminateStoppedInstance: deleting volume with DeleteOnTermination=true", "name", ebsRequest.Name)
-		_, err := d.volumeService.DeleteVolume(&ec2.DeleteVolumeInput{
-			VolumeId: &ebsRequest.Name,
-		}, instance.AccountID)
-		if err != nil {
-			slog.Error("handleEC2TerminateStoppedInstance: failed to delete volume", "name", ebsRequest.Name, "err", err)
-		}
-	}
-	instance.EBSRequests.Mu.Unlock()
-
-	// Release public IP before termination
-	if instance.PublicIP != "" && instance.PublicIPPool != "" && d.externalIPAM != nil {
-		portName := "port-" + instance.ENIId
-		vpcId := ""
-		logicalIP := ""
-		if instance.Instance != nil {
-			if instance.Instance.VpcId != nil {
-				vpcId = *instance.Instance.VpcId
-			}
-			if instance.Instance.PrivateIpAddress != nil {
-				logicalIP = *instance.Instance.PrivateIpAddress
-			}
-		}
-		d.publishNATEvent("vpc.delete-nat", vpcId, instance.PublicIP, logicalIP, portName, "")
-
-		if err := d.externalIPAM.ReleaseIP(instance.PublicIPPool, instance.PublicIP); err != nil {
-			slog.Warn("handleEC2TerminateStoppedInstance: failed to release public IP", "ip", instance.PublicIP, "pool", instance.PublicIPPool, "err", err)
-		} else {
-			slog.Info("handleEC2TerminateStoppedInstance: released public IP", "ip", instance.PublicIP, "instanceId", req.InstanceID)
-		}
-	}
-
-	// Delete ENI if present
-	if instance.ENIId != "" && d.vpcService != nil {
-		_, eniErr := d.vpcService.DeleteNetworkInterface(&ec2.DeleteNetworkInterfaceInput{
-			NetworkInterfaceId: &instance.ENIId,
-		}, instance.AccountID)
-		if eniErr != nil {
-			slog.Error("handleEC2TerminateStoppedInstance: failed to delete ENI", "eni", instance.ENIId, "err", eniErr)
-		} else {
-			slog.Info("handleEC2TerminateStoppedInstance: deleted ENI", "eni", instance.ENIId, "instanceId", req.InstanceID)
-		}
-	}
-
-	// Write to terminated KV bucket FIRST so the instance is visible in DescribeInstances.
-	// If this fails, the instance remains in the stopped bucket (safe to retry).
-	instance.Status = vm.StateTerminated
-	if err := d.jsManager.WriteTerminatedInstance(req.InstanceID, instance); err != nil {
-		slog.Error("handleEC2TerminateStoppedInstance: failed to write to terminated KV, aborting", "instanceId", req.InstanceID, "err", err)
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-
-	// Now safe to remove from shared stopped KV — instance already exists in terminated bucket.
-	// Retry once on failure to avoid duplicate entries in DescribeInstances.
-	if err := d.jsManager.DeleteStoppedInstance(req.InstanceID); err != nil {
-		slog.Warn("handleEC2TerminateStoppedInstance: first stopped KV delete failed, retrying",
-			"instanceId", req.InstanceID, "err", err)
-		if retryErr := d.jsManager.DeleteStoppedInstance(req.InstanceID); retryErr != nil {
-			slog.Error("handleEC2TerminateStoppedInstance: stopped KV delete failed after retry, instance may appear in both buckets",
-				"instanceId", req.InstanceID, "err", retryErr)
-		}
-	}
-
-	slog.Info("Terminated stopped instance from shared KV", "instanceId", req.InstanceID)
-
-	if err := msg.Respond(fmt.Appendf(nil, `{"status":"terminated","instanceId":"%s"}`, req.InstanceID)); err != nil {
-		slog.Error("Failed to respond to NATS request", "err", err)
-	}
+	handleNATSRequest(msg, d.instanceService.TerminateStoppedInstance)
 }
 
 // handleEC2DescribeStoppedInstances returns stopped instances from shared KV.
 func (d *Daemon) handleEC2DescribeStoppedInstances(msg *nats.Msg) {
-	d.describeInstancesFromKV(msg, d.jsManager.ListStoppedInstances, 80, "stopped", "handleEC2DescribeStoppedInstances")
+	if d.stateStore == nil {
+		respondWithError(msg, awserrors.ErrorServerInternal)
+		return
+	}
+	d.describeInstancesFromKV(msg, d.stateStore.ListStoppedInstances, 80, "stopped", "handleEC2DescribeStoppedInstances")
 }
 
 // handleEC2DescribeTerminatedInstances returns terminated instances from the terminated KV bucket.
 func (d *Daemon) handleEC2DescribeTerminatedInstances(msg *nats.Msg) {
-	d.describeInstancesFromKV(msg, d.jsManager.ListTerminatedInstances, 48, "terminated", "handleEC2DescribeTerminatedInstances")
+	if d.stateStore == nil {
+		respondWithError(msg, awserrors.ErrorServerInternal)
+		return
+	}
+	d.describeInstancesFromKV(msg, d.stateStore.ListTerminatedInstances, 48, "terminated", "handleEC2DescribeTerminatedInstances")
 }
 
 // describeInstancesFromKV is a shared helper for DescribeStopped/TerminatedInstances handlers.
 // It lists instances from a KV bucket, filters by account/instance ID, and responds with reservations.
 func (d *Daemon) describeInstancesFromKV(msg *nats.Msg, listFn func() ([]*vm.VM, error), fallbackCode int64, fallbackName, handlerName string) {
-	if d.jsManager == nil {
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-
 	accountID := utils.AccountIDFromMsg(msg)
 
 	describeInput := &ec2.DescribeInstancesInput{}
@@ -1234,12 +552,22 @@ func (d *Daemon) describeInstancesFromKV(msg *nats.Msg, listFn func() ([]*vm.VM,
 
 		instanceCopy := *instance.Instance
 		instanceCopy.State = &ec2.InstanceState{}
-		if info, ok := vm.EC2StateCodes[instance.Status]; ok {
+		if info, ok := vm.EC2APIState(instance.Status); ok {
 			instanceCopy.State.SetCode(info.Code)
 			instanceCopy.State.SetName(info.Name)
 		} else {
 			instanceCopy.State.SetCode(fallbackCode)
 			instanceCopy.State.SetName(fallbackName)
+		}
+
+		// Project IamInstanceProfile from vm.VM (cleared on terminate;
+		// preserved across stop/start). Mirrors handleEC2DescribeInstances.
+		if instance.IamInstanceProfileArn != "" {
+			instanceCopy.IamInstanceProfile = &ec2.IamInstanceProfile{
+				Arn: aws.String(instance.IamInstanceProfileArn),
+			}
+		} else {
+			instanceCopy.IamInstanceProfile = nil
 		}
 
 		if len(parsedFilters) > 0 && !instanceMatchesFilters(instance, &instanceCopy, parsedFilters) {
@@ -1258,248 +586,11 @@ func (d *Daemon) describeInstancesFromKV(msg *nats.Msg, listFn func() ([]*vm.VM,
 	slog.Info(handlerName+" completed", "count", len(reservations))
 }
 
-// handleEC2ModifyInstanceAttribute modifies attributes of a stopped instance in shared KV.
-// All supported attributes (InstanceType, UserData) require the instance to be stopped.
 func (d *Daemon) handleEC2ModifyInstanceAttribute(msg *nats.Msg) {
-	var input ec2.ModifyInstanceAttributeInput
-	if err := json.Unmarshal(msg.Data, &input); err != nil {
-		slog.Error("handleEC2ModifyInstanceAttribute: failed to unmarshal request", "err", err)
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-
-	if input.InstanceId == nil || *input.InstanceId == "" {
-		slog.Error("handleEC2ModifyInstanceAttribute: missing instance_id")
-		respondWithError(msg, awserrors.ErrorMissingParameter)
-		return
-	}
-
-	instanceID := *input.InstanceId
-
-	// SourceDestCheck is a networking concept that doesn't apply to bare-metal VMs.
-	// Accept the call as a no-op so Terraform and the AWS CLI don't error out.
-	// Unlike InstanceType/UserData, AWS allows this on running instances, so handle
-	// it before the stopped-state gate.
-	if input.SourceDestCheck != nil {
-		slog.Info("handleEC2ModifyInstanceAttribute: accepting SourceDestCheck (no-op on bare metal)", "instanceId", instanceID)
-		if err := msg.Respond([]byte(`{}`)); err != nil {
-			slog.Error("Failed to respond to NATS request", "err", err)
-		}
-		return
-	}
-
-	if d.jsManager == nil {
-		slog.Error("handleEC2ModifyInstanceAttribute: JetStream not available")
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-
-	instance, err := d.jsManager.LoadStoppedInstance(instanceID)
-	if err != nil {
-		slog.Error("handleEC2ModifyInstanceAttribute: failed to load stopped instance", "instanceId", instanceID, "err", err)
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-	if instance == nil {
-		slog.Warn("handleEC2ModifyInstanceAttribute: instance not found in shared KV", "instanceId", instanceID)
-		respondWithError(msg, awserrors.ErrorInvalidInstanceIDNotFound)
-		return
-	}
-
-	if instance.Status != vm.StateStopped {
-		slog.Error("handleEC2ModifyInstanceAttribute: instance not in stopped state", "instanceId", instanceID, "status", instance.Status)
-		respondWithError(msg, awserrors.ErrorIncorrectInstanceState)
-		return
-	}
-
-	// Verify the caller owns this instance
-	if !checkInstanceOwnership(msg, instanceID, instance.AccountID) {
-		return
-	}
-
-	// Apply the requested attribute change
-	if input.InstanceType != nil && input.InstanceType.Value != nil {
-		newType := *input.InstanceType.Value
-		if newType == "" {
-			slog.Error("handleEC2ModifyInstanceAttribute: empty instance type value", "instanceId", instanceID)
-			respondWithError(msg, awserrors.ErrorInvalidInstanceAttributeValue)
-			return
-		}
-		if instance.Instance == nil {
-			slog.Error("handleEC2ModifyInstanceAttribute: instance.Instance is nil, data integrity issue", "instanceId", instanceID)
-			respondWithError(msg, awserrors.ErrorServerInternal)
-			return
-		}
-		slog.Info("handleEC2ModifyInstanceAttribute: changing instance type",
-			"instanceId", instanceID, "oldType", instance.InstanceType, "newType", newType)
-
-		instance.InstanceType = newType
-		instance.Config.InstanceType = newType
-		instance.Instance.InstanceType = aws.String(newType)
-		// Clear StateReason — resolves capacity-unavailable state from instance-type-missing bug
-		instance.Instance.StateReason = nil
-	}
-
-	if input.UserData != nil && input.UserData.Value != nil {
-		slog.Info("handleEC2ModifyInstanceAttribute: changing user data", "instanceId", instanceID)
-
-		// Value arrives as decoded bytes (JSON unmarshal handles base64 → []byte automatically)
-		instance.UserData = string(input.UserData.Value)
-		if instance.RunInstancesInput != nil {
-			instance.RunInstancesInput.UserData = aws.String(base64.StdEncoding.EncodeToString(input.UserData.Value))
-		}
-	}
-
-	if err := d.jsManager.WriteStoppedInstance(instanceID, instance); err != nil {
-		slog.Error("handleEC2ModifyInstanceAttribute: failed to write modified instance to KV",
-			"instanceId", instanceID, "err", err)
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-
-	slog.Info("handleEC2ModifyInstanceAttribute: completed successfully", "instanceId", instanceID)
-
-	if err := msg.Respond([]byte(`{}`)); err != nil {
-		slog.Error("Failed to respond to NATS request", "err", err)
-	}
+	handleNATSRequest(msg, d.instanceService.ModifyInstanceAttribute)
 }
 
 // handleEC2DescribeInstanceAttribute returns a single requested attribute for an instance.
-// It checks running instances first (in-memory), then falls back to stopped instances in KV.
 func (d *Daemon) handleEC2DescribeInstanceAttribute(msg *nats.Msg) {
-	var input ec2.DescribeInstanceAttributeInput
-	if err := json.Unmarshal(msg.Data, &input); err != nil {
-		slog.Error("handleEC2DescribeInstanceAttribute: failed to unmarshal request", "err", err)
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
-	}
-
-	if input.InstanceId == nil || *input.InstanceId == "" {
-		slog.Error("handleEC2DescribeInstanceAttribute: missing instance_id")
-		respondWithError(msg, awserrors.ErrorMissingParameter)
-		return
-	}
-	if input.Attribute == nil || *input.Attribute == "" {
-		slog.Error("handleEC2DescribeInstanceAttribute: missing attribute")
-		respondWithError(msg, awserrors.ErrorMissingParameter)
-		return
-	}
-
-	instanceID := *input.InstanceId
-	attribute := *input.Attribute
-	accountID := utils.AccountIDFromMsg(msg)
-
-	// Look up instance: running first, then stopped KV.
-	var instance *vm.VM
-
-	d.Instances.Mu.Lock()
-	if running, ok := d.Instances.VMS[instanceID]; ok {
-		instance = running
-	}
-	d.Instances.Mu.Unlock()
-
-	if instance == nil {
-		if d.jsManager == nil {
-			slog.Error("handleEC2DescribeInstanceAttribute: JetStream not available")
-			respondWithError(msg, awserrors.ErrorServerInternal)
-			return
-		}
-		stopped, err := d.jsManager.LoadStoppedInstance(instanceID)
-		if err != nil {
-			slog.Error("handleEC2DescribeInstanceAttribute: failed to load stopped instance",
-				"instanceId", instanceID, "err", err)
-			respondWithError(msg, awserrors.ErrorServerInternal)
-			return
-		}
-		instance = stopped
-	}
-
-	if instance == nil {
-		slog.Warn("handleEC2DescribeInstanceAttribute: instance not found",
-			"instanceId", instanceID)
-		respondWithError(msg, awserrors.ErrorInvalidInstanceIDNotFound)
-		return
-	}
-
-	if !checkInstanceOwnership(msg, instanceID, instance.AccountID) {
-		return
-	}
-
-	output := &ec2.DescribeInstanceAttributeOutput{
-		InstanceId: &instanceID,
-	}
-
-	switch attribute {
-	case ec2.InstanceAttributeNameInstanceType:
-		val := instance.InstanceType
-		output.InstanceType = &ec2.AttributeValue{Value: &val}
-
-	case ec2.InstanceAttributeNameUserData:
-		val := instance.UserData
-		output.UserData = &ec2.AttributeValue{Value: &val}
-
-	case ec2.InstanceAttributeNameDisableApiTermination:
-		val := false
-		output.DisableApiTermination = &ec2.AttributeBooleanValue{Value: &val}
-
-	case ec2.InstanceAttributeNameDisableApiStop:
-		val := false
-		output.DisableApiStop = &ec2.AttributeBooleanValue{Value: &val}
-
-	case ec2.InstanceAttributeNameInstanceInitiatedShutdownBehavior:
-		val := ec2.ShutdownBehaviorStop
-		output.InstanceInitiatedShutdownBehavior = &ec2.AttributeValue{Value: &val}
-
-	case ec2.InstanceAttributeNameEbsOptimized:
-		val := false
-		output.EbsOptimized = &ec2.AttributeBooleanValue{Value: &val}
-
-	case ec2.InstanceAttributeNameEnaSupport:
-		val := true
-		output.EnaSupport = &ec2.AttributeBooleanValue{Value: &val}
-
-	case ec2.InstanceAttributeNameSourceDestCheck:
-		val := true
-		output.SourceDestCheck = &ec2.AttributeBooleanValue{Value: &val}
-
-	case ec2.InstanceAttributeNameGroupSet:
-		if instance.Instance != nil && len(instance.Instance.SecurityGroups) > 0 {
-			output.Groups = instance.Instance.SecurityGroups
-		} else {
-			output.Groups = []*ec2.GroupIdentifier{}
-		}
-
-	default:
-		slog.Warn("handleEC2DescribeInstanceAttribute: unsupported attribute",
-			"instanceId", instanceID, "attribute", attribute)
-		respondWithError(msg, awserrors.ErrorInvalidParameterValue)
-		return
-	}
-
-	slog.Info("handleEC2DescribeInstanceAttribute: completed",
-		"instanceId", instanceID, "attribute", attribute, "accountID", accountID)
-	respondWithJSON(msg, output)
-}
-
-// publishNATEvent sends a NAT lifecycle event (vpc.add-nat or vpc.delete-nat) to NATS.
-// For vpc.add-nat, it uses request-reply to ensure the OVN NAT rule is committed
-// before returning, preventing ARP propagation races. For vpc.delete-nat, it
-// uses fire-and-forget since the caller doesn't need to wait.
-func (d *Daemon) publishNATEvent(topic, vpcId, externalIP, logicalIP, portName, mac string) {
-	evt := struct {
-		VpcId      string `json:"vpc_id"`
-		ExternalIP string `json:"external_ip"`
-		LogicalIP  string `json:"logical_ip"`
-		PortName   string `json:"port_name"`
-		MAC        string `json:"mac"`
-	}{VpcId: vpcId, ExternalIP: externalIP, LogicalIP: logicalIP, PortName: portName, MAC: mac}
-
-	if topic == "vpc.add-nat" {
-		if err := utils.RequestEvent(d.natsConn, topic, evt, 10*time.Second); err != nil {
-			slog.Warn("publishNATEvent: failed to add NAT rule — OVN dnat_and_snat rule not created; restart vpcd or re-associate EIP to recover",
-				"topic", topic, "externalIP", externalIP, "logicalIP", logicalIP, "err", err)
-		}
-		return
-	}
-	utils.PublishEvent(d.natsConn, topic, evt)
+	handleNATSRequest(msg, d.instanceService.DescribeInstanceAttribute)
 }

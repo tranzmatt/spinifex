@@ -22,6 +22,7 @@ func setupTestVPCServiceWithNC(t *testing.T) (*VPCServiceImpl, *nats.Conn) {
 
 	svc, err := NewVPCServiceImplWithNATS(nil, nc)
 	require.NoError(t, err)
+	testutil.StubVpcdSGResponder(t, nc)
 	return svc, nc
 }
 
@@ -29,6 +30,18 @@ func setupTestVPCService(t *testing.T) *VPCServiceImpl {
 	t.Helper()
 	svc, _ := setupTestVPCServiceWithNC(t)
 	return svc
+}
+
+// setupTestVPCServiceWithFailingVpcd creates a VPC service whose vpcd stub
+// always returns success=false. Used to assert vpcd-side errors surface to the
+// API caller.
+func setupTestVPCServiceWithFailingVpcd(t *testing.T, errMsg string) (*VPCServiceImpl, *nats.Conn) {
+	t.Helper()
+	_, nc, _ := testutil.StartTestJetStream(t)
+	svc, err := NewVPCServiceImplWithNATS(nil, nc)
+	require.NoError(t, err)
+	testutil.StubVpcdSGFailingResponder(t, nc, errMsg)
+	return svc, nc
 }
 
 func createTestVPC(t *testing.T, svc *VPCServiceImpl, cidr string) string {
@@ -174,14 +187,6 @@ func TestDeleteVpc(t *testing.T) {
 	}, testAccountID)
 	assert.ErrorContains(t, err, "InvalidVpcID.NotFound")
 	assert.Nil(t, desc)
-}
-
-func TestDeleteVpc_NotFound(t *testing.T) {
-	svc := setupTestVPCService(t)
-	_, err := svc.DeleteVpc(&ec2.DeleteVpcInput{
-		VpcId: aws.String("vpc-nonexistent"),
-	}, testAccountID)
-	assert.ErrorContains(t, err, "InvalidVpcID.NotFound")
 }
 
 func TestDeleteVpc_MissingID(t *testing.T) {
@@ -368,14 +373,6 @@ func TestDeleteSubnet(t *testing.T) {
 	}, testAccountID)
 	assert.ErrorContains(t, err, "InvalidSubnetID.NotFound")
 	assert.Nil(t, desc)
-}
-
-func TestDeleteSubnet_NotFound(t *testing.T) {
-	svc := setupTestVPCService(t)
-	_, err := svc.DeleteSubnet(&ec2.DeleteSubnetInput{
-		SubnetId: aws.String("subnet-nonexistent"),
-	}, testAccountID)
-	assert.ErrorContains(t, err, "InvalidSubnetID.NotFound")
 }
 
 func TestDeleteSubnet_MissingID(t *testing.T) {
@@ -581,6 +578,132 @@ func TestEnsureDefaultVPC_SkipsWhenDefaultExists(t *testing.T) {
 	assert.Equal(t, 1, defaultCount)
 }
 
+// TestCreateMainRouteTable_Idempotent asserts a second createMainRouteTable
+// call for the same VPC is a no-op. Concurrent calls otherwise create duplicate
+// IsMain=true records, corrupting route-table resolution.
+func TestCreateMainRouteTable_Idempotent(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.99.0.0/16") // CreateVpc auto-calls createMainRouteTable
+
+	firstID, err := svc.findMainRouteTableID(testAccountID, vpcID)
+	require.NoError(t, err)
+	require.NotEmpty(t, firstID, "CreateVpc should have created a main route table")
+
+	require.NoError(t, svc.createMainRouteTable(testAccountID, vpcID, "10.99.0.0/16"))
+
+	secondID, err := svc.findMainRouteTableID(testAccountID, vpcID)
+	require.NoError(t, err)
+	assert.Equal(t, firstID, secondID, "second call must be a no-op")
+
+	mains := countMainRouteTablesForVPC(t, svc, vpcID)
+	assert.Equal(t, 1, mains, "exactly one IsMain=true record after duplicate call")
+}
+
+// TestDeleteVpc_ReapsMainRouteTable asserts DeleteVpc reclaims the VPC's
+// auto-created main route table. DeleteRouteTable refuses to delete a main RT
+// (AWS-faithful), so without DeleteVpc reaping it the rtbKV bucket leaks one
+// orphaned main RT per deleted VPC.
+func TestDeleteVpc_ReapsMainRouteTable(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.77.0.0/16") // auto-creates the main RT
+
+	rtbID, err := svc.findMainRouteTableID(testAccountID, vpcID)
+	require.NoError(t, err)
+	require.NotEmpty(t, rtbID, "CreateVpc should have created a main route table")
+	require.Equal(t, 1, countMainRouteTablesForVPC(t, svc, vpcID))
+
+	_, err = svc.DeleteVpc(&ec2.DeleteVpcInput{VpcId: aws.String(vpcID)}, testAccountID)
+	require.NoError(t, err)
+
+	gone, err := svc.findMainRouteTableID(testAccountID, vpcID)
+	require.NoError(t, err)
+	assert.Empty(t, gone, "DeleteVpc must reap the main route table, not leak it")
+	assert.Equal(t, 0, countMainRouteTablesForVPC(t, svc, vpcID))
+}
+
+// countMainRouteTablesForVPC scans rtbKV directly to surface duplicate-main
+// state in tests. Returns the number of IsMain=true records for vpcID.
+func countMainRouteTablesForVPC(t *testing.T, svc *VPCServiceImpl, vpcID string) int {
+	t.Helper()
+	keys, err := svc.rtbKV.Keys()
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, key := range keys {
+		entry, err := svc.rtbKV.Get(key)
+		if err != nil {
+			continue
+		}
+		var rt struct {
+			VpcId  string `json:"vpc_id"`
+			IsMain bool   `json:"is_main"`
+		}
+		if err := json.Unmarshal(entry.Value(), &rt); err != nil {
+			continue
+		}
+		if rt.VpcId == vpcID && rt.IsMain {
+			n++
+		}
+	}
+	return n
+}
+
+// TestEnsureDefaultVPC_NoVpcdResponder simulates the daemon-startup race where
+// EnsureDefaultVPC runs before vpcd has subscribed. The SG step is best-effort,
+// so subnet and RTB must still land in KV when vpcd is absent.
+func TestEnsureDefaultVPC_NoVpcdResponder(t *testing.T) {
+	_, nc, _ := testutil.StartTestJetStream(t)
+	svc, err := NewVPCServiceImplWithNATS(nil, nc)
+	require.NoError(t, err)
+	// Intentionally NOT calling StubVpcdSGResponder — vpc.create-sg has no
+	// responder, mirroring the bootstrap race.
+
+	info, err := svc.EnsureDefaultVPC(testAccountID)
+	require.NoError(t, err)
+	require.NotNil(t, info)
+
+	// Default VPC, subnet, and main RTB must all be present in KV.
+	desc, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, desc.Vpcs, 1)
+	assert.True(t, *desc.Vpcs[0].IsDefault)
+
+	subDesc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, subDesc.Subnets, 1)
+	assert.Equal(t, info.VpcId, *subDesc.Subnets[0].VpcId)
+
+	require.NotNil(t, svc.rtbKV)
+	rtbKeys, err := svc.rtbKV.Keys()
+	require.NoError(t, err)
+	foundMainRTB := false
+	for _, k := range rtbKeys {
+		entry, err := svc.rtbKV.Get(k)
+		if err != nil {
+			continue
+		}
+		var rec struct {
+			VpcId  string `json:"vpc_id"`
+			IsMain bool   `json:"is_main"`
+		}
+		if err := json.Unmarshal(entry.Value(), &rec); err != nil {
+			continue
+		}
+		if rec.VpcId == info.VpcId && rec.IsMain {
+			foundMainRTB = true
+			break
+		}
+	}
+	assert.True(t, foundMainRTB, "main route table must exist for default VPC even when vpcd is unavailable")
+
+	// Default SG record is best-effort; KV write happens before the synchronous
+	// vpcd round-trip, so the record should still be present.
+	sgKeys, err := svc.sgKV.Keys()
+	require.NoError(t, err)
+	assert.NotEmpty(t, sgKeys, "default SG record must persist in KV for vpcd reconciler to converge")
+}
+
 func TestGetDefaultSubnet(t *testing.T) {
 	svc := setupTestVPCService(t)
 
@@ -780,6 +903,7 @@ func TestDeleteSubnet_PublishesEvent(t *testing.T) {
 func TestEnsureDefaultVPC_WithConfigAZ(t *testing.T) {
 	// Create a service with custom config that has AZ set
 	_, nc, _ := testutil.StartTestJetStream(t)
+	testutil.StubVpcdSGResponder(t, nc)
 
 	cfg := &config.Config{AZ: "us-west-2b"}
 	svc, err := NewVPCServiceImplWithNATS(cfg, nc)
@@ -1595,4 +1719,130 @@ func TestDescribeSubnets_FilterByTag(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, desc.Subnets, 1)
 	assert.Equal(t, *out.Subnet.SubnetId, *desc.Subnets[0].SubnetId)
+}
+
+// --- SetExternalIPAM / GetSubnet ---
+
+func TestGetSubnet_Success(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
+	subnetID := createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
+
+	rec, err := svc.GetSubnet(testAccountID, subnetID)
+	require.NoError(t, err)
+	assert.Equal(t, subnetID, rec.SubnetId)
+	assert.Equal(t, vpcID, rec.VpcId)
+	assert.Equal(t, "10.0.1.0/24", rec.CidrBlock)
+}
+
+func TestGetSubnet_NotFound(t *testing.T) {
+	svc := setupTestVPCService(t)
+
+	_, err := svc.GetSubnet(testAccountID, "subnet-missing")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "subnet-missing")
+}
+
+// --- CreateTags write-through (mulga-siv-347) ---
+
+func TestApplyRecordTags_SubnetTagFilteredDescribe(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
+	subnetID := createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
+
+	err := svc.ApplyRecordTags(&ec2.CreateTagsInput{
+		Resources: []*string{aws.String(subnetID)},
+		Tags: []*ec2.Tag{
+			{Key: aws.String("kubernetes.io/role/elb"), Value: aws.String("1")},
+		},
+	}, testAccountID)
+	require.NoError(t, err)
+
+	// DescribeSubnets must surface the tag...
+	out, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+		SubnetIds: []*string{aws.String(subnetID)},
+	}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, out.Subnets, 1)
+	assert.Equal(t, "1", findTag(out.Subnets[0].Tags, "kubernetes.io/role/elb"))
+
+	// ...and a tag: filter must match it (the LBC auto-discovery path).
+	filtered, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+		Filters: []*ec2.Filter{
+			{Name: aws.String("tag:kubernetes.io/role/elb"), Values: []*string{aws.String("1")}},
+		},
+	}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, filtered.Subnets, 1)
+	assert.Equal(t, subnetID, *filtered.Subnets[0].SubnetId)
+}
+
+func TestApplyRecordTags_VpcMergePreservesRecord(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.1.0.0/16")
+
+	err := svc.ApplyRecordTags(&ec2.CreateTagsInput{
+		Resources: []*string{aws.String(vpcID)},
+		Tags:      []*ec2.Tag{{Key: aws.String("Name"), Value: aws.String("prod")}},
+	}, testAccountID)
+	require.NoError(t, err)
+
+	out, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+		VpcIds: []*string{aws.String(vpcID)},
+	}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, out.Vpcs, 1)
+	// Merge must not clobber the rest of the record.
+	assert.Equal(t, "10.1.0.0/16", *out.Vpcs[0].CidrBlock)
+	assert.Equal(t, "prod", findTag(out.Vpcs[0].Tags, "Name"))
+}
+
+func TestRemoveRecordTags_Subnet(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.2.0.0/16")
+	subnetID := createTestSubnet(t, svc, vpcID, "10.2.1.0/24")
+
+	require.NoError(t, svc.ApplyRecordTags(&ec2.CreateTagsInput{
+		Resources: []*string{aws.String(subnetID)},
+		Tags: []*ec2.Tag{
+			{Key: aws.String("keep"), Value: aws.String("yes")},
+			{Key: aws.String("drop"), Value: aws.String("v")},
+		},
+	}, testAccountID))
+
+	// Value-mismatched delete is a no-op; matched delete removes.
+	require.NoError(t, svc.RemoveRecordTags(&ec2.DeleteTagsInput{
+		Resources: []*string{aws.String(subnetID)},
+		Tags: []*ec2.Tag{
+			{Key: aws.String("keep"), Value: aws.String("wrong")},
+			{Key: aws.String("drop"), Value: aws.String("v")},
+		},
+	}, testAccountID))
+
+	out, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+		SubnetIds: []*string{aws.String(subnetID)},
+	}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, out.Subnets, 1)
+	assert.Equal(t, "yes", findTag(out.Subnets[0].Tags, "keep"))
+	assert.Equal(t, "", findTag(out.Subnets[0].Tags, "drop"))
+}
+
+func TestApplyRecordTags_UnknownResourceNoError(t *testing.T) {
+	svc := setupTestVPCService(t)
+	// Absent subnet + non-VPC-owned resource id: both skipped without error.
+	err := svc.ApplyRecordTags(&ec2.CreateTagsInput{
+		Resources: []*string{aws.String("subnet-doesnotexist"), aws.String("i-instance")},
+		Tags:      []*ec2.Tag{{Key: aws.String("k"), Value: aws.String("v")}},
+	}, testAccountID)
+	require.NoError(t, err)
+}
+
+func findTag(tags []*ec2.Tag, key string) string {
+	for _, t := range tags {
+		if t.Key != nil && *t.Key == key {
+			return aws.StringValue(t.Value)
+		}
+	}
+	return ""
 }

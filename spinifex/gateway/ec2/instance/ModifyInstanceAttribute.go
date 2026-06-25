@@ -27,7 +27,6 @@ func ValidateModifyInstanceAttributeInput(input *ec2.ModifyInstanceAttributeInpu
 		return errors.New(awserrors.ErrorInvalidInstanceIDMalformed)
 	}
 
-	// Exactly one attribute must be set
 	count := 0
 	if input.InstanceType != nil {
 		count++
@@ -38,11 +37,13 @@ func ValidateModifyInstanceAttributeInput(input *ec2.ModifyInstanceAttributeInpu
 	if input.SourceDestCheck != nil {
 		count++
 	}
+	if input.DisableApiTermination != nil {
+		count++
+	}
 	if count != 1 {
 		return errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 
-	// Validate instance type value is non-empty if present
 	if input.InstanceType != nil && (input.InstanceType.Value == nil || *input.InstanceType.Value == "") {
 		return errors.New(awserrors.ErrorInvalidInstanceAttributeValue)
 	}

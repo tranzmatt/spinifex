@@ -1,6 +1,7 @@
 package testutil
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -57,6 +58,77 @@ func StartTestJetStream(t *testing.T) (*server.Server, *nats.Conn, nats.JetStrea
 	js, err := nc.JetStream()
 	require.NoError(t, err)
 	return ns, nc, js
+}
+
+// vpcdStubTopics lists every synchronous vpcd topic the stub auto-replies to.
+// All block on a 5 s round-trip, so missing any one causes test timeouts.
+var vpcdStubTopics = []string{
+	"vpc.create-sg",
+	"vpc.delete-sg",
+	"vpc.update-sg",
+	"vpc.update-port-sgs",
+	"vpc.create-port",
+}
+
+// vpcdStubRegistry holds the per-conn response map. Per-conn so concurrent tests with separate conns don't interfere.
+var (
+	vpcdStubMu       sync.RWMutex
+	vpcdStubRegistry = map[*nats.Conn]map[string][]byte{}
+)
+
+// StubVpcdSGResponder auto-replies success to all synchronous vpcd topics.
+// Use OverrideVpcdStubResponse to swap a reply mid-test without adding a racing second subscriber.
+func StubVpcdSGResponder(t *testing.T, nc *nats.Conn) {
+	t.Helper()
+	registerVpcdStub(t, nc, []byte(`{"success":true}`))
+}
+
+// StubVpcdSGFailingResponder is the negative-path counterpart: all topics reply success=false.
+func StubVpcdSGFailingResponder(t *testing.T, nc *nats.Conn, errMsg string) {
+	t.Helper()
+	registerVpcdStub(t, nc, []byte(`{"success":false,"error":"`+errMsg+`"}`))
+}
+
+// OverrideVpcdStubResponse changes the stub's reply for one topic on the given conn.
+// Updates the existing subscriber in-place — no second responder, no race.
+func OverrideVpcdStubResponse(nc *nats.Conn, topic string, payload []byte) {
+	vpcdStubMu.Lock()
+	defer vpcdStubMu.Unlock()
+	if vpcdStubRegistry[nc] == nil {
+		vpcdStubRegistry[nc] = make(map[string][]byte, len(vpcdStubTopics))
+	}
+	vpcdStubRegistry[nc][topic] = payload
+}
+
+func registerVpcdStub(t *testing.T, nc *nats.Conn, defaultPayload []byte) {
+	t.Helper()
+	vpcdStubMu.Lock()
+	if vpcdStubRegistry[nc] == nil {
+		vpcdStubRegistry[nc] = make(map[string][]byte, len(vpcdStubTopics))
+	}
+	for _, topic := range vpcdStubTopics {
+		vpcdStubRegistry[nc][topic] = defaultPayload
+	}
+	vpcdStubMu.Unlock()
+
+	for _, topic := range vpcdStubTopics {
+		sub, err := nc.Subscribe(topic, func(m *nats.Msg) {
+			if m.Reply == "" {
+				return
+			}
+			vpcdStubMu.RLock()
+			resp := vpcdStubRegistry[nc][topic]
+			vpcdStubMu.RUnlock()
+			_ = m.Respond(resp)
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = sub.Unsubscribe() })
+	}
+	t.Cleanup(func() {
+		vpcdStubMu.Lock()
+		delete(vpcdStubRegistry, nc)
+		vpcdStubMu.Unlock()
+	})
 }
 
 // SeedKV creates a KV bucket and populates it with the given entries.

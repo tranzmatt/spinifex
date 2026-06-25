@@ -8,6 +8,7 @@ vi.mock("@/lib/awsClient", () => ({
 
 import {
   ec2AvailabilityZonesQueryOptions,
+  ec2IamInstanceProfileAssociationsQueryOptions,
   ec2ImageQueryOptions,
   ec2ImagesQueryOptions,
   ec2InstanceQueryOptions,
@@ -32,23 +33,32 @@ import {
 
 describe("query keys", () => {
   it("ec2InstancesQueryOptions has correct key", () => {
-    expect(ec2InstancesQueryOptions.queryKey).toEqual(["ec2", "instances"])
+    expect(ec2InstancesQueryOptions.queryKey).toStrictEqual([
+      "ec2",
+      "instances",
+    ])
   })
 
   it("ec2InstanceQueryOptions includes instanceId in key", () => {
-    expect(ec2InstanceQueryOptions("i-123").queryKey).toEqual([
+    expect(ec2InstanceQueryOptions("i-123").queryKey).toStrictEqual([
       "ec2",
       "instances",
       "i-123",
     ])
   })
 
+  it("ec2IamInstanceProfileAssociationsQueryOptions includes instanceId in key", () => {
+    expect(
+      ec2IamInstanceProfileAssociationsQueryOptions("i-123").queryKey,
+    ).toStrictEqual(["ec2", "iam-instance-profile-associations", "i-123"])
+  })
+
   it("ec2ImagesQueryOptions has correct key", () => {
-    expect(ec2ImagesQueryOptions.queryKey).toEqual(["ec2", "images"])
+    expect(ec2ImagesQueryOptions.queryKey).toStrictEqual(["ec2", "images"])
   })
 
   it("ec2ImageQueryOptions uses 'none' for undefined imageId", () => {
-    expect(ec2ImageQueryOptions(undefined).queryKey).toEqual([
+    expect(ec2ImageQueryOptions(undefined).queryKey).toStrictEqual([
       "ec2",
       "images",
       "none",
@@ -56,11 +66,11 @@ describe("query keys", () => {
   })
 
   it("ec2KeyPairsQueryOptions has correct key", () => {
-    expect(ec2KeyPairsQueryOptions.queryKey).toEqual(["ec2", "keypairs"])
+    expect(ec2KeyPairsQueryOptions.queryKey).toStrictEqual(["ec2", "keypairs"])
   })
 
   it("ec2KeyPairQueryOptions includes keyPairId", () => {
-    expect(ec2KeyPairQueryOptions("kp-abc").queryKey).toEqual([
+    expect(ec2KeyPairQueryOptions("kp-abc").queryKey).toStrictEqual([
       "ec2",
       "keypairs",
       "kp-abc",
@@ -68,11 +78,11 @@ describe("query keys", () => {
   })
 
   it("ec2VolumesQueryOptions has correct key", () => {
-    expect(ec2VolumesQueryOptions.queryKey).toEqual(["ec2", "volumes"])
+    expect(ec2VolumesQueryOptions.queryKey).toStrictEqual(["ec2", "volumes"])
   })
 
   it("ec2VolumeQueryOptions includes volumeId", () => {
-    expect(ec2VolumeQueryOptions("vol-1").queryKey).toEqual([
+    expect(ec2VolumeQueryOptions("vol-1").queryKey).toStrictEqual([
       "ec2",
       "volumes",
       "vol-1",
@@ -80,11 +90,14 @@ describe("query keys", () => {
   })
 
   it("ec2SnapshotsQueryOptions has correct key", () => {
-    expect(ec2SnapshotsQueryOptions.queryKey).toEqual(["ec2", "snapshots"])
+    expect(ec2SnapshotsQueryOptions.queryKey).toStrictEqual([
+      "ec2",
+      "snapshots",
+    ])
   })
 
   it("ec2SnapshotQueryOptions includes snapshotId", () => {
-    expect(ec2SnapshotQueryOptions("snap-1").queryKey).toEqual([
+    expect(ec2SnapshotQueryOptions("snap-1").queryKey).toStrictEqual([
       "ec2",
       "snapshots",
       "snap-1",
@@ -92,11 +105,11 @@ describe("query keys", () => {
   })
 
   it("ec2VpcsQueryOptions has correct key", () => {
-    expect(ec2VpcsQueryOptions.queryKey).toEqual(["ec2", "vpcs"])
+    expect(ec2VpcsQueryOptions.queryKey).toStrictEqual(["ec2", "vpcs"])
   })
 
   it("ec2VpcQueryOptions includes vpcId", () => {
-    expect(ec2VpcQueryOptions("vpc-1").queryKey).toEqual([
+    expect(ec2VpcQueryOptions("vpc-1").queryKey).toStrictEqual([
       "ec2",
       "vpcs",
       "vpc-1",
@@ -104,11 +117,11 @@ describe("query keys", () => {
   })
 
   it("ec2SubnetsQueryOptions has correct key", () => {
-    expect(ec2SubnetsQueryOptions.queryKey).toEqual(["ec2", "subnets"])
+    expect(ec2SubnetsQueryOptions.queryKey).toStrictEqual(["ec2", "subnets"])
   })
 
   it("ec2SubnetQueryOptions includes subnetId", () => {
-    expect(ec2SubnetQueryOptions("subnet-1").queryKey).toEqual([
+    expect(ec2SubnetQueryOptions("subnet-1").queryKey).toStrictEqual([
       "ec2",
       "subnets",
       "subnet-1",
@@ -116,7 +129,7 @@ describe("query keys", () => {
   })
 
   it("ec2InstanceTypesQueryOptions has correct key", () => {
-    expect(ec2InstanceTypesQueryOptions.queryKey).toEqual([
+    expect(ec2InstanceTypesQueryOptions.queryKey).toStrictEqual([
       "ec2",
       "instances",
       "types",
@@ -124,14 +137,14 @@ describe("query keys", () => {
   })
 
   it("ec2PlacementGroupsQueryOptions has correct key", () => {
-    expect(ec2PlacementGroupsQueryOptions.queryKey).toEqual([
+    expect(ec2PlacementGroupsQueryOptions.queryKey).toStrictEqual([
       "ec2",
       "placementGroups",
     ])
   })
 
   it("ec2PlacementGroupQueryOptions includes groupId in key", () => {
-    expect(ec2PlacementGroupQueryOptions("pg-123").queryKey).toEqual([
+    expect(ec2PlacementGroupQueryOptions("pg-123").queryKey).toStrictEqual([
       "ec2",
       "placementGroups",
       "pg-123",
@@ -139,14 +152,14 @@ describe("query keys", () => {
   })
 
   it("ec2SecurityGroupsQueryOptions has correct key", () => {
-    expect(ec2SecurityGroupsQueryOptions.queryKey).toEqual([
+    expect(ec2SecurityGroupsQueryOptions.queryKey).toStrictEqual([
       "ec2",
       "securityGroups",
     ])
   })
 
   it("ec2SecurityGroupQueryOptions includes groupId in key", () => {
-    expect(ec2SecurityGroupQueryOptions("sg-123").queryKey).toEqual([
+    expect(ec2SecurityGroupQueryOptions("sg-123").queryKey).toStrictEqual([
       "ec2",
       "securityGroups",
       "sg-123",
@@ -189,7 +202,7 @@ describe("queryFn", () => {
     const options = ec2ImageQueryOptions(undefined)
     const queryFn = options.queryFn as (ctx: never) => Promise<unknown>
     const result = await queryFn({} as never)
-    expect(result).toEqual({ Images: [], $metadata: {} })
+    expect(result).toStrictEqual({ Images: [], $metadata: {} })
     expect(mockSend).not.toHaveBeenCalled()
   })
 
@@ -199,7 +212,7 @@ describe("queryFn", () => {
     ) => Promise<unknown>
     await queryFn({} as never)
     expect(mockSend).toHaveBeenCalledOnce()
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       ImageIds: ["ami-123"],
     })
   })
@@ -210,7 +223,7 @@ describe("queryFn", () => {
     ) => Promise<unknown>
     await queryFn({} as never)
     expect(mockSend).toHaveBeenCalledOnce()
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({})
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({})
   })
 
   it("ec2InstanceQueryOptions sends DescribeInstancesCommand with ID", async () => {
@@ -218,7 +231,7 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       InstanceIds: ["i-123"],
     })
   })
@@ -229,7 +242,7 @@ describe("queryFn", () => {
     ) => Promise<unknown>
     await queryFn({} as never)
     expect(mockSend).toHaveBeenCalledOnce()
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({})
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({})
   })
 
   it("ec2KeyPairQueryOptions sends DescribeKeyPairsCommand with ID", async () => {
@@ -237,7 +250,7 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       KeyPairIds: ["kp-abc"],
     })
   })
@@ -255,7 +268,7 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       VolumeIds: ["vol-1"],
     })
   })
@@ -273,7 +286,7 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       SnapshotIds: ["snap-1"],
     })
   })
@@ -291,7 +304,7 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       VpcIds: ["vpc-1"],
     })
   })
@@ -309,7 +322,7 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       SubnetIds: ["subnet-1"],
     })
   })
@@ -343,7 +356,7 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       Filters: [{ Name: "capacity", Values: ["true"] }],
     })
   })
@@ -354,7 +367,7 @@ describe("queryFn", () => {
     ) => Promise<unknown>
     await queryFn({} as never)
     expect(mockSend).toHaveBeenCalledOnce()
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({})
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({})
   })
 
   it("ec2PlacementGroupQueryOptions sends DescribePlacementGroupsCommand with ID", async () => {
@@ -362,7 +375,7 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       GroupIds: ["pg-123"],
     })
   })
@@ -373,7 +386,7 @@ describe("queryFn", () => {
     ) => Promise<unknown>
     await queryFn({} as never)
     expect(mockSend).toHaveBeenCalledOnce()
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({})
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({})
   })
 
   it("ec2SecurityGroupQueryOptions sends DescribeSecurityGroupsCommand with ID", async () => {
@@ -381,8 +394,17 @@ describe("queryFn", () => {
       ctx: never,
     ) => Promise<unknown>
     await queryFn({} as never)
-    expect(mockSend.mock.calls[0]?.[0].input).toEqual({
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       GroupIds: ["sg-123"],
+    })
+  })
+
+  it("ec2IamInstanceProfileAssociationsQueryOptions filters by instance-id", async () => {
+    const queryFn = ec2IamInstanceProfileAssociationsQueryOptions("i-123")
+      .queryFn as (ctx: never) => Promise<unknown>
+    await queryFn({} as never)
+    expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
+      Filters: [{ Name: "instance-id", Values: ["i-123"] }],
     })
   })
 })

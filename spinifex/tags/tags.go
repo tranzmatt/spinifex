@@ -1,8 +1,5 @@
-// Package tags defines tag keys and values used to mark
-// Spinifex system-owned resources (ENIs, EC2 instances, AMIs).
-//
-// The UI filters resources carrying these tags out of customer-facing
-// listings. Operators can append ?system=1 to the URL to surface them.
+// Package tags defines tag keys for Spinifex system-owned resources.
+// The UI filters these out of customer-facing listings; operators append ?system=1 to surface them.
 package tags
 
 const (
@@ -14,6 +11,18 @@ const (
 	// (HAProxy VMs, their ENIs, the LB AMI).
 	ManagedByELBv2 = "elbv2"
 
+	// ManagedByEKS identifies EKS-owned resources (K3s control-plane VMs,
+	// their ENIs, the unified eks-node AMI, cluster + nodegroup SGs).
+	ManagedByEKS = "eks"
+
 	// LBARNKey stores the parent LB ARN on ELBv2-managed ENIs.
 	LBARNKey = "spinifex:lb-arn"
 )
+
+// IsSystemManaged reports whether a ManagedBy value denotes a Spinifex
+// platform-owned system VM (an empty value is a customer instance). System
+// VMs bind a system.TerminateInstance.{id} subject so a cluster-wide teardown
+// invoked on any node can route a terminate to the owning node.
+func IsSystemManaged(managedBy string) bool {
+	return managedBy == ManagedByELBv2 || managedBy == ManagedByEKS
+}

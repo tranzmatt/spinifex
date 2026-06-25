@@ -14,16 +14,14 @@ const { routerState, sdk } = vi.hoisted(() => {
     readonly input: unknown
   }
   const handlers = new Map<string, (input: unknown) => unknown>()
-  const send = vi.fn((command: Command): Promise<unknown> => {
+  const send = vi.fn(async (command: Command): Promise<unknown> => {
     const handler = handlers.get(command.constructor.name)
     if (!handler) {
-      return Promise.reject(
-        new Error(
-          `No handler registered for SDK command ${command.constructor.name}`,
-        ),
+      throw new Error(
+        `No handler registered for SDK command ${command.constructor.name}`,
       )
     }
-    return Promise.resolve(handler(command.input))
+    return handler(command.input)
   })
   return {
     routerState: {
@@ -88,14 +86,14 @@ describe("create-target-group route", () => {
 
     setup()
 
-    expect(await screen.findByLabelText("Name")).toBeInTheDocument()
+    await expect(screen.findByLabelText("Name")).resolves.toBeInTheDocument()
     await user.type(screen.getByLabelText("Name"), "my-tg")
     await user.click(
-      screen.getByRole("button", { name: "Create target group" }),
+      screen.getByRole("button", { name: "Create Target Group" }),
     )
 
     await waitFor(() => {
-      expect(sdk.send).toHaveBeenCalledTimes(1)
+      expect(sdk.send).toHaveBeenCalledOnce()
     })
     const input = sdk.send.mock.calls[0]?.[0].input as {
       Name: string
@@ -116,15 +114,47 @@ describe("create-target-group route", () => {
     })
   })
 
+  it("creates a TCP target group with a TCP health check and no path/matcher", async () => {
+    const user = userEvent.setup()
+    sdk.setHandler("CreateTargetGroupCommand", () => ({
+      TargetGroups: [{ TargetGroupArn: "arn:tg:tcp" }],
+    }))
+
+    setup()
+
+    await user.type(await screen.findByLabelText("Name"), "tcp-tg")
+    await user.click(screen.getByLabelText("Protocol"))
+    await user.click(await screen.findByRole("option", { name: "TCP" }))
+    await user.click(
+      screen.getByRole("button", { name: "Create Target Group" }),
+    )
+
+    await waitFor(() => {
+      expect(sdk.send).toHaveBeenCalledOnce()
+    })
+    const input = sdk.send.mock.calls[0]?.[0].input as {
+      Protocol: string
+      HealthCheckProtocol: string
+      HealthCheckPath?: string
+      Matcher?: unknown
+    }
+    expect(input.Protocol).toBe("TCP")
+    expect(input.HealthCheckProtocol).toBe("TCP")
+    expect(input.HealthCheckPath).toBeUndefined()
+    expect(input.Matcher).toBeUndefined()
+  })
+
   it("blocks submit and shows a validation error when the name is empty", async () => {
     const user = userEvent.setup()
     setup()
 
     await user.click(
-      screen.getByRole("button", { name: "Create target group" }),
+      screen.getByRole("button", { name: "Create Target Group" }),
     )
 
-    expect(await screen.findByText("Name is required")).toBeInTheDocument()
+    await expect(
+      screen.findByText("Name is required"),
+    ).resolves.toBeInTheDocument()
     expect(sdk.send).not.toHaveBeenCalled()
     expect(routerState.navigate).not.toHaveBeenCalled()
   })
@@ -139,12 +169,12 @@ describe("create-target-group route", () => {
 
     await user.type(screen.getByLabelText("Name"), "my-tg")
     await user.click(
-      screen.getByRole("button", { name: "Create target group" }),
+      screen.getByRole("button", { name: "Create Target Group" }),
     )
 
-    expect(
-      await screen.findByText(/Failed to create target group/i),
-    ).toBeInTheDocument()
+    await expect(
+      screen.findByText(/Failed to create target group/i),
+    ).resolves.toBeInTheDocument()
     expect(routerState.navigate).not.toHaveBeenCalled()
   })
 })

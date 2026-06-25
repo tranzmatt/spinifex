@@ -15,7 +15,7 @@
 #   VERBOSE                    Set to 1 to echo "[setup] <stage>" before each top-level step.
 #   SETUP_STAGES               Comma-separated subset of stages to run:
 #                                deps, aws, users, sudoers, files, directories,
-#                                env, systemd, logrotate, fixown, migrations
+#                                env, systemd, logrotate, udev, fixown, migrations
 #                              Unset = run every stage appropriate for the current mode.
 
 set -e
@@ -186,12 +186,15 @@ install_sudoers() {
 spinifex-daemon ALL=(root) NOPASSWD: /sbin/ip, /usr/sbin/ip
 spinifex-daemon ALL=(root) NOPASSWD: /usr/bin/ovs-vsctl, /usr/bin/ovs-appctl
 spinifex-daemon ALL=(root) NOPASSWD: /usr/sbin/dhcpcd
+spinifex-daemon ALL=(root) NOPASSWD: /usr/bin/systemctl is-active openvswitch-ipsec.service
+spinifex-daemon ALL=(root) NOPASSWD: /usr/bin/ovn-nbctl set NB_Global . ipsec=true
 
 # Spinifex VPC daemon: OVN and OVS read/write, OVN controller status check and DHCP
 spinifex-vpcd ALL=(root) NOPASSWD: /usr/sbin/dhcpcd
 spinifex-vpcd ALL=(root) NOPASSWD: /usr/bin/ovs-vsctl, /usr/bin/ovs-appctl
-spinifex-vpcd ALL=(root) NOPASSWD: /usr/bin/ovn-nbctl, /usr/bin/ovn-sbctl
+spinifex-vpcd ALL=(root) NOPASSWD: /usr/bin/ovn-nbctl, /usr/bin/ovn-sbctl, /usr/bin/ovn-appctl
 spinifex-vpcd ALL=(root) NOPASSWD: /usr/bin/systemctl is-active --quiet ovn-controller
+spinifex-vpcd ALL=(root) NOPASSWD: /sbin/ip, /usr/sbin/ip
 SUDOERS
     $SUDO chmod 0440 /etc/sudoers.d/spinifex-network
     $SUDO visudo -cf /etc/sudoers.d/spinifex-network || fatal "Invalid sudoers syntax in spinifex-network"
@@ -213,10 +216,12 @@ install_apt_deps() {
 
         DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq \
             nbdkit \
-            $QEMU_PACKAGES qemu-utils qemu-kvm less \
+            $QEMU_PACKAGES qemu-utils gdisk qemu-kvm ovmf qemu-efi-aarch64 less \
             libvirt-daemon-system libvirt-clients \
+            pciutils \
             jq curl iproute2 netcat-openbsd wget unzip xz-utils file \
-            ovn-central ovn-host openvswitch-switch dhcpcd-base \
+            ovn-central ovn-host openvswitch-switch openvswitch-ipsec strongswan-charon dhcpcd-base \
+            chrony \
             > /dev/null
 
         info "System dependencies installed"
@@ -344,6 +349,13 @@ install_files() {
         $SUDO install -m 0755 "$EXTRACT_DIR/setup.sh" /usr/local/share/spinifex/setup.sh
         info "  /usr/local/share/spinifex/setup.sh"
     fi
+
+    # microVM kernel + initramfs
+    $SUDO install -d /usr/share/spinifex/microvm
+    if [ -d "$EXTRACT_DIR/microvm" ]; then
+        $SUDO cp "$EXTRACT_DIR/microvm/"* /usr/share/spinifex/microvm/
+        info "  /usr/share/spinifex/microvm/*"
+    fi
 }
 
 # --- Create directories ---
@@ -378,11 +390,14 @@ create_directories() {
     # /run is tmpfs — direct mkdir doesn't survive reboot, and units have
     # ReadWritePaths= on these paths which fails namespace setup with ENOENT
     # if the dirs are absent at service start.
-    $SUDO install -m 0644 /dev/stdin /etc/tmpfiles.d/spinifex.conf <<'TMPEOF'
+    _tmpf=$(mktemp)
+    cat > "$_tmpf" <<'TMPEOF'
 # Type  Path               Mode  User                 Group                Age
 d       /run/spinifex      0770  root                 spinifex             -
 d       /run/spinifex/nbd  0770  spinifex-viperblock  spinifex-viperblock  -
 TMPEOF
+    $SUDO install -m 0644 "$_tmpf" /etc/tmpfiles.d/spinifex.conf
+    rm -f "$_tmpf"
     if [ "${ISO_BUILD:-0}" != "1" ]; then
         # Live systems: materialise the runtime dirs immediately so a re-run of
         # setup.sh on an existing host has correct /run state without a reboot.
@@ -401,6 +416,14 @@ TMPEOF
     $SUDO mkdir -p /etc/spinifex/awsgw
     $SUDO chown "spinifex-gw:$SPINIFEX_GROUP" /etc/spinifex/awsgw
     $SUDO chmod 0750 /etc/spinifex/awsgw
+
+    # Viperblock's at-rest encryption key dir. 0750 group-traversable; the key
+    # itself is set to root:spinifex 0640 by SetServiceOwnership because both
+    # viperblockd (spinifex-viperblock) and the awsgw handlers (spinifex-gw)
+    # load it.
+    $SUDO mkdir -p /etc/spinifex/viperblock
+    $SUDO chown "spinifex-viperblock:$SPINIFEX_GROUP" /etc/spinifex/viperblock
+    $SUDO chmod 0750 /etc/spinifex/viperblock
 
     # Per-service data directories
     $SUDO mkdir -p /var/lib/spinifex/nats
@@ -585,6 +608,20 @@ install_systemd() {
         info "  /etc/systemd/system/$(basename "$unit")"
     done
 
+    # Reserve RAM + CPU priority for system.slice (sshd, journald, the operator)
+    # so a maxed spinifex.slice cannot starve them — the "stay sshable" guarantee.
+    # Generated here rather than shipped as a staged file because the packaging
+    # globs flatten the systemd/ dir and would skip a nested drop-in directory;
+    # this mirrors the sshd-keygen drop-in pattern in build-rootfs.sh. MemoryMin
+    # is a guaranteed-unreclaimable floor, not a cap.
+    $SUDO mkdir -p /etc/systemd/system/system.slice.d
+    $SUDO tee /etc/systemd/system/system.slice.d/spinifex-reserve.conf > /dev/null << 'EOF'
+[Slice]
+MemoryMin=1G
+CPUWeight=300
+EOF
+    info "  /etc/systemd/system/system.slice.d/spinifex-reserve.conf"
+
     # daemon-reload / enable require a running systemd — skip inside the ISO
     # chroot. Unit files are still dropped into place; firstboot enables them.
     if [ "${ISO_BUILD:-0}" = "1" ]; then
@@ -606,6 +643,24 @@ install_logrotate() {
         return
     fi
     info "Logrotate config installed"
+}
+
+# --- Install udev rules ---
+install_udev() {
+    stage "installing udev rules"
+    if [ ! -d "$EXTRACT_DIR/udev" ]; then
+        return
+    fi
+    $SUDO install -d /etc/udev/rules.d
+    for rule in "$EXTRACT_DIR"/udev/*; do
+        $SUDO install -m 0644 "$rule" "/etc/udev/rules.d/$(basename "$rule")"
+        info "  /etc/udev/rules.d/$(basename "$rule")"
+    done
+    if [ "${ISO_BUILD:-0}" != "1" ]; then
+        $SUDO udevadm control --reload-rules
+        $SUDO udevadm trigger --subsystem-match=vfio 2>/dev/null || true
+    fi
+    info "udev rules installed"
 }
 
 # --- Upgrade handling ---
@@ -672,6 +727,48 @@ print_summary() {
     echo ""
 }
 
+# --- Configure host swap (mulga-siv-251) ---
+# Provisions an 8G swapfile and lowers vm.swappiness so spinifex.slice
+# (MemorySwapMax=100%) has a backing device for graceful degradation under
+# memory pressure. Reverses the historical swap=0 assumption. Idempotent.
+setup_swap() {
+    stage "configuring host swap"
+
+    # ISO build runs in a chroot — cannot swapon, and baking an 8G file into the
+    # rootfs bloats the image. ISO hosts provision swap at firstboot instead.
+    if [ "${ISO_BUILD:-0}" = "1" ]; then
+        info "Swap setup skipped (ISO_BUILD=1; firstboot provisions swap)"
+        return
+    fi
+
+    local swapfile=/swapfile size_mb=8192
+
+    # Swap is a safety buffer, not a routine path: reclaim page cache first.
+    $SUDO tee /etc/sysctl.d/99-spinifex-swap.conf > /dev/null << 'EOF'
+# Spinifex: minimise swapping; swap backs spinifex.slice graceful degradation.
+vm.swappiness = 10
+EOF
+    $SUDO chmod 0644 /etc/sysctl.d/99-spinifex-swap.conf
+    $SUDO sysctl -q -w vm.swappiness=10 || true
+
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$swapfile"; then
+        info "Swap already active ($swapfile)"
+        return
+    fi
+
+    if [ ! -f "$swapfile" ]; then
+        info "Creating ${size_mb}MiB $swapfile"
+        $SUDO fallocate -l "${size_mb}M" "$swapfile" 2>/dev/null \
+            || $SUDO dd if=/dev/zero of="$swapfile" bs=1M count="$size_mb" status=none
+        $SUDO chmod 0600 "$swapfile"
+        $SUDO mkswap "$swapfile" > /dev/null
+    fi
+    $SUDO swapon "$swapfile"
+    grep -q "^$swapfile " /etc/fstab 2>/dev/null \
+        || echo "$swapfile none swap sw 0 0" | $SUDO tee -a /etc/fstab > /dev/null
+    info "Swap enabled: $swapfile (${size_mb}MiB), vm.swappiness=10"
+}
+
 # --- Main ---
 main() {
     info "Spinifex installer"
@@ -688,10 +785,11 @@ main() {
         handle_upgrade
     fi
 
-    # Stages that need EXTRACT_DIR: files, directories, systemd, logrotate.
+    # Stages that need EXTRACT_DIR: files, directories, systemd, logrotate, udev.
     # Only download/extract when at least one such stage is enabled.
     if stage_enabled files || stage_enabled directories \
-        || stage_enabled systemd || stage_enabled logrotate; then
+        || stage_enabled systemd || stage_enabled logrotate \
+        || stage_enabled udev; then
         download_spinifex
     fi
 
@@ -705,6 +803,8 @@ main() {
     stage_enabled fixown     && fix_file_ownership
     stage_enabled systemd    && install_systemd
     stage_enabled logrotate  && install_logrotate
+    stage_enabled udev       && install_udev
+    stage_enabled swap       && setup_swap
 
     # Migrations are only safe on a live system (need a running NATS and a
     # persisted config file). Skip under ISO_BUILD and under any explicit

@@ -8,119 +8,36 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/mulgadc/spinifex/spinifex/awserrors"
+	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go"
 )
 
-// DescribeInstances queries all spinifex nodes for their instances via NATS
-// and aggregates the results into a single response
+// DescribeInstances fans out to all nodes via NATS and aggregates the results.
 func DescribeInstances(input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string) (*ec2.DescribeInstancesOutput, error) {
-	// Marshal input to JSON
 	jsonData, err := json.Marshal(input)
 	if err != nil {
 		slog.Error("DescribeInstances: Failed to marshal input", "err", err)
 		return nil, fmt.Errorf("failed to marshal input: %w", err)
 	}
 
-	// Create an inbox for collecting responses from all nodes
-	inbox := nats.NewInbox()
-	sub, err := natsConn.SubscribeSync(inbox)
+	frames, sum, err := utils.Gather(natsConn, "ec2.DescribeInstances", jsonData,
+		utils.GatherOpts{Timeout: 3 * time.Second, ExpectedNodes: expectedNodes, AccountID: accountID})
 	if err != nil {
-		slog.Error("DescribeInstances: Failed to create inbox subscription", "err", err)
-		return nil, fmt.Errorf("failed to create inbox: %w", err)
+		return nil, err
 	}
-	defer sub.Unsubscribe()
-
-	// Publish request to all nodes with account ID header
-	pubMsg := nats.NewMsg("ec2.DescribeInstances")
-	pubMsg.Reply = inbox
-	pubMsg.Data = jsonData
-	pubMsg.Header.Set(utils.AccountIDHeader, accountID)
-	err = natsConn.PublishMsg(pubMsg)
-	if err != nil {
-		slog.Error("DescribeInstances: Failed to publish request", "err", err)
-		return nil, fmt.Errorf("failed to publish request: %w", err)
-	}
-
-	// Collect responses from all nodes
-	// Timeout serves as a safety mechanism in case some nodes don't respond
-	timeout := 3 * time.Second
-	deadline := time.Now().Add(timeout)
 
 	var allReservations []*ec2.Reservation
-	var clientError string // first client error code from any node (e.g. InvalidParameterValue)
-	responsesReceived := 0
-
-	// If expectedNodes is not configured (0), fall back to timeout-based collection
-	if expectedNodes <= 0 {
-		expectedNodes = -1 // Disable early exit
-		slog.Warn("DescribeInstances: ExpectedNodes not configured, using timeout-only collection")
-	}
-
-	for time.Now().Before(deadline) {
-		// Check if we've received responses from all expected nodes
-		if expectedNodes > 0 && responsesReceived >= expectedNodes {
-			slog.Info("DescribeInstances: Received responses from all expected nodes", "expected", expectedNodes, "received", responsesReceived)
-			break
-		}
-
-		// Calculate remaining timeout
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
-		}
-
-		// Wait for next message with remaining timeout
-		msg, err := sub.NextMsg(remaining)
-		if err != nil {
-			if err == nats.ErrTimeout {
-				// Timeout reached, no more messages
-				break
-			}
-			slog.Error("DescribeInstances: Error receiving message", "err", err)
-			break
-		}
-
-		// Increment response counter (even for errors, as we heard from the node)
-		responsesReceived++
-
-		// Check if response is an error
-		responseError, err := utils.ValidateErrorPayload(msg.Data)
-		if err != nil {
-			code := ""
-			if responseError.Code != nil {
-				code = *responseError.Code
-			}
-			// Capture the first client error (e.g. InvalidParameterValue). Client errors
-			// are deterministic — all nodes return the same error for the same invalid
-			// request — so we propagate them to the caller after collection completes.
-			if clientError == "" && code != "" {
-				if info, known := awserrors.ErrorLookup[code]; known && info.HTTPCode >= 400 && info.HTTPCode < 500 {
-					clientError = code
-				}
-			}
-			slog.Warn("DescribeInstances: Received error from node", "code", code, "responses_received", responsesReceived)
-			continue
-		}
-
-		// Parse the DescribeInstancesOutput from this node
+	for _, frame := range frames {
 		var nodeOutput ec2.DescribeInstancesOutput
-		err = json.Unmarshal(msg.Data, &nodeOutput)
-		if err != nil {
-			slog.Error("DescribeInstances: Failed to unmarshal node response", "err", err)
-			continue
-		}
-
-		// Aggregate reservations from this node
-		if nodeOutput.Reservations != nil {
+		if json.Unmarshal(frame, &nodeOutput) == nil && nodeOutput.Reservations != nil {
 			allReservations = append(allReservations, nodeOutput.Reservations...)
-			slog.Info("DescribeInstances: Collected reservations from node", "count", len(nodeOutput.Reservations), "responses_received", responsesReceived)
 		}
 	}
 
-	// Query stopped and terminated instances in parallel (both use queue groups — single responder each)
+	// Both topics use queue groups (single responder each); query in parallel.
 	var kvMu sync.Mutex
 	var kvWg sync.WaitGroup
 	for _, topic := range []string{"ec2.DescribeStoppedInstances", "ec2.DescribeTerminatedInstances"} {
@@ -137,13 +54,11 @@ func DescribeInstances(input *ec2.DescribeInstancesInput, natsConn *nats.Conn, e
 	}
 	kvWg.Wait()
 
-	// If every node returned a client error and we collected no data, propagate
-	// the error to the caller so the HTTP response carries the correct status.
-	if clientError != "" && len(allReservations) == 0 {
-		return nil, errors.New(clientError)
+	// Propagate a deterministic 4xx only when nothing was collected (fan-out + KV).
+	if sum.FirstClient4xx != "" && len(allReservations) == 0 {
+		return nil, errors.New(sum.FirstClient4xx)
 	}
 
-	// Build final aggregated response
 	output := &ec2.DescribeInstancesOutput{
 		Reservations: allReservations,
 	}
@@ -152,7 +67,47 @@ func DescribeInstances(input *ec2.DescribeInstancesInput, natsConn *nats.Conn, e
 	return output, nil
 }
 
-// queryInstanceBucket sends a NATS request to a describe topic and returns the reservations.
+// EnrichInstanceProfileIDs resolves IamInstanceProfile.Id for every instance
+// that carries only an ARN. Results are cached per ARN to avoid repeated RPCs.
+// Misses are warn-logged and leave Id empty (graceful degradation for deleted profiles).
+// Safe to call with a nil output or nil IAMService (no-op).
+func EnrichInstanceProfileIDs(out *ec2.DescribeInstancesOutput, iamSvc handlers_iam.IAMService, accountID string) {
+	if out == nil || iamSvc == nil {
+		return
+	}
+	cache := map[string]string{} // ARN → ID; "" = miss
+	for _, res := range out.Reservations {
+		if res == nil {
+			continue
+		}
+		for _, inst := range res.Instances {
+			if inst == nil || inst.IamInstanceProfile == nil {
+				continue
+			}
+			arn := aws.StringValue(inst.IamInstanceProfile.Arn)
+			if arn == "" {
+				continue
+			}
+			id, cached := cache[arn]
+			if !cached {
+				profile, err := iamSvc.ResolveInstanceProfile(accountID, arn)
+				if err != nil || profile == nil {
+					slog.Warn("DescribeInstances: failed to resolve instance profile ID",
+						"arn", arn, "err", err)
+					cache[arn] = ""
+				} else {
+					id = profile.InstanceProfileID
+					cache[arn] = id
+				}
+			}
+			if id != "" {
+				inst.IamInstanceProfile.Id = aws.String(id)
+			}
+		}
+	}
+}
+
+// queryInstanceBucket queries a single describe topic and returns its reservations.
 func queryInstanceBucket(natsConn *nats.Conn, topic string, jsonData []byte, accountID string) []*ec2.Reservation {
 	reqMsg := nats.NewMsg(topic)
 	reqMsg.Data = jsonData

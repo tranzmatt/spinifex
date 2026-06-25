@@ -1,4 +1,4 @@
-import { useSuspenseQuery } from "@tanstack/react-query"
+import { useQuery, useSuspenseQuery } from "@tanstack/react-query"
 import { createFileRoute, Link } from "@tanstack/react-router"
 import { ImagePlus, Settings2, Terminal } from "lucide-react"
 import { useState } from "react"
@@ -28,11 +28,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { formatDateTime } from "@/lib/utils"
+import { useAdmin } from "@/contexts/admin-context"
+import { formatDateTime, formatVRAMMiB } from "@/lib/utils"
 import {
   useGetConsoleOutput,
   useModifyInstanceAttribute,
 } from "@/mutations/ec2"
+import { adminVMsQueryOptions } from "@/queries/admin"
 import {
   ec2ImageQueryOptions,
   ec2InstanceQueryOptions,
@@ -41,6 +43,7 @@ import {
 
 import { AmiDetails } from "../../-components/ami-details"
 import { CreateImageDialog } from "../../-components/create-image-dialog"
+import { IamRolePanel } from "../../-components/iam-role-panel"
 import { InstanceActions } from "../../-components/instance-actions"
 
 export const Route = createFileRoute(
@@ -67,6 +70,7 @@ export const Route = createFileRoute(
 
 function InstanceDetail() {
   const { id } = Route.useParams()
+  const { isAdmin } = useAdmin()
   const { data } = useSuspenseQuery(ec2InstanceQueryOptions(id))
   const instance = data.Reservations?.[0]?.Instances?.[0]
 
@@ -78,6 +82,14 @@ function InstanceDetail() {
   const { data: instanceTypesData } = useSuspenseQuery(
     ec2InstanceTypesQueryOptions,
   )
+
+  const { data: vmsData } = useQuery({
+    ...adminVMsQueryOptions,
+    enabled: isAdmin,
+    refetchInterval: 5000,
+  })
+  const vmInfo = vmsData?.vms?.find((v) => v.instance_id === id)
+
   const modifyMutation = useModifyInstanceAttribute()
   const consoleMutation = useGetConsoleOutput()
 
@@ -192,7 +204,7 @@ function InstanceDetail() {
               <StateBadge state={instance.State?.Name} />
             </div>
           }
-          subtitle="EC2 Instance Details"
+          subtitle="Instance Details"
           title={instance.InstanceId}
         />
 
@@ -315,6 +327,36 @@ function InstanceDetail() {
                   ", ",
                 )}
               />
+            </DetailCard.Content>
+          </DetailCard>
+        )}
+
+        {/* IAM Role */}
+        <IamRolePanel instanceId={instance.InstanceId} />
+
+        {/* GPU */}
+        {isAdmin && vmInfo?.gpu && (
+          <DetailCard>
+            <DetailCard.Header>GPU</DetailCard.Header>
+            <DetailCard.Content>
+              <DetailRow label="Model" value={vmInfo.gpu.model} />
+              <DetailRow
+                label="VRAM"
+                value={formatVRAMMiB(vmInfo.gpu.vram_mib)}
+              />
+              <DetailRow
+                label="Attachment"
+                value={vmInfo.gpu.profile ? "MIG slice" : "PCIe passthrough"}
+              />
+              {vmInfo.gpu.profile && (
+                <DetailRow label="Profile" value={vmInfo.gpu.profile} />
+              )}
+              {vmInfo.gpu.mdev_path && (
+                <DetailRow label="Mdev path" value={vmInfo.gpu.mdev_path} />
+              )}
+              {vmInfo.gpu.pci_address && (
+                <DetailRow label="PCI address" value={vmInfo.gpu.pci_address} />
+              )}
             </DetailCard.Content>
           </DetailCard>
         )}

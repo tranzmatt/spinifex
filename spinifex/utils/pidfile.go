@@ -20,7 +20,6 @@ func ReadPidFile(name string) (int, error) {
 		return 0, err
 	}
 
-	// Strip whitespace and /r or /n
 	pidFile = bytes.TrimSpace(pidFile)
 
 	return strconv.Atoi(string(pidFile))
@@ -41,7 +40,6 @@ func GeneratePidFile(name string) (string, error) {
 }
 
 func WritePidFile(name string, pid int) error {
-	// Write PID to file, check XDG, otherwise user home directory ~/spinifex/
 	pidFilename, err := GeneratePidFile(name)
 
 	if err != nil {
@@ -63,10 +61,8 @@ func WritePidFile(name string, pid int) error {
 	return nil
 }
 
-// WritePidFileTo writes a PID file to a specific directory. If dir is empty,
-// falls back to the default pidPath(). Used by services that know their own
-// data directory (e.g. predastore's BasePath) to avoid PID file collisions
-// when multiple nodes run on the same host.
+// WritePidFileTo writes a PID file to dir (or pidPath() if empty).
+// Per-service data directories prevent PID file collisions on multi-node hosts.
 func WritePidFileTo(dir string, name string, pid int) error {
 	if dir == "" {
 		return WritePidFile(name, pid)
@@ -126,10 +122,7 @@ func ServiceStatus(dir, name string) (string, error) {
 	return fmt.Sprintf("running (pid: %d)", pid), nil
 }
 
-// StopProcessAt stops a process using a PID file in a specific directory.
-// If dir is empty, falls back to the default pidPath(). The PID file is
-// always removed, even if the process is already dead, to prevent stale
-// PID files from accumulating across restarts.
+// StopProcessAt stops a process using its PID file. Always removes the PID file, even if the process is already dead.
 func StopProcessAt(dir string, name string) error {
 	pid, err := ReadPidFileFrom(dir, name)
 	if err != nil {
@@ -138,8 +131,6 @@ func StopProcessAt(dir string, name string) error {
 
 	killErr := KillProcess(pid)
 
-	// Always remove the PID file to avoid stale entries. If the process is
-	// already dead, the PID file is stale and must be cleaned up.
 	if removeErr := RemovePidFileAt(dir, name); removeErr != nil && killErr == nil {
 		return removeErr
 	}
@@ -173,10 +164,8 @@ func pidPath() string {
 	return os.TempDir()
 }
 
-// WaitForProcessExit polls until the given PID is no longer alive or the
-// timeout expires. Unlike WaitForPidFileRemoval, this checks the process
-// itself via kill(pid, 0), so it works after SIGKILL where the target
-// cannot clean up its own PID file.
+// WaitForProcessExit polls until the PID is no longer alive or timeout expires.
+// Uses kill(pid,0) — works after SIGKILL where the process can't clean up its PID file.
 func WaitForProcessExit(pid int, timeout time.Duration) error {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -199,6 +188,39 @@ func WaitForProcessExit(pid int, timeout time.Duration) error {
 	}
 }
 
+// WaitForPidFile polls until QEMU writes its pidfile or the timeout expires.
+// A short poll avoids premature failure cascades under recovery load while keeping fast-start latency.
+func WaitForPidFile(instanceID string, timeout time.Duration) (int, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		pid, err := ReadPidFile(instanceID)
+		if err == nil {
+			return pid, nil
+		}
+		if time.Now().After(deadline) {
+			return 0, err
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// WaitForUnixSocket polls until a Unix socket exists at path or timeout expires.
+// Uses os.Stat rather than a dial probe to avoid consuming the accept queue before the real client.
+func WaitForUnixSocket(path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for unix socket %s", path)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func WaitForPidFileRemoval(instanceID string, timeout time.Duration) error {
 	timeoutCh := time.After(timeout)
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -211,7 +233,6 @@ func WaitForPidFileRemoval(instanceID string, timeout time.Duration) error {
 		case <-ticker.C:
 			_, err := ReadPidFile(instanceID)
 			if err != nil {
-				// PID file no longer exists
 				return nil
 			}
 		}

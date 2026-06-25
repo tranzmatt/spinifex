@@ -603,14 +603,29 @@ func TestGetVolumeByID_FullMetadata(t *testing.T) {
 		VolumeType:          "gp3",
 		IOPS:                5000,
 		SnapshotID:          "snap-abc",
-		IsEncrypted:         true,
 		AttachedInstance:    "i-12345",
 		DeviceName:          "/dev/nbd0",
 		DeleteOnTermination: true,
 		AttachedAt:          now,
 		Tags:                map[string]string{"Name": "test-vol", "env": "dev"},
 	}
-	createVolumeInStoreWithMeta(t, store, "vol-full", meta)
+	// Seed as a full VBState with EncryptionEnabled=true so getVolumeByID
+	// reports Encrypted via the authoritative VBState.EncryptionEnabled path.
+	state := viperblock.VBState{
+		VolumeName:        "vol-full",
+		VolumeSize:        meta.SizeGiB * 1024 * 1024 * 1024,
+		BlockSize:         4096,
+		EncryptionEnabled: true,
+		VolumeConfig:      viperblock.VolumeConfig{VolumeMetadata: meta},
+	}
+	data, err := json.Marshal(state)
+	require.NoError(t, err)
+	_, err = store.PutObject(&s3.PutObjectInput{
+		Bucket: aws.String("test-bucket"),
+		Key:    aws.String("vol-full/config.json"),
+		Body:   strings.NewReader(string(data)),
+	})
+	require.NoError(t, err)
 
 	result, err := svc.getVolumeByID("vol-full")
 	require.NoError(t, err)
@@ -948,10 +963,7 @@ func TestCreateVolume_StampsAccountID(t *testing.T) {
 	store := objectstore.NewMemoryObjectStore()
 	svc := newTestVolumeServiceWithStore("ap-southeast-2a", store)
 
-	// CreateVolume will fail at viperblock layer (no real S3), but the
-	// VolumeConfig should have TenantID set if we can inspect it.
-	// We test via the validation path — CreateVolume with invalid size
-	// should NOT fail because of accountID.
+	// Test via the validation path — CreateVolume should not fail because of accountID.
 	_, err := svc.CreateVolume(&ec2.CreateVolumeInput{
 		Size:             aws.Int64(1),
 		AvailabilityZone: aws.String("ap-southeast-2a"),
@@ -1312,6 +1324,59 @@ func TestDeleteVolume_VolumeAttachedButAvailable(t *testing.T) {
 	}, "")
 	require.Error(t, err)
 	assert.Equal(t, awserrors.ErrorVolumeInUse, err.Error())
+}
+
+func TestDeleteVolume_EmptyStateUnattachedDeletable(t *testing.T) {
+	kv := setupTestVolumeKV(t)
+	store := objectstore.NewMemoryObjectStore()
+	svc := newTestVolumeServiceWithStore("ap-southeast-2a", store)
+	svc.snapshotKV = kv
+
+	// Drift: a detach/terminate left State empty with no attachment. The volume
+	// is not in use and must be deletable, not VolumeInUse (mulga-siv-409).
+	createVolumeInStoreWithMeta(t, store, "vol-drift", viperblock.VolumeMetadata{
+		VolumeID: "vol-drift",
+		SizeGiB:  10,
+		State:    "",
+	})
+
+	_, err := svc.DeleteVolume(&ec2.DeleteVolumeInput{
+		VolumeId: aws.String("vol-drift"),
+	}, "")
+	require.NoError(t, err)
+}
+
+func TestDescribeVolumes_EmptyStateDerivedFromAttachment(t *testing.T) {
+	store := objectstore.NewMemoryObjectStore()
+	svc := newTestVolumeServiceWithStore("ap-southeast-2a", store)
+	seedVolume(t, svc, "vol-empty-unattached", "", "")
+	seedVolume(t, svc, "vol-empty-attached", "", "i-attached00000000")
+
+	out, err := svc.DescribeVolumes(&ec2.DescribeVolumesInput{
+		VolumeIds: []*string{aws.String("vol-empty-unattached"), aws.String("vol-empty-attached")},
+	}, testVolAccountID)
+	require.NoError(t, err)
+
+	got := map[string]string{}
+	for _, v := range out.Volumes {
+		got[aws.StringValue(v.VolumeId)] = aws.StringValue(v.State)
+	}
+	assert.Equal(t, "available", got["vol-empty-unattached"], "empty state + no attachment renders available")
+	assert.Equal(t, "in-use", got["vol-empty-attached"], "empty state + attachment must not be masked as available (mulga-siv-409)")
+}
+
+func TestUpdateVolumeState_EmptyUnattachedNormalizesToAvailable(t *testing.T) {
+	store := objectstore.NewMemoryObjectStore()
+	svc := newTestVolumeServiceWithStore("ap-southeast-2a", store)
+	seedVolume(t, svc, "vol-norm", "in-use", "i-x")
+
+	// A detach writeback that clears the attachment without a state must not
+	// strand the volume with an empty State (mulga-siv-409).
+	require.NoError(t, svc.UpdateVolumeState("vol-norm", "", "", ""))
+	cfg, err := svc.GetVolumeConfig("vol-norm")
+	require.NoError(t, err)
+	assert.Equal(t, "available", cfg.VolumeMetadata.State)
+	assert.Empty(t, cfg.VolumeMetadata.AttachedInstance)
 }
 
 func TestDeleteVolume_WithNATSNotification(t *testing.T) {

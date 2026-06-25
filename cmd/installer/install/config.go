@@ -55,6 +55,10 @@ type Config struct {
 	// JoinAddr is the primary node address (host:port) when ClusterRole is "join".
 	JoinAddr string
 
+	// SkipFormation skips spx admin init/join in firstboot; the provisioning
+	// controller (e.g. bm-bootstrap.sh) owns cluster formation instead.
+	SkipFormation bool
+
 	// CA certificate (PEM), optional.
 	HasCACert bool
 	CACert    string
@@ -67,4 +71,9 @@ type Config struct {
 	// Required on interactive installs; may be empty on headless/CI installs
 	// when SPINIFEX_EMAIL is not supplied on the kernel cmdline.
 	Email string
+
+	// GPUPassthrough enables VFIO GPU passthrough on this node.
+	// Set via SPINIFEX_GPU_PASSTHROUGH=1 on headless installs.
+	// Passes --gpu-passthrough to `spx admin init` during firstboot.
+	GPUPassthrough bool
 }

@@ -200,6 +200,50 @@ func TestDescribeImages_AfterCreate(t *testing.T) {
 	assert.Equal(t, testAccountID, *result.Images[0].OwnerId)
 }
 
+// TestDescribeImages_BootModeProjection asserts that AMIMetadata.BootMode round-trips
+// through DescribeImages; empty BootMode on legacy AMIs must pass through unchanged.
+func TestDescribeImages_BootModeProjection(t *testing.T) {
+	svc, store := setupTestImageService(t)
+
+	createTestAMIConfigFull(t, store, viperblock.AMIMetadata{
+		ImageID:         "ami-uefi001",
+		Name:            "uefi-image",
+		Architecture:    "x86_64",
+		PlatformDetails: "Linux/UNIX",
+		Virtualization:  "hvm",
+		RootDeviceType:  "ebs",
+		VolumeSizeGiB:   8,
+		ImageOwnerAlias: testAccountID,
+		BootMode:        "uefi",
+	})
+	createTestAMIConfigFull(t, store, viperblock.AMIMetadata{
+		ImageID:         "ami-legacy001",
+		Name:            "legacy-image",
+		Architecture:    "x86_64",
+		PlatformDetails: "Linux/UNIX",
+		Virtualization:  "hvm",
+		RootDeviceType:  "ebs",
+		VolumeSizeGiB:   8,
+		ImageOwnerAlias: testAccountID,
+	})
+
+	result, err := svc.DescribeImages(&ec2.DescribeImagesInput{
+		ImageIds: []*string{aws.String("ami-uefi001"), aws.String("ami-legacy001")},
+	}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, result.Images, 2)
+
+	byID := map[string]*ec2.Image{}
+	for _, img := range result.Images {
+		byID[aws.StringValue(img.ImageId)] = img
+	}
+	require.Contains(t, byID, "ami-uefi001")
+	require.Contains(t, byID, "ami-legacy001")
+	assert.Equal(t, "uefi", aws.StringValue(byID["ami-uefi001"].BootMode))
+	assert.Equal(t, "", aws.StringValue(byID["ami-legacy001"].BootMode),
+		"legacy AMIs (empty BootMode) must pass through as empty, not be backfilled")
+}
+
 func TestGetVolumeConfig(t *testing.T) {
 	svc, store := setupTestImageService(t)
 
@@ -825,10 +869,8 @@ func createTestAMIConfigFull(t *testing.T, store *objectstore.MemoryObjectStore,
 	require.NoError(t, err)
 }
 
-// TestDescribeImages_FilterBy verifies single-attribute filters. Each subtest
-// builds its own AMI fixtures and asserts which IDs the filter selects.
-// Multi-filter, wildcard, error-path, and no-filter cases live in their own
-// dedicated tests below.
+// TestDescribeImages_FilterBy verifies single-attribute filters; each subtest builds
+// its own AMI fixtures. Multi-filter, wildcard, and error-path cases have their own tests.
 func TestDescribeImages_FilterBy(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -865,11 +907,11 @@ func TestDescribeImages_FilterBy(t *testing.T) {
 		{
 			name: "name",
 			setup: func(t *testing.T, store *objectstore.MemoryObjectStore) {
-				createTestAMIConfigWithName(t, store, "ami-aaa", "debian-12")
+				createTestAMIConfigWithName(t, store, "ami-aaa", "debian-13")
 				createTestAMIConfigWithName(t, store, "ami-bbb", "ubuntu-22")
 			},
 			input: &ec2.DescribeImagesInput{Filters: []*ec2.Filter{
-				{Name: aws.String("name"), Values: []*string{aws.String("debian-12")}},
+				{Name: aws.String("name"), Values: []*string{aws.String("debian-13")}},
 			}},
 			wantIDs: []string{"ami-aaa"},
 		},
@@ -986,13 +1028,13 @@ func TestDescribeImages_FilterBy(t *testing.T) {
 
 func TestDescribeImages_FilterMultipleValues_OR(t *testing.T) {
 	svc, store := setupTestImageService(t)
-	createTestAMIConfigWithName(t, store, "ami-aaa", "debian-12")
+	createTestAMIConfigWithName(t, store, "ami-aaa", "debian-13")
 	createTestAMIConfigWithName(t, store, "ami-bbb", "ubuntu-22")
 	createTestAMIConfigWithName(t, store, "ami-ccc", "centos-9")
 
 	out, err := svc.DescribeImages(&ec2.DescribeImagesInput{
 		Filters: []*ec2.Filter{
-			{Name: aws.String("name"), Values: []*string{aws.String("debian-12"), aws.String("centos-9")}},
+			{Name: aws.String("name"), Values: []*string{aws.String("debian-13"), aws.String("centos-9")}},
 		},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -1002,17 +1044,17 @@ func TestDescribeImages_FilterMultipleValues_OR(t *testing.T) {
 func TestDescribeImages_FilterMultipleNames_AND(t *testing.T) {
 	svc, store := setupTestImageService(t)
 	createTestAMIConfigFull(t, store, viperblock.AMIMetadata{
-		ImageID: "ami-match", Name: "debian-12", Architecture: "x86_64",
+		ImageID: "ami-match", Name: "debian-13", Architecture: "x86_64",
 		RootDeviceType: "ebs", VolumeSizeGiB: 8,
 	})
 	createTestAMIConfigFull(t, store, viperblock.AMIMetadata{
-		ImageID: "ami-nomatch", Name: "debian-12", Architecture: "arm64",
+		ImageID: "ami-nomatch", Name: "debian-13", Architecture: "arm64",
 		RootDeviceType: "ebs", VolumeSizeGiB: 8,
 	})
 
 	out, err := svc.DescribeImages(&ec2.DescribeImagesInput{
 		Filters: []*ec2.Filter{
-			{Name: aws.String("name"), Values: []*string{aws.String("debian-12")}},
+			{Name: aws.String("name"), Values: []*string{aws.String("debian-13")}},
 			{Name: aws.String("architecture"), Values: []*string{aws.String("x86_64")}},
 		},
 	}, testAccountID)
@@ -1049,7 +1091,7 @@ func TestDescribeImages_FilterWildcard(t *testing.T) {
 
 func TestDescribeImages_FilterNoResults(t *testing.T) {
 	svc, store := setupTestImageService(t)
-	createTestAMIConfigWithName(t, store, "ami-aaa", "debian-12")
+	createTestAMIConfigWithName(t, store, "ami-aaa", "debian-13")
 
 	out, err := svc.DescribeImages(&ec2.DescribeImagesInput{
 		Filters: []*ec2.Filter{
@@ -1062,7 +1104,7 @@ func TestDescribeImages_FilterNoResults(t *testing.T) {
 
 func TestDescribeImages_FilterNoFilters(t *testing.T) {
 	svc, store := setupTestImageService(t)
-	createTestAMIConfigWithName(t, store, "ami-aaa", "debian-12")
+	createTestAMIConfigWithName(t, store, "ami-aaa", "debian-13")
 	createTestAMIConfigWithName(t, store, "ami-bbb", "ubuntu-22")
 
 	out, err := svc.DescribeImages(&ec2.DescribeImagesInput{}, testAccountID)
@@ -1496,11 +1538,8 @@ func putTestAMIConfigWithSnapshot(t *testing.T, store *objectstore.MemoryObjectS
 	require.NoError(t, err)
 }
 
-// seedCopyableAMI writes a matching (snapshot, AMI) pair so CopyImage can
-// complete end-to-end. Returns the AMI metadata that was persisted (callers
-// can customise fields before seeding by tweaking the returned VolumeID /
-// tags via preceding calls, but the helper takes the simple path for the
-// happy case).
+// seedCopyableAMI writes a matching (snapshot, AMI) pair so CopyImage can complete
+// end-to-end.
 func seedCopyableAMI(t *testing.T, store *objectstore.MemoryObjectStore, imageID, name, owner, snapshotID, volumeID string, sizeGiB int64) {
 	t.Helper()
 	cfg := handlers_ec2_snapshot.SnapshotConfig{
@@ -1595,6 +1634,7 @@ func TestCopyImage_InheritsSourceFields(t *testing.T) {
 		VolumeSizeGiB:   32,
 		RootDeviceType:  "ebs",
 		Description:     "arm source",
+		BootMode:        "uefi",
 	})
 
 	before := time.Now()
@@ -1608,6 +1648,7 @@ func TestCopyImage_InheritsSourceFields(t *testing.T) {
 	assert.Equal(t, "hvm", newMeta.Virtualization)
 	assert.Equal(t, uint64(32), newMeta.VolumeSizeGiB)
 	assert.Equal(t, "ebs", newMeta.RootDeviceType)
+	assert.Equal(t, "uefi", newMeta.BootMode, "CopyImage must propagate BootMode from source")
 	assert.False(t, newMeta.CreationDate.Before(before), "CreationDate must be refreshed on copy, not inherited")
 }
 
@@ -1656,10 +1697,8 @@ func TestCopyImage_SystemAMICopiedIntoCallerAccount(t *testing.T) {
 	assert.Equal(t, "spinifex", srcMeta.ImageOwnerAlias)
 }
 
-// Bundled system AMIs (admin-imported) have no standalone snap-xxx/metadata.json
-// — their SnapshotID refers to a viperblock-internal snap, and blocks live under
-// ami-xxx/. CopyImage must still succeed (AWS parity: copy of a public AMI works),
-// falling back to synthesizing a snap view where VolumeID = sourceImageID.
+// Bundled system AMIs have no standalone snap-xxx/metadata.json; CopyImage must
+// still succeed by synthesizing a snap view where VolumeID = sourceImageID.
 func TestCopyImage_BundledSystemAMINoStandaloneSnap(t *testing.T) {
 	svc, store := setupTestImageService(t)
 

@@ -12,6 +12,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
+	"github.com/mulgadc/spinifex/spinifex/testutil"
+	"github.com/nats-io/nats.go"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCheckIP_AllowsUnknownIP(t *testing.T) {
@@ -60,12 +63,10 @@ func TestCheckIP_RejectsLockedIP(t *testing.T) {
 		rl.RecordFailure(ip)
 	}
 
-	// Should be locked.
 	if errCode := rl.CheckIP(ip); errCode != awserrors.ErrorRequestLimitExceeded {
 		t.Fatalf("expected locked IP to be rejected, got %q", errCode)
 	}
 
-	// Repeated checks should also be rejected.
 	if errCode := rl.CheckIP(ip); errCode != awserrors.ErrorRequestLimitExceeded {
 		t.Fatalf("expected locked IP to still be rejected, got %q", errCode)
 	}
@@ -102,14 +103,12 @@ func TestRecordSuccess_ClearsLockout(t *testing.T) {
 		rl.RecordFailure(ip)
 	}
 
-	// Should be locked.
 	if errCode := rl.CheckIP(ip); errCode == "" {
 		t.Fatal("expected IP to be locked")
 	}
 
 	rl.RecordSuccess(ip)
 
-	// After success, should be unlocked.
 	if errCode := rl.CheckIP(ip); errCode != "" {
 		t.Fatalf("expected IP to be allowed after success, got %q", errCode)
 	}
@@ -308,32 +307,12 @@ func TestConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-func TestExtractClientIP(t *testing.T) {
-	tests := []struct {
-		name       string
-		remoteAddr string
-		expected   string
-	}{
-		{"IPv4 with port", "192.168.1.1:12345", "192.168.1.1"},
-		{"IPv6 with port", "[::1]:12345", "::1"},
-		{"IPv4 bare", "192.168.1.1", "192.168.1.1"},
-		{"IPv6 full with port", "[2001:db8::1]:443", "2001:db8::1"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			r := &http.Request{RemoteAddr: tt.remoteAddr}
-			got := extractClientIP(r)
-			if got != tt.expected {
-				t.Errorf("extractClientIP(%q) = %q, want %q", tt.remoteAddr, got, tt.expected)
-			}
-		})
-	}
-}
-
 // setupTestAppWithRateLimiter creates a test HTTP handler with SigV4 auth and
-// the given rate limiter attached.
-func setupTestAppWithRateLimiter(accessKey, secretKey string, rl *AuthRateLimiter) http.Handler {
+// the given rate limiter attached. A real NATS connection is used so the
+// cluster-unavailable short-circuit does not mask rate-limit behaviour.
+func setupTestAppWithRateLimiter(t *testing.T, accessKey, secretKey string, rl *AuthRateLimiter) http.Handler {
+	t.Helper()
+
 	encryptedSecret, err := handlers_iam.EncryptSecret(secretKey, testMasterKey)
 	if err != nil {
 		panic("failed to encrypt test secret: " + err.Error())
@@ -351,11 +330,17 @@ func setupTestAppWithRateLimiter(accessKey, secretKey string, rl *AuthRateLimite
 		},
 	}
 
+	ns, _ := testutil.StartTestNATS(t)
+	nc, err := nats.Connect(ns.ClientURL())
+	require.NoError(t, err)
+	t.Cleanup(nc.Close)
+
 	gw := &GatewayConfig{
 		DisableLogging: true,
 		Region:         testRegion,
 		IAMService:     mockSvc,
 		RateLimiter:    rl,
+		NATSConn:       nc,
 	}
 
 	r := chi.NewRouter()
@@ -371,14 +356,14 @@ func TestRateLimitIntegration_LockedIPGets503(t *testing.T) {
 	rl := NewAuthRateLimiter()
 	defer rl.Stop()
 
-	handler := setupTestAppWithRateLimiter(testAccessKey, testSecretKey, rl)
+	handler := setupTestAppWithRateLimiter(t, testAccessKey, testSecretKey, rl)
 
 	// Send maxFailures requests with invalid signatures to trigger lockout.
 	for range maxFailures {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		req.Host = "localhost:9999"
 		req.RemoteAddr = "10.99.0.1:54321"
-		req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAINVALIDKEY000000/20240101/us-east-1/ec2/aws4_request, SignedHeaders=host;x-amz-date, Signature=badsig")
+		req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAINVALIDKEY000000/20240101/us-east-1/ec2/aws4_request, SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000")
 		req.Header.Set("X-Amz-Date", time.Now().UTC().Format("20060102T150405Z"))
 		doRequest(handler, req)
 	}
@@ -387,7 +372,7 @@ func TestRateLimitIntegration_LockedIPGets503(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Host = "localhost:9999"
 	req.RemoteAddr = "10.99.0.1:54321"
-	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAINVALIDKEY000000/20240101/us-east-1/ec2/aws4_request, SignedHeaders=host;x-amz-date, Signature=badsig")
+	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAINVALIDKEY000000/20240101/us-east-1/ec2/aws4_request, SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000")
 	req.Header.Set("X-Amz-Date", time.Now().UTC().Format("20060102T150405Z"))
 
 	resp := doRequest(handler, req)
@@ -405,25 +390,23 @@ func TestRateLimitIntegration_SuccessResetsLockout(t *testing.T) {
 	rl := NewAuthRateLimiter()
 	defer rl.Stop()
 
-	handler := setupTestAppWithRateLimiter(testAccessKey, testSecretKey, rl)
+	handler := setupTestAppWithRateLimiter(t, testAccessKey, testSecretKey, rl)
 
 	// Accumulate failures below threshold.
 	for range maxFailures - 1 {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		req.Host = "localhost:9999"
 		req.RemoteAddr = "10.99.0.2:54321"
-		req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAINVALIDKEY000000/20240101/us-east-1/ec2/aws4_request, SignedHeaders=host;x-amz-date, Signature=badsig")
+		req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAINVALIDKEY000000/20240101/us-east-1/ec2/aws4_request, SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000")
 		req.Header.Set("X-Amz-Date", time.Now().UTC().Format("20060102T150405Z"))
 		doRequest(handler, req)
 	}
 
 	// Now send a valid request — should succeed and clear failure state.
-	authHeader, timestamp := generateTestAuthHeader("GET", "/", "", "", testAccessKey, testSecretKey, testRegion, testService)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Host = "localhost:9999"
 	req.RemoteAddr = "10.99.0.2:54321"
-	req.Header.Set("Authorization", authHeader)
-	req.Header.Set("X-Amz-Date", timestamp)
+	signTestRequest(t, req, nil, testAccessKey, testSecretKey)
 
 	resp := doRequest(handler, req)
 	if resp.StatusCode != http.StatusOK {

@@ -2,44 +2,32 @@ import type { LoadBalancer } from "@aws-sdk/client-elastic-load-balancing-v2"
 import { useSuspenseQuery } from "@tanstack/react-query"
 import { Link, useNavigate } from "@tanstack/react-router"
 
-import { LbImageMissingBanner } from "@/components/elbv2/lb-image-missing-banner"
 import { PageHeading } from "@/components/page-heading"
 import { StateBadge } from "@/components/state-badge"
 import { Button } from "@/components/ui/button"
-import { hasLbImage } from "@/lib/system-managed"
-import { ec2ImagesQueryOptions } from "@/queries/ec2"
+import { formatDateTime } from "@/lib/utils"
 import { elbv2LoadBalancersQueryOptions } from "@/queries/elbv2"
-
-function formatCreatedAt(createdAt: Date | undefined): string {
-  if (!createdAt) {
-    return ""
-  }
-  return new Date(createdAt).toLocaleString()
-}
 
 export function DescribeLoadBalancersPage() {
   const navigate = useNavigate()
   const { data } = useSuspenseQuery(elbv2LoadBalancersQueryOptions)
-  const { data: imagesData } = useSuspenseQuery(ec2ImagesQueryOptions)
 
   const loadBalancers = data.LoadBalancers ?? []
-  const lbImageImported = hasLbImage(imagesData.Images ?? [])
 
   return (
     <>
       <PageHeading
         actions={
           <Button
-            disabled={!lbImageImported}
-            onClick={() => navigate({ to: "/ec2/create-load-balancer" })}
+            onClick={async () =>
+              await navigate({ to: "/ec2/create-load-balancer" })
+            }
           >
-            Create load balancer
+            Create Load Balancer
           </Button>
         }
-        title="Load balancers"
+        title="Load Balancers"
       />
-
-      {!lbImageImported && <LbImageMissingBanner />}
 
       {loadBalancers.length > 0 ? (
         <div className="overflow-x-auto rounded-lg border bg-card">
@@ -47,7 +35,7 @@ export function DescribeLoadBalancersPage() {
             <thead>
               <tr className="border-b text-left text-muted-foreground">
                 <th className="px-4 py-2 font-medium">Name</th>
-                <th className="px-4 py-2 font-medium">DNS name</th>
+                <th className="px-4 py-2 font-medium">DNS Name</th>
                 <th className="px-4 py-2 font-medium">State</th>
                 <th className="px-4 py-2 font-medium">Type</th>
                 <th className="px-4 py-2 font-medium">Scheme</th>
@@ -65,8 +53,8 @@ export function DescribeLoadBalancersPage() {
                   <tr
                     className="cursor-pointer border-b transition-colors last:border-0 hover:bg-accent"
                     key={arn}
-                    onClick={() =>
-                      navigate({
+                    onClick={async () =>
+                      await navigate({
                         to: "/ec2/describe-load-balancers/$id",
                         params: { id: encodeURIComponent(arn) },
                       })
@@ -94,7 +82,7 @@ export function DescribeLoadBalancersPage() {
                       {lb.VpcId ?? ""}
                     </td>
                     <td className="px-4 py-2 text-xs">
-                      {formatCreatedAt(lb.CreatedTime)}
+                      {formatDateTime(lb.CreatedTime)}
                     </td>
                   </tr>
                 )

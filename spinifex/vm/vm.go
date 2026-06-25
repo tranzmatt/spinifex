@@ -10,7 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/mulgadc/spinifex/spinifex/gpu"
 	"github.com/mulgadc/spinifex/spinifex/qmp"
 	"github.com/mulgadc/spinifex/spinifex/types"
 )
@@ -35,33 +37,26 @@ type ExtraENI struct {
 
 type VM struct {
 	ID           string        `json:"id"`
-	PID          int           `json:"pid"`
-	Running      bool          `json:"running"`
 	Status       InstanceState `json:"status"`
 	InstanceType string        `json:"instance_type"`
 	Config       Config        `json:"config"`
 
 	EBSRequests types.EBSRequests `json:"ebs_requests"`
+	ENIRequests types.ENIRequests `json:"eni_requests"`
 
 	QMPClient *qmp.QMPClient `json:"-"`
 
 	// User attributes (user initiated stop/delete)
 	Attributes types.EC2CommandAttributes `json:"attributes"`
 
-	// EC2 API metadata - stored for AWS API compatibility
-	// RunInstancesInput contains the original request parameters (ImageId, KeyName, UserData, etc.)
+	// EC2 API metadata stored for AWS API compatibility.
 	RunInstancesInput *ec2.RunInstancesInput `json:"run_instances_input,omitempty"`
-	// Reservation contains the reservation metadata (ReservationId, OwnerId, etc.)
-	Reservation *ec2.Reservation `json:"reservation,omitempty"`
-	// Instance contains the current instance state and metadata
-	Instance *ec2.Instance `json:"instance,omitempty"`
+	Reservation       *ec2.Reservation       `json:"reservation,omitempty"`
+	Instance          *ec2.Instance          `json:"instance,omitempty"`
 
 	// LastNode records which daemon node last ran this instance.
 	// Set when ownership is released on stop for shared KV storage.
 	LastNode string `json:"last_node,omitempty"`
-
-	// User data for cloud-init (decoded from base64)
-	UserData string `json:"user_data,omitempty"`
 
 	// Metadata server address (e.g., "127.0.0.1:12345") for EC2 metadata service
 	MetadataServerAddress string `json:"metadata_server_address,omitempty"`
@@ -69,29 +64,24 @@ type VM struct {
 	// Health tracks crash detection and auto-restart state
 	Health InstanceHealthState `json:"health"`
 
-	// AccountID is the AWS account that owns this instance.
-	// Empty for pre-Phase4 resources (treated as visible to all accounts).
+	// AccountID is the AWS account that owns this instance. Empty for legacy
+	// resources visible only to the root account.
 	AccountID string `json:"account_id,omitempty"`
 
 	// VPC networking: ENI attached to this instance (set by RunInstances when VPC mode is active)
 	ENIId  string `json:"eni_id,omitempty"`
 	ENIMac string `json:"eni_mac,omitempty"`
 
-	// ExtraENIs lists additional VPC NICs beyond the primary ENIId/ENIMac.
-	// Used by multi-AZ system VMs (ALBs with subnets in multiple subnets) —
-	// each entry gets its own tap device on br-int and its own QEMU NIC.
-	// Empty for customer EC2 instances and single-subnet ALBs.
+	// ExtraENIs lists additional VPC NICs beyond the primary ENI.
+	// Each gets its own tap on br-int. Empty for single-ENI instances.
 	ExtraENIs []ExtraENI `json:"extra_enis,omitempty"`
 
 	// Public IP auto-assigned from external IPAM pool (released on termination)
 	PublicIP     string `json:"public_ip,omitempty"`
 	PublicIPPool string `json:"public_ip_pool,omitempty"`
 
-	// PublicIPAllocID / PublicIPAssocID are set when the public IP was
-	// allocated through the EIP service (handlers/ec2/eip) rather than
-	// directly via externalIPAM. Presence signals that teardown must go
-	// back through the EIP service (DisassociateAddress + ReleaseAddress)
-	// so the EIP KV record is removed.
+	// PublicIPAllocID / PublicIPAssocID are set when the IP was allocated via the
+	// EIP service; teardown must go through DisassociateAddress + ReleaseAddress.
 	PublicIPAllocID string `json:"public_ip_alloc_id,omitempty"`
 	PublicIPAssocID string `json:"public_ip_assoc_id,omitempty"`
 
@@ -100,9 +90,10 @@ type VM struct {
 	DevMAC string `json:"dev_mac,omitempty"`
 
 	// Management NIC for system instance control plane (reaches host via br-mgmt).
+	// Tap name derived via MgmtTapName(ID); not persisted so terminate-during-launch
+	// can still clean up.
 	MgmtMAC string `json:"mgmt_mac,omitempty"` // MAC address (02:a0:00 prefix)
 	MgmtIP  string `json:"mgmt_ip,omitempty"`  // Static IP on management subnet
-	MgmtTap string `json:"mgmt_tap,omitempty"` // TAP device name on host
 
 	// Placement group tracking (set during RunInstances when a placement group is specified)
 	PlacementGroupName string `json:"placement_group_name,omitempty"`
@@ -117,22 +108,63 @@ type VM struct {
 	// VM (e.g. "elbv2"). Empty for customer-launched instances. The UI
 	// filters out tagged VMs from customer-facing listings.
 	ManagedBy string `json:"managed_by,omitempty"`
+
+	// IamInstanceProfileArn is the ARN of the instance profile attached at
+	// launch or via AssociateIamInstanceProfile. Empty when no profile is
+	// attached. Auto-cleared on TerminateInstances; preserved across stop/start.
+	IamInstanceProfileArn string `json:"iam_instance_profile_arn,omitempty"`
+
+	// IamInstanceProfileAssociationId is the association ID used by
+	// DescribeIamInstanceProfileAssociations. Regenerated on every Associate/Replace.
+	IamInstanceProfileAssociationId string `json:"iam_instance_profile_association_id,omitempty"`
+
+	// DirectBoot signals that Config was pre-built by the launcher (microvm path).
+	// When true, startQEMU skips buildBaseVMConfig.
+	DirectBoot bool `json:"direct_boot,omitempty"`
+
+	// GPUAttachments describes GPU attachments. Each entry has either a PCI address
+	// (whole-GPU VFIO passthrough) or an mdev path (MIG slice), never both.
+	GPUAttachments []gpu.GPUAttachment `json:"gpu_attachments,omitempty"`
+
+	// BootMode captures the AMI's boot mode at launch so firmware choice survives
+	// restarts. Empty for legacy VMs; treated as "bios" by the launch path.
+	BootMode string `json:"boot_mode,omitempty"`
+
+	// Teardown records per-dependent terminate progress (dependent → done|
+	// pending|failed). Stamped by terminateCleanup; the GC backstop retries
+	// pending/failed and purges the record once all dependents are done.
+	Teardown map[string]string `json:"teardown,omitempty"`
+
+	// TerminatedAt is when the instance entered StateTerminated. The GC backstop
+	// keeps a completed terminated record describable until this is older than
+	// the visibility window, after which it may reclaim it early; the bucket's
+	// 1h TTL bounds visibility regardless.
+	TerminatedAt time.Time `json:"terminated_at,omitzero"`
+
+	// CapacityReservationId is the On-Demand Capacity Reservation this instance
+	// was launched into (targeted launch). Empty for instances on general
+	// capacity. Drives slot restore to the reservation on stop/terminate.
+	CapacityReservationId string `json:"capacity_reservation_id,omitempty"`
 }
 
-// ResetNodeLocalState zeroes out fields that are specific to the daemon node
-// that last ran this instance. Must be called after deserializing a VM from
-// shared KV before launching it on a new node.
+// ResetNodeLocalState zeroes node-specific fields after deserializing a VM
+// from shared KV before launching it on a new node.
 func (v *VM) ResetNodeLocalState() {
-	v.PID = 0
-	v.Running = false
 	v.MetadataServerAddress = ""
 	v.QMPClient = &qmp.QMPClient{}
 	v.EBSRequests.Mu = sync.Mutex{}
+	v.ENIRequests.Mu = sync.Mutex{}
 }
 
-type Instances struct {
-	VMS map[string]*VM `json:"vms"`
-	Mu  sync.Mutex     `json:"-"`
+// IsTerminationProtected reports whether the instance was launched with
+// DisableApiTermination=true and that value has not been cleared via
+// ModifyInstanceAttribute. Nil-safe for legacy instances missing
+// RunInstancesInput.
+func (v *VM) IsTerminationProtected() bool {
+	if v == nil || v.RunInstancesInput == nil {
+		return false
+	}
+	return aws.BoolValue(v.RunInstancesInput.DisableApiTermination)
 }
 
 type NetDev struct {
@@ -150,6 +182,11 @@ type Drive struct {
 	Media  string `json:"media"`
 	ID     string `json:"id"`
 	Cache  string `json:"cache,omitempty"`
+	// Unit selects the pflash slot when If=="pflash": 0 is the CODE blob,
+	// 1 is the per-VM VARS volume. Ignored for non-pflash drives.
+	Unit int `json:"unit,omitempty"`
+	// ReadOnly emits readonly=on; used for the pflash CODE blob.
+	ReadOnly bool `json:"readonly,omitempty"`
 }
 
 type IOThread struct {
@@ -178,6 +215,21 @@ type Config struct {
 	// InstanceType is a friendly name (e.g., t3.micro, t4g.micro)
 	InstanceType string `json:"instance_type"`
 	Architecture string `json:"architecture"`
+
+	// UseUEFI requests UEFI firmware. Execute() probes FirmwarePathCandidates and
+	// returns an error if no pair is found — no silent SeaBIOS fallback.
+	UseUEFI bool `json:"use_uefi,omitempty"`
+
+	KernelImage   string       `json:"kernel_image,omitempty"`   // path to vmlinuz; emits -kernel when set
+	Initrd        string       `json:"initrd,omitempty"`         // path to initramfs; emits -initrd when set
+	KernelCmdline string       `json:"kernel_cmdline,omitempty"` // emits -append when set
+	FwCfg         []FwCfgEntry `json:"fw_cfg,omitempty"`         // each emits -fw_cfg name=<name>,file=<path>
+}
+
+// FwCfgEntry describes a single QEMU firmware configuration file entry.
+type FwCfgEntry struct {
+	Name string `json:"name"`
+	File string `json:"file"`
 }
 
 func (cfg *Config) Execute() (*exec.Cmd, error) {
@@ -213,10 +265,19 @@ func (cfg *Config) Execute() (*exec.Cmd, error) {
 		args = append(args, "-display", "none")
 	}
 
-	if cfg.SerialSocket != "" && cfg.ConsoleLogPath != "" {
+	if IsMMIO(cfg.MachineType) && cfg.ConsoleLogPath != "" {
+		// microvm with isa-serial=on: the machine creates the ISA serial device.
+		// Use -chardev file so output is captured without a socket client, then
+		// -serial chardev:console0 wires it to the existing device (not a new one).
+		// Do NOT use -device isa-serial here — that adds a second device (ttyS1)
+		// while the kernel talks to ttyS0.
+		args = append(args, "-chardev", fmt.Sprintf("file,id=console0,path=%s", cfg.ConsoleLogPath))
+		args = append(args, "-serial", "chardev:console0")
+	} else if cfg.SerialSocket != "" && cfg.ConsoleLogPath != "" {
 		chardevOpts := fmt.Sprintf("socket,id=console0,path=%s,server=on,wait=off,logfile=%s",
 			cfg.SerialSocket, cfg.ConsoleLogPath)
-		args = append(args, "-chardev", chardevOpts, "-serial", "chardev:console0")
+		args = append(args, "-chardev", chardevOpts)
+		args = append(args, "-serial", "chardev:console0")
 	}
 
 	if cfg.CPUCount > 0 {
@@ -235,14 +296,24 @@ func (cfg *Config) Execute() (*exec.Cmd, error) {
 		args = append(args, "-object", fmt.Sprintf("iothread,id=%s", iot.ID))
 	}
 
-	if len(cfg.Drives) == 0 {
-		return nil, fmt.Errorf("at least one drive is required")
+	if len(cfg.Drives) == 0 && cfg.KernelImage == "" {
+		return nil, fmt.Errorf("at least one drive or a kernel image is required")
 	}
 
-	for _, drive := range cfg.Drives {
-		var opts []string
+	drives := cfg.Drives
+	if cfg.UseUEFI {
+		codePath, _, _, fwErr := FirmwarePaths(cfg.Architecture)
+		if fwErr != nil {
+			return nil, fwErr
+		}
+		// pflash CODE must come before VARS so QEMU loads firmware into the
+		// readonly slot first; buildDrives emits the VARS drive (unit 1) from
+		// the per-VM EFI viperblock volume.
+		drives = append([]Drive{{If: "pflash", Format: "raw", Unit: 0, ReadOnly: true, File: codePath}}, drives...)
+	}
 
-		//args = append(args, "-drive", fmt.Sprintf("file=%s", drive.File)
+	for _, drive := range drives {
+		var opts []string
 
 		if drive.File != "" {
 			opts = append(opts, fmt.Sprintf("file=%s", drive.File))
@@ -254,6 +325,14 @@ func (cfg *Config) Execute() (*exec.Cmd, error) {
 
 		if drive.If != "" {
 			opts = append(opts, fmt.Sprintf("if=%s", drive.If))
+		}
+
+		if drive.If == "pflash" {
+			opts = append(opts, fmt.Sprintf("unit=%d", drive.Unit))
+		}
+
+		if drive.ReadOnly {
+			opts = append(opts, "readonly=on")
 		}
 
 		if drive.Media != "" {
@@ -279,6 +358,22 @@ func (cfg *Config) Execute() (*exec.Cmd, error) {
 		args = append(args, "-netdev", netdev.Value)
 	}
 
+	if cfg.KernelImage != "" {
+		args = append(args, "-kernel", cfg.KernelImage)
+	}
+
+	if cfg.Initrd != "" {
+		args = append(args, "-initrd", cfg.Initrd)
+	}
+
+	if cfg.KernelCmdline != "" {
+		args = append(args, "-append", cfg.KernelCmdline)
+	}
+
+	for _, fw := range cfg.FwCfg {
+		args = append(args, "-fw_cfg", fmt.Sprintf("name=%s,file=%s", fw.Name, fw.File))
+	}
+
 	var qemuArchitecture string
 
 	switch cfg.Architecture {
@@ -292,21 +387,12 @@ func (cfg *Config) Execute() (*exec.Cmd, error) {
 		return nil, fmt.Errorf("architecture missing")
 	}
 
-	// Note, require `-M` machine type for ARM (virt) if set to q35 (incompatible)
+	// arm64 q35 is incompatible with the q35 PC machine; override to virt.
+	// Firmware loading is unified: UseUEFI emits pflash drives above; no
+	// SeaBIOS fallback (aarch64 has none, and a UEFI-only x86_64 guest under
+	// SeaBIOS panics on missing ESP).
 	if cfg.Architecture == "arm64" && cfg.MachineType == "q35" {
 		args = append(args, "-M", "virt")
-
-		// For ARM, when using virt, preload the firmware file
-		// Note: this requires the `qemu-efi-aarch64` package to be installed on the host
-		uefiPath := "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd"
-
-		// TODO: Use EFI via NBD for state persistence
-		if _, err := os.Stat(uefiPath); err == nil {
-			args = append(args, "-bios", uefiPath)
-		} else {
-			slog.Warn("UEFI firmware file not found for ARM virt machine. Ensure qemu-efi-aarch64 package is installed.", "path", uefiPath)
-			return nil, fmt.Errorf("UEFI firmware file not found for ARM virt machine")
-		}
 	} else if cfg.MachineType != "" {
 		args = append(args, "-M", cfg.MachineType)
 	}

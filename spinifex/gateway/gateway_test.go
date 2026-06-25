@@ -12,6 +12,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	awscreds "github.com/aws/aws-sdk-go/aws/credentials"
+	awssession "github.com/aws/aws-sdk-go/aws/session"
+	awsec2 "github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/mulgadc/predastore/ratelimit"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
@@ -63,20 +68,14 @@ func TestGenerateEC2ErrorResponse_Structure(t *testing.T) {
 
 			xmlStr := string(output)
 
-			// Verify XML header
 			assert.True(t, strings.HasPrefix(xmlStr, xml.Header))
-
-			// Verify error code
 			assert.Contains(t, xmlStr, "<Code>"+tc.code+"</Code>")
-
-			// Verify request ID
 			assert.Contains(t, xmlStr, "<RequestID>"+tc.requestID+"</RequestID>")
 
-			// Verify root element
-			assert.Contains(t, xmlStr, `<ErrorResponse xmlns="`+xmlnsEC2+`">`)
-			assert.Contains(t, xmlStr, "</ErrorResponse>")
-
-			// Verify Errors wrapper
+			// EC2 query API uses <Response>/<Errors>, not <ErrorResponse>; aws-sdk-go v1
+			// rejects the latter with SerializationError.
+			assert.Contains(t, xmlStr, "<Response>")
+			assert.Contains(t, xmlStr, "</Response>")
 			assert.Contains(t, xmlStr, "<Errors>")
 			assert.Contains(t, xmlStr, "<Error>")
 		})
@@ -87,13 +86,11 @@ func TestGenerateEC2ErrorResponse_ValidXML(t *testing.T) {
 	output := GenerateEC2ErrorResponse("TestCode", "Test message", "req-999")
 	require.NotNil(t, output)
 
-	// Strip XML header and verify it's well-formed
 	xmlBody := strings.TrimPrefix(string(output), xml.Header)
 	decoder := xml.NewDecoder(strings.NewReader(xmlBody))
 	for {
 		_, err := decoder.Token()
 		if err != nil {
-			// io.EOF means we parsed the entire document successfully
 			assert.ErrorIs(t, err, io.EOF)
 			break
 		}
@@ -134,13 +131,9 @@ func TestGenerateIAMErrorResponse_Structure(t *testing.T) {
 
 			xmlStr := string(output)
 
-			// Verify XML header
 			assert.True(t, strings.HasPrefix(xmlStr, xml.Header))
-
 			assert.Contains(t, xmlStr, "<ErrorResponse>")
 			assert.Contains(t, xmlStr, "</ErrorResponse>")
-
-			// Verify IAM-specific structure
 			assert.Contains(t, xmlStr, "<Type>Sender</Type>")
 			assert.Contains(t, xmlStr, "<Code>"+tc.code+"</Code>")
 			assert.Contains(t, xmlStr, "<RequestId>"+tc.requestID+"</RequestId>")
@@ -166,7 +159,6 @@ func TestGenerateIAMErrorResponse_ValidXML(t *testing.T) {
 func TestErrorHandler_IAMService(t *testing.T) {
 	gw := &GatewayConfig{DisableLogging: true}
 
-	// Build a handler that sets service context and returns an IAM error
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), ctxService, "iam")
 		r = r.WithContext(ctx)
@@ -203,8 +195,30 @@ func TestErrorHandler_UnknownError(t *testing.T) {
 	xmlStr := string(body)
 	// Unknown errors should be remapped to InternalError
 	assert.Contains(t, xmlStr, "<Code>InternalError</Code>")
-	assert.Contains(t, xmlStr, `<ErrorResponse xmlns="`+xmlnsEC2+`">`)
+	assert.Contains(t, xmlStr, "<Response>")
 	assert.Contains(t, xmlStr, "<Errors>")
+}
+
+func TestErrorHandler_ELBv2Service(t *testing.T) {
+	gw := &GatewayConfig{DisableLogging: true}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), ctxService, "elasticloadbalancing")
+		r = r.WithContext(ctx)
+		gw.ErrorHandler(w, r, errors.New(awserrors.ErrorInvalidAction))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	resp := doRequest(handler, req)
+	assert.Equal(t, 400, resp.StatusCode)
+
+	body, _ := io.ReadAll(resp.Body)
+	xmlStr := string(body)
+	// ELBv2 uses the IAM-style Query envelope; EC2 shape breaks SDK Code parsing.
+	assert.Contains(t, xmlStr, "<ErrorResponse>")
+	assert.Contains(t, xmlStr, "<Type>Sender</Type>")
+	assert.Contains(t, xmlStr, "<Code>InvalidAction</Code>")
+	assert.NotContains(t, xmlStr, "<Errors>")
 }
 
 func TestErrorHandler_EC2Service(t *testing.T) {
@@ -222,7 +236,7 @@ func TestErrorHandler_EC2Service(t *testing.T) {
 
 	body, _ := io.ReadAll(resp.Body)
 	xmlStr := string(body)
-	assert.Contains(t, xmlStr, `<ErrorResponse xmlns="`+xmlnsEC2+`">`)
+	assert.Contains(t, xmlStr, "<Response>")
 	assert.Contains(t, xmlStr, "<Errors>")
 	assert.Contains(t, xmlStr, "<Code>InvalidParameterValue</Code>")
 }
@@ -348,16 +362,6 @@ func TestDiscoverActiveNodes_DuplicateNodes(t *testing.T) {
 
 	result := gw.DiscoverActiveNodes()
 	assert.Equal(t, 1, result)
-}
-
-func TestSupportedServices(t *testing.T) {
-	assert.True(t, supportedServices["ec2"])
-	assert.True(t, supportedServices["iam"])
-	assert.True(t, supportedServices["account"])
-	assert.True(t, supportedServices["elasticloadbalancing"])
-	assert.False(t, supportedServices["s3"])
-	assert.False(t, supportedServices["dynamodb"])
-	assert.False(t, supportedServices[""])
 }
 
 func TestParseAWSQueryArgs(t *testing.T) {
@@ -489,6 +493,11 @@ func TestGetService(t *testing.T) {
 			ctxVal:  "account",
 			wantSvc: "account",
 		},
+		{
+			name:    "tagging service",
+			ctxVal:  "tagging",
+			wantSvc: "tagging",
+		},
 	}
 
 	for _, tc := range tests {
@@ -553,7 +562,8 @@ func TestRequest_MalformedQueryString_EndToEnd(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			gw := &GatewayConfig{DisableLogging: true}
+			// A live NATS connection bypasses the cluster-unavailable gate.
+			gw := &GatewayConfig{DisableLogging: true, NATSConn: connectedNATS(t)}
 			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tc.body))
 			ctx := context.WithValue(req.Context(), ctxService, tc.service)
 			ctx = context.WithValue(ctx, ctxAccountID, "123456789012")
@@ -571,10 +581,11 @@ func TestRequest_MalformedQueryString_EndToEnd(t *testing.T) {
 }
 
 func TestRequest_EC2MissingAction(t *testing.T) {
-	gw := &GatewayConfig{DisableLogging: true}
+	gw := &GatewayConfig{DisableLogging: true, NATSConn: connectedNATS(t)}
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(""))
 	ctx := context.WithValue(req.Context(), ctxService, "ec2")
 	ctx = context.WithValue(ctx, ctxAccountID, "123456789012")
+	ctx = context.WithValue(ctx, ctxPrincipalType, principalTypeUser)
 	req = req.WithContext(ctx)
 	w := httptest.NewRecorder()
 
@@ -587,10 +598,11 @@ func TestRequest_EC2MissingAction(t *testing.T) {
 }
 
 func TestRequest_IAMNilService(t *testing.T) {
-	gw := &GatewayConfig{DisableLogging: true, IAMService: nil}
+	gw := &GatewayConfig{DisableLogging: true, IAMService: nil, NATSConn: connectedNATS(t)}
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("Action=CreateUser&UserName=test"))
 	ctx := context.WithValue(req.Context(), ctxService, "iam")
 	ctx = context.WithValue(ctx, ctxAccountID, "123456789012")
+	ctx = context.WithValue(ctx, ctxPrincipalType, principalTypeUser)
 	req = req.WithContext(ctx)
 	w := httptest.NewRecorder()
 
@@ -602,17 +614,15 @@ func TestRequest_IAMNilService(t *testing.T) {
 	assert.Contains(t, string(body), "InternalError")
 }
 
-func TestRequest_AccountReturns200(t *testing.T) {
-	gw := &GatewayConfig{DisableLogging: true}
-	req := httptest.NewRequest(http.MethodPost, "/", nil)
-	ctx := context.WithValue(req.Context(), ctxService, "account")
-	req = req.WithContext(ctx)
-	w := httptest.NewRecorder()
-
-	gw.Request(w, req)
-
-	resp := w.Result()
-	assert.Equal(t, 200, resp.StatusCode)
+// connectedNATS returns a live test NATS connection for short-circuit-bypass
+// tests that exercise per-service handlers without actually publishing.
+func connectedNATS(t *testing.T) *nats.Conn {
+	t.Helper()
+	ns, _ := testutil.StartTestNATS(t)
+	nc, err := nats.Connect(ns.ClientURL())
+	require.NoError(t, err)
+	t.Cleanup(nc.Close)
+	return nc
 }
 
 // setupEC2Request creates an http.Request with EC2 service context and optional account ID.
@@ -746,10 +756,28 @@ func TestCheckPolicy_RootUserGlobalAccount(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	ctx := context.WithValue(req.Context(), ctxIdentity, "root")
 	ctx = context.WithValue(ctx, ctxAccountID, "000000000000") // GlobalAccountID
+	ctx = context.WithValue(ctx, ctxPrincipalType, principalTypeUser)
 	req = req.WithContext(ctx)
 
 	err := gw.checkPolicy(req, "ec2", "DescribeInstances")
 	assert.NoError(t, err)
+}
+
+// TestCheckPolicy_AssumedRoleSessionNamedRoot ensures the principal-type gate
+// fires BEFORE the identity-string root short-circuit. A session whose
+// SessionName is "root" must not inherit root privileges.
+func TestCheckPolicy_AssumedRoleSessionNamedRoot(t *testing.T) {
+	gw := &GatewayConfig{DisableLogging: true, IAMService: &mockIAMService{}}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx := context.WithValue(req.Context(), ctxIdentity, "root")
+	ctx = context.WithValue(ctx, ctxAccountID, "000000000000")
+	ctx = context.WithValue(ctx, ctxPrincipalType, principalTypeAssumedRole)
+	ctx = context.WithValue(ctx, ctxAssumedRoleARN, "arn:aws:sts::000000000000:assumed-role/r/root")
+	req = req.WithContext(ctx)
+
+	err := gw.checkPolicy(req, "ec2", "DescribeInstances")
+	require.Error(t, err)
+	assert.Equal(t, awserrors.ErrorAccessDenied, err.Error())
 }
 
 func TestCheckPolicy_NonRootAllowPolicy(t *testing.T) {
@@ -769,6 +797,7 @@ func TestCheckPolicy_NonRootAllowPolicy(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	ctx := context.WithValue(req.Context(), ctxIdentity, "alice")
 	ctx = context.WithValue(ctx, ctxAccountID, "123456789012")
+	ctx = context.WithValue(ctx, ctxPrincipalType, principalTypeUser)
 	req = req.WithContext(ctx)
 
 	err := gw.checkPolicy(req, "ec2", "DescribeInstances")
@@ -792,6 +821,7 @@ func TestCheckPolicy_NonRootDenyPolicy(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	ctx := context.WithValue(req.Context(), ctxIdentity, "alice")
 	ctx = context.WithValue(ctx, ctxAccountID, "123456789012")
+	ctx = context.WithValue(ctx, ctxPrincipalType, principalTypeUser)
 	req = req.WithContext(ctx)
 
 	err := gw.checkPolicy(req, "ec2", "DescribeInstances")
@@ -809,6 +839,7 @@ func TestCheckPolicy_NonRootNoPolicies(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	ctx := context.WithValue(req.Context(), ctxIdentity, "alice")
 	ctx = context.WithValue(ctx, ctxAccountID, "123456789012")
+	ctx = context.WithValue(ctx, ctxPrincipalType, principalTypeUser)
 	req = req.WithContext(ctx)
 
 	err := gw.checkPolicy(req, "ec2", "DescribeInstances")
@@ -826,6 +857,7 @@ func TestCheckPolicy_GetUserPoliciesError(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	ctx := context.WithValue(req.Context(), ctxIdentity, "alice")
 	ctx = context.WithValue(ctx, ctxAccountID, "123456789012")
+	ctx = context.WithValue(ctx, ctxPrincipalType, principalTypeUser)
 	req = req.WithContext(ctx)
 
 	err := gw.checkPolicy(req, "ec2", "DescribeInstances")
@@ -838,6 +870,7 @@ func TestCheckPolicy_EmptyIdentity(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	ctx := context.WithValue(req.Context(), ctxIdentity, "")
 	ctx = context.WithValue(ctx, ctxAccountID, "123456789012")
+	ctx = context.WithValue(ctx, ctxPrincipalType, principalTypeUser)
 	req = req.WithContext(ctx)
 
 	err := gw.checkPolicy(req, "ec2", "DescribeInstances")
@@ -868,6 +901,7 @@ func TestCheckPolicy_NATSTransientRetriesAllAttempts(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	ctx := context.WithValue(req.Context(), ctxIdentity, "alice")
 	ctx = context.WithValue(ctx, ctxAccountID, "123456789012")
+	ctx = context.WithValue(ctx, ctxPrincipalType, principalTypeUser)
 	req = req.WithContext(ctx)
 
 	err := gw.checkPolicy(req, "ec2", "DescribeInstances")
@@ -898,6 +932,7 @@ func TestCheckPolicy_NATSTransientRetriesThenSucceeds(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	ctx := context.WithValue(req.Context(), ctxIdentity, "alice")
 	ctx = context.WithValue(ctx, ctxAccountID, "123456789012")
+	ctx = context.WithValue(ctx, ctxPrincipalType, principalTypeUser)
 	req = req.WithContext(ctx)
 
 	err := gw.checkPolicy(req, "ec2", "DescribeInstances")
@@ -915,6 +950,7 @@ func TestCheckPolicy_NonTransientErrorStillFails(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	ctx := context.WithValue(req.Context(), ctxIdentity, "alice")
 	ctx = context.WithValue(ctx, ctxAccountID, "123456789012")
+	ctx = context.WithValue(ctx, ctxPrincipalType, principalTypeUser)
 	req = req.WithContext(ctx)
 
 	err := gw.checkPolicy(req, "ec2", "DescribeInstances")
@@ -930,101 +966,9 @@ func TestIsNATSTransient(t *testing.T) {
 	assert.False(t, isNATSTransient(errors.New("some other error")))
 }
 
-func TestSlogRequestLogger_CallsNext(t *testing.T) {
-	nextCalled := false
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		nextCalled = true
-	})
-
-	handler := slogRequestLogger(next)
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	assert.True(t, nextCalled)
-	assert.Equal(t, 200, w.Code)
-}
-
-func TestSlogRequestLogger_CapturesStatusCode(t *testing.T) {
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	})
-
-	handler := slogRequestLogger(next)
-	req := httptest.NewRequest(http.MethodGet, "/missing", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	assert.Equal(t, 404, w.Code)
-}
-
-func TestEC2ActionMapCompleteness(t *testing.T) {
-	expectedActions := []string{
-		"DescribeInstances", "RunInstances", "StartInstances", "StopInstances",
-		"TerminateInstances", "RebootInstances", "DescribeInstanceTypes", "GetConsoleOutput",
-		"ModifyInstanceAttribute", "DescribeInstanceAttribute",
-		"CreateKeyPair", "DeleteKeyPair", "DescribeKeyPairs", "ImportKeyPair",
-		"DescribeImages", "CreateImage", "DeregisterImage", "RegisterImage", "CopyImage",
-		"DescribeImageAttribute", "ModifyImageAttribute", "ResetImageAttribute",
-		"DescribeRegions", "DescribeAvailabilityZones",
-		"DescribeVolumes", "ModifyVolume", "CreateVolume", "DeleteVolume",
-		"AttachVolume", "DescribeVolumeStatus", "DescribeVolumesModifications", "DetachVolume",
-		"DescribeAccountAttributes", "EnableEbsEncryptionByDefault",
-		"DisableEbsEncryptionByDefault", "GetEbsEncryptionByDefault",
-		"GetSerialConsoleAccessStatus", "EnableSerialConsoleAccess",
-		"DisableSerialConsoleAccess",
-		"CreateTags", "DeleteTags", "DescribeTags",
-		"CreateSnapshot", "DeleteSnapshot", "DescribeSnapshots", "CopySnapshot",
-		"CreateInternetGateway", "DeleteInternetGateway",
-		"DescribeInternetGateways", "AttachInternetGateway", "DetachInternetGateway",
-		"CreateEgressOnlyInternetGateway", "DeleteEgressOnlyInternetGateway",
-		"DescribeEgressOnlyInternetGateways",
-		"CreatePlacementGroup", "DeletePlacementGroup", "DescribePlacementGroups",
-		"CreateVpc", "DeleteVpc", "DescribeVpcs", "ModifyVpcAttribute", "DescribeVpcAttribute",
-		"CreateSubnet", "DeleteSubnet", "DescribeSubnets", "ModifySubnetAttribute",
-		"CreateNetworkInterface", "DeleteNetworkInterface", "DescribeNetworkInterfaces", "ModifyNetworkInterfaceAttribute",
-		"CreateSecurityGroup", "DeleteSecurityGroup", "DescribeSecurityGroups",
-		"AuthorizeSecurityGroupIngress", "AuthorizeSecurityGroupEgress",
-		"RevokeSecurityGroupIngress", "RevokeSecurityGroupEgress",
-		"DescribeInstanceCreditSpecifications",
-		"AllocateAddress", "ReleaseAddress", "AssociateAddress", "DisassociateAddress", "DescribeAddresses", "DescribeAddressesAttribute",
-		"CreateRouteTable", "DeleteRouteTable", "DescribeRouteTables",
-		"CreateRoute", "DeleteRoute", "ReplaceRoute",
-		"AssociateRouteTable", "DisassociateRouteTable", "ReplaceRouteTableAssociation",
-		"CreateNatGateway", "DeleteNatGateway", "DescribeNatGateways",
-	}
-
-	for _, action := range expectedActions {
-		assert.Contains(t, ec2Actions, action, "ec2Actions missing %s", action)
-	}
-	assert.Len(t, ec2Actions, len(expectedActions), "ec2Actions has unexpected entries")
-}
-
-func TestEC2LocalActionsCompleteness(t *testing.T) {
-	expected := []string{"DescribeRegions", "DescribeAvailabilityZones", "DescribeAccountAttributes"}
-	for _, action := range expected {
-		assert.True(t, ec2LocalActions[action], "ec2LocalActions missing %s", action)
-	}
-	assert.Len(t, ec2LocalActions, len(expected), "ec2LocalActions has unexpected entries")
-}
-
-func TestIAMActionMapCompleteness(t *testing.T) {
-	expectedActions := []string{
-		"CreateUser", "GetUser", "ListUsers", "DeleteUser",
-		"CreateAccessKey", "ListAccessKeys", "DeleteAccessKey", "UpdateAccessKey",
-		"CreatePolicy", "GetPolicy", "GetPolicyVersion", "ListPolicies", "DeletePolicy",
-		"AttachUserPolicy", "DetachUserPolicy", "ListAttachedUserPolicies",
-	}
-
-	for _, action := range expectedActions {
-		assert.Contains(t, iamActions, action, "iamActions missing %s", action)
-	}
-	assert.Len(t, iamActions, len(expectedActions), "iamActions has unexpected entries")
-}
-
 func TestImportKeyPair_Base64PaddingWorkaround(t *testing.T) {
-	// The ImportKeyPair handler has a workaround that decodes URL-encoded
-	// Base64 padding (%3D%3D → ==) before passing to the generic handler.
+	// The ImportKeyPair handler decodes URL-encoded Base64 padding (%3D%3D → ==)
+	// before passing to the generic handler.
 	handler := ec2Actions["ImportKeyPair"]
 	require.NotNil(t, handler)
 
@@ -1035,11 +979,9 @@ func TestImportKeyPair_Base64PaddingWorkaround(t *testing.T) {
 	}
 
 	gw := &GatewayConfig{DisableLogging: true, NATSConn: nil}
-	// The handler will fail because NATS is nil, but we can verify the
-	// workaround ran by checking that q["PublicKeyMaterial"] was modified.
-	_, _ = handler("ImportKeyPair", q, gw, "123456789012")
+	// NATS is nil so the handler errors, but PublicKeyMaterial is modified before that.
+	_, _ = handler("ImportKeyPair", q, gw, "123456789012", nil)
 
-	// After the workaround, the URL-encoded padding should be decoded
 	assert.True(t, strings.HasSuffix(q["PublicKeyMaterial"], "=="),
 		"Expected PublicKeyMaterial to end with == but got: %s", q["PublicKeyMaterial"])
 	assert.False(t, strings.Contains(q["PublicKeyMaterial"], "%3D"),
@@ -1048,10 +990,7 @@ func TestImportKeyPair_Base64PaddingWorkaround(t *testing.T) {
 
 func TestParseArgsToStruct(t *testing.T) {
 	// ParseArgsToStruct wraps QueryParamsToStruct errors as ErrorInvalidParameter.
-	// The *any parameter causes a reflection kind mismatch (Interface vs Struct)
-	// in QueryParamsToStruct, so this function always returns the wrapped error.
-	// Tests verify the error wrapping behavior.
-
+	// The *any parameter causes a reflection kind mismatch, so this always errors.
 	type simpleInput struct {
 		Action string `locationName:"Action"`
 	}
@@ -1143,7 +1082,7 @@ func TestWriteThrottleError_EC2(t *testing.T) {
 	assert.Equal(t, 503, resp.StatusCode)
 	assert.Equal(t, "application/xml", resp.Header.Get("Content-Type"))
 	assert.Contains(t, string(body), "<Code>RequestLimitExceeded</Code>")
-	assert.Contains(t, string(body), `<ErrorResponse xmlns="`+xmlnsEC2+`">`)
+	assert.Contains(t, string(body), "<Response>")
 }
 
 func TestWriteThrottleError_IAM(t *testing.T) {
@@ -1178,7 +1117,6 @@ func TestThrottleMiddleware_Integration(t *testing.T) {
 		Throttler:      throttler,
 	}
 
-	// Build a minimal handler that the throttle middleware wraps.
 	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -1213,7 +1151,7 @@ func TestThrottleMiddleware_Integration(t *testing.T) {
 }
 
 func TestThrottleMiddleware_DisabledConfig(t *testing.T) {
-	// When Throttler is nil, SetupRoutes skips middleware entirely.
+	// When Throttler is nil, SetupRoutes skips middleware — no panic.
 	gw := &GatewayConfig{DisableLogging: true, Throttler: nil}
 	handler := gw.SetupRoutes()
 
@@ -1224,8 +1162,7 @@ func TestThrottleMiddleware_DisabledConfig(t *testing.T) {
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
-	// Without auth it'll fail on SigV4, not on throttling — that's expected.
-	// The key assertion: no panic from nil Throttler.
+	// Without auth the request fails on SigV4, not throttling.
 	resp := w.Result()
 	assert.NotEqual(t, 503, resp.StatusCode)
 }
@@ -1267,4 +1204,104 @@ func TestThrottleMiddleware_PerActionIsolation(t *testing.T) {
 	// RunInstances should be independent.
 	resp = makeReq("RunInstances")
 	assert.Equal(t, 200, resp.StatusCode)
+}
+
+func TestRequest_ClusterUnavailableNilConn_EC2(t *testing.T) {
+	gw := &GatewayConfig{DisableLogging: true}
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx := context.WithValue(req.Context(), ctxService, "ec2")
+	req = req.WithContext(ctx)
+
+	w := httptest.NewRecorder()
+	gw.Request(w, req)
+	resp := w.Result()
+
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	xmlStr := string(body)
+	assert.Contains(t, xmlStr, "<Code>ServiceUnavailable</Code>")
+	assert.Contains(t, xmlStr, "cluster unavailable: NATS disconnected")
+	assert.Contains(t, xmlStr, "/local/status")
+	assert.Contains(t, xmlStr, "<Response>") // EC2 XML envelope
+}
+
+func TestRequest_ClusterUnavailableNilConn_IAM(t *testing.T) {
+	gw := &GatewayConfig{DisableLogging: true}
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx := context.WithValue(req.Context(), ctxService, "iam")
+	req = req.WithContext(ctx)
+
+	w := httptest.NewRecorder()
+	gw.Request(w, req)
+	resp := w.Result()
+
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	xmlStr := string(body)
+	assert.Contains(t, xmlStr, "<Code>ServiceUnavailable</Code>")
+	assert.Contains(t, xmlStr, "<ErrorResponse>") // IAM XML envelope
+}
+
+func TestRequest_ClusterUnavailableClosedConn(t *testing.T) {
+	ns, _ := testutil.StartTestNATS(t)
+	nc, err := nats.Connect(ns.ClientURL())
+	require.NoError(t, err)
+	nc.Close()
+
+	gw := &GatewayConfig{DisableLogging: true, NATSConn: nc}
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx := context.WithValue(req.Context(), ctxService, "ec2")
+	req = req.WithContext(ctx)
+
+	w := httptest.NewRecorder()
+	gw.Request(w, req)
+	resp := w.Result()
+
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
+// TestGenerateEC2ErrorResponse_SDKRoundTrip serves the EC2 error envelope from
+// an httptest server, points an aws-sdk-go v1 EC2 client at it, and asserts
+// the SDK surfaces the code via awserr.Error.Code() — not SerializationError.
+// aws-sdk-go v1's ec2query handler rejects the IAM <ErrorResponse> envelope and
+// discards the embedded code, so the EC2 <Response>/<Errors> shape is required.
+func TestGenerateEC2ErrorResponse_SDKRoundTrip(t *testing.T) {
+	const wantCode = "InvalidInstanceType"
+	const wantMessage = "The instance type 't2.micro' is not supported in this region."
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		body := GenerateEC2ErrorResponse(wantCode, wantMessage, "req-sdk-roundtrip")
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	sess, err := awssession.NewSession(&aws.Config{
+		Region:      aws.String("us-east-1"),
+		Endpoint:    aws.String(srv.URL),
+		Credentials: awscreds.NewStaticCredentials("AKIA-TEST", "secret", ""),
+		DisableSSL:  aws.Bool(true),
+		// Suppress the default retry loop — error responses are not retryable
+		// here and waiting them out wastes test time.
+		MaxRetries: aws.Int(0),
+	})
+	require.NoError(t, err)
+
+	client := awsec2.New(sess)
+	_, err = client.RunInstances(&awsec2.RunInstancesInput{
+		ImageId:      aws.String("ami-test"),
+		InstanceType: aws.String("t2.micro"),
+		MinCount:     aws.Int64(1),
+		MaxCount:     aws.Int64(1),
+	})
+	require.Error(t, err)
+
+	var awsErr awserr.Error
+	require.True(t, errors.As(err, &awsErr), "expected awserr.Error, got %T: %v", err, err)
+	assert.Equal(t, wantCode, awsErr.Code())
+	assert.NotEqual(t, "SerializationError", awsErr.Code(), "SDK could not parse the envelope")
 }

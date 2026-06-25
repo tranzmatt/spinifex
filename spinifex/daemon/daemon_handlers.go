@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
+	"github.com/mulgadc/spinifex/spinifex/gpu"
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/spinifex/spinifex/vm"
@@ -57,6 +58,28 @@ func handleNATSRequest[I any, O any](msg *nats.Msg, serviceFn func(*I, string) (
 	respondWithJSON(msg, output)
 }
 
+// handleNATSRequestWithPrincipal is handleNATSRequest for service methods that
+// also need the caller's IAM principal ARN (X-Principal-ARN header) — e.g. EKS
+// CreateCluster, which mints the bootstrap-creator-admin AccessEntry for the
+// caller.
+func handleNATSRequestWithPrincipal[I any, O any](msg *nats.Msg, serviceFn func(*I, string, string) (*O, error)) {
+	accountID := utils.AccountIDFromMsg(msg)
+	principalARN := utils.PrincipalARNFromMsg(msg)
+	input := new(I)
+	if errResp := utils.UnmarshalJsonPayload(input, msg.Data); errResp != nil {
+		if err := msg.Respond(errResp); err != nil {
+			slog.Error("Failed to respond to NATS request", "err", err)
+		}
+		return
+	}
+	output, err := serviceFn(input, accountID, principalARN)
+	if err != nil {
+		respondWithError(msg, awserrors.ValidErrorCode(err.Error()))
+		return
+	}
+	respondWithJSON(msg, output)
+}
+
 // handleEC2Events processes incoming EC2 instance events (start, stop, terminate, attach-volume)
 func (d *Daemon) handleEC2Events(msg *nats.Msg) {
 	var command types.EC2InstanceCommand
@@ -69,10 +92,7 @@ func (d *Daemon) handleEC2Events(msg *nats.Msg) {
 
 	slog.Debug("Received message", "subject", msg.Subject, "data", string(msg.Data))
 
-	d.Instances.Mu.Lock()
-	instance, ok := d.Instances.VMS[command.ID]
-	d.Instances.Mu.Unlock()
-
+	instance, ok := d.vmMgr.Get(command.ID)
 	if !ok {
 		slog.Warn("Instance is not running on this node", "id", command.ID)
 		respondWithError(msg, awserrors.ErrorInvalidInstanceIDNotFound)
@@ -89,12 +109,36 @@ func (d *Daemon) handleEC2Events(msg *nats.Msg) {
 		d.handleAttachVolume(msg, command, instance)
 	case command.Attributes.DetachVolume:
 		d.handleDetachVolume(msg, command, instance)
+	case command.Attributes.AttachENI:
+		d.handleAttachNetworkInterface(msg, command, instance)
+	case command.Attributes.DetachENI:
+		d.handleDetachNetworkInterface(msg, command, instance)
+	case command.Attributes.AssociateIamInstanceProfile:
+		d.handleAssociateIamInstanceProfile(msg, command, instance)
 	case command.Attributes.StartInstance:
-		d.handleStartInstance(msg, command, instance)
+		if err := d.instanceService.StartInstance(instance, command); err != nil {
+			respondWithError(msg, awserrors.ValidErrorCode(err.Error()))
+			return
+		}
+		if err := msg.Respond(fmt.Appendf(nil, `{"status":"running","instanceId":"%s"}`, instance.ID)); err != nil {
+			slog.Error("Failed to respond to NATS request", "err", err)
+		}
 	case command.Attributes.RebootInstance:
-		d.handleRebootInstance(msg, command, instance)
+		if err := d.instanceService.RebootInstance(instance, command); err != nil {
+			respondWithError(msg, awserrors.ValidErrorCode(err.Error()))
+			return
+		}
+		if err := msg.Respond([]byte(`{}`)); err != nil {
+			slog.Error("Failed to respond to NATS request", "err", err)
+		}
 	case command.Attributes.StopInstance, command.Attributes.TerminateInstance:
-		d.handleStopOrTerminateInstance(msg, command, instance)
+		if err := d.instanceService.StopOrTerminateInstance(instance, command); err != nil {
+			respondWithError(msg, awserrors.ValidErrorCode(err.Error()))
+			return
+		}
+		if err := msg.Respond([]byte(`{}`)); err != nil {
+			slog.Error("Failed to respond to NATS request", "err", err)
+		}
 	default:
 		slog.Warn("Unhandled EC2 instance command", "id", command.ID, "attributes", command.Attributes)
 		respondWithError(msg, awserrors.ErrorServerInternal)
@@ -158,31 +202,51 @@ func (d *Daemon) daemonIP() string {
 func (d *Daemon) handleNodeStatus(msg *nats.Msg) {
 	totalVCPU, totalMemGB, reservedVCPU, reservedMemGB, allocVCPU, allocMemGB, caps := d.resourceMgr.GetResourceStats()
 
-	d.Instances.Mu.Lock()
 	vmCount := 0
-	for _, v := range d.Instances.VMS {
+	d.vmMgr.ForEach(func(v *vm.VM) {
 		if v.Status == vm.StateRunning {
 			vmCount++
 		}
+	})
+
+	totalGPUs, allocGPUs := 0, 0
+	if d.gpuManager != nil {
+		totalGPUs = d.gpuManager.TotalCount()
+		allocGPUs = d.gpuManager.AllocatedCount()
 	}
-	d.Instances.Mu.Unlock()
+
+	var gpuModelNames []string
+	for _, dev := range d.gpuProbe.Devices {
+		gpuModelNames = append(gpuModelNames, dev.Model)
+	}
+
+	var gpuInventory []types.GPUInfo
+	if d.gpuManager != nil {
+		gpuInventory = buildGPUInventory(d.gpuManager.Snapshot())
+	}
 
 	resp := types.NodeStatusResponse{
-		Node:          d.node,
-		Status:        "Ready",
-		Host:          d.daemonIP(),
-		Region:        d.config.Region,
-		AZ:            d.config.AZ,
-		Uptime:        int64(time.Since(d.startTime).Seconds()),
-		Services:      d.config.GetServices(),
-		TotalVCPU:     totalVCPU,
-		TotalMemGB:    totalMemGB,
-		ReservedVCPU:  reservedVCPU,
-		ReservedMemGB: reservedMemGB,
-		AllocVCPU:     allocVCPU,
-		AllocMemGB:    allocMemGB,
-		VMCount:       vmCount,
-		InstanceTypes: caps,
+		Node:           d.node,
+		Status:         "Ready",
+		Host:           d.daemonIP(),
+		Region:         d.config.Region,
+		AZ:             d.config.AZ,
+		Uptime:         int64(time.Since(d.startTime).Seconds()),
+		Services:       d.config.GetServices(),
+		TotalVCPU:      totalVCPU,
+		TotalMemGB:     totalMemGB,
+		ReservedVCPU:   reservedVCPU,
+		ReservedMemGB:  reservedMemGB,
+		AllocVCPU:      allocVCPU,
+		AllocMemGB:     allocMemGB,
+		TotalGPUs:      totalGPUs,
+		AllocGPUs:      allocGPUs,
+		GPUCapable:     d.gpuProbe.Capable,
+		GPUPassthrough: d.gpuManager != nil,
+		GPUModels:      gpuModelNames,
+		GPUs:           gpuInventory,
+		VMCount:        vmCount,
+		InstanceTypes:  caps,
 	}
 
 	// Query service roles concurrently to halve worst-case latency (500ms vs 1s).
@@ -262,6 +326,93 @@ func fetchNATSRole(url string, client *http.Client) string {
 	return roleFollower
 }
 
+// buildGPUInventory converts a pool snapshot into per-physical-GPU GPUInfo
+// records suitable for the NodeStatusResponse. Entries are ordered by first
+// appearance of each PCI address in the snapshot.
+func buildGPUInventory(snapshot []gpu.PoolEntry) []types.GPUInfo {
+	byPCI := make(map[string]*types.GPUInfo, len(snapshot))
+	var order []string
+
+	for _, e := range snapshot {
+		pci := e.Device.PCIAddress
+		if _, ok := byPCI[pci]; !ok {
+			byPCI[pci] = &types.GPUInfo{
+				PCIAddress: pci,
+				Model:      e.Device.Model,
+				VRAMMiB:    e.Device.MemoryMiB,
+			}
+			order = append(order, pci)
+		}
+		g := byPCI[pci]
+		if e.MIGInstance != nil {
+			g.MIGEnabled = true
+			g.MIGProfile = e.MIGInstance.Profile.Name
+			g.Slices = append(g.Slices, types.GPUSliceInfo{
+				GIID:       e.MIGInstance.GIID,
+				Profile:    e.MIGInstance.Profile.Name,
+				VRAMMiB:    e.MIGInstance.Profile.MemoryMiB,
+				MdevPath:   e.MIGInstance.MdevPath,
+				InstanceID: e.InstanceID,
+			})
+		} else if g.InstanceID == "" {
+			g.InstanceID = e.InstanceID
+		}
+	}
+
+	gpus := make([]types.GPUInfo, 0, len(order))
+	for _, pci := range order {
+		gpus = append(gpus, *byPCI[pci])
+	}
+	return gpus
+}
+
+// buildPoolLookup snapshots the GPU manager and returns two lookup maps:
+// mdev path → PoolEntry (for MIG slices) and PCI address → PoolEntry (for
+// whole-GPU entries). Both maps are nil when manager is nil.
+func buildPoolLookup(mgr *gpu.Manager) (byMdev, byPCI map[string]gpu.PoolEntry) {
+	if mgr == nil {
+		return nil, nil
+	}
+	snap := mgr.Snapshot()
+	byMdev = make(map[string]gpu.PoolEntry, len(snap))
+	byPCI = make(map[string]gpu.PoolEntry, len(snap))
+	for _, e := range snap {
+		if e.MIGInstance != nil {
+			byMdev[e.MIGInstance.MdevPath] = e
+		} else {
+			byPCI[e.Device.PCIAddress] = e
+		}
+	}
+	return byMdev, byPCI
+}
+
+// resolveVMGPU maps a single GPUAttachment to a VMGPUInfo using the pool
+// lookup tables built by buildPoolLookup. Returns nil if the attachment cannot
+// be matched (e.g. daemon restart before pool is fully restored).
+func resolveVMGPU(att gpu.GPUAttachment, byMdev, byPCI map[string]gpu.PoolEntry) *types.VMGPUInfo {
+	if att.MdevPath != "" {
+		if e, ok := byMdev[att.MdevPath]; ok && e.MIGInstance != nil {
+			return &types.VMGPUInfo{
+				Model:    e.Device.Model,
+				VRAMMiB:  e.MIGInstance.Profile.MemoryMiB,
+				Profile:  e.MIGInstance.Profile.Name,
+				MdevPath: att.MdevPath,
+			}
+		}
+		return nil
+	}
+	if att.PCIAddress != "" {
+		if e, ok := byPCI[att.PCIAddress]; ok {
+			return &types.VMGPUInfo{
+				Model:      e.Device.Model,
+				VRAMMiB:    e.Device.MemoryMiB,
+				PCIAddress: att.PCIAddress,
+			}
+		}
+	}
+	return nil
+}
+
 // fetchPredastoreRole queries a Predastore /status endpoint and returns "leader", "follower", or "".
 func fetchPredastoreRole(url string, client *http.Client) string {
 	resp, err := client.Get(url) //nolint:noctx // internal monitoring call
@@ -288,16 +439,16 @@ func fetchPredastoreRole(url string, client *http.Client) string {
 // handleNodeVMs responds with the list of VMs running on this node.
 // Used by the CLI: spx get vms.
 func (d *Daemon) handleNodeVMs(msg *nats.Msg) {
-	d.Instances.Mu.Lock()
-	vms := make([]types.VMInfo, 0, len(d.Instances.VMS))
-	for _, v := range d.Instances.VMS {
+	poolByMdev, poolByPCI := buildPoolLookup(d.gpuManager)
+
+	vms := make([]types.VMInfo, 0, d.vmMgr.Count())
+	d.vmMgr.ForEach(func(v *vm.VM) {
 		info := types.VMInfo{
 			InstanceID:   v.ID,
 			Status:       string(v.Status),
 			InstanceType: v.InstanceType,
 			ManagedBy:    v.ManagedBy,
 		}
-		// Get vCPU/memory from the resource manager's instance type info
 		if it, ok := d.resourceMgr.instanceTypes[v.InstanceType]; ok {
 			info.VCPU = int(instanceTypeVCPUs(it))
 			info.MemoryGB = float64(instanceTypeMemoryMiB(it)) / 1024.0
@@ -305,9 +456,11 @@ func (d *Daemon) handleNodeVMs(msg *nats.Msg) {
 		if v.Instance != nil && v.Instance.LaunchTime != nil {
 			info.LaunchTime = v.Instance.LaunchTime.Unix()
 		}
+		if len(v.GPUAttachments) > 0 {
+			info.GPU = resolveVMGPU(v.GPUAttachments[0], poolByMdev, poolByPCI)
+		}
 		vms = append(vms, info)
-	}
-	d.Instances.Mu.Unlock()
+	})
 
 	resp := types.NodeVMsResponse{
 		Node: d.node,

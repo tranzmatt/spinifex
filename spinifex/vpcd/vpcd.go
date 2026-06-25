@@ -1,0 +1,809 @@
+package vpcd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/netip"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/mulgadc/spinifex/spinifex/admin"
+	handlers_imds "github.com/mulgadc/spinifex/spinifex/handlers/imds"
+	"github.com/mulgadc/spinifex/spinifex/network/external"
+	"github.com/mulgadc/spinifex/spinifex/network/external/dhcp"
+	"github.com/mulgadc/spinifex/spinifex/network/host"
+	"github.com/mulgadc/spinifex/spinifex/network/ovn"
+	"github.com/mulgadc/spinifex/spinifex/network/policy"
+	"github.com/mulgadc/spinifex/spinifex/network/reconcile"
+	"github.com/mulgadc/spinifex/spinifex/network/subscribers"
+	"github.com/mulgadc/spinifex/spinifex/network/topology"
+	"github.com/mulgadc/spinifex/spinifex/utils"
+	"github.com/nats-io/nats.go"
+)
+
+// Bridge mode selects how the WAN NIC reaches the OVS bridge.
+// Direct: WAN NIC added to OVS (distributed NAT, not safe on mgmt NIC).
+// Veth: veth pair links a Linux bridge to OVS (requires centralized NAT).
+const (
+	BridgeModeDirect = "direct"
+	BridgeModeVeth   = "veth"
+	// OvnExternalBridge is the OVS bridge targeted by ovn-bridge-mappings for the "external" localnet.
+	OvnExternalBridge = "br-ext"
+)
+
+// waitForFlowsHV runs `ovn-nbctl --wait=hv sync`, blocking until all chassis acknowledge the new NB sequence.
+// Bounded at 30 s; overruns log a Warn and return nil. Declared as a var so tests can stub it.
+var waitForFlowsHV = func() error {
+	start := time.Now()
+	cmd := sudoCommand("ovn-nbctl",
+		"--no-leader-only",
+		"--timeout=30",
+		"--wait=hv",
+		"sync",
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		slog.Warn("vpcd: OVN flows-ready barrier overran; continuing without confirmation",
+			"elapsed", time.Since(start),
+			"err", err,
+			"output", strings.TrimSpace(string(out)),
+		)
+		return nil
+	}
+	slog.Debug("vpcd: OVN flows-ready barrier complete", "elapsed", time.Since(start))
+	return nil
+}
+
+// sudoCommand wraps exec.Command with sudo when not root; OVS/OVN commands require elevated privileges.
+func sudoCommand(name string, args ...string) *exec.Cmd {
+	if os.Getuid() == 0 {
+		return exec.Command(name, args...)
+	}
+	return exec.Command("sudo", append([]string{name}, args...)...)
+}
+
+var serviceName = "vpcd"
+
+// Compile-time check: host.GatewayClaimProber implements reconcile.GatewayClaimVerifier.
+var _ reconcile.GatewayClaimVerifier = (*host.GatewayClaimProber)(nil)
+
+// BootstrapVPC holds the default VPC IDs from spinifex.toml used to seed OVN topology on first boot.
+type BootstrapVPC struct {
+	AccountID  string
+	VpcId      string
+	SubnetId   string
+	IgwId      string
+	Cidr       string
+	SubnetCidr string
+}
+
+// Config holds the vpcd service configuration.
+type Config struct {
+	// NatsHost is the NATS server address (host:port).
+	NatsHost string
+	// NatsToken is the NATS authentication token.
+	NatsToken string
+	// NatsCACert is the path to the CA certificate for NATS TLS.
+	NatsCACert string
+	// OVNNBAddr is the OVN Northbound DB address (e.g., "tcp:127.0.0.1:6641").
+	OVNNBAddr string
+	// OVNSBAddr is the OVN Southbound DB address (e.g., "tcp:127.0.0.1:6642"), used for monitoring.
+	OVNSBAddr string
+	// BaseDir is the base directory for PID files and state.
+	BaseDir string
+	// Debug enables debug logging.
+	Debug bool
+	// ExternalMode is "pool" or "" (disabled).
+	ExternalMode string
+	// ExternalPools holds the cluster-wide external IP pool configs.
+	ExternalPools []ExternalPoolConfig
+	// Bootstrap holds the default VPC config from spinifex.toml for first-boot reconciliation.
+	Bootstrap *BootstrapVPC
+	// ExternalInterface is the WAN NIC name (e.g., "enp0s3"). Used by
+	// detectBridgeMode for veth/direct auto-detection.
+	ExternalInterface string
+	// BridgeMode is "direct" or "veth". Direct bridge adds the WAN NIC
+	// directly to the OVS bridge; veth uses a veth pair to link a Linux bridge
+	// to OVS. When empty, auto-detected at startup.
+	BridgeMode string
+	// AZ is the local availability zone identifier. The reconciler uses it
+	// to scope its IntentState scan to local-AZ KV records; new VPC records
+	// are stamped with this value at create time.
+	AZ string
+}
+
+// ExternalPoolConfig mirrors config.ExternalPool for vpcd's internal use.
+type ExternalPoolConfig struct {
+	Name            string
+	Source          string // "static" (default) or "dhcp"
+	BindBridge      string // Linux bridge for DHCP DORA (source=dhcp only)
+	RangeStart      string
+	RangeEnd        string
+	Gateway         string
+	GatewayIP       string
+	PrefixLen       int
+	DNSServers      []string
+	Region          string
+	AZ              string
+	GwLrpRangeStart string // Sub-range for OVN gateway LRP IPs in centralized NAT mode.
+	GwLrpRangeEnd   string
+}
+
+// Service implements the Spinifex service interface for vpcd.
+type Service struct {
+	Config *Config
+}
+
+// New creates a new vpcd Service.
+func New(config any) (*Service, error) {
+	cfg, ok := config.(*Config)
+	if !ok {
+		return nil, fmt.Errorf("invalid config type for vpcd service")
+	}
+	return &Service{
+		Config: cfg,
+	}, nil
+}
+
+// Start starts the vpcd service.
+func (svc *Service) Start() (int, error) {
+	if err := utils.WritePidFileTo(svc.Config.BaseDir, serviceName, os.Getpid()); err != nil {
+		return 0, fmt.Errorf("write pid file: %w", err)
+	}
+
+	err := launchService(svc.Config)
+	if err != nil {
+		slog.Error("Failed to launch vpcd service", "err", err)
+		return 0, err
+	}
+
+	return os.Getpid(), nil
+}
+
+// Stop stops the vpcd service.
+func (svc *Service) Stop() error {
+	return utils.StopProcessAt(svc.Config.BaseDir, serviceName)
+}
+
+// Status returns the vpcd service status.
+func (svc *Service) Status() (string, error) {
+	return utils.ServiceStatus(svc.Config.BaseDir, serviceName)
+}
+
+// Shutdown gracefully shuts down the vpcd service.
+func (svc *Service) Shutdown() error {
+	return svc.Stop()
+}
+
+// Reload reloads the vpcd service configuration.
+func (svc *Service) Reload() error {
+	return nil
+}
+
+// checkBrInt verifies the OVS integration bridge (br-int) exists.
+// This is the bridge that all VM TAP devices connect to.
+var checkBrInt = func() error {
+	cmd := sudoCommand("ovs-vsctl", "br-exists", "br-int")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("br-int does not exist (%w): run ./scripts/setup-ovn.sh --management", err)
+	}
+	return nil
+}
+
+// checkOVNController verifies ovn-controller is running. Tries legacy socket path, then OVN 22.03+ path, then systemctl.
+var checkOVNController = func() error {
+	if sudoCommand("ovs-appctl", "-t", "ovn-controller", "version").Run() == nil {
+		return nil
+	}
+	if matches, _ := filepath.Glob("/var/run/ovn/ovn-controller.*.ctl"); len(matches) > 0 {
+		if sudoCommand("ovs-appctl", "-t", matches[0], "version").Run() == nil {
+			return nil
+		}
+	}
+	if sudoCommand("systemctl", "is-active", "--quiet", "ovn-controller").Run() == nil {
+		return nil
+	}
+
+	return fmt.Errorf("ovn-controller is not running: run ./scripts/setup-ovn.sh --management")
+}
+
+// localSystemID returns the OVS external-ids:system-id (the chassis name in the Southbound DB).
+// Uses Output() not CombinedOutput(): AmbientCapabilities causes sudo's PAM to emit stderr noise
+// that would corrupt the system-id and cause discoverChassis to misidentify the local chassis.
+var localSystemID = func() (string, error) {
+	out, err := sudoCommand("ovs-vsctl", "get", "open_vswitch", ".", "external-ids:system-id").Output()
+	if err != nil {
+		var stderr string
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			stderr = strings.TrimSpace(string(exitErr.Stderr))
+		}
+		return "", fmt.Errorf("ovs-vsctl get system-id: %s: %w", stderr, err)
+	}
+	return strings.Trim(strings.TrimSpace(string(out)), "\""), nil
+}
+
+// discoverChassis queries the OVN Southbound DB for chassis names, filtering out stale local entries.
+// Stale rows (from a system-id change) must be excluded to prevent gateway ports binding to phantom chassis.
+var discoverChassis = func(sbAddr string) ([]string, error) {
+	localID, err := localSystemID()
+	if err != nil {
+		return nil, fmt.Errorf("discover chassis: %w", err)
+	}
+	localHostname, _ := os.Hostname()
+
+	args := []string{"--no-leader-only"}
+	if sbAddr != "" {
+		args = append(args, "--db="+sbAddr)
+	}
+	// OVN 25.03+ removed "list-chassis"; use "--columns=name,hostname list Chassis" instead.
+	// Output() not CombinedOutput(): sudo PAM stderr would corrupt name/hostname parsing.
+	args = append(args, "--bare", "--columns=name,hostname", "list", "Chassis")
+	out, err := sudoCommand("ovn-sbctl", args...).Output()
+	if err != nil {
+		var stderr string
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			stderr = strings.TrimSpace(string(exitErr.Stderr))
+		}
+		return nil, fmt.Errorf("ovn-sbctl list Chassis: %s: %w", stderr, err)
+	}
+
+	return parseChassisList(string(out), localID, localHostname), nil
+}
+
+// parseChassisList parses ovn-sbctl --bare --columns=name,hostname output (name/hostname pairs separated by blank lines)
+// and filters out stale chassis on the local host.
+func parseChassisList(raw, localID, localHostname string) []string {
+	var names []string
+	var pair []string
+	for line := range strings.SplitSeq(strings.TrimSpace(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			if len(pair) == 2 {
+				names = appendIfActive(names, pair[0], pair[1], localID, localHostname)
+			}
+			pair = pair[:0]
+			continue
+		}
+		pair = append(pair, line)
+	}
+	if len(pair) == 2 { // last row may have no trailing blank line
+		names = appendIfActive(names, pair[0], pair[1], localID, localHostname)
+	}
+	return names
+}
+
+func appendIfActive(names []string, name, hostname, localID, localHostname string) []string {
+	if hostname == localHostname && name != localID {
+		slog.Info("discoverChassis: skipping stale local chassis", "name", name, "hostname", hostname, "localID", localID)
+		return names
+	}
+	return append(names, name)
+}
+
+// preflightOVN runs all OVN preflight checks and returns the first failure.
+func preflightOVN() error {
+	if err := checkBrInt(); err != nil {
+		return fmt.Errorf("OVN preflight failed: %w", err)
+	}
+	if err := checkOVNController(); err != nil {
+		return fmt.Errorf("OVN preflight failed: %w", err)
+	}
+	return nil
+}
+
+// externalCIDRFromBridge returns the first IPv4 CIDR on the named bridge.
+// Injected as a var so tests can stub it without a real interface.
+var externalCIDRFromBridge = func(bridge string) (netip.Prefix, error) {
+	iface, err := net.InterfaceByName(bridge)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("interface %q: %w", bridge, err)
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("addrs %q: %w", bridge, err)
+	}
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		v4 := ipnet.IP.To4()
+		if v4 == nil {
+			continue
+		}
+		ones, _ := ipnet.Mask.Size()
+		addr, _ := netip.AddrFromSlice(v4)
+		return netip.PrefixFrom(addr, ones), nil
+	}
+	return netip.Prefix{}, fmt.Errorf("no IPv4 address on %q", bridge)
+}
+
+// resolveExternalCIDR blocks until the WAN bridge has an IPv4 address or timeout elapses.
+// Guards the boot race where vpcd starts before systemd-networkd or netplan assigns the uplink address.
+func resolveExternalCIDR(ctx context.Context, bridge string, timeout time.Duration) (netip.Prefix, error) {
+	const retryDelay = 500 * time.Millisecond
+	deadline := time.Now().Add(timeout)
+	attempt := 0
+	for {
+		attempt++
+		cidr, err := externalCIDRFromBridge(bridge)
+		if err == nil {
+			if attempt > 1 {
+				slog.Info("vpcd: external CIDR resolved", "bridge", bridge, "cidr", cidr.String(), "attempts", attempt)
+			}
+			return cidr, nil
+		}
+		if time.Now().After(deadline) {
+			return netip.Prefix{}, fmt.Errorf("external CIDR not resolved on %q after %s (%d attempts): %w",
+				bridge, timeout, attempt, err)
+		}
+		slog.Warn("vpcd: external CIDR not yet assigned, retrying",
+			"bridge", bridge, "err", err, "attempt", attempt, "retry_in", retryDelay)
+		select {
+		case <-ctx.Done():
+			return netip.Prefix{}, fmt.Errorf("external CIDR resolution cancelled: %w", ctx.Err())
+		case <-time.After(retryDelay):
+		}
+	}
+}
+
+// ensureExternalCIDRReady blocks until the WAN bridge has an IPv4 address within the timeout.
+// No-op when externalMode is empty (overlay-only). Missing address indicates boot race or misconfiguration.
+func ensureExternalCIDRReady(ctx context.Context, externalMode, bridge string) error {
+	if externalMode == "" {
+		return nil
+	}
+	cidr, err := resolveExternalCIDR(ctx, bridge, 30*time.Second)
+	if err != nil {
+		slog.Error("vpcd: external CIDR resolution failed", "bridge", bridge, "err", err)
+		return err
+	}
+	slog.Info("vpcd: external CIDR resolved at startup", "bridge", bridge, "cidr", cidr.String())
+	return nil
+}
+
+func launchService(cfg *Config) error {
+	slog.Info("Starting vpcd service",
+		"ovn_nb_addr", cfg.OVNNBAddr,
+		"nats_host", cfg.NatsHost,
+	)
+
+	if err := preflightOVN(); err != nil {
+		slog.Error("OVN preflight check failed — vpcd cannot start without OVN", "err", err)
+		return err
+	}
+	slog.Info("OVN preflight passed (br-int exists, ovn-controller running)")
+
+	nc, err := utils.ConnectNATSWithRetry(admin.DialTarget(cfg.NatsHost), cfg.NatsToken, cfg.NatsCACert)
+	if err != nil {
+		slog.Error("Failed to connect to NATS", "err", err)
+		return err
+	}
+	defer nc.Close()
+
+	if cfg.OVNNBAddr == "" {
+		return fmt.Errorf("OVN NB DB address not configured (ovn_nb_addr is empty)")
+	}
+
+	liveClient := ovn.NewLiveClient(cfg.OVNNBAddr)
+	ctx := context.Background()
+	if err := liveClient.Connect(ctx); err != nil {
+		slog.Error("Failed to connect to OVN NB DB", "endpoint", cfg.OVNNBAddr, "err", err)
+		return fmt.Errorf("connect OVN NB DB: %w", err)
+	}
+	defer liveClient.Close()
+	slog.Info("Connected to OVN NB DB", "endpoint", cfg.OVNNBAddr)
+
+	bridgeMode, wanBridge := resolveBridgeConfig(cfg.BridgeMode, cfg.ExternalInterface)
+	slog.Info("External bridge mode", "mode", bridgeMode, "wan_bridge", wanBridge)
+	if err := verifyBridgeMode(bridgeMode, cfg.ExternalInterface, wanBridge); err != nil {
+		slog.Error("vpcd: bridge mode sanity check failed", "err", err)
+		return err
+	}
+
+	if err := ensureExternalCIDRReady(ctx, cfg.ExternalMode, wanBridge); err != nil {
+		return err
+	}
+
+	if cfg.ExternalMode != "" {
+		slog.Info("External network enabled", "mode", cfg.ExternalMode, "pools", len(cfg.ExternalPools))
+	}
+	// Fail-start if no chassis found — missing chassis means ovn-controller hasn't registered yet (boot race).
+	chassisNames, err := discoverChassis(cfg.OVNSBAddr)
+	if err != nil {
+		return fmt.Errorf("vpcd: discover OVN chassis: %w", err)
+	}
+	if len(chassisNames) == 0 {
+		return fmt.Errorf("vpcd: no OVN chassis registered in SBDB — is ovn-controller running and connected?")
+	}
+	slog.Info("vpcd: gateway chassis discovered", "chassis", chassisNames)
+
+	uplinkMode := host.UplinkModePhysical
+	if bridgeMode == BridgeModeVeth {
+		uplinkMode = host.UplinkModeVeth
+	}
+	natMode := policy.NATModeFromUplinkMode(uplinkMode)
+
+	var topoOpts []topology.Option
+	if dns := pickDNSServer(cfg.ExternalPools); dns != "" {
+		topoOpts = append(topoOpts, topology.WithDNSServer(func() string { return dns }))
+	}
+	topoMgr := topology.NewLiveManager(liveClient, topoOpts...)
+
+	sgMgr := policy.NewSecurityGroupManager(liveClient)
+	natMgr, err := policy.NewNATManager(liveClient, natMode,
+		policy.WithFlowsBarrier(waitForFlowsHV),
+		policy.WithNeighFlusher(neighFlusher(wanBridge)),
+		policy.WithNeighPrimer(neighPrimer(wanBridge)),
+	)
+	if err != nil {
+		return fmt.Errorf("construct NAT manager: %w", err)
+	}
+	routeMgr := policy.NewRouteManager(liveClient)
+
+	var igwPool *external.ExternalPoolConfig
+	if cfg.ExternalMode != "" && len(cfg.ExternalPools) > 0 {
+		p := externalPoolConfigToShared(cfg.ExternalPools[0])
+		igwPool = &p
+	}
+
+	js, err := nc.JetStream()
+	if err != nil {
+		return fmt.Errorf("get JetStream context: %w", err)
+	}
+
+	// Create IMDS KV at replica=1; daemon upgrades replicas later. Using chassis count here
+	// could exceed the NATS node count and fail bucket creation.
+	imdsVethKV, _, err := handlers_imds.InitBuckets(js, 1)
+	if err != nil {
+		return fmt.Errorf("init imds buckets: %w", err)
+	}
+	imdsTopoMgr, err := external.NewIMDSTopologyManager(liveClient, handlers_imds.NewVethStore(imdsVethKV))
+	if err != nil {
+		return fmt.Errorf("construct IMDS topology manager: %w", err)
+	}
+
+	// vpcd holds the network capabilities needed for IMDS; STS/IAM stay in awsgw over NATS.
+	imdsCtx, cancelIMDS := context.WithCancel(ctx)
+	defer cancelIMDS()
+	imdsSvc, err := handlers_imds.NewIMDSServiceImpl(
+		nc,
+		handlers_imds.NewNATSSTSAssumer(nc),
+		handlers_imds.NewNATSProfileLookup(nc),
+		handlers_imds.NewNATSPublicKeyLookup(nc),
+		max(len(chassisNames), 1),
+		host.EnsureIMDSVeth, host.RemoveIMDSVeth,
+	)
+	if err != nil {
+		return fmt.Errorf("construct IMDS service: %w", err)
+	}
+	go func() {
+		if err := imdsSvc.Run(imdsCtx); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("vpcd: IMDS service exited", "err", err)
+		}
+	}()
+
+	dhcpMgr, dhcpSubs, err := startDHCPManagerIfNeeded(ctx, nc, js, cfg)
+	if err != nil {
+		return fmt.Errorf("start dhcp manager: %w", err)
+	}
+	defer func() {
+		for _, s := range dhcpSubs {
+			_ = s.Unsubscribe()
+		}
+		if dhcpMgr != nil {
+			dhcpMgr.Stop()
+		}
+	}()
+
+	gwAllocator := pickGatewayAllocator(igwPool, liveClient, dhcpMgr)
+	igwMgr, err := external.NewIGWManager(external.IGWManagerConfig{
+		OVN:          liveClient,
+		Routes:       routeMgr,
+		NAT:          natMgr,
+		Pool:         igwPool,
+		Allocator:    gwAllocator,
+		Chassis:      chassisNames,
+		NATMode:      natMode,
+		FlowsBarrier: waitForFlowsHV,
+	})
+	if err != nil {
+		return fmt.Errorf("construct IGW manager: %w", err)
+	}
+	eipMgr, err := external.NewEIPManager(natMgr, waitForFlowsHV)
+	if err != nil {
+		return fmt.Errorf("construct EIP manager: %w", err)
+	}
+	natgwMgr, err := external.NewNATGWManager(natMgr)
+	if err != nil {
+		return fmt.Errorf("construct NATGW manager: %w", err)
+	}
+
+	// Elect one vpcd for startup reconcile; without this, concurrent Get-then-Create on Logical_Router
+	// produces duplicate rows that ovn-nbctl rejects. Runtime events still fan out via queue groups.
+	holder, _ := os.Hostname()
+	releaseLeader, isLeader := reconcile.AcquireLeader(nc, holder)
+
+	subscriber, err := subscribers.New(subscribers.Config{
+		Topology: topoMgr,
+		SG:       sgMgr,
+		EIP:      eipMgr,
+		NATGW:    natgwMgr,
+		IGW:      igwMgr,
+		IMDS:     imdsTopoMgr,
+	})
+	if err != nil {
+		return fmt.Errorf("construct subscriber: %w", err)
+	}
+	subs, err := subscriber.Subscribe(nc)
+	if err != nil {
+		slog.Error("Failed to subscribe to VPC topics", "err", err)
+		return err
+	}
+	defer func() {
+		for _, s := range subs {
+			_ = s.Unsubscribe()
+		}
+	}()
+
+	rec, err := reconcile.New(reconcile.Config{
+		OVN:          liveClient,
+		SG:           sgMgr,
+		NAT:          natMgr,
+		Routes:       routeMgr,
+		IGW:          igwMgr,
+		Topology:     topoMgr,
+		IMDS:         imdsTopoMgr,
+		LocalAZ:      cfg.AZ,
+		NodeHostname: holder,
+		Chassis:      chassisNames,
+		GatewayClaim: host.NewGatewayClaimProber(cfg.OVNSBAddr),
+		DNSServer:    pickDNSServer(cfg.ExternalPools),
+	})
+	if err != nil {
+		return fmt.Errorf("construct reconciler: %w", err)
+	}
+
+	// Startup reconcile (leader-gated, apply-only). Orphan pruning is skipped because intent may be stale:
+	// a peer's vpc.create-sg could be mid-flight and a prune would sweep those port groups as orphans.
+	// Drift loop uses full Reconcile.
+	if isLeader {
+		intent, intentErr := reconcile.LoadIntentFromKV(ctx, js, cfg.AZ)
+		if intentErr != nil {
+			slog.Warn("vpcd: startup intent load failed", "err", intentErr)
+		} else if err := rec.ReconcileApplyOnly(ctx, intent); err != nil {
+			slog.Warn("vpcd: startup reconcile failed", "err", err)
+		}
+		releaseLeader()
+	}
+
+	// Periodic drift detection, leader-gated so only one vpcd scans at a time.
+	loopCtx, loopCancel := context.WithCancel(ctx)
+	defer loopCancel()
+	loopDone := make(chan struct{})
+	go func() {
+		reconcile.DriftLoop(loopCtx, rec, nc, cfg.AZ, holder)
+		close(loopDone)
+	}()
+
+	slog.Info("vpcd service started, waiting for VPC lifecycle events",
+		"subscriptions", len(subs))
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+
+	slog.Info("vpcd service shutting down")
+	loopCancel()
+	<-loopDone
+	return nil
+}
+
+// pickDNSServer returns the OVN dhcp_options dns_server from the first unscoped pool with DNS servers.
+// Empty falls back to topology.NewLiveManager's default.
+func pickDNSServer(pools []ExternalPoolConfig) string {
+	for _, p := range pools {
+		if p.Region == "" && p.AZ == "" && len(p.DNSServers) > 0 {
+			return "{" + strings.Join(p.DNSServers, ", ") + "}"
+		}
+	}
+	return ""
+}
+
+// startDHCPManagerIfNeeded starts the per-AZ DHCP Manager when any pool has Source="dhcp".
+// Returns (nil, nil, nil) when not needed.
+func startDHCPManagerIfNeeded(ctx context.Context, nc *nats.Conn, js nats.JetStreamContext, cfg *Config) (*dhcp.Manager, []*nats.Subscription, error) {
+	if cfg == nil || cfg.ExternalMode == "" {
+		return nil, nil, nil
+	}
+	wantDHCP := false
+	for _, p := range cfg.ExternalPools {
+		if p.Source == external.SourceDHCP {
+			wantDHCP = true
+			break
+		}
+	}
+	if !wantDHCP {
+		return nil, nil, nil
+	}
+
+	store, err := dhcp.NewStore(js, cfg.AZ)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create dhcp lease store: %w", err)
+	}
+	mgr, err := dhcp.NewManager(dhcp.ManagerConfig{
+		Client: dhcp.NewNClient4(0),
+		Store:  store,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("create dhcp manager: %w", err)
+	}
+	if err := mgr.Start(ctx); err != nil {
+		return nil, nil, fmt.Errorf("start dhcp manager: %w", err)
+	}
+	subs, err := mgr.Subscribe(nc)
+	if err != nil {
+		mgr.Stop()
+		return nil, nil, fmt.Errorf("subscribe dhcp manager: %w", err)
+	}
+	slog.Info("vpcd: dhcp manager started", "az", cfg.AZ, "subscriptions", len(subs))
+	return mgr, subs, nil
+}
+
+// pickGatewayAllocator returns a DHCPGatewayLRPAllocator for DHCP-sourced pools; otherwise StaticRangeAllocator.
+func pickGatewayAllocator(pool *external.ExternalPoolConfig, ovnClient ovn.Client, mgr *dhcp.Manager) external.GatewayIPAllocator {
+	if pool.IsDHCP() && mgr != nil {
+		return dhcp.NewDHCPGatewayLRPAllocator(mgr)
+	}
+	return external.NewStaticRangeAllocator(ovnClient)
+}
+
+// externalPoolConfigToShared translates vpcd's ExternalPoolConfig into the network/external shared type.
+func externalPoolConfigToShared(p ExternalPoolConfig) external.ExternalPoolConfig {
+	return external.ExternalPoolConfig{
+		Name:            p.Name,
+		Source:          p.Source,
+		BindBridge:      p.BindBridge,
+		RangeStart:      p.RangeStart,
+		RangeEnd:        p.RangeEnd,
+		Gateway:         p.Gateway,
+		GatewayIP:       p.GatewayIP,
+		PrefixLen:       p.PrefixLen,
+		DNSServers:      p.DNSServers,
+		Region:          p.Region,
+		AZ:              p.AZ,
+		GwLrpRangeStart: p.GwLrpRangeStart,
+		GwLrpRangeEnd:   p.GwLrpRangeEnd,
+	}
+}
+
+// resolveBridgeConfig picks bridge mode (auto-detecting when unset) and always uses "br-wan" as the WAN bridge.
+func resolveBridgeConfig(cfgBridgeMode, externalIface string) (string, string) {
+	bridgeMode := cfgBridgeMode
+	if bridgeMode == "" && externalIface != "" {
+		bridgeMode = detectBridgeMode(externalIface)
+	}
+	return bridgeMode, "br-wan"
+}
+
+// neighFlusher builds the ARP-flush hook for AddEIP/DeleteEIP so recycled IPs re-resolve L2 immediately.
+// No-op when wanBridge is unset.
+func neighFlusher(wanBridge string) policy.NeighFlusher {
+	return func(externalIP string) error {
+		if wanBridge == "" {
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return host.FlushNeigh(ctx, nil, wanBridge, externalIP)
+	}
+}
+
+// neighPrimer builds the ARP-prime hook for distributed EIPs so recycled IPs are reachable immediately
+// without waiting for an ARP reply. No-op when wanBridge or MAC is unset.
+func neighPrimer(wanBridge string) policy.NeighPrimer {
+	return func(eip policy.EIPSpec) error {
+		if wanBridge == "" || eip.MAC == "" {
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return host.ReplaceNeigh(ctx, nil, wanBridge, eip.ExternalIP, eip.MAC)
+	}
+}
+
+// ifaceExists returns true when the kernel reports the named link.
+var ifaceExists = func(name string) bool {
+	return exec.Command("ip", "link", "show", name).Run() == nil
+}
+
+// detectBridgeMode infers bridge mode: veth when veth-wan-ovs exists, direct otherwise.
+// Each branch logs at Info/Warn so `journalctl | grep bridge` shows the full detection trail.
+func detectBridgeMode(externalIface string) string {
+	if ifaceExists("veth-wan-ovs") {
+		slog.Info("vpcd: detected veth pair linking Linux bridge to OVS", "mode", BridgeModeVeth)
+		return BridgeModeVeth
+	}
+	slog.Warn("vpcd: no veth interface found, assuming direct bridge mode",
+		"external_iface", externalIface, "checked_veth", "veth-wan-ovs",
+		"mode", BridgeModeDirect)
+	return BridgeModeDirect
+}
+
+// portToBr returns the OVS bridge owning port, or "" if not in OVSDB.
+// Uses Output() not CombinedOutput(): AmbientCapabilities causes sudo PAM stderr that would corrupt the bridge name.
+var portToBr = func(port string) (string, error) {
+	out, err := sudoCommand("ovs-vsctl", "port-to-br", port).Output()
+	if err != nil {
+		var stderr string
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			stderr = strings.TrimSpace(string(exitErr.Stderr))
+		}
+		return "", fmt.Errorf("ovs-vsctl port-to-br %s: %s: %w", port, stderr, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// readLinkMaster returns the master of a kernel link via /sys/class/net/<iface>/master, or "" if none.
+var readLinkMaster = func(iface string) (string, error) {
+	target, err := os.Readlink(filepath.Join("/sys/class/net", iface, "master"))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Base(target), nil
+}
+
+// verifyBridgeMode validates that the chosen mode matches host plumbing. Fail-start on mismatch:
+// direct requires ExternalInterface on the WAN OVS bridge; veth requires veth-wan-ovs on OvnExternalBridge
+// and veth-wan-br enslaved to the WAN Linux bridge.
+func verifyBridgeMode(mode, externalIface, wanBridge string) error {
+	switch mode {
+	case BridgeModeDirect:
+		if externalIface == "" {
+			return fmt.Errorf("vpcd: direct bridge mode requires external_interface (the WAN NIC name)")
+		}
+		if wanBridge == "" {
+			return fmt.Errorf("vpcd: direct bridge mode requires the WAN bridge (the OVS bridge holding the WAN NIC)")
+		}
+		br, err := portToBr(externalIface)
+		if err != nil {
+			return fmt.Errorf("vpcd: direct bridge mode: %w", err)
+		}
+		if br != wanBridge {
+			return fmt.Errorf("vpcd: direct bridge mode: %q is on OVS bridge %q, expected %q",
+				externalIface, br, wanBridge)
+		}
+		return nil
+	case BridgeModeVeth:
+		if wanBridge == "" {
+			return fmt.Errorf("vpcd: veth bridge mode requires wan_bridge (the Linux bridge holding the WAN NIC)")
+		}
+		br, err := portToBr("veth-wan-ovs")
+		if err != nil {
+			return fmt.Errorf("vpcd: veth bridge mode: veth-wan-ovs not on OVS — is spinifex-veth-wan.service running? %w", err)
+		}
+		if br != OvnExternalBridge {
+			return fmt.Errorf("vpcd: veth bridge mode: veth-wan-ovs is on OVS bridge %q, expected %q",
+				br, OvnExternalBridge)
+		}
+		master, err := readLinkMaster("veth-wan-br")
+		if err != nil {
+			return fmt.Errorf("vpcd: veth bridge mode: veth-wan-br missing or has no master — is spinifex-veth-wan.service running? %w", err)
+		}
+		if master != wanBridge {
+			return fmt.Errorf("vpcd: veth bridge mode: veth-wan-br master is %q, expected %q (wan_bridge)",
+				master, wanBridge)
+		}
+		return nil
+	default:
+		return fmt.Errorf("vpcd: unknown bridge_mode %q — supported values: %q, %q",
+			mode, BridgeModeDirect, BridgeModeVeth)
+	}
+}

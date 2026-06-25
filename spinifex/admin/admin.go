@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"text/template"
@@ -43,13 +44,12 @@ type ConfigSettings struct {
 	LogDir    string
 	ConfigDir string
 
-	// Add more fields as needed
 	Node   string
 	Az     string
 	Port   string
 	BindIP string
-	// AdvertiseIP is the off-host dial target rendered into the local node's
-	// [nodes.X].advertise field. Empty → callers fall back to BindIP.
+	// AdvertiseIP is the off-host dial target rendered into [nodes.X].advertise.
+	// Empty → callers fall back to BindIP.
 	AdvertiseIP string
 
 	// Cluster settings
@@ -59,6 +59,10 @@ type ConfigSettings struct {
 
 	// Predastore multi-node
 	PredastoreNodeID int
+
+	// CompactionIntervalSeconds gates the predastore [compaction] block. Zero
+	// means unset: no block is emitted and predastore keeps its built-in default.
+	CompactionIntervalSeconds int
 
 	// Node capabilities
 	Services []string
@@ -71,21 +75,18 @@ type ConfigSettings struct {
 	// External networking for public subnets
 	ExternalMode   string   // "pool" or "" (disabled)
 	ExternalIface  string   // WAN NIC name (e.g., "eth0", "eth1")
-	DhcpBindBridge string   // Bridge where the DHCP AF_PACKET socket binds (Linux bridge in veth mode, OVS bridge in direct mode; never "br-ext")
-	ExternalDHCP   bool     // Obtain gateway IP via DHCP on macvlan/bridge
 	PoolName       string   // External pool name (e.g., "wan")
-	PoolSource     string   // IP source: "static" (default) or "dhcp" (from router DHCP)
-	PoolStart      string   // First IP in external pool range (static source only)
-	PoolEnd        string   // Last IP in external pool range (static source only)
+	PoolSource     string   // IP source: "static" or "dhcp"
+	PoolBindBridge string   // Linux bridge for upstream DORA (source=dhcp only)
+	PoolStart      string   // First IP in external pool range (static only)
+	PoolEnd        string   // Last IP in external pool range (static only)
 	PoolGateway    string   // WAN gateway IP
-	PoolGatewayIP  string   // Explicit SNAT IP (for nat mode without DHCP)
+	PoolGatewayIP  string   // Explicit SNAT IP (overrides default of first IP in range)
 	PoolPrefixLen  int      // Subnet prefix length (default 24)
 	PoolDNSServers []string // DNS servers for VM DHCP (auto-detected from host)
 
-	// OperatorEmail is the address collected at install time (TUI, SPINIFEX_EMAIL,
-	// or `spx admin init --email`). Written under [operator] in spinifex.toml so
-	// reset-dev-env.sh can preserve it across wipes. Empty means no operator
-	// identity was supplied.
+	// OperatorEmail is the address collected at install time. Written under [operator]
+	// in spinifex.toml so it survives wipes. Empty means no identity was supplied.
 	OperatorEmail string
 
 	// Other nodes in the cluster (for config source of truth)
@@ -99,6 +100,20 @@ type ConfigSettings struct {
 	BootstrapIgwId      string
 	BootstrapCidr       string
 	BootstrapSubnetCidr string
+
+	// GPUPassthrough enables VFIO GPU passthrough in the daemon config.
+	// Sets gpu_passthrough = true under [nodes.<node>.daemon].
+	GPUPassthrough bool
+
+	// IPSecEnabled toggles cluster-wide OVN native IPsec on intra-AZ Geneve.
+	// Written under [network] in spinifex.toml; daemon reads it via cluster config.
+	IPSecEnabled bool
+
+	// EncryptionKeyFile is the path to the cluster-wide viperblock at-rest
+	// encryption key, rendered into [nodes.X.viperblock].encryption_key_file.
+	// Empty means no key was provisioned and volumes are written cleartext
+	// (legacy mode); the template omits the field entirely in that case.
+	EncryptionKeyFile string
 }
 
 // PredastoreNodeConfig describes a single Predastore node for multi-node config generation.
@@ -124,22 +139,19 @@ func GenerateConfigFiles(configs []ConfigFile, configSettings ConfigSettings) er
 	return nil
 }
 
-// generateConfigFile creates a configuration file from a template
+// GenerateConfigFile creates a configuration file from a template.
 func GenerateConfigFile(configPath string, configTemplate string, configSettings ConfigSettings) error {
-	// Parse the embedded template
 	tmpl, err := template.New("config").Parse(configTemplate)
 	if err != nil {
 		return fmt.Errorf("failed to parse template: %w", err)
 	}
 
-	// Create file with secure permissions
 	f, err := os.OpenFile(configPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to create config file: %w", err)
 	}
 	defer f.Close()
 
-	// Execute template
 	if err := tmpl.Execute(f, configSettings); err != nil {
 		return fmt.Errorf("failed to execute template: %w", err)
 	}
@@ -147,8 +159,22 @@ func GenerateConfigFile(configPath string, configTemplate string, configSettings
 	return nil
 }
 
-func GenerateCertificatesIfNeeded(configDir string, force bool, bindIP string) (caCertPath string) {
-	// Certificate paths
+// AWSGWServiceDNSNames builds the AWS-parity TLS SANs for the awsgw cert from
+// the cluster region and internal suffix: the exact ECR control-plane host and
+// the wildcard covering per-account registry hosts. Returns nil if either input
+// is empty so callers omit the SANs rather than emitting malformed names.
+func AWSGWServiceDNSNames(region, suffix string) []string {
+	if region == "" || suffix == "" {
+		return nil
+	}
+	base := "ecr." + region + "." + suffix
+	return []string{
+		base,            // control plane: ecr.{region}.{suffix}
+		"*.dkr." + base, // registry: *.dkr.ecr.{region}.{suffix}
+	}
+}
+
+func GenerateCertificatesIfNeeded(configDir string, force bool, bindIP string, awsRegion, internalSuffix string) (caCertPath string) {
 	caCertPath = filepath.Join(configDir, "ca.pem")
 	caKeyPath := filepath.Join(configDir, "ca.key")
 	serverCertPath := filepath.Join(configDir, "server.pem")
@@ -162,7 +188,6 @@ func GenerateCertificatesIfNeeded(configDir string, force bool, bindIP string) (
 	if needsGeneration {
 		fmt.Println("\n🔐 Generating Certificate Authority and SSL certificates...")
 
-		// Step 1: Generate CA certificate
 		if err := GenerateCACert(caCertPath, caKeyPath); err != nil {
 			fmt.Fprintf(os.Stderr, "Error generating CA certificate: %v\n", err)
 			os.Exit(1)
@@ -171,8 +196,8 @@ func GenerateCertificatesIfNeeded(configDir string, force bool, bindIP string) (
 		fmt.Printf("   CA Certificate: %s\n", caCertPath)
 		fmt.Printf("   CA Key: %s\n", caKeyPath)
 
-		// Step 2: Generate server certificate signed by CA (with bind IP in SANs)
-		if err := GenerateSignedCert(serverCertPath, serverKeyPath, caCertPath, caKeyPath, bindIP); err != nil {
+		extraDNS := AWSGWServiceDNSNames(awsRegion, internalSuffix)
+		if err := GenerateSignedCertWithDNS(serverCertPath, serverKeyPath, caCertPath, caKeyPath, []string{bindIP}, extraDNS); err != nil {
 			fmt.Fprintf(os.Stderr, "Error generating server certificate: %v\n", err)
 			os.Exit(1)
 		}
@@ -195,24 +220,23 @@ func GenerateCertificatesIfNeeded(configDir string, force bool, bindIP string) (
 }
 
 // GenerateServerCertOnly generates a server certificate signed by an existing CA.
-// Used by joining nodes that receive the CA from the leader.
-func GenerateServerCertOnly(configDir string, bindIP string) error {
+// Used by joining nodes that receive the CA from the leader. awsRegion and
+// internalSuffix add the AWS-parity ECR SANs; empty values omit them.
+func GenerateServerCertOnly(configDir string, bindIP, awsRegion, internalSuffix string) error {
 	caCertPath := filepath.Join(configDir, "ca.pem")
 	caKeyPath := filepath.Join(configDir, "ca.key")
 	serverCertPath := filepath.Join(configDir, "server.pem")
 	serverKeyPath := filepath.Join(configDir, "server.key")
 
-	// Verify CA files exist
 	if !FileExists(caCertPath) || !FileExists(caKeyPath) {
 		return fmt.Errorf("CA files not found in %s", configDir)
 	}
 
-	// Generate server cert signed by CA with this node's bind IP
-	return GenerateSignedCert(serverCertPath, serverKeyPath, caCertPath, caKeyPath, bindIP)
+	extraDNS := AWSGWServiceDNSNames(awsRegion, internalSuffix)
+	return GenerateSignedCertWithDNS(serverCertPath, serverKeyPath, caCertPath, caKeyPath, []string{bindIP}, extraDNS)
 }
 
 func CreateServiceDirectories(spxRoot string) {
-	// Create additional directories
 	dirs := []string{
 		filepath.Join(spxRoot, "images"),
 		filepath.Join(spxRoot, "amis"),
@@ -229,7 +253,6 @@ func CreateServiceDirectories(spxRoot string) {
 
 	fmt.Println("\n📁 Creating directory structure...")
 	for _, dir := range dirs {
-		// Check if directory exists
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
 			if err := os.MkdirAll(dir, 0750); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: Could not create %s: %v\n", dir, err)
@@ -239,16 +262,12 @@ func CreateServiceDirectories(spxRoot string) {
 	fmt.Printf("✅ Directory structure created in %s\n", spxRoot)
 }
 
-// Helper functions
-
 func FileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
 }
 
-// ChownRecursive changes ownership of a path and all its contents to the
-// specified username. Used after init to hand production directories back
-// to the service user when init runs as root via sudo.
+// ChownRecursive changes ownership of path and its contents to username.
 // Best-effort: errors are logged but do not halt the operation.
 func ChownRecursive(path, username string) {
 	u, err := user.Lookup(username)
@@ -297,7 +316,6 @@ func ChownRecursive(path, username string) {
 
 // SetServiceOwnership sets per-service ownership on data/config directories
 // and shared config files to root:spinifex with correct modes.
-// Keep in sync with setup.sh create_directories() and plan doc section 2.
 func SetServiceOwnership() {
 	grp, err := user.LookupGroup("spinifex")
 	if err != nil {
@@ -318,6 +336,7 @@ func SetServiceOwnership() {
 		"/var/lib/spinifex/nats":       "spinifex-nats",
 		"/etc/spinifex/predastore":     "spinifex-storage",
 		"/var/lib/spinifex/predastore": "spinifex-storage",
+		"/etc/spinifex/viperblock":     "spinifex-viperblock",
 		"/var/lib/spinifex/spinifex":   "spinifex-daemon",
 		"/var/lib/spinifex/viperblock": "spinifex-viperblock",
 		"/var/lib/spinifex/vpcd":       "spinifex-vpcd",
@@ -352,11 +371,12 @@ func SetServiceOwnership() {
 	// bootstrap.json lives in the awsgw data dir (not /etc/spinifex),
 	// so /etc/spinifex stays at 0750 (no group-write needed).
 	for path, mode := range map[string]os.FileMode{
-		"/etc/spinifex/spinifex.toml": 0640,
-		"/etc/spinifex/master.key":    0640,
-		"/etc/spinifex/server.pem":    0644,
-		"/etc/spinifex/server.key":    0640,
-		"/etc/spinifex/ca.pem":        0644,
+		"/etc/spinifex/spinifex.toml":             0640,
+		"/etc/spinifex/master.key":                0640,
+		"/etc/spinifex/viperblock/encryption.key": 0640,
+		"/etc/spinifex/server.pem":                0644,
+		"/etc/spinifex/server.key":                0640,
+		"/etc/spinifex/ca.pem":                    0644,
 	} {
 		if _, err := os.Stat(path); err != nil {
 			continue
@@ -370,12 +390,11 @@ func SetServiceOwnership() {
 	}
 }
 
-// updateAWSINIFile updates or creates an AWS INI file section with given key-value pairs
+// UpdateAWSINIFile updates or creates an AWS INI file section with the given key-value pairs.
 func UpdateAWSINIFile(path, section string, values map[string]string) error {
 	var cfg *ini.File
 	var err error
 
-	// Load existing file or create new one
 	if FileExists(path) {
 		cfg, err = ini.Load(path)
 		if err != nil {
@@ -385,27 +404,42 @@ func UpdateAWSINIFile(path, section string, values map[string]string) error {
 		cfg = ini.Empty()
 	}
 
-	// Get or create section
 	sec, err := cfg.NewSection(section)
 	if err != nil {
-		// Section already exists, get it
+		// Section already exists, get it.
 		sec, err = cfg.GetSection(section)
 		if err != nil {
 			return fmt.Errorf("failed to get section: %w", err)
 		}
 	}
 
-	// Set key-value pairs
 	for key, value := range values {
 		sec.Key(key).SetValue(value)
 	}
 
-	// Save with proper permissions
-	return cfg.SaveTo(path)
+	// Write atomically: ini.SaveTo uses os.Create (world-readable); render to a
+	// sibling temp file (0600) and rename to avoid briefly exposing secrets.
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".aws-ini-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp INI file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeds
+	if _, err := cfg.WriteTo(tmp); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to write INI file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to close INI file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("failed to rename INI file into place: %w", err)
+	}
+	return nil
 }
 
-// generateAWSAccessKey generates an AWS-style access key
-// Format: AKIA + 16 random uppercase alphanumeric characters
+// GenerateAWSAccessKey generates an AWS-style access key (AKIA + 16 random alphanumeric chars).
 func GenerateAWSAccessKey() (string, error) {
 	const prefix = "AKIA"
 	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -423,8 +457,7 @@ func GenerateAWSAccessKey() (string, error) {
 	return prefix + string(result), nil
 }
 
-// generateAWSSecretKey generates an AWS-style secret key
-// 40 character base64-encoded string
+// GenerateAWSSecretKey generates a 40-character base64-encoded AWS-style secret key.
 func GenerateAWSSecretKey() (string, error) {
 	bytes := make([]byte, 30) // 30 bytes = 40 chars in base64
 	if _, err := rand.Read(bytes); err != nil {
@@ -459,15 +492,13 @@ func GenerateNATSToken() (string, error) {
 	return "nats_" + base64.URLEncoding.EncodeToString(bytes)[:32], nil
 }
 
-// GenerateCACert generates a Certificate Authority certificate and key
+// GenerateCACert generates a Certificate Authority certificate and key.
 func GenerateCACert(caCertPath, caKeyPath string) error {
-	// Generate CA private key
 	caPrivateKey, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
 		return fmt.Errorf("failed to generate CA private key: %w", err)
 	}
 
-	// Create CA certificate template
 	notBefore := time.Now()
 	notAfter := notBefore.Add(3650 * 24 * time.Hour) // 10 years
 
@@ -490,13 +521,11 @@ func GenerateCACert(caCertPath, caKeyPath string) error {
 		MaxPathLen:            1,
 	}
 
-	// Self-sign the CA certificate
 	caDerBytes, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caPrivateKey.PublicKey, caPrivateKey)
 	if err != nil {
 		return fmt.Errorf("failed to create CA certificate: %w", err)
 	}
 
-	// Write CA certificate to file
 	caCertOut, err := os.Create(caCertPath)
 	if err != nil {
 		return fmt.Errorf("failed to create CA cert file: %w", err)
@@ -507,7 +536,6 @@ func GenerateCACert(caCertPath, caKeyPath string) error {
 		return fmt.Errorf("failed to write CA cert: %w", err)
 	}
 
-	// Write CA private key to file
 	caKeyOut, err := os.OpenFile(caKeyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to create CA key file: %w", err)
@@ -723,15 +751,13 @@ func GenerateSignedCertWithDNS(certPath, keyPath, caCertPath, caKeyPath string, 
 	return nil
 }
 
-// generateSelfSignedCert generates a self-signed SSL certificate (legacy, kept for compatibility)
+// GenerateSelfSignedCert generates a self-signed SSL certificate (legacy, kept for compatibility).
 func GenerateSelfSignedCert(certPath, keyPath string) error {
-	// Generate private key
 	privateKey, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
 		return fmt.Errorf("failed to generate private key: %w", err)
 	}
 
-	// Create certificate template
 	notBefore := time.Now()
 	notAfter := notBefore.Add(3650 * 24 * time.Hour) // 10 years
 
@@ -755,13 +781,11 @@ func GenerateSelfSignedCert(certPath, keyPath string) error {
 		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
 	}
 
-	// Create certificate
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
 	if err != nil {
 		return fmt.Errorf("failed to create certificate: %w", err)
 	}
 
-	// Write certificate to file
 	certOut, err := os.Create(certPath)
 	if err != nil {
 		return fmt.Errorf("failed to create cert file: %w", err)
@@ -772,7 +796,6 @@ func GenerateSelfSignedCert(certPath, keyPath string) error {
 		return fmt.Errorf("failed to write cert: %w", err)
 	}
 
-	// Write private key to file
 	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to create key file: %w", err)
@@ -792,11 +815,6 @@ func GenerateSelfSignedCert(certPath, keyPath string) error {
 }
 
 // SetupAWSCredentials updates ~/.aws/credentials and ~/.aws/config.
-// bindIP is the IP the AWS gateway listens on. If empty or "0.0.0.0", the
-// operator's local ~/.aws/config endpoint_url falls back to "localhost" (this
-// runs on the same box as the gateway). wanIP is reserved for a future
-// --operator-endpoint flag that will let remote operators point their CLI at
-// the host's WAN IP; today it is accepted but unused.
 // When running under sudo, writes to SUDO_USER's home instead of root's.
 func SetupAWSCredentials(accessKey, secretKey, region, certPath, bindIP, wanIP string) error {
 	_ = wanIP
@@ -805,8 +823,6 @@ func SetupAWSCredentials(accessKey, secretKey, region, certPath, bindIP, wanIP s
 		return err
 	}
 
-	// When running under sudo, write to the invoking user's home directory
-	// so the operator can use AWS_PROFILE=spinifex without sudo.
 	sudoUser := os.Getenv("SUDO_USER")
 	if os.Getuid() == 0 && sudoUser != "" {
 		if u, err := user.Lookup(sudoUser); err == nil {
@@ -822,21 +838,8 @@ func SetupAWSCredentials(accessKey, secretKey, region, certPath, bindIP, wanIP s
 	credPath := filepath.Join(awsDir, "credentials")
 	configPath := filepath.Join(awsDir, "config")
 
-	// Determine profile name
-	//profileName := "default"
-
-	// Use Spinifex as the default profile
 	profileName := "spinifex"
 
-	if FileExists(credPath) {
-		// Check if default profile already exists
-		cfg, err := ini.Load(credPath)
-		if err == nil && cfg.HasSection("default") {
-			profileName = "spinifex"
-		}
-	}
-
-	// Update credentials file
 	if err := UpdateAWSINIFile(credPath, profileName, map[string]string{
 		"aws_access_key_id":     accessKey,
 		"aws_secret_access_key": secretKey,
@@ -844,7 +847,6 @@ func SetupAWSCredentials(accessKey, secretKey, region, certPath, bindIP, wanIP s
 		return err
 	}
 
-	// Update config file
 	configSection := profileName
 	if profileName != "default" {
 		configSection = "profile " + profileName
@@ -880,20 +882,21 @@ func SetupAWSCredentials(accessKey, secretKey, region, certPath, bindIP, wanIP s
 // GenerateMultiNodePredastoreConfig produces a complete predastore.toml for a
 // multi-node Predastore cluster. Each node gets its own DB entry (port 6660)
 // and shard entry (port 9991) on a distinct IP. Node ID 1 is the bootstrap leader.
-func GenerateMultiNodePredastoreConfig(templateStr string, nodes []PredastoreNodeConfig, accessKey, secretKey, region, natsToken, configDir, bindIP string) (string, error) {
-	if len(nodes) < 3 {
-		return "", fmt.Errorf("multi-node predastore requires at least 3 nodes, got %d", len(nodes))
+func GenerateMultiNodePredastoreConfig(templateStr string, nodes []PredastoreNodeConfig, accessKey, secretKey, region, natsToken, configDir, bindIP string, compactionIntervalSeconds int) (string, error) {
+	if len(nodes) < 2 {
+		return "", fmt.Errorf("multi-node predastore requires at least 2 nodes, got %d", len(nodes))
 	}
 
 	data := struct {
-		Nodes     []PredastoreNodeConfig
-		AccessKey string
-		SecretKey string
-		Region    string
-		NatsToken string
-		ConfigDir string
-		BindIP    string
-	}{nodes, accessKey, secretKey, region, natsToken, configDir, bindIP}
+		Nodes                     []PredastoreNodeConfig
+		AccessKey                 string
+		SecretKey                 string
+		Region                    string
+		NatsToken                 string
+		ConfigDir                 string
+		BindIP                    string
+		CompactionIntervalSeconds int
+	}{nodes, accessKey, secretKey, region, natsToken, configDir, bindIP, compactionIntervalSeconds}
 
 	tmpl, err := template.New("predastore-multinode").Parse(templateStr)
 	if err != nil {
@@ -930,4 +933,104 @@ func ParsePredastoreNodeIDFromConfig(tomlContent string, ip string) int {
 		return 0
 	}
 	return FindNodeIDByIP(cfg.DB, ip)
+}
+
+// SetMIGProfile idempotently writes mig_profile = "<profile>" for the given node
+// into spinifex.toml. An empty profile clears the setting.
+func SetMIGProfile(tomlPath, node, profile string) error {
+	raw, err := os.ReadFile(tomlPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", tomlPath, err)
+	}
+	text := string(raw)
+	quoted := `"` + profile + `"`
+
+	sectionHeader := "[nodes." + node + ".daemon]"
+	sectionStart := strings.Index(text, sectionHeader)
+	if sectionStart < 0 {
+		text = strings.TrimRight(text, "\n") +
+			"\n\n[nodes." + node + ".daemon]\nmig_profile = " + quoted + "\n"
+		return os.WriteFile(tomlPath, []byte(text), 0640) //nolint:gosec // spinifex.toml is root:spinifex 0640
+	}
+
+	bodyStart := sectionStart + len(sectionHeader)
+	rest := text[bodyStart:]
+	nextSection := strings.Index(rest, "\n[")
+	var body, suffix string
+	if nextSection < 0 {
+		body = rest
+	} else {
+		body = rest[:nextSection]
+		suffix = rest[nextSection:]
+	}
+
+	if regexp.MustCompile(`mig_profile\s*=\s*` + regexp.QuoteMeta(quoted)).MatchString(body) {
+		return nil
+	}
+
+	flipRe := regexp.MustCompile(`mig_profile\s*=\s*"[^"]*"`)
+	var newBody string
+	if flipRe.MatchString(body) {
+		newBody = flipRe.ReplaceAllString(body, "mig_profile = "+quoted)
+	} else {
+		newBody = "\nmig_profile = " + quoted + body
+	}
+
+	text = text[:bodyStart] + newBody + suffix
+	return os.WriteFile(tomlPath, []byte(text), 0640) //nolint:gosec // spinifex.toml is root:spinifex 0640
+}
+
+// SetGPUPassthrough idempotently writes gpu_passthrough = <enabled> for the
+// given node into spinifex.toml, preserving all other content and comments.
+// Returns nil without touching the file if the setting is already correct.
+func SetGPUPassthrough(tomlPath, node string, enabled bool) error {
+	raw, err := os.ReadFile(tomlPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", tomlPath, err)
+	}
+	text := string(raw)
+	value := "false"
+	if enabled {
+		value = "true"
+	}
+
+	sectionHeader := "[nodes." + node + ".daemon]"
+
+	sectionStart := strings.Index(text, sectionHeader)
+	if sectionStart < 0 {
+		// No daemon section — append one.
+		text = strings.TrimRight(text, "\n") +
+			"\n\n[nodes." + node + ".daemon]\ngpu_passthrough = " + value + "\n"
+		return os.WriteFile(tomlPath, []byte(text), 0640) //nolint:gosec // spinifex.toml is root:spinifex 0640 so the daemon can read it
+	}
+
+	// Extract body of just this section (stops at the next section header).
+	bodyStart := sectionStart + len(sectionHeader)
+	rest := text[bodyStart:]
+	nextSection := strings.Index(rest, "\n[")
+	var body, suffix string
+	if nextSection < 0 {
+		body = rest
+	} else {
+		body = rest[:nextSection]
+		suffix = rest[nextSection:]
+	}
+
+	// Already correct — no-op.
+	if regexp.MustCompile(`gpu_passthrough\s*=\s*` + value).MatchString(body) {
+		return nil
+	}
+
+	// Key exists with wrong value — flip within this section only.
+	flipRe := regexp.MustCompile(`gpu_passthrough\s*=\s*(?:true|false)`)
+	var newBody string
+	if flipRe.MatchString(body) {
+		newBody = flipRe.ReplaceAllString(body, "gpu_passthrough = "+value)
+	} else {
+		// Key absent — insert right after section header.
+		newBody = "\ngpu_passthrough = " + value + body
+	}
+
+	text = text[:bodyStart] + newBody + suffix
+	return os.WriteFile(tomlPath, []byte(text), 0640) //nolint:gosec // spinifex.toml is root:spinifex 0640 so the daemon can read it
 }

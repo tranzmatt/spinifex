@@ -12,16 +12,14 @@ const { routerState, sdk } = vi.hoisted(() => {
     readonly input: unknown
   }
   const handlers = new Map<string, (input: unknown) => unknown>()
-  const send = vi.fn((command: Command): Promise<unknown> => {
+  const send = vi.fn(async (command: Command): Promise<unknown> => {
     const handler = handlers.get(command.constructor.name)
     if (!handler) {
-      return Promise.reject(
-        new Error(
-          `No handler registered for SDK command ${command.constructor.name}`,
-        ),
+      throw new Error(
+        `No handler registered for SDK command ${command.constructor.name}`,
       )
     }
-    return Promise.resolve(handler(command.input))
+    return handler(command.input)
   })
   return {
     routerState: { navigate: vi.fn() },
@@ -120,7 +118,7 @@ describe("target-group detail route", () => {
     renderWithClient(<TargetGroupDetailPage arn={TG_ARN} />, seed())
 
     expect(screen.getByText("my-tg")).toBeInTheDocument()
-    expect(screen.getByText("Target group details")).toBeInTheDocument()
+    expect(screen.getByText("Target Group Details")).toBeInTheDocument()
     expect(screen.getByText(TG_ARN)).toBeInTheDocument()
     expect(screen.getByText("instance")).toBeInTheDocument()
   })

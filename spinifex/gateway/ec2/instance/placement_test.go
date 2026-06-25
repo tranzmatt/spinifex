@@ -177,7 +177,7 @@ func TestQueryNodeCapacity_FiltersEligibleNodes(t *testing.T) {
 	defer sub.Unsubscribe()
 
 	// Query for t3.micro — should get node-1 (cap 4) and node-3 (cap 2), not node-2 (cap 0)
-	nodes, err := queryNodeCapacity(nc, "t3.micro")
+	nodes, err := queryNodeCapacity(nc, "t3.micro", 3, "test-account")
 	require.NoError(t, err)
 
 	assert.Len(t, nodes, 2)
@@ -192,7 +192,7 @@ func TestQueryNodeCapacity_NoNodes(t *testing.T) {
 	_, nc := startTestNATSServer(t)
 
 	// No subscribers → timeout, empty result
-	nodes, err := queryNodeCapacity(nc, "t3.micro")
+	nodes, err := queryNodeCapacity(nc, "t3.micro", 2, "test-account")
 	require.NoError(t, err)
 	assert.Len(t, nodes, 0)
 }
@@ -393,7 +393,7 @@ func TestDistributeInstances_SuccessfulSpread(t *testing.T) {
 		MaxCount:     aws.Int64(2),
 	}
 
-	reservation, err := distributeInstances(input, nc, "test-account")
+	reservation, err := distributeInstances(input, nc, "test-account", 2)
 	require.NoError(t, err)
 	assert.Len(t, reservation.Instances, 2)
 
@@ -430,7 +430,7 @@ func TestDistributeInstances_InsufficientCapacity(t *testing.T) {
 		MaxCount:     aws.Int64(3),
 	}
 
-	_, err = distributeInstances(input, nc, "test-account")
+	_, err = distributeInstances(input, nc, "test-account", 1)
 	require.Error(t, err)
 	assert.Equal(t, awserrors.ErrorInsufficientInstanceCapacity, err.Error())
 }
@@ -466,10 +466,64 @@ func TestDistributeInstances_PropagatesAMINotFound(t *testing.T) {
 		MaxCount:     aws.Int64(1),
 	}
 
-	_, err = distributeInstances(input, nc, "test-account")
+	_, err = distributeInstances(input, nc, "test-account", 1)
 	require.Error(t, err)
 	assert.Equal(t, awserrors.ErrorInvalidAMIIDNotFound, err.Error(),
 		"should propagate InvalidAMIID.NotFound, not InsufficientInstanceCapacity")
+}
+
+// TestDistributeInstances_PropagatesSGValidationErrors verifies that
+// SG-related boundary errors from the daemon (`InvalidGroup.NotFound`,
+// `InvalidParameterValue` for cross-VPC SGs, and
+// `SecurityGroupsPerInterfaceLimitExceeded` for >5 SGs) reach the caller
+// instead of being collapsed into `InsufficientInstanceCapacity`.
+// Terraform / SDK consumers branch on the specific code; masking it as
+// "no capacity" makes a typo'd SG ID look like a transient cluster issue.
+func TestDistributeInstances_PropagatesSGValidationErrors(t *testing.T) {
+	cases := []struct {
+		name          string
+		daemonErrCode string
+	}{
+		{"invalid-group-not-found", awserrors.ErrorInvalidGroupNotFound},
+		{"cross-vpc-invalid-param-value", awserrors.ErrorInvalidParameterValue},
+		{"too-many-sgs", awserrors.ErrorSecurityGroupsPerInterfaceLimitExceeded},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, nc := startTestNATSServer(t)
+
+			statusSub, err := nc.Subscribe("spinifex.node.status", func(msg *nats.Msg) {
+				resp := types.NodeStatusResponse{
+					Node:          "node-1",
+					InstanceTypes: []types.InstanceTypeCap{{Name: "t3.micro", Available: 2}},
+				}
+				data, _ := json.Marshal(resp)
+				_ = nc.Publish(msg.Reply, data)
+			})
+			require.NoError(t, err)
+			defer statusSub.Unsubscribe()
+
+			daemonSub, err := nc.Subscribe("ec2.RunInstances.t3.micro.node-1", func(msg *nats.Msg) {
+				_ = msg.Respond(utils.GenerateErrorPayload(tc.daemonErrCode))
+			})
+			require.NoError(t, err)
+			defer daemonSub.Unsubscribe()
+
+			time.Sleep(50 * time.Millisecond)
+
+			input := &ec2.RunInstancesInput{
+				ImageId:      aws.String("ami-test"),
+				InstanceType: aws.String("t3.micro"),
+				MinCount:     aws.Int64(1),
+				MaxCount:     aws.Int64(1),
+			}
+
+			_, err = distributeInstances(input, nc, "test-account", 1)
+			require.Error(t, err)
+			assert.Equal(t, tc.daemonErrCode, err.Error(),
+				"daemon SG validation error must be surfaced, not InsufficientInstanceCapacity")
+		})
+	}
 }
 
 func TestDistributeInstances_LaunchCountCappedToMaxCount(t *testing.T) {
@@ -512,7 +566,7 @@ func TestDistributeInstances_LaunchCountCappedToMaxCount(t *testing.T) {
 		MaxCount:     aws.Int64(2),
 	}
 
-	reservation, err := distributeInstances(input, nc, "test-account")
+	reservation, err := distributeInstances(input, nc, "test-account", 3)
 	require.NoError(t, err)
 	// Should launch exactly 2 (MaxCount), not 3 (total capacity)
 	assert.Len(t, reservation.Instances, 2)
@@ -531,7 +585,7 @@ func TestDistributeInstances_NoNodesAvailable(t *testing.T) {
 		MaxCount:     aws.Int64(2),
 	}
 
-	_, err := distributeInstances(input, nc, "test-account")
+	_, err := distributeInstances(input, nc, "test-account", 2)
 	require.Error(t, err)
 	assert.Equal(t, awserrors.ErrorInsufficientInstanceCapacity, err.Error())
 }
@@ -577,7 +631,7 @@ func TestRunInstances_SingleInstanceDistributes(t *testing.T) {
 		MaxCount:     aws.Int64(1),
 	}
 
-	reservation, err := RunInstances(input, nc, "test-account")
+	reservation, err := RunInstances(input, nc, nil, "test-account", nil, 1)
 	require.NoError(t, err)
 	assert.Len(t, reservation.Instances, 1)
 	assert.Equal(t, "i-single", aws.StringValue(reservation.Instances[0].InstanceId))
@@ -770,7 +824,7 @@ func TestDistributeInstancesCluster_FirstLaunchPicksBestNode(t *testing.T) {
 		MaxCount:     aws.Int64(3),
 	}
 
-	reservation, err := distributeInstancesCluster(input, nc, "test-account", "my-cluster-group")
+	reservation, err := distributeInstancesCluster(input, nc, "test-account", "my-cluster-group", 2)
 	require.NoError(t, err)
 	assert.Len(t, reservation.Instances, 3)
 
@@ -847,7 +901,7 @@ func TestDistributeInstancesCluster_SubsequentLaunchPinsToExistingNode(t *testin
 		MaxCount:     aws.Int64(2),
 	}
 
-	reservation, err := distributeInstancesCluster(input, nc, "test-account", "my-cluster-group")
+	reservation, err := distributeInstancesCluster(input, nc, "test-account", "my-cluster-group", 2)
 	require.NoError(t, err)
 	assert.Len(t, reservation.Instances, 2)
 	assert.False(t, node1Contacted, "cluster should only contact the pinned node")
@@ -890,7 +944,7 @@ func TestDistributeInstancesCluster_InsufficientCapacityOnPinnedNode(t *testing.
 		MaxCount:     aws.Int64(3),
 	}
 
-	_, err = distributeInstancesCluster(input, nc, "test-account", "my-cluster-group")
+	_, err = distributeInstancesCluster(input, nc, "test-account", "my-cluster-group", 2)
 	require.Error(t, err)
 	assert.Equal(t, awserrors.ErrorInsufficientInstanceCapacity, err.Error())
 }
@@ -931,7 +985,7 @@ func TestDistributeInstancesCluster_PinnedNodeNotInCapacityResults(t *testing.T)
 		MaxCount:     aws.Int64(1),
 	}
 
-	_, err = distributeInstancesCluster(input, nc, "test-account", "my-cluster-group")
+	_, err = distributeInstancesCluster(input, nc, "test-account", "my-cluster-group", 1)
 	require.Error(t, err)
 	assert.Equal(t, awserrors.ErrorInsufficientInstanceCapacity, err.Error())
 }
@@ -996,7 +1050,7 @@ func TestDistributeInstancesCluster_LaunchCountCappedByCapacityAndMaxCount(t *te
 		MaxCount:     aws.Int64(2),
 	}
 
-	reservation, err := distributeInstancesCluster(input, nc, "test-account", "my-cluster-group")
+	reservation, err := distributeInstancesCluster(input, nc, "test-account", "my-cluster-group", 1)
 	require.NoError(t, err)
 	assert.Len(t, reservation.Instances, 2, "should launch min(MaxCount=2, capacity=3) = 2")
 }
@@ -1082,7 +1136,7 @@ func TestRunInstances_ClusterPlacementGroupRouting(t *testing.T) {
 		},
 	}
 
-	reservation, err := RunInstances(input, nc, "test-account")
+	reservation, err := RunInstances(input, nc, nil, "test-account", nil, 1)
 	require.NoError(t, err)
 	assert.Len(t, reservation.Instances, 2)
 }
@@ -1130,7 +1184,7 @@ func TestRunInstances_MultiInstanceUsesDistribution(t *testing.T) {
 		MaxCount:     aws.Int64(2),
 	}
 
-	reservation, err := RunInstances(input, nc, "test-account")
+	reservation, err := RunInstances(input, nc, nil, "test-account", nil, 1)
 	require.NoError(t, err)
 	assert.Len(t, reservation.Instances, 2)
 	assert.True(t, statusQueried, "multi-instance launch should query node status")

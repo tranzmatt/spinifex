@@ -3,13 +3,12 @@ package gateway
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -17,14 +16,17 @@ import (
 	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
+	"github.com/mulgadc/spinifex/spinifex/utils"
 )
 
-const (
-	// Maximum allowed clock skew for signature validation (5 minutes)
-	maxClockSkew = 5 * time.Minute
+// Maximum request body size for signature validation (10 MB).
+const maxBodySize = 10 * 1024 * 1024
 
-	// Maximum request body size for signature validation (10 MB)
-	maxBodySize = 10 * 1024 * 1024
+// AKID prefixes. Prefix-first dispatch prevents a misfiled record from being
+// resolved by the wrong lookup path.
+const (
+	longLivedAKIDPrefix = "AKIA"
+	sessionAKIDPrefix   = "ASIA"
 )
 
 // SigV4AuthMiddleware returns stdlib middleware that validates AWS Signature V4 authentication.
@@ -34,125 +36,60 @@ func (gw *GatewayConfig) SigV4AuthMiddleware() func(http.Handler) http.Handler {
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Rate-limit check: reject locked-out IPs before any crypto work.
-			clientIP := extractClientIP(r)
+			clientIP := utils.ClientIP(r.RemoteAddr)
 			if errCode := gw.RateLimiter.CheckIP(clientIP); errCode != "" {
 				gw.writeSigV4Error(w, r, errCode)
 				return
 			}
 
-			authHeader := r.Header.Get("Authorization")
-			if authHeader == "" {
-				gw.writeSigV4Error(w, r, awserrors.ErrorMissingAuthenticationToken)
+			sig, err := auth.ParseReq(r)
+			if err != nil {
+				gw.writeSigV4Error(w, r, parseSigV4ErrorCode(err))
 				return
 			}
 
-			// Parse the Authorization header
-			// Format: AWS4-HMAC-SHA256 Credential=ACCESS_KEY/DATE/REGION/SERVICE/aws4_request, SignedHeaders=..., Signature=...
-			if !strings.HasPrefix(authHeader, "AWS4-HMAC-SHA256 ") {
-				gw.writeSigV4Error(w, r, awserrors.ErrorIncompleteSignature)
+			// Reject unknown services before crypto; otherwise Verify re-signs with
+			// the client-claimed service name and rubber-stamps the scope.
+			if !supportedServices[sig.Service] {
+				gw.writeSigV4Error(w, r, awserrors.ErrorSignatureDoesNotMatch)
 				return
 			}
 
-			// Extract components from the Authorization header
-			parts := strings.Split(authHeader[len("AWS4-HMAC-SHA256 "):], ", ")
-			if len(parts) != 3 {
-				gw.writeSigV4Error(w, r, awserrors.ErrorIncompleteSignature)
+			// Fail fast when NATS is down; LookupAccessKey would hang 5 s otherwise.
+			// Nil NATSConn (test helpers) skips this check.
+			if gw.NATSConn != nil && !gw.NATSConn.IsConnected() {
+				gw.writeClusterUnavailable(w, r, sig.Service)
 				return
 			}
 
-			// Parse Credential
-			var accessKey, date, region, service string
-			if after, ok := strings.CutPrefix(parts[0], "Credential="); ok {
-				credParts := strings.Split(after, "/")
-				if len(credParts) != 5 || credParts[4] != "aws4_request" {
-					gw.writeSigV4Error(w, r, awserrors.ErrorIncompleteSignature)
-					return
-				}
-				accessKey = credParts[0]
-				date = credParts[1]
-				region = credParts[2]
-				service = credParts[3]
-			} else {
-				gw.writeSigV4Error(w, r, awserrors.ErrorIncompleteSignature)
-				return
-			}
-
-			// Parse SignedHeaders
-			var signedHeaders string
-			if after, ok := strings.CutPrefix(parts[1], "SignedHeaders="); ok {
-				signedHeaders = after
-			} else {
-				gw.writeSigV4Error(w, r, awserrors.ErrorIncompleteSignature)
-				return
-			}
-
-			// Parse Signature
-			var providedSignature string
-			if after, ok := strings.CutPrefix(parts[2], "Signature="); ok {
-				providedSignature = after
-			} else {
-				gw.writeSigV4Error(w, r, awserrors.ErrorIncompleteSignature)
-				return
-			}
-
-			// Lookup access key in IAM KV store
 			if gw.IAMService == nil {
 				slog.Error("SigV4 auth: IAM service not initialized")
 				gw.writeSigV4Error(w, r, awserrors.ErrorInternalError)
 				return
 			}
 
-			ak, err := gw.IAMService.LookupAccessKey(accessKey)
-			if err != nil {
-				if strings.Contains(err.Error(), awserrors.ErrorIAMNoSuchEntity) {
-					slog.Warn("Auth failure: access key not found", "accessKeyID", accessKey, "sourceIP", clientIP)
-					gw.RateLimiter.RecordFailure(clientIP)
-					gw.writeSigV4Error(w, r, awserrors.ErrorInvalidClientTokenId)
-					return
-				}
-				slog.Error("IAM lookup failed", "accessKeyID", accessKey, "err", err)
-				gw.writeSigV4Error(w, r, awserrors.ErrorInternalError)
-				return
-			}
-			if ak.Status != handlers_iam.AccessKeyStatusActive {
-				slog.Warn("Auth failure: access key inactive", "accessKeyID", accessKey, "sourceIP", clientIP)
+			var (
+				secret     string
+				principal  principalContext
+				lookupCode string
+			)
+			switch {
+			case strings.HasPrefix(sig.AccessKeyID, longLivedAKIDPrefix):
+				secret, principal, lookupCode = gw.resolveLongLivedAKID(sig.AccessKeyID, clientIP)
+			case strings.HasPrefix(sig.AccessKeyID, sessionAKIDPrefix):
+				secret, principal, lookupCode = gw.resolveSessionAKID(r, sig.AccessKeyID, clientIP)
+			default:
+				slog.Warn("Auth failure: unknown AKID prefix", "accessKeyID", sig.AccessKeyID, "sourceIP", clientIP)
 				gw.RateLimiter.RecordFailure(clientIP)
 				gw.writeSigV4Error(w, r, awserrors.ErrorInvalidClientTokenId)
 				return
 			}
-
-			secret, err := gw.IAMService.DecryptSecret(ak.SecretAccessKey)
-			if err != nil {
-				slog.Error("Failed to decrypt IAM secret", "accessKeyID", accessKey, "err", err)
-				gw.writeSigV4Error(w, r, awserrors.ErrorInternalError)
+			if lookupCode != "" {
+				gw.writeSigV4Error(w, r, lookupCode)
 				return
 			}
 
-			// Get timestamp from X-Amz-Date header
-			timestamp := r.Header.Get("X-Amz-Date")
-			if timestamp == "" {
-				gw.writeSigV4Error(w, r, awserrors.ErrorIncompleteSignature)
-				return
-			}
-
-			// Validate timestamp is within acceptable bounds to prevent replay attacks
-			parsedTime, err := time.Parse("20060102T150405Z", timestamp)
-			if err != nil {
-				slog.Debug("Invalid timestamp format", "timestamp", timestamp)
-				gw.writeSigV4Error(w, r, awserrors.ErrorIncompleteSignature)
-				return
-			}
-			if time.Since(parsedTime).Abs() > maxClockSkew {
-				slog.Debug("Signature expired", "timestamp", timestamp, "skew", time.Since(parsedTime))
-				gw.writeSigV4Error(w, r, awserrors.ErrorSignatureDoesNotMatch)
-				return
-			}
-
-			// Limit request body size to prevent OOM from unauthenticated requests
 			r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
-
-			// Read body once and re-buffer for downstream handlers
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
 				var maxBytesErr *http.MaxBytesError
@@ -167,29 +104,44 @@ func (gw *GatewayConfig) SigV4AuthMiddleware() func(http.Handler) http.Handler {
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
 
-			// Compute expected signature using decrypted secret
-			expectedSignature := computeSignatureWithSecret(r, body, secret, date, timestamp, region, service, signedHeaders)
+			sum := sha256.Sum256(body)
+			bodyHash := hex.EncodeToString(sum[:])
 
-			// Compare signatures using constant-time comparison to prevent timing attacks
-			if subtle.ConstantTimeCompare([]byte(expectedSignature), []byte(providedSignature)) != 1 {
-				slog.Warn("Auth failure: signature mismatch",
-					"accessKeyID", accessKey,
+			if err := sig.Verify(secret, sig.Service, gw.Region,
+				auth.WithBodyHash(bodyHash)); err != nil {
+				attrs := []any{
+					"accessKeyID", sig.AccessKeyID,
 					"sourceIP", clientIP,
-				)
+					"err", err,
+				}
+				var sme *auth.SigMismatchError
+				if errors.As(err, &sme) {
+					attrs = append(attrs, "expectedAuthHdr", sme.ExpectedAuthHdr, "providedAuthHdr", sme.ProvidedAuthHdr)
+				}
+				slog.Warn("Auth failure: verification failed", attrs...)
 				gw.RateLimiter.RecordFailure(clientIP)
-				gw.writeSigV4Error(w, r, awserrors.ErrorSignatureDoesNotMatch)
+				gw.writeSigV4Error(w, r, verifySigV4ErrorCode(err))
 				return
 			}
 
-			// Store parsed auth data in context for downstream handlers
 			ctx := r.Context()
-			ctx = context.WithValue(ctx, ctxIdentity, ak.UserName)
-			ctx = context.WithValue(ctx, ctxAccountID, ak.AccountID)
-			ctx = context.WithValue(ctx, ctxService, service)
-			ctx = context.WithValue(ctx, ctxRegion, region)
-			ctx = context.WithValue(ctx, ctxAccessKey, accessKey)
+			ctx = context.WithValue(ctx, ctxIdentity, principal.identity)
+			ctx = context.WithValue(ctx, ctxAccountID, principal.accountID)
+			ctx = context.WithValue(ctx, ctxService, sig.Service)
+			ctx = context.WithValue(ctx, ctxRegion, sig.Region)
+			ctx = context.WithValue(ctx, ctxAccessKey, sig.AccessKeyID)
+			ctx = context.WithValue(ctx, ctxPrincipalType, principal.principalType)
+			if principal.assumedRoleARN != "" {
+				ctx = context.WithValue(ctx, ctxAssumedRoleARN, principal.assumedRoleARN)
+			}
+			if principal.assumedRoleID != "" {
+				ctx = context.WithValue(ctx, ctxAssumedRoleID, principal.assumedRoleID)
+			}
+			if principal.underlyingRoleARN != "" {
+				ctx = context.WithValue(ctx, ctxUnderlyingRoleARN, principal.underlyingRoleARN)
+			}
 
-			// Parse once; dispatchers reuse via ctxQueryArgs. On error, the
+			// Parse once; dispatchers reuse via ctxQueryArgs. On error the
 			// dispatcher re-parses and returns MalformedQueryString.
 			if args, err := ParseAWSQueryArgs(string(body)); err == nil {
 				ctx = context.WithValue(ctx, ctxQueryArgs, args)
@@ -198,139 +150,144 @@ func (gw *GatewayConfig) SigV4AuthMiddleware() func(http.Handler) http.Handler {
 				}
 			}
 
-			slog.Debug("SigV4 authentication successful", "accessKey", accessKey, "identity", ak.UserName)
+			slog.Debug("SigV4 authentication successful",
+				"accessKey", sig.AccessKeyID,
+				"identity", principal.identity,
+				"principalType", principal.principalType)
 			gw.RateLimiter.RecordSuccess(clientIP)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
-// computeSignatureWithSecret builds the canonical request and computes the AWS Signature V4 signature
-// using the provided secret key. The body is passed explicitly since it has already been read from r.Body.
-func computeSignatureWithSecret(r *http.Request, body []byte, secretKey, date, timestamp, region, service, signedHeaders string) string {
-	// Build canonical URI (URI-encoded path)
-	path := r.URL.Path
-	if path == "" {
-		path = "/"
-	}
-	canonicalURI := auth.UriEncode(path, false)
-	if canonicalURI == "" {
-		canonicalURI = "/"
-	}
-
-	// Build canonical query string (sorted, encoded)
-	canonicalQueryString := buildCanonicalQueryString(r.URL.RawQuery)
-
-	// Build canonical headers from SignedHeaders list
-	headersList := strings.Split(signedHeaders, ";")
-	sort.Strings(headersList)
-
-	var canonicalHeaders strings.Builder
-	for _, header := range headersList {
-		header = strings.ToLower(strings.TrimSpace(header))
-		var value string
-		if header == "host" {
-			value = r.Host
-		} else {
-			value = r.Header.Get(canonicalHeaderName(header))
-		}
-		// Trim leading/trailing whitespace and collapse multiple spaces
-		value = strings.TrimSpace(value)
-		canonicalHeaders.WriteString(header)
-		canonicalHeaders.WriteString(":")
-		canonicalHeaders.WriteString(value)
-		canonicalHeaders.WriteString("\n")
-	}
-
-	// Hash payload body with SHA256
-	payloadHash := auth.HashSHA256(string(body))
-
-	// Build canonical request
-	canonicalRequest := fmt.Sprintf(
-		"%s\n%s\n%s\n%s\n%s\n%s",
-		r.Method,
-		canonicalURI,
-		canonicalQueryString,
-		canonicalHeaders.String(),
-		signedHeaders,
-		payloadHash,
-	)
-
-	hashedCanonicalRequest := auth.HashSHA256(canonicalRequest)
-
-	// Build string-to-sign
-	scope := fmt.Sprintf("%s/%s/%s/aws4_request", date, region, service)
-	stringToSign := fmt.Sprintf(
-		"AWS4-HMAC-SHA256\n%s\n%s\n%s",
-		timestamp,
-		scope,
-		hashedCanonicalRequest,
-	)
-
-	// Derive signing key and compute signature
-	signingKey := auth.GetSigningKey(secretKey, date, region, service)
-	signature := auth.HmacSHA256Hex(signingKey, stringToSign)
-
-	return signature
+// principalContext is the identity envelope set on the request context after
+// SigV4 verification succeeds.
+type principalContext struct {
+	identity          string
+	accountID         string
+	principalType     string
+	assumedRoleARN    string
+	assumedRoleID     string
+	underlyingRoleARN string
 }
 
-// buildCanonicalQueryString creates the canonical query string according to AWS specs.
-func buildCanonicalQueryString(queryString string) string {
-	if queryString == "" {
-		return ""
-	}
-
-	// Parse query parameters
-	params := make(map[string][]string)
-	pairs := strings.SplitSeq(queryString, "&")
-	for pair := range pairs {
-		if pair == "" {
-			continue
+// resolveLongLivedAKID handles the AKIA path: IAM lookup, status check, secret decrypt.
+func (gw *GatewayConfig) resolveLongLivedAKID(accessKeyID, clientIP string) (string, principalContext, string) {
+	ak, err := gw.IAMService.LookupAccessKey(accessKeyID)
+	if err != nil {
+		if strings.Contains(err.Error(), awserrors.ErrorIAMNoSuchEntity) {
+			slog.Warn("Auth failure: access key not found", "accessKeyID", accessKeyID, "sourceIP", clientIP)
+			gw.RateLimiter.RecordFailure(clientIP)
+			return "", principalContext{}, awserrors.ErrorInvalidClientTokenId
 		}
-		kv := strings.SplitN(pair, "=", 2)
-		key := kv[0]
-		value := ""
-		if len(kv) == 2 {
-			value = kv[1]
-		}
-		params[key] = append(params[key], value)
+		slog.Error("IAM lookup failed", "accessKeyID", accessKeyID, "err", err)
+		return "", principalContext{}, awserrors.ErrorInternalError
 	}
-
-	// Sort keys
-	keys := make([]string, 0, len(params))
-	for k := range params {
-		keys = append(keys, k)
+	if ak.Status != handlers_iam.AccessKeyStatusActive {
+		slog.Warn("Auth failure: access key inactive", "accessKeyID", accessKeyID, "sourceIP", clientIP)
+		gw.RateLimiter.RecordFailure(clientIP)
+		return "", principalContext{}, awserrors.ErrorInvalidClientTokenId
 	}
-	sort.Strings(keys)
-
-	// Build canonical query string
-	var result []string
-	for _, key := range keys {
-		values := params[key]
-		sort.Strings(values)
-		encodedKey := auth.UriEncode(key, true)
-		for _, v := range values {
-			encodedValue := auth.UriEncode(v, true)
-			result = append(result, fmt.Sprintf("%s=%s", encodedKey, encodedValue))
-		}
+	secret, err := gw.IAMService.DecryptSecret(ak.SecretAccessKey)
+	if err != nil {
+		// Undecryptable secret (e.g. master key rotated): treat as auth failure, not
+		// server fault, so the client re-authenticates instead of retrying a dead request.
+		slog.Error("Failed to decrypt IAM secret", "accessKeyID", accessKeyID, "err", err)
+		gw.RateLimiter.RecordFailure(clientIP)
+		return "", principalContext{}, awserrors.ErrorInvalidClientTokenId
 	}
-
-	return strings.Join(result, "&")
+	return secret, principalContext{
+		identity:      ak.UserName,
+		accountID:     ak.AccountID,
+		principalType: principalTypeUser,
+	}, ""
 }
 
-// canonicalHeaderName converts a lowercase header name to the canonical form for lookup.
-func canonicalHeaderName(header string) string {
-	// Convert header names like "x-amz-date" to "X-Amz-Date" for http.Header.Get
-	parts := strings.Split(header, "-")
-	for i, part := range parts {
-		if len(part) > 0 {
-			parts[i] = strings.ToUpper(part[:1]) + part[1:]
-		}
+// resolveSessionAKID handles the ASIA path: STS lookup, expiry check,
+// X-Amz-Security-Token HMAC verify, secret decrypt. Nil STSService surfaces
+// as InternalError so misconfiguration is loud at startup.
+func (gw *GatewayConfig) resolveSessionAKID(r *http.Request, accessKeyID, clientIP string) (string, principalContext, string) {
+	if gw.STSService == nil {
+		slog.Error("SigV4 auth: STS service not initialized but session AKID presented", "accessKeyID", accessKeyID)
+		return "", principalContext{}, awserrors.ErrorInternalError
 	}
-	return strings.Join(parts, "-")
+	cred, err := gw.STSService.LookupSessionCredential(accessKeyID)
+	if err != nil {
+		slog.Error("STS lookup failed", "accessKeyID", accessKeyID, "err", err)
+		return "", principalContext{}, awserrors.ErrorInternalError
+	}
+	if cred == nil {
+		slog.Warn("Auth failure: session credential not found", "accessKeyID", accessKeyID, "sourceIP", clientIP)
+		gw.RateLimiter.RecordFailure(clientIP)
+		return "", principalContext{}, awserrors.ErrorInvalidClientTokenId
+	}
+	if time.Now().UTC().After(cred.ExpiresAt) {
+		slog.Warn("Auth failure: session credential expired",
+			"accessKeyID", accessKeyID, "sourceIP", clientIP, "expiresAt", cred.ExpiresAt)
+		gw.RateLimiter.RecordFailure(clientIP)
+		return "", principalContext{}, awserrors.ErrorExpiredToken
+	}
+
+	tokenHeader := r.Header.Get("X-Amz-Security-Token")
+	if tokenHeader == "" {
+		slog.Warn("Auth failure: session AKID presented without X-Amz-Security-Token",
+			"accessKeyID", accessKeyID, "sourceIP", clientIP)
+		gw.RateLimiter.RecordFailure(clientIP)
+		return "", principalContext{}, awserrors.ErrorInvalidClientTokenId
+	}
+	if !gw.STSService.VerifySessionToken(cred, tokenHeader) {
+		slog.Warn("Auth failure: session token HMAC mismatch",
+			"accessKeyID", accessKeyID, "sourceIP", clientIP)
+		gw.RateLimiter.RecordFailure(clientIP)
+		return "", principalContext{}, awserrors.ErrorInvalidClientTokenId
+	}
+
+	secret, err := gw.IAMService.DecryptSecret(cred.SecretEncrypted)
+	if err != nil {
+		// Unverifiable secret: same auth-failure reasoning as resolveLongLivedAKID.
+		slog.Error("Failed to decrypt session secret", "accessKeyID", accessKeyID, "err", err)
+		gw.RateLimiter.RecordFailure(clientIP)
+		return "", principalContext{}, awserrors.ErrorInvalidClientTokenId
+	}
+	if cred.PrincipalType == principalTypeUser {
+		// GetSessionToken session: resolve to the user so policy is evaluated as a user.
+		return secret, principalContext{
+			identity:      cred.SessionName,
+			accountID:     cred.AccountID,
+			principalType: principalTypeUser,
+		}, ""
+	}
+
+	// "assumed-role" or empty (pre-PrincipalType records) — both resolve as role session.
+	return secret, principalContext{
+		identity:          cred.SessionName,
+		accountID:         cred.AccountID,
+		principalType:     principalTypeAssumedRole,
+		assumedRoleARN:    cred.AssumedRoleARN,
+		assumedRoleID:     cred.AssumedRoleID,
+		underlyingRoleARN: cred.UnderlyingRoleARN,
+	}, ""
 }
 
-// writeSigV4Error writes an EC2-compatible XML error response for authentication failures.
+func parseSigV4ErrorCode(err error) string {
+	switch {
+	case errors.Is(err, auth.ErrMissingAuth):
+		return awserrors.ErrorMissingAuthenticationToken
+	default:
+		return awserrors.ErrorIncompleteSignature
+	}
+}
+
+func verifySigV4ErrorCode(err error) string {
+	switch {
+	case errors.Is(err, auth.ErrMissingContentSHA):
+		return awserrors.ErrorIncompleteSignature
+	default:
+		return awserrors.ErrorSignatureDoesNotMatch
+	}
+}
+
+// writeSigV4Error writes an EC2-compatible XML error response for auth failures.
 func (gw *GatewayConfig) writeSigV4Error(w http.ResponseWriter, r *http.Request, errorCode string) {
 	requestID := uuid.NewString()
 

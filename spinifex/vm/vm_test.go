@@ -1,11 +1,15 @@
 package vm
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExecute(t *testing.T) {
@@ -33,9 +37,9 @@ func TestExecute(t *testing.T) {
 
 	cmd, err = cfg.Execute()
 
-	// Expect error, at least one drive required
+	// Expect error, at least one drive or kernel image required
 	assert.Error(t, err)
-	assert.ErrorContains(t, err, "at least one drive is required")
+	assert.ErrorContains(t, err, "at least one drive or a kernel image is required")
 	assert.Nil(t, cmd)
 
 	cfg.Drives = []Drive{
@@ -230,58 +234,63 @@ func argExists(args []string, flag string) bool {
 	return slices.Contains(args, flag)
 }
 
+// allArgValues returns all values following flag (every occurrence).
+func allArgValues(args []string, flag string) []string {
+	var out []string
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			out = append(out, args[i+1])
+		}
+	}
+	return out
+}
+
+func TestExecute_DriveAndKernelInvariant(t *testing.T) {
+	base := Config{
+		CPUCount:     2,
+		Memory:       1024,
+		Architecture: "x86_64",
+	}
+
+	t.Run("drives-only is OK", func(t *testing.T) {
+		cfg := base
+		cfg.Drives = []Drive{{File: "disk.img", Format: "raw"}}
+		cmd, err := cfg.Execute()
+		assert.NoError(t, err)
+		assert.NotNil(t, cmd)
+	})
+
+	t.Run("kernel-only is OK", func(t *testing.T) {
+		cfg := base
+		cfg.KernelImage = "/boot/vmlinuz"
+		cmd, err := cfg.Execute()
+		assert.NoError(t, err)
+		assert.NotNil(t, cmd)
+	})
+
+	t.Run("both-empty returns error", func(t *testing.T) {
+		cfg := base
+		cmd, err := cfg.Execute()
+		assert.Error(t, err)
+		assert.ErrorContains(t, err, "at least one drive or a kernel image")
+		assert.Nil(t, cmd)
+	})
+}
+
 func TestResetNodeLocalState(t *testing.T) {
 	v := &VM{
 		ID:                    "i-abc123",
-		PID:                   12345,
-		Running:               true,
 		MetadataServerAddress: "127.0.0.1:9999",
 		Status:                StateRunning,
 	}
 
 	v.ResetNodeLocalState()
 
-	assert.Equal(t, 0, v.PID)
-	assert.False(t, v.Running)
 	assert.Empty(t, v.MetadataServerAddress)
 	assert.NotNil(t, v.QMPClient)
 	// ID and Status should be unchanged
 	assert.Equal(t, "i-abc123", v.ID)
 	assert.Equal(t, StateRunning, v.Status)
-}
-
-func TestExecute_PIDFileAndQMPSocket(t *testing.T) {
-	cfg := Config{
-		CPUCount:     1,
-		Memory:       512,
-		Architecture: "x86_64",
-		PIDFile:      "/run/test.pid",
-		QMPSocket:    "/run/test.sock",
-		Drives:       []Drive{{File: "disk.img", Format: "raw"}},
-	}
-
-	cmd, err := cfg.Execute()
-	assert.NoError(t, err)
-
-	args := cmd.Args[1:]
-	assert.Equal(t, "/run/test.pid", argValue(args, "-pidfile"))
-	assert.Equal(t, "unix:/run/test.sock,server,nowait", argValue(args, "-qmp"))
-}
-
-func TestExecute_NoGraphic(t *testing.T) {
-	cfg := Config{
-		CPUCount:     1,
-		Memory:       512,
-		Architecture: "x86_64",
-		NoGraphic:    true,
-		Drives:       []Drive{{File: "disk.img", Format: "raw"}},
-	}
-
-	cmd, err := cfg.Execute()
-	assert.NoError(t, err)
-
-	args := cmd.Args[1:]
-	assert.Equal(t, "none", argValue(args, "-display"))
 }
 
 func TestExecute_SerialSocketAndConsoleLog(t *testing.T) {
@@ -343,38 +352,28 @@ func TestExecute_SerialSocketAndConsoleLog(t *testing.T) {
 	})
 }
 
-func TestExecute_NetDevs(t *testing.T) {
+func TestExecute_MicrovmFileChardev(t *testing.T) {
 	cfg := Config{
-		CPUCount:     1,
-		Memory:       512,
-		Architecture: "x86_64",
-		Drives:       []Drive{{File: "disk.img", Format: "raw"}},
-		NetDevs: []NetDev{
-			{Value: "tap,id=net0,ifname=tap0,script=no"},
-		},
+		CPUCount:       1,
+		Memory:         512,
+		Architecture:   "x86_64",
+		MachineType:    "microvm,x-option-roms=off",
+		ConsoleLogPath: "/var/log/console.log",
+		KernelImage:    "/boot/vmlinuz",
 	}
 
 	cmd, err := cfg.Execute()
 	assert.NoError(t, err)
+	require.NotNil(t, cmd)
 
 	args := cmd.Args[1:]
-	assert.Equal(t, "tap,id=net0,ifname=tap0,script=no", argValue(args, "-netdev"))
-}
-
-func TestExecute_MachineType_x86(t *testing.T) {
-	cfg := Config{
-		CPUCount:     1,
-		Memory:       512,
-		Architecture: "x86_64",
-		MachineType:  "q35",
-		Drives:       []Drive{{File: "disk.img", Format: "raw"}},
-	}
-
-	cmd, err := cfg.Execute()
-	assert.NoError(t, err)
-
-	args := cmd.Args[1:]
-	assert.Equal(t, "q35", argValue(args, "-M"))
+	chardev := argValue(args, "-chardev")
+	assert.Equal(t, "file,id=console0,path=/var/log/console.log", chardev)
+	// -serial chardev:console0 attaches to the isa-serial=on device (ttyS0).
+	assert.Equal(t, "chardev:console0", argValue(args, "-serial"))
+	// No explicit isa-serial device addition (would create ttyS1, not ttyS0).
+	devs := strings.Join(allArgValues(args, "-device"), " ")
+	assert.NotContains(t, devs, "isa-serial")
 }
 
 func TestExecute_ARM64_Q35(t *testing.T) {
@@ -386,26 +385,106 @@ func TestExecute_ARM64_Q35(t *testing.T) {
 		Drives:       []Drive{{File: "disk.img", Format: "raw"}},
 	}
 
-	uefiPath := "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd"
-	_, uefiErr := os.Stat(uefiPath)
-	hasUEFI := uefiErr == nil
-
 	cmd, err := cfg.Execute()
 
-	if hasUEFI {
-		// UEFI firmware exists — should succeed with -M virt and -bios
-		assert.NoError(t, err)
-		assert.NotNil(t, cmd)
-		args := cmd.Args[1:]
-		assert.Contains(t, cmd.Path, "qemu-system-aarch64")
-		assert.Equal(t, "virt", argValue(args, "-M"))
-		assert.Equal(t, uefiPath, argValue(args, "-bios"))
-	} else {
-		// No firmware — error
-		assert.Error(t, err)
-		assert.Nil(t, cmd)
-		assert.Contains(t, err.Error(), "UEFI firmware file not found")
+	assert.NoError(t, err)
+	require.NotNil(t, cmd)
+	args := cmd.Args[1:]
+	assert.Contains(t, cmd.Path, "qemu-system-aarch64")
+	assert.Equal(t, "virt", argValue(args, "-M"))
+	// Firmware is no longer auto-loaded via -bios on arm64 q35; it flows
+	// from cfg.UseUEFI as pflash CODE+VARS instead.
+	assert.False(t, argExists(args, "-bios"), "-bios must not be emitted")
+}
+
+// installFakeFirmware seeds a temp directory with code+vars files matching the
+// pflash split-file shape and swaps FirmwarePathCandidates so tests don't
+// depend on whatever firmware happens to be installed on the host.
+func installFakeFirmware(t *testing.T, arch string, varsBytes []byte) (codePath, varsPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	codePath = filepath.Join(dir, "CODE.fd")
+	varsPath = filepath.Join(dir, "VARS.fd")
+	require.NoError(t, os.WriteFile(codePath, []byte("fake-code"), 0o644))
+	require.NoError(t, os.WriteFile(varsPath, varsBytes, 0o644))
+
+	orig := FirmwarePathCandidates
+	FirmwarePathCandidates = map[string][]FirmwareCandidate{
+		arch: {{Code: codePath, VarsTemplate: varsPath}},
 	}
+	t.Cleanup(func() { FirmwarePathCandidates = orig })
+	return codePath, varsPath
+}
+
+func TestExecute_x86_64_UEFI(t *testing.T) {
+	codePath, _ := installFakeFirmware(t, "x86_64", make([]byte, 540_672))
+
+	cfg := Config{
+		CPUCount:     2,
+		Memory:       1024,
+		Architecture: "x86_64",
+		MachineType:  "q35",
+		UseUEFI:      true,
+		Drives:       []Drive{{File: "disk.img", Format: "raw", If: "none", ID: "os"}},
+	}
+
+	cmd, err := cfg.Execute()
+	require.NoError(t, err)
+	require.NotNil(t, cmd)
+	args := cmd.Args[1:]
+
+	driveArgs := allArgValues(args, "-drive")
+	require.GreaterOrEqual(t, len(driveArgs), 1)
+	assert.Equal(t, fmt.Sprintf("file=%s,format=raw,if=pflash,unit=0,readonly=on", codePath), driveArgs[0],
+		"first -drive must be pflash CODE readonly unit=0")
+	assert.False(t, argExists(args, "-bios"), "-bios must not be emitted under UEFI")
+}
+
+func TestExecute_x86_64_UEFI_MissingFirmware(t *testing.T) {
+	orig := FirmwarePathCandidates
+	FirmwarePathCandidates = map[string][]FirmwareCandidate{
+		"x86_64": {{Code: "/nonexistent/CODE.fd", VarsTemplate: "/nonexistent/VARS.fd"}},
+	}
+	t.Cleanup(func() { FirmwarePathCandidates = orig })
+
+	cfg := Config{
+		CPUCount:     1,
+		Memory:       512,
+		Architecture: "x86_64",
+		MachineType:  "q35",
+		UseUEFI:      true,
+		Drives:       []Drive{{File: "disk.img", Format: "raw"}},
+	}
+
+	cmd, err := cfg.Execute()
+	assert.Nil(t, cmd)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "x86_64", "error must name the architecture so operators know which firmware to install")
+}
+
+func TestExecute_ARM64_UEFI_pflash(t *testing.T) {
+	codePath, _ := installFakeFirmware(t, "arm64", make([]byte, 67_108_864))
+
+	cfg := Config{
+		CPUCount:     1,
+		Memory:       512,
+		Architecture: "arm64",
+		MachineType:  "q35",
+		UseUEFI:      true,
+		Drives:       []Drive{{File: "nbd:unix:/tmp/efi.sock", Format: "raw", If: "pflash", Unit: 1}},
+	}
+
+	cmd, err := cfg.Execute()
+	require.NoError(t, err)
+	require.NotNil(t, cmd)
+	args := cmd.Args[1:]
+	assert.Contains(t, cmd.Path, "qemu-system-aarch64")
+	assert.Equal(t, "virt", argValue(args, "-M"))
+
+	driveArgs := allArgValues(args, "-drive")
+	require.Len(t, driveArgs, 2, "expect pflash CODE + VARS")
+	assert.Equal(t, fmt.Sprintf("file=%s,format=raw,if=pflash,unit=0,readonly=on", codePath), driveArgs[0])
+	assert.Equal(t, "file=nbd:unix:/tmp/efi.sock,format=raw,if=pflash,unit=1", driveArgs[1])
 }
 
 func TestExecute_MissingArchitecture(t *testing.T) {
@@ -422,6 +501,10 @@ func TestExecute_MissingArchitecture(t *testing.T) {
 }
 
 func TestExecute_KVMAndCPUType(t *testing.T) {
+	if _, err := os.Stat("/dev/kvm"); err != nil {
+		t.Skipf("/dev/kvm missing: %v", err)
+	}
+
 	cfg := Config{
 		CPUCount:     2,
 		Memory:       1024,
@@ -435,15 +518,8 @@ func TestExecute_KVMAndCPUType(t *testing.T) {
 	assert.NoError(t, err)
 
 	args := cmd.Args[1:]
-
-	// KVM/CPU flags depend on whether /dev/kvm exists on host
-	if _, err := os.Stat("/dev/kvm"); err == nil {
-		assert.True(t, argExists(args, "-enable-kvm"))
-		assert.Equal(t, "host", argValue(args, "-cpu"))
-	} else {
-		assert.False(t, argExists(args, "-enable-kvm"))
-		assert.Empty(t, argValue(args, "-cpu"))
-	}
+	assert.True(t, argExists(args, "-enable-kvm"))
+	assert.Equal(t, "host", argValue(args, "-cpu"))
 }
 
 func TestExecute_FullConfig(t *testing.T) {

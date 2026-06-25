@@ -1,5 +1,7 @@
 package awserrors
 
+import "strings"
+
 type ErrorMessage struct {
 	HTTPCode int
 	Message  string
@@ -43,6 +45,7 @@ var (
 	ErrorDuplicateSubnetsInSameZone                            = "DuplicateSubnetsInSameZone"
 	ErrorEncryptedVolumesNotSupported                          = "EncryptedVolumesNotSupported"
 	ErrorExistingVpcEndpointConnections                        = "ExistingVpcEndpointConnections"
+	ErrorExpiredToken                                          = "ExpiredToken"
 	ErrorFilterLimitExceeded                                   = "FilterLimitExceeded"
 	ErrorFleetNotInModifiableState                             = "FleetNotInModifiableState"
 	ErrorFlowLogAlreadyExists                                  = "FlowLogAlreadyExists"
@@ -165,6 +168,12 @@ var (
 	ErrorInvalidID                                             = "InvalidID"
 	ErrorInvalidIPAddressInUse                                 = "InvalidIPAddress.InUse"
 	ErrorInvalidIamInstanceProfileArnMalformed                 = "InvalidIamInstanceProfileArn.Malformed"
+	ErrorInvalidIamInstanceProfileNotFound                     = "InvalidIamInstanceProfile.NotFound"
+	ErrorInvalidIdentityToken                                  = "InvalidIdentityToken"
+	ErrorIDPRejectedClaim                                      = "IDPRejectedClaim"
+	ErrorIDPCommunicationError                                 = "IDPCommunicationError"
+	ErrorIamInstanceProfileAlreadyAssociated                   = "IamInstanceProfileAlreadyAssociated"
+	ErrorNoSuchAssociation                                     = "NoSuchAssociation"
 	ErrorInvalidInput                                          = "InvalidInput"
 	ErrorInvalidInstanceAttributeValue                         = "InvalidInstanceAttributeValue"
 	ErrorInvalidInstanceConnectEndpointIdMalformed             = "InvalidInstanceConnectEndpointId.Malformed"
@@ -212,219 +221,228 @@ var (
 	ErrorInvalidOptionConflict                                 = "InvalidOption.Conflict"
 	ErrorInvalidPaginationToken                                = "InvalidPaginationToken"
 	ErrorInvalidParameter                                      = "InvalidParameter"
-	ErrorInvalidParameterCombination                           = "InvalidParameterCombination"
-	ErrorInvalidParameterDependency                            = "InvalidParameterDependency"
-	ErrorInvalidParameterValue                                 = "InvalidParameterValue"
-	ErrorInvalidPermissionDuplicate                            = "InvalidPermission.Duplicate"
-	ErrorInvalidPermissionMalformed                            = "InvalidPermission.Malformed"
-	ErrorInvalidPermissionNotFound                             = "InvalidPermission.NotFound"
-	ErrorInvalidPlacementGroupDuplicate                        = "InvalidPlacementGroup.Duplicate"
-	ErrorInvalidPlacementGroupInUse                            = "InvalidPlacementGroup.InUse"
-	ErrorInvalidPlacementGroupUnknown                          = "InvalidPlacementGroup.Unknown"
-	ErrorInvalidPlacementGroupIdMalformed                      = "InvalidPlacementGroupId.Malformed"
-	ErrorInvalidPolicyDocument                                 = "InvalidPolicyDocument"
-	ErrorInvalidPrefixListIDNotFound                           = "InvalidPrefixListID.NotFound"
-	ErrorInvalidPrefixListIdMalformed                          = "InvalidPrefixListId.Malformed"
-	ErrorInvalidProductInfo                                    = "InvalidProductInfo"
-	ErrorInvalidPurchaseTokenExpired                           = "InvalidPurchaseToken.Expired"
-	ErrorInvalidPurchaseTokenMalformed                         = "InvalidPurchaseToken.Malformed"
-	ErrorInvalidQuantity                                       = "InvalidQuantity"
-	ErrorInvalidQueryParameter                                 = "InvalidQueryParameter"
-	ErrorInvalidRamDiskIdMalformed                             = "InvalidRamDiskId.Malformed"
-	ErrorInvalidRegion                                         = "InvalidRegion"
-	ErrorInvalidRequest                                        = "InvalidRequest"
-	ErrorInvalidReservationIDMalformed                         = "InvalidReservationID.Malformed"
-	ErrorInvalidReservationIDNotFound                          = "InvalidReservationID.NotFound"
-	ErrorInvalidReservedInstancesId                            = "InvalidReservedInstancesId"
-	ErrorInvalidReservedInstancesOfferingId                    = "InvalidReservedInstancesOfferingId"
-	ErrorInvalidResourceConfigurationArnMalformed              = "InvalidResourceConfigurationArn.Malformed"
-	ErrorInvalidResourceConfigurationArnNotFound               = "InvalidResourceConfigurationArn.NotFound"
-	ErrorInvalidResourceTypeUnknown                            = "InvalidResourceType.Unknown"
-	ErrorInvalidRouteInvalidState                              = "InvalidRoute.InvalidState"
-	ErrorInvalidRouteMalformed                                 = "InvalidRoute.Malformed"
-	ErrorInvalidRouteNotFound                                  = "InvalidRoute.NotFound"
-	ErrorInvalidRouteTableIDNotFound                           = "InvalidRouteTableID.NotFound"
-	ErrorInvalidRouteTableIdMalformed                          = "InvalidRouteTableId.Malformed"
-	ErrorInvalidScheduledInstance                              = "InvalidScheduledInstance"
-	ErrorInvalidSecurityRequestHasExpired                      = "InvalidSecurity.RequestHasExpired"
-	ErrorInvalidSecurityGroupIDNotFound                        = "InvalidSecurityGroupID.NotFound"
-	ErrorInvalidSecurityGroupIdMalformed                       = "InvalidSecurityGroupId.Malformed"
-	ErrorInvalidSecurityGroupRuleIdMalformed                   = "InvalidSecurityGroupRuleId.Malformed"
-	ErrorInvalidSecurityGroupRuleIdNotFound                    = "InvalidSecurityGroupRuleId.NotFound"
-	ErrorInvalidServiceName                                    = "InvalidServiceName"
-	ErrorInvalidSnapshotInUse                                  = "InvalidSnapshot.InUse"
-	ErrorInvalidSnapshotNotFound                               = "InvalidSnapshot.NotFound"
-	ErrorInvalidSnapshotIDMalformed                            = "InvalidSnapshotID.Malformed"
-	ErrorInvalidSpotDatafeedNotFound                           = "InvalidSpotDatafeed.NotFound"
-	ErrorInvalidSpotFleetRequestConfig                         = "InvalidSpotFleetRequestConfig"
-	ErrorInvalidSpotFleetRequestIdMalformed                    = "InvalidSpotFleetRequestId.Malformed"
-	ErrorInvalidSpotFleetRequestIdNotFound                     = "InvalidSpotFleetRequestId.NotFound"
-	ErrorInvalidSpotInstanceRequestIDMalformed                 = "InvalidSpotInstanceRequestID.Malformed"
-	ErrorInvalidSpotInstanceRequestIDNotFound                  = "InvalidSpotInstanceRequestID.NotFound"
-	ErrorInvalidState                                          = "InvalidState"
-	ErrorInvalidStateTransition                                = "InvalidStateTransition"
-	ErrorInvalidSubnet                                         = "InvalidSubnet"
-	ErrorInvalidSubnetConflict                                 = "InvalidSubnet.Conflict"
-	ErrorInvalidSubnetRange                                    = "InvalidSubnet.Range"
-	ErrorInvalidSubnetIDMalformed                              = "InvalidSubnetID.Malformed"
-	ErrorInvalidSubnetIDNotFound                               = "InvalidSubnetID.NotFound"
-	ErrorInvalidTagKeyMalformed                                = "InvalidTagKey.Malformed"
-	ErrorInvalidTargetArnUnknown                               = "InvalidTargetArn.Unknown"
-	ErrorInvalidTargetException                                = "InvalidTargetException"
-	ErrorInvalidTenancy                                        = "InvalidTenancy"
-	ErrorInvalidTime                                           = "InvalidTime"
-	ErrorInvalidTrafficMirrorFilterNotFound                    = "InvalidTrafficMirrorFilterNotFound"
-	ErrorInvalidTrafficMirrorFilterRuleNotFound                = "InvalidTrafficMirrorFilterRuleNotFound"
-	ErrorInvalidTrafficMirrorSessionNotFound                   = "InvalidTrafficMirrorSessionNotFound"
-	ErrorInvalidTrafficMirrorTargetNoFound                     = "InvalidTrafficMirrorTargetNoFound"
-	ErrorInvalidUserIDMalformed                                = "InvalidUserID.Malformed"
-	ErrorInvalidVolumeNotFound                                 = "InvalidVolume.NotFound"
-	ErrorInvalidVolumeZoneMismatch                             = "InvalidVolume.ZoneMismatch"
-	ErrorInvalidVolumeIDDuplicate                              = "InvalidVolumeID.Duplicate"
-	ErrorInvalidVolumeIDMalformed                              = "InvalidVolumeID.Malformed"
-	ErrorInvalidVolumeIDZoneMismatch                           = "InvalidVolumeID.ZoneMismatch"
-	ErrorInvalidVpcEndpointNotFound                            = "InvalidVpcEndpoint.NotFound"
-	ErrorInvalidVpcEndpointIdMalformed                         = "InvalidVpcEndpointId.Malformed"
-	ErrorInvalidVpcEndpointIdNotFound                          = "InvalidVpcEndpointId.NotFound"
-	ErrorInvalidVpcEndpointServiceNotFound                     = "InvalidVpcEndpointService.NotFound"
-	ErrorInvalidVpcEndpointServiceIdNotFound                   = "InvalidVpcEndpointServiceId.NotFound"
-	ErrorInvalidVpcEndpointServiceIdIdMalformed                = "InvalidVpcEndpointServiceIdId.Malformed"
-	ErrorInvalidVpcEndpointType                                = "InvalidVpcEndpointType"
-	ErrorInvalidVpcIDMalformed                                 = "InvalidVpcID.Malformed"
-	ErrorInvalidVpcIDNotFound                                  = "InvalidVpcID.NotFound"
-	ErrorInvalidVpcPeeringConnectionIDNotFound                 = "InvalidVpcPeeringConnectionID.NotFound"
-	ErrorInvalidVpcPeeringConnectionIdMalformed                = "InvalidVpcPeeringConnectionId.Malformed"
-	ErrorInvalidVpcPeeringConnectionStateDnsHostnamesDisabled  = "InvalidVpcPeeringConnectionState.DnsHostnamesDisabled"
-	ErrorInvalidVpcRange                                       = "InvalidVpcRange"
-	ErrorInvalidVpcState                                       = "InvalidVpcState"
-	ErrorInvalidVpnConnectionInvalidState                      = "InvalidVpnConnection.InvalidState"
-	ErrorInvalidVpnConnectionInvalidType                       = "InvalidVpnConnection.InvalidType"
-	ErrorInvalidVpnConnectionID                                = "InvalidVpnConnectionID"
-	ErrorInvalidVpnConnectionIDNotFound                        = "InvalidVpnConnectionID.NotFound"
-	ErrorInvalidVpnGatewayAttachmentNotFound                   = "InvalidVpnGatewayAttachment.NotFound"
-	ErrorInvalidVpnGatewayIDNotFound                           = "InvalidVpnGatewayID.NotFound"
-	ErrorInvalidVpnGatewayState                                = "InvalidVpnGatewayState"
-	ErrorInvalidZoneNotFound                                   = "InvalidZone.NotFound"
-	ErrorKeyPairLimitExceeded                                  = "KeyPairLimitExceeded"
-	ErrorLegacySecurityGroup                                   = "LegacySecurityGroup"
-	ErrorLimitPriceExceeded                                    = "LimitPriceExceeded"
-	ErrorLogDestinationNotFound                                = "LogDestinationNotFound"
-	ErrorLogDestinationPermissionIssue                         = "LogDestinationPermissionIssue"
-	ErrorMalformedQueryString                                  = "MalformedQueryString"
-	ErrorMaxConfigLimitExceededException                       = "MaxConfigLimitExceededException"
-	ErrorMaxIOPSLimitExceeded                                  = "MaxIOPSLimitExceeded"
-	ErrorMaxScheduledInstanceCapacityExceeded                  = "MaxScheduledInstanceCapacityExceeded"
-	ErrorMaxSpotFleetRequestCountExceeded                      = "MaxSpotFleetRequestCountExceeded"
-	ErrorMaxSpotInstanceCountExceeded                          = "MaxSpotInstanceCountExceeded"
-	ErrorMaxTemplateLimitExceeded                              = "MaxTemplateLimitExceeded"
-	ErrorMaxTemplateVersionLimitExceeded                       = "MaxTemplateVersionLimitExceeded"
-	ErrorMissingAction                                         = "MissingAction"
-	ErrorMissingAuthenticationToken                            = "MissingAuthenticationToken"
-	ErrorMissingInput                                          = "MissingInput"
-	ErrorMissingParameter                                      = "MissingParameter"
-	ErrorNatGatewayLimitExceeded                               = "NatGatewayLimitExceeded"
-	ErrorNatGatewayMalformed                                   = "NatGatewayMalformed"
-	ErrorNatGatewayNotFound                                    = "NatGatewayNotFound"
-	ErrorNetworkAclEntryAlreadyExists                          = "NetworkAclEntryAlreadyExists"
-	ErrorNetworkAclEntryLimitExceeded                          = "NetworkAclEntryLimitExceeded"
-	ErrorNetworkAclLimitExceeded                               = "NetworkAclLimitExceeded"
-	ErrorNetworkInterfaceLimitExceeded                         = "NetworkInterfaceLimitExceeded"
-	ErrorNetworkInterfaceNotSupported                          = "NetworkInterfaceNotSupported"
-	ErrorNetworkLoadBalancerNotFoundException                  = "NetworkLoadBalancerNotFoundException"
-	ErrorNlbInUseByTrafficMirrorTargetException                = "NlbInUseByTrafficMirrorTargetException"
-	ErrorNoSuchVersion                                         = "NoSuchVersion"
-	ErrorNonEBSInstance                                        = "NonEBSInstance"
-	ErrorNotExportable                                         = "NotExportable"
-	ErrorOperationNotPermitted                                 = "OperationNotPermitted"
-	ErrorOptInRequired                                         = "OptInRequired"
-	ErrorOutstandingVpcPeeringConnectionLimitExceeded          = "OutstandingVpcPeeringConnectionLimitExceeded"
-	ErrorPendingSnapshotLimitExceeded                          = "PendingSnapshotLimitExceeded"
-	ErrorPendingVerification                                   = "PendingVerification"
-	ErrorPendingVpcPeeringConnectionLimitExceeded              = "PendingVpcPeeringConnectionLimitExceeded"
-	ErrorPlacementGroupLimitExceeded                           = "PlacementGroupLimitExceeded"
-	ErrorPrivateIpAddressLimitExceeded                         = "PrivateIpAddressLimitExceeded"
-	ErrorRequestEntityTooLarge                                 = "RequestEntityTooLarge"
-	ErrorRequestExpired                                        = "RequestExpired"
-	ErrorRequestLimitExceeded                                  = "RequestLimitExceeded"
-	ErrorRequestResourceCountExceeded                          = "RequestResourceCountExceeded"
-	ErrorReservationCapacityExceeded                           = "ReservationCapacityExceeded"
-	ErrorReservedInstancesCountExceeded                        = "ReservedInstancesCountExceeded"
-	ErrorReservedInstancesLimitExceeded                        = "ReservedInstancesLimitExceeded"
-	ErrorReservedInstancesUnavailable                          = "ReservedInstancesUnavailable"
-	ErrorResourceAlreadyAssigned                               = "Resource.AlreadyAssigned"
-	ErrorResourceAlreadyAssociated                             = "Resource.AlreadyAssociated"
-	ErrorResourceCountExceeded                                 = "ResourceCountExceeded"
-	ErrorResourceCountLimitExceeded                            = "ResourceCountLimitExceeded"
-	ErrorResourceLimitExceeded                                 = "ResourceLimitExceeded"
-	ErrorRetryableError                                        = "RetryableError"
-	ErrorRouteAlreadyExists                                    = "RouteAlreadyExists"
-	ErrorRouteLimitExceeded                                    = "RouteLimitExceeded"
-	ErrorRouteTableLimitExceeded                               = "RouteTableLimitExceeded"
-	ErrorRulesPerSecurityGroupLimitExceeded                    = "RulesPerSecurityGroupLimitExceeded"
-	ErrorScheduledInstanceLimitExceeded                        = "ScheduledInstanceLimitExceeded"
-	ErrorScheduledInstanceParameterMismatch                    = "ScheduledInstanceParameterMismatch"
-	ErrorScheduledInstanceSlotNotOpen                          = "ScheduledInstanceSlotNotOpen"
-	ErrorScheduledInstanceSlotUnavailable                      = "ScheduledInstanceSlotUnavailable"
-	ErrorSecurityGroupLimitExceeded                            = "SecurityGroupLimitExceeded"
-	ErrorSecurityGroupsPerInstanceLimitExceeded                = "SecurityGroupsPerInstanceLimitExceeded"
-	ErrorSecurityGroupsPerInterfaceLimitExceeded               = "SecurityGroupsPerInterfaceLimitExceeded"
-	ErrorSerialConsoleSessionUnavailable                       = "SerialConsoleSessionUnavailable"
-	ErrorServerInternal                                        = "ServerInternal"
-	ErrorServiceUnavailable                                    = "ServiceUnavailable"
-	ErrorSignatureDoesNotMatch                                 = "SignatureDoesNotMatch"
-	ErrorSnapshotCopyUnsupportedInterRegion                    = "SnapshotCopyUnsupported.InterRegion"
-	ErrorSnapshotCreationPerVolumeRateExceeded                 = "SnapshotCreationPerVolumeRateExceeded"
-	ErrorSnapshotLimitExceeded                                 = "SnapshotLimitExceeded"
-	ErrorSpotMaxPriceTooLow                                    = "SpotMaxPriceTooLow"
-	ErrorSubnetLimitExceeded                                   = "SubnetLimitExceeded"
-	ErrorTagLimitExceeded                                      = "TagLimitExceeded"
-	ErrorTagPolicyViolation                                    = "TagPolicyViolation"
-	ErrorThrottling                                            = "Throttling"
-	ErrorTargetCapacityLimitExceededException                  = "TargetCapacityLimitExceededException"
-	ErrorTrafficMirrorFilterInUse                              = "TrafficMirrorFilterInUse"
-	ErrorTrafficMirrorFilterLimitExceeded                      = "TrafficMirrorFilterLimitExceeded"
-	ErrorTrafficMirrorFilterRuleAlreadyExists                  = "TrafficMirrorFilterRuleAlreadyExists"
-	ErrorTrafficMirrorFilterRuleLimitExceeded                  = "TrafficMirrorFilterRuleLimitExceeded"
-	ErrorTrafficMirrorSessionLimitExceeded                     = "TrafficMirrorSessionLimitExceeded"
-	ErrorTrafficMirrorSessionsPerInterfaceLimitExceeded        = "TrafficMirrorSessionsPerInterfaceLimitExceeded"
-	ErrorTrafficMirrorSessionsPerTargetLimitExceeded           = "TrafficMirrorSessionsPerTargetLimitExceeded"
-	ErrorTrafficMirrorSourcesPerTargetLimitExceeded            = "TrafficMirrorSourcesPerTargetLimitExceeded"
-	ErrorTrafficMirrorTargetInUseException                     = "TrafficMirrorTargetInUseException"
-	ErrorTrafficMirrorTargetLimitExceeded                      = "TrafficMirrorTargetLimitExceeded"
-	ErrorUnauthorizedOperation                                 = "UnauthorizedOperation"
-	ErrorUnavailable                                           = "Unavailable"
-	ErrorUnavailableHostRequirements                           = "UnavailableHostRequirements"
-	ErrorUnfulfillableCapacity                                 = "UnfulfillableCapacity"
-	ErrorUnknownParameter                                      = "UnknownParameter"
-	ErrorUnknownPrincipalTypeUnsupported                       = "UnknownPrincipalType.Unsupported"
-	ErrorUnknownVolumeType                                     = "UnknownVolumeType"
-	ErrorUnsupported                                           = "Unsupported"
-	ErrorUnsupportedException                                  = "UnsupportedException"
-	ErrorUnsupportedHibernationConfiguration                   = "UnsupportedHibernationConfiguration"
-	ErrorUnsupportedHostConfiguration                          = "UnsupportedHostConfiguration"
-	ErrorUnsupportedInstanceAttribute                          = "UnsupportedInstanceAttribute"
-	ErrorUnsupportedInstanceTypeOnHost                         = "UnsupportedInstanceTypeOnHost"
-	ErrorUnsupportedOperation                                  = "UnsupportedOperation"
-	ErrorUnsupportedProtocol                                   = "UnsupportedProtocol"
-	ErrorUnsupportedTenancy                                    = "UnsupportedTenancy"
-	ErrorUpdateLimitExceeded                                   = "UpdateLimitExceeded"
-	ErrorVPCIdNotSpecified                                     = "VPCIdNotSpecified"
-	ErrorVPCResourceNotSpecified                               = "VPCResourceNotSpecified"
-	ErrorValidationError                                       = "ValidationError"
-	ErrorVcpuLimitExceeded                                     = "VcpuLimitExceeded"
-	ErrorVolumeIOPSLimit                                       = "VolumeIOPSLimit"
-	ErrorVolumeInUse                                           = "VolumeInUse"
-	ErrorVolumeLimitExceeded                                   = "VolumeLimitExceeded"
-	ErrorVolumeModificationSizeLimitExceeded                   = "VolumeModificationSizeLimitExceeded"
-	ErrorVolumeTypeNotAvailableInZone                          = "VolumeTypeNotAvailableInZone"
-	ErrorVpcEndpointLimitExceeded                              = "VpcEndpointLimitExceeded"
-	ErrorVpcLimitExceeded                                      = "VpcLimitExceeded"
-	ErrorVpcPeeringConnectionAlreadyExists                     = "VpcPeeringConnectionAlreadyExists"
-	ErrorVpcPeeringConnectionsPerVpcLimitExceeded              = "VpcPeeringConnectionsPerVpcLimitExceeded"
-	ErrorVpnConnectionLimitExceeded                            = "VpnConnectionLimitExceeded"
-	ErrorVpnGatewayAttachmentLimitExceeded                     = "VpnGatewayAttachmentLimitExceeded"
-	ErrorVpnGatewayLimitExceeded                               = "VpnGatewayLimitExceeded"
-	ErrorZonesMismatched                                       = "ZonesMismatched"
+	// ACM error: the JSON envelope appends "Exception" on the wire; not-found reuses ErrorResourceNotFound.
+	ErrorACMInvalidArn                                        = "InvalidArn"
+	ErrorInvalidParameterCombination                          = "InvalidParameterCombination"
+	ErrorInvalidParameterDependency                           = "InvalidParameterDependency"
+	ErrorInvalidParameterValue                                = "InvalidParameterValue"
+	ErrorInvalidPermissionDuplicate                           = "InvalidPermission.Duplicate"
+	ErrorInvalidPermissionMalformed                           = "InvalidPermission.Malformed"
+	ErrorInvalidPermissionNotFound                            = "InvalidPermission.NotFound"
+	ErrorInvalidPlacementGroupDuplicate                       = "InvalidPlacementGroup.Duplicate"
+	ErrorInvalidPlacementGroupInUse                           = "InvalidPlacementGroup.InUse"
+	ErrorInvalidPlacementGroupUnknown                         = "InvalidPlacementGroup.Unknown"
+	ErrorInvalidPlacementGroupIdMalformed                     = "InvalidPlacementGroupId.Malformed"
+	ErrorInvalidPolicyDocument                                = "InvalidPolicyDocument"
+	ErrorInvalidPrefixListIDNotFound                          = "InvalidPrefixListID.NotFound"
+	ErrorInvalidPrefixListIdMalformed                         = "InvalidPrefixListId.Malformed"
+	ErrorInvalidProductInfo                                   = "InvalidProductInfo"
+	ErrorInvalidPurchaseTokenExpired                          = "InvalidPurchaseToken.Expired"
+	ErrorInvalidPurchaseTokenMalformed                        = "InvalidPurchaseToken.Malformed"
+	ErrorInvalidQuantity                                      = "InvalidQuantity"
+	ErrorInvalidQueryParameter                                = "InvalidQueryParameter"
+	ErrorInvalidRamDiskIdMalformed                            = "InvalidRamDiskId.Malformed"
+	ErrorInvalidRegion                                        = "InvalidRegion"
+	ErrorInvalidRequest                                       = "InvalidRequest"
+	ErrorInvalidReservationIDMalformed                        = "InvalidReservationID.Malformed"
+	ErrorInvalidReservationIDNotFound                         = "InvalidReservationID.NotFound"
+	ErrorInvalidReservedInstancesId                           = "InvalidReservedInstancesId"
+	ErrorInvalidReservedInstancesOfferingId                   = "InvalidReservedInstancesOfferingId"
+	ErrorInvalidResourceConfigurationArnMalformed             = "InvalidResourceConfigurationArn.Malformed"
+	ErrorInvalidResourceConfigurationArnNotFound              = "InvalidResourceConfigurationArn.NotFound"
+	ErrorInvalidResourceTypeUnknown                           = "InvalidResourceType.Unknown"
+	ErrorInvalidRouteInvalidState                             = "InvalidRoute.InvalidState"
+	ErrorInvalidRouteMalformed                                = "InvalidRoute.Malformed"
+	ErrorInvalidRouteNotFound                                 = "InvalidRoute.NotFound"
+	ErrorInvalidRouteTableIDNotFound                          = "InvalidRouteTableID.NotFound"
+	ErrorInvalidRouteTableIdMalformed                         = "InvalidRouteTableId.Malformed"
+	ErrorInvalidScheduledInstance                             = "InvalidScheduledInstance"
+	ErrorInvalidSecurityRequestHasExpired                     = "InvalidSecurity.RequestHasExpired"
+	ErrorInvalidSecurityGroupIDNotFound                       = "InvalidSecurityGroupID.NotFound"
+	ErrorInvalidSecurityGroupIdMalformed                      = "InvalidSecurityGroupId.Malformed"
+	ErrorInvalidSecurityGroupRuleIdMalformed                  = "InvalidSecurityGroupRuleId.Malformed"
+	ErrorInvalidSecurityGroupRuleIdNotFound                   = "InvalidSecurityGroupRuleId.NotFound"
+	ErrorInvalidServiceName                                   = "InvalidServiceName"
+	ErrorInvalidSnapshotInUse                                 = "InvalidSnapshot.InUse"
+	ErrorInvalidSnapshotNotFound                              = "InvalidSnapshot.NotFound"
+	ErrorInvalidSnapshotIDMalformed                           = "InvalidSnapshotID.Malformed"
+	ErrorInvalidSpotDatafeedNotFound                          = "InvalidSpotDatafeed.NotFound"
+	ErrorInvalidSpotFleetRequestConfig                        = "InvalidSpotFleetRequestConfig"
+	ErrorInvalidSpotFleetRequestIdMalformed                   = "InvalidSpotFleetRequestId.Malformed"
+	ErrorInvalidSpotFleetRequestIdNotFound                    = "InvalidSpotFleetRequestId.NotFound"
+	ErrorInvalidSpotInstanceRequestIDMalformed                = "InvalidSpotInstanceRequestID.Malformed"
+	ErrorInvalidSpotInstanceRequestIDNotFound                 = "InvalidSpotInstanceRequestID.NotFound"
+	ErrorInvalidState                                         = "InvalidState"
+	ErrorInvalidStateTransition                               = "InvalidStateTransition"
+	ErrorInvalidSubnet                                        = "InvalidSubnet"
+	ErrorInvalidSubnetConflict                                = "InvalidSubnet.Conflict"
+	ErrorInvalidSubnetRange                                   = "InvalidSubnet.Range"
+	ErrorInvalidSubnetIDMalformed                             = "InvalidSubnetID.Malformed"
+	ErrorInvalidSubnetIDNotFound                              = "InvalidSubnetID.NotFound"
+	ErrorInvalidTagKeyMalformed                               = "InvalidTagKey.Malformed"
+	ErrorInvalidTargetArnUnknown                              = "InvalidTargetArn.Unknown"
+	ErrorInvalidTargetException                               = "InvalidTargetException"
+	ErrorInvalidTenancy                                       = "InvalidTenancy"
+	ErrorInvalidTime                                          = "InvalidTime"
+	ErrorInvalidTrafficMirrorFilterNotFound                   = "InvalidTrafficMirrorFilterNotFound"
+	ErrorInvalidTrafficMirrorFilterRuleNotFound               = "InvalidTrafficMirrorFilterRuleNotFound"
+	ErrorInvalidTrafficMirrorSessionNotFound                  = "InvalidTrafficMirrorSessionNotFound"
+	ErrorInvalidTrafficMirrorTargetNoFound                    = "InvalidTrafficMirrorTargetNoFound"
+	ErrorInvalidUserIDMalformed                               = "InvalidUserID.Malformed"
+	ErrorInvalidVolumeNotFound                                = "InvalidVolume.NotFound"
+	ErrorInvalidVolumeZoneMismatch                            = "InvalidVolume.ZoneMismatch"
+	ErrorInvalidVolumeIDDuplicate                             = "InvalidVolumeID.Duplicate"
+	ErrorInvalidVolumeIDMalformed                             = "InvalidVolumeID.Malformed"
+	ErrorInvalidVolumeIDZoneMismatch                          = "InvalidVolumeID.ZoneMismatch"
+	ErrorInvalidVpcEndpointNotFound                           = "InvalidVpcEndpoint.NotFound"
+	ErrorInvalidVpcEndpointIdMalformed                        = "InvalidVpcEndpointId.Malformed"
+	ErrorInvalidVpcEndpointIdNotFound                         = "InvalidVpcEndpointId.NotFound"
+	ErrorInvalidVpcEndpointServiceNotFound                    = "InvalidVpcEndpointService.NotFound"
+	ErrorInvalidVpcEndpointServiceIdNotFound                  = "InvalidVpcEndpointServiceId.NotFound"
+	ErrorInvalidVpcEndpointServiceIdIdMalformed               = "InvalidVpcEndpointServiceIdId.Malformed"
+	ErrorInvalidVpcEndpointType                               = "InvalidVpcEndpointType"
+	ErrorInvalidVpcIDMalformed                                = "InvalidVpcID.Malformed"
+	ErrorInvalidVpcIDNotFound                                 = "InvalidVpcID.NotFound"
+	ErrorInvalidVpcPeeringConnectionIDNotFound                = "InvalidVpcPeeringConnectionID.NotFound"
+	ErrorInvalidVpcPeeringConnectionIdMalformed               = "InvalidVpcPeeringConnectionId.Malformed"
+	ErrorInvalidVpcPeeringConnectionStateDnsHostnamesDisabled = "InvalidVpcPeeringConnectionState.DnsHostnamesDisabled"
+	ErrorInvalidVpcRange                                      = "InvalidVpcRange"
+	ErrorInvalidVpcState                                      = "InvalidVpcState"
+	ErrorInvalidVpnConnectionInvalidState                     = "InvalidVpnConnection.InvalidState"
+	ErrorInvalidVpnConnectionInvalidType                      = "InvalidVpnConnection.InvalidType"
+	ErrorInvalidVpnConnectionID                               = "InvalidVpnConnectionID"
+	ErrorInvalidVpnConnectionIDNotFound                       = "InvalidVpnConnectionID.NotFound"
+	ErrorInvalidVpnGatewayAttachmentNotFound                  = "InvalidVpnGatewayAttachment.NotFound"
+	ErrorInvalidVpnGatewayIDNotFound                          = "InvalidVpnGatewayID.NotFound"
+	ErrorInvalidVpnGatewayState                               = "InvalidVpnGatewayState"
+	ErrorInvalidZoneNotFound                                  = "InvalidZone.NotFound"
+	ErrorKeyPairLimitExceeded                                 = "KeyPairLimitExceeded"
+	ErrorLegacySecurityGroup                                  = "LegacySecurityGroup"
+	ErrorLimitPriceExceeded                                   = "LimitPriceExceeded"
+	ErrorLogDestinationNotFound                               = "LogDestinationNotFound"
+	ErrorLogDestinationPermissionIssue                        = "LogDestinationPermissionIssue"
+	ErrorMalformedQueryString                                 = "MalformedQueryString"
+	ErrorMaxConfigLimitExceededException                      = "MaxConfigLimitExceededException"
+	ErrorMaxIOPSLimitExceeded                                 = "MaxIOPSLimitExceeded"
+	ErrorMaxScheduledInstanceCapacityExceeded                 = "MaxScheduledInstanceCapacityExceeded"
+	ErrorMaxSpotFleetRequestCountExceeded                     = "MaxSpotFleetRequestCountExceeded"
+	ErrorMaxSpotInstanceCountExceeded                         = "MaxSpotInstanceCountExceeded"
+	ErrorMaxTemplateLimitExceeded                             = "MaxTemplateLimitExceeded"
+	ErrorMaxTemplateVersionLimitExceeded                      = "MaxTemplateVersionLimitExceeded"
+	ErrorMissingAction                                        = "MissingAction"
+	ErrorMissingAuthenticationToken                           = "MissingAuthenticationToken"
+	ErrorMissingInput                                         = "MissingInput"
+	ErrorMissingParameter                                     = "MissingParameter"
+	ErrorNatGatewayLimitExceeded                              = "NatGatewayLimitExceeded"
+	ErrorNatGatewayMalformed                                  = "NatGatewayMalformed"
+	ErrorNatGatewayNotFound                                   = "NatGatewayNotFound"
+	ErrorNetworkAclEntryAlreadyExists                         = "NetworkAclEntryAlreadyExists"
+	ErrorNetworkAclEntryLimitExceeded                         = "NetworkAclEntryLimitExceeded"
+	ErrorNetworkAclLimitExceeded                              = "NetworkAclLimitExceeded"
+	ErrorNetworkInterfaceLimitExceeded                        = "NetworkInterfaceLimitExceeded"
+	ErrorNetworkInterfaceNotSupported                         = "NetworkInterfaceNotSupported"
+	ErrorNetworkLoadBalancerNotFoundException                 = "NetworkLoadBalancerNotFoundException"
+	ErrorNlbInUseByTrafficMirrorTargetException               = "NlbInUseByTrafficMirrorTargetException"
+	ErrorNoSuchVersion                                        = "NoSuchVersion"
+	ErrorNonEBSInstance                                       = "NonEBSInstance"
+	ErrorNotExportable                                        = "NotExportable"
+	ErrorNotImplemented                                       = "NotImplemented"
+	ErrorOperationNotPermitted                                = "OperationNotPermitted"
+	ErrorOptInRequired                                        = "OptInRequired"
+	ErrorOutstandingVpcPeeringConnectionLimitExceeded         = "OutstandingVpcPeeringConnectionLimitExceeded"
+	ErrorPackedPolicyTooLarge                                 = "PackedPolicyTooLarge"
+	ErrorPendingSnapshotLimitExceeded                         = "PendingSnapshotLimitExceeded"
+	ErrorPendingVerification                                  = "PendingVerification"
+	ErrorPendingVpcPeeringConnectionLimitExceeded             = "PendingVpcPeeringConnectionLimitExceeded"
+	ErrorPlacementGroupLimitExceeded                          = "PlacementGroupLimitExceeded"
+	ErrorPrivateIpAddressLimitExceeded                        = "PrivateIpAddressLimitExceeded"
+	ErrorRegionDisabled                                       = "RegionDisabledException"
+	ErrorRequestEntityTooLarge                                = "RequestEntityTooLarge"
+	ErrorRequestExpired                                       = "RequestExpired"
+	ErrorRequestLimitExceeded                                 = "RequestLimitExceeded"
+	ErrorRequestResourceCountExceeded                         = "RequestResourceCountExceeded"
+	ErrorReservationCapacityExceeded                          = "ReservationCapacityExceeded"
+	ErrorReservedInstancesCountExceeded                       = "ReservedInstancesCountExceeded"
+	ErrorReservedInstancesLimitExceeded                       = "ReservedInstancesLimitExceeded"
+	ErrorReservedInstancesUnavailable                         = "ReservedInstancesUnavailable"
+	ErrorResourceAlreadyAssigned                              = "Resource.AlreadyAssigned"
+	ErrorResourceAlreadyAssociated                            = "Resource.AlreadyAssociated"
+	ErrorResourceCountExceeded                                = "ResourceCountExceeded"
+	ErrorResourceCountLimitExceeded                           = "ResourceCountLimitExceeded"
+	ErrorResourceLimitExceeded                                = "ResourceLimitExceeded"
+	// ErrorResourceNotFound is the ACM not-found code. EKS must use ErrorEKSResourceNotFound — do not cross-wire.
+	ErrorResourceNotFound                               = "ResourceNotFound"
+	ErrorEKSResourceInUse                               = "ResourceInUseException"
+	ErrorEKSResourceNotFound                            = "ResourceNotFoundException"
+	ErrorRetryableError                                 = "RetryableError"
+	ErrorRouteAlreadyExists                             = "RouteAlreadyExists"
+	ErrorRouteLimitExceeded                             = "RouteLimitExceeded"
+	ErrorRouteTableLimitExceeded                        = "RouteTableLimitExceeded"
+	ErrorRulesPerSecurityGroupLimitExceeded             = "RulesPerSecurityGroupLimitExceeded"
+	ErrorScheduledInstanceLimitExceeded                 = "ScheduledInstanceLimitExceeded"
+	ErrorScheduledInstanceParameterMismatch             = "ScheduledInstanceParameterMismatch"
+	ErrorScheduledInstanceSlotNotOpen                   = "ScheduledInstanceSlotNotOpen"
+	ErrorScheduledInstanceSlotUnavailable               = "ScheduledInstanceSlotUnavailable"
+	ErrorSecurityGroupLimitExceeded                     = "SecurityGroupLimitExceeded"
+	ErrorSecurityGroupsPerInstanceLimitExceeded         = "SecurityGroupsPerInstanceLimitExceeded"
+	ErrorSecurityGroupsPerInterfaceLimitExceeded        = "SecurityGroupsPerInterfaceLimitExceeded"
+	ErrorSerialConsoleSessionUnavailable                = "SerialConsoleSessionUnavailable"
+	ErrorServerInternal                                 = "ServerInternal"
+	ErrorServiceUnavailable                             = "ServiceUnavailable"
+	ErrorSignatureDoesNotMatch                          = "SignatureDoesNotMatch"
+	ErrorSnapshotCopyUnsupportedInterRegion             = "SnapshotCopyUnsupported.InterRegion"
+	ErrorSnapshotCreationPerVolumeRateExceeded          = "SnapshotCreationPerVolumeRateExceeded"
+	ErrorSnapshotLimitExceeded                          = "SnapshotLimitExceeded"
+	ErrorSpotMaxPriceTooLow                             = "SpotMaxPriceTooLow"
+	ErrorSubnetLimitExceeded                            = "SubnetLimitExceeded"
+	ErrorTagLimitExceeded                               = "TagLimitExceeded"
+	ErrorTagPolicyViolation                             = "TagPolicyViolation"
+	ErrorThrottling                                     = "Throttling"
+	ErrorTargetCapacityLimitExceededException           = "TargetCapacityLimitExceededException"
+	ErrorTrafficMirrorFilterInUse                       = "TrafficMirrorFilterInUse"
+	ErrorTrafficMirrorFilterLimitExceeded               = "TrafficMirrorFilterLimitExceeded"
+	ErrorTrafficMirrorFilterRuleAlreadyExists           = "TrafficMirrorFilterRuleAlreadyExists"
+	ErrorTrafficMirrorFilterRuleLimitExceeded           = "TrafficMirrorFilterRuleLimitExceeded"
+	ErrorTrafficMirrorSessionLimitExceeded              = "TrafficMirrorSessionLimitExceeded"
+	ErrorTrafficMirrorSessionsPerInterfaceLimitExceeded = "TrafficMirrorSessionsPerInterfaceLimitExceeded"
+	ErrorTrafficMirrorSessionsPerTargetLimitExceeded    = "TrafficMirrorSessionsPerTargetLimitExceeded"
+	ErrorTrafficMirrorSourcesPerTargetLimitExceeded     = "TrafficMirrorSourcesPerTargetLimitExceeded"
+	ErrorTrafficMirrorTargetInUseException              = "TrafficMirrorTargetInUseException"
+	ErrorTrafficMirrorTargetLimitExceeded               = "TrafficMirrorTargetLimitExceeded"
+	ErrorUnauthorizedOperation                          = "UnauthorizedOperation"
+	ErrorUnavailable                                    = "Unavailable"
+	ErrorUnavailableHostRequirements                    = "UnavailableHostRequirements"
+	ErrorUnfulfillableCapacity                          = "UnfulfillableCapacity"
+	ErrorUnknownParameter                               = "UnknownParameter"
+	ErrorUnknownPrincipalTypeUnsupported                = "UnknownPrincipalType.Unsupported"
+	ErrorUnknownVolumeType                              = "UnknownVolumeType"
+	ErrorUnsupported                                    = "Unsupported"
+	ErrorUnsupportedException                           = "UnsupportedException"
+	ErrorUnsupportedHibernationConfiguration            = "UnsupportedHibernationConfiguration"
+	ErrorUnsupportedHostConfiguration                   = "UnsupportedHostConfiguration"
+	ErrorUnsupportedInstanceAttribute                   = "UnsupportedInstanceAttribute"
+	ErrorUnsupportedInstanceTypeOnHost                  = "UnsupportedInstanceTypeOnHost"
+	ErrorUnsupportedOperation                           = "UnsupportedOperation"
+	ErrorUnsupportedProtocol                            = "UnsupportedProtocol"
+	ErrorUnsupportedTenancy                             = "UnsupportedTenancy"
+	ErrorUpdateLimitExceeded                            = "UpdateLimitExceeded"
+	ErrorVPCIdNotSpecified                              = "VPCIdNotSpecified"
+	ErrorVPCResourceNotSpecified                        = "VPCResourceNotSpecified"
+	ErrorValidationError                                = "ValidationError"
+	ErrorVcpuLimitExceeded                              = "VcpuLimitExceeded"
+	ErrorVolumeIOPSLimit                                = "VolumeIOPSLimit"
+	ErrorVolumeInUse                                    = "VolumeInUse"
+	ErrorVolumeLimitExceeded                            = "VolumeLimitExceeded"
+	ErrorVolumeModificationSizeLimitExceeded            = "VolumeModificationSizeLimitExceeded"
+	ErrorVolumeTypeNotAvailableInZone                   = "VolumeTypeNotAvailableInZone"
+	ErrorVpcEndpointLimitExceeded                       = "VpcEndpointLimitExceeded"
+	ErrorVpcLimitExceeded                               = "VpcLimitExceeded"
+	ErrorVpcPeeringConnectionAlreadyExists              = "VpcPeeringConnectionAlreadyExists"
+	ErrorVpcPeeringConnectionsPerVpcLimitExceeded       = "VpcPeeringConnectionsPerVpcLimitExceeded"
+	ErrorVpnConnectionLimitExceeded                     = "VpnConnectionLimitExceeded"
+	ErrorVpnGatewayAttachmentLimitExceeded              = "VpnGatewayAttachmentLimitExceeded"
+	ErrorVpnGatewayLimitExceeded                        = "VpnGatewayLimitExceeded"
+	ErrorZonesMismatched                                = "ZonesMismatched"
 
 	// IAM-specific error codes
 	ErrorIAMNoSuchEntity            = "NoSuchEntity"
@@ -434,6 +452,21 @@ var (
 	ErrorIAMInvalidInput            = ErrorInvalidInput // alias for IAM usage
 	ErrorIAMMalformedPolicyDocument = "MalformedPolicyDocument"
 	ErrorAccessDenied               = "AccessDenied"
+
+	// ECR-specific error codes
+	ErrorRepositoryNotFound       = "RepositoryNotFoundException"
+	ErrorRepositoryPolicyNotFound = "RepositoryPolicyNotFoundException"
+	ErrorLifecyclePolicyNotFound  = "LifecyclePolicyNotFoundException"
+	ErrorRepositoryAlreadyExists  = "RepositoryAlreadyExistsException"
+	ErrorRepositoryNotEmpty       = "RepositoryNotEmptyException"
+	ErrorImageNotFound            = "ImageNotFoundException"
+	ErrorImageAlreadyExists       = "ImageAlreadyExistsException"
+	ErrorImageTagAlreadyExists    = "ImageTagAlreadyExistsException"
+	ErrorImageDigestDoesNotMatch  = "ImageDigestDoesNotMatchException"
+	ErrorLayersNotFound           = "LayersNotFoundException"
+	ErrorReferencedImagesNotFound = "ReferencedImagesNotFoundException"
+	ErrorTooManyTags              = "TooManyTagsException"
+	ErrorOperationNotSupported    = "OperationNotSupportedException"
 
 	// ELBv2-specific error codes
 	ErrorELBv2LoadBalancerNotFound         = "LoadBalancerNotFound"
@@ -453,6 +486,14 @@ var (
 	ErrorELBv2SubnetNotFound               = "SubnetNotFound"
 	ErrorELBv2AvailabilityZoneNotSupported = "AvailabilityZoneNotSupported"
 	ErrorELBv2InvalidConfigurationRequest  = "InvalidConfigurationRequest"
+	ErrorELBv2RuleNotFound                 = "RuleNotFound"
+	ErrorELBv2PriorityInUse                = "PriorityInUse"
+	ErrorELBv2TooManyRules                 = "TooManyRules"
+	ErrorELBv2TooManyActions               = "TooManyActions"
+	ErrorELBv2InvalidRulePriority          = "InvalidRulePriority"
+	ErrorELBv2IncompatibleProtocols        = "IncompatibleProtocols"
+	ErrorELBv2CertificateNotFound          = "CertificateNotFound"
+	ErrorELBv2SSLPolicyNotFound            = "SSLPolicyNotFound"
 )
 
 // ValidErrorCode returns the error code if it exists in ErrorLookup,
@@ -463,6 +504,29 @@ func ValidErrorCode(code string) string {
 		return code
 	}
 	return ErrorServerInternal
+}
+
+// HasErrorCode reports whether s is exactly a registered AWS error code.
+// Use it to decide whether an error string may be surfaced to clients verbatim
+// (mapped to its real HTTP status) rather than wrapped/sanitized to 500.
+func HasErrorCode(s string) bool {
+	_, ok := ErrorLookup[s]
+	return ok
+}
+
+// IsErrorCode reports whether err carries the named AWS error code.
+// Uses substring matching because handlers return codes as plain strings, sometimes wrapped with %w.
+func IsErrorCode(err error, code string) bool {
+	return err != nil && strings.Contains(err.Error(), code)
+}
+
+// IsNotFound reports whether err carries an AWS "*.NotFound" error code — the
+// canonical "resource absent" signal. Destroy orchestration (teardown / GC /
+// reaper) uses this to treat an already-gone resource as success, so the API
+// handlers stay AWS-faithful (idempotency lives at the call site, not the
+// handler). Substring match mirrors IsErrorCode for %w-wrapped errors.
+func IsNotFound(err error) bool {
+	return err != nil && strings.Contains(err.Error(), ".NotFound")
 }
 
 var ErrorLookup = map[string]ErrorMessage{
@@ -503,6 +567,7 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorDuplicateSubnetsInSameZone:                            {HTTPCode: 400, Message: "For an interface VPC endpoint, you can specify only one subnet per Availability Zone."},
 	ErrorEncryptedVolumesNotSupported:                          {HTTPCode: 400, Message: "Encrypted Amazon EBS volumes may only be attached to instances that support Amazon EBS encryption. For more information, see Amazon EBS encryption."},
 	ErrorExistingVpcEndpointConnections:                        {HTTPCode: 400, Message: "You cannot delete a VPC endpoint service configuration or change the load balancers for the endpoint service if there are endpoints attached to the service."},
+	ErrorExpiredToken:                                          {HTTPCode: 400, Message: "The security token included in the request is expired."},
 	ErrorFilterLimitExceeded:                                   {HTTPCode: 400, Message: "The request uses too many filters or too many filter values."},
 	ErrorFleetNotInModifiableState:                             {HTTPCode: 400, Message: "The Spot Fleet request must be in the active state in order to modify it. For more information, see Spot Fleet request types."},
 	ErrorFlowLogAlreadyExists:                                  {HTTPCode: 409, Message: "A flow log with the specified configuration already exists."},
@@ -536,7 +601,7 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorInsufficientVolumeCapacity:                            {HTTPCode: 503, Message: "There is not enough capacity to fulfill your EBS volume provision request. You can try to provision a different volume type, EBS volume in a different availability zone, or you can wait for additional capacity to become available."},
 	ErrorInterfaceInUseByTrafficMirrorSession:                  {HTTPCode: 409, Message: "The Traffic Mirror source that you are trying to create uses an interface that is already associated with a session. An interface can only be associated with a session, or with a target, but not both."},
 	ErrorInterfaceInUseByTrafficMirrorTarget:                   {HTTPCode: 409, Message: "The Traffic Mirror source that you are trying to create uses an interface that is already associated with a target. An interface can only be associated with a session, or with a target, but not both. If the interface is associated with a target, it cannot be associated with another target."},
-	ErrorInternalError:                                         {HTTPCode: 500, Message: "An internal error has occurred. Retry your request, but if the problem persists, contact us with details by posting a message on AWS re:Post."},
+	ErrorInternalError:                                         {HTTPCode: 500, Message: "An internal error has occurred. Retry your request, but if the problem persists, contact us with details. "},
 	ErrorInternalFailure:                                       {HTTPCode: 404, Message: "The request processing has failed because of an unknown error, exception, or failure."},
 	ErrorInternetGatewayLimitExceeded:                          {HTTPCode: 400, Message: "You've reached the limit on the number of internet gateways that you can create. For more information, see Amazon VPC quotas."},
 	ErrorInvalidAMIAttributeItemValue:                          {HTTPCode: 400, Message: "The value of an item added to, or removed from, an image attribute is not valid. If you are specifying a userId, check that it is in the form of an AWS account ID, without hyphens."},
@@ -625,6 +690,12 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorInvalidID:                                             {HTTPCode: 400, Message: "The specified ID for the resource you are trying to tag is not valid. Ensure that you provide the full resource ID; for example, ami-2bb65342 for an AMI. If you're using the command line tools on a Windows system, you might need to use quotation marks for the key-value pair; for example, \"Name=TestTag\"."},
 	ErrorInvalidIPAddressInUse:                                 {HTTPCode: 409, Message: "The specified IP address is already in use. If you are trying to release an address, you must first disassociate it from the instance."},
 	ErrorInvalidIamInstanceProfileArnMalformed:                 {HTTPCode: 400, Message: "The specified IAM instance profile ARN is not valid. For more information about valid ARN formats, see Amazon Resource Names (ARNs)."},
+	ErrorInvalidIamInstanceProfileNotFound:                     {HTTPCode: 404, Message: "The specified IAM instance profile name or ARN does not exist."},
+	ErrorInvalidIdentityToken:                                  {HTTPCode: 400, Message: "The web identity token that was passed is invalid or expired."},
+	ErrorIDPRejectedClaim:                                      {HTTPCode: 403, Message: "The identity provider (IdP) reported that authentication failed."},
+	ErrorIDPCommunicationError:                                 {HTTPCode: 400, Message: "The request could not be fulfilled because the identity provider (IdP) that was asked to verify the incoming identity token could not be reached."},
+	ErrorIamInstanceProfileAlreadyAssociated:                   {HTTPCode: 400, Message: "There is an existing association for the specified instance."},
+	ErrorNoSuchAssociation:                                     {HTTPCode: 404, Message: "The specified IAM instance profile association does not exist."},
 	ErrorInvalidInput:                                          {HTTPCode: 400, Message: "An input parameter in the request is not valid. For example, you may have specified an incorrect Reserved Instance listing ID in the request or the Reserved Instance you tried to list cannot be sold in the Reserved Instances Marketplace (for example, if it has a scope of Region, or is a Convertible Reserved Instance)."},
 	ErrorInvalidInstanceAttributeValue:                         {HTTPCode: 400, Message: "The specified instance attribute value is not valid. This error is most commonly encountered when trying to set the InstanceType/--instance-type attribute to an unrecognized value."},
 	ErrorInvalidInstanceConnectEndpointIdMalformed:             {HTTPCode: 400, Message: "The specified EC2 Instance Connect Endpoint ID is malformed. Ensure that you specify the ID in the form eice-xxxxxxxxxxxxxxxxx."},
@@ -659,6 +730,7 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorInvalidMaxResults:                                     {HTTPCode: 400, Message: "The specified value for MaxResults is not valid."},
 	ErrorInvalidNatGatewayIDNotFound:                           {HTTPCode: 404, Message: "The specified NAT gateway ID does not exist. Ensure that you specify the AWS Region in which the NAT gateway is located, if it's not in the default Region."},
 	ErrorInvalidNetworkAclEntryNotFound:                        {HTTPCode: 404, Message: "The specified network ACL entry does not exist."},
+	ErrorACMInvalidArn:                                         {HTTPCode: 400, Message: "The requested Amazon Resource Name (ARN) does not refer to an existing resource."},
 	ErrorInvalidNetworkAclIDNotFound:                           {HTTPCode: 404, Message: "The specified network ACL does not exist. Ensure that you specify the AWS Region in which the network ACL is located, if it's not in the default Region."},
 	ErrorInvalidNetworkAclIdMalformed:                          {HTTPCode: 400, Message: "The specified network ACL ID is malformed. Ensure that you provide the ID in the form acl-xxxxxxxxxxxxxxxxx."},
 	ErrorInvalidNetworkInterfaceInUse:                          {HTTPCode: 409, Message: "The specified interface is currently in use and cannot be deleted or attached to another instance. Ensure that you have detached the network interface first. If a network interface is in use, you may also receive the InvalidParameterValue error."},
@@ -795,14 +867,17 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorNoSuchVersion:                                         {HTTPCode: 404, Message: "The specified API version does not exist."},
 	ErrorNonEBSInstance:                                        {HTTPCode: 400, Message: "The specified instance does not support Amazon EBS. Restart the instance and try again, to ensure that the code is run on an instance with updated code."},
 	ErrorNotExportable:                                         {HTTPCode: 400, Message: "The specified instance cannot be exported. You can only export certain instances. For more information, see Considerations for instance export."},
+	ErrorNotImplemented:                                        {HTTPCode: 501, Message: "Operation not implemented"},
 	ErrorOperationNotPermitted:                                 {HTTPCode: 400, Message: "The specified operation is not allowed. This error can occur for a number of reasons; for example, you might be trying to terminate an instance that has termination protection enabled, or trying to detach the primary network interface (eth0) from an instance."},
 	ErrorOptInRequired:                                         {HTTPCode: 403, Message: "You are not authorized to use the requested service. Ensure that you have subscribed to the service you are trying to use. If you are new to AWS, your account might take some time to be activated while your credit card details are being verified."},
 	ErrorOutstandingVpcPeeringConnectionLimitExceeded:          {HTTPCode: 400, Message: "You've reached the limit on the number of VPC peering connection requests that you can create for the specified VPC."},
+	ErrorPackedPolicyTooLarge:                                  {HTTPCode: 400, Message: "Serialized policy size exceeded the allowed maximum."},
 	ErrorPendingSnapshotLimitExceeded:                          {HTTPCode: 409, Message: "You've reached the limit on the number of Amazon EBS snapshots that you can have in the pending state."},
 	ErrorPendingVerification:                                   {HTTPCode: 409, Message: "Your account is pending verification. Until the verification process is complete, you may not be able to carry out requests with this account. If you have questions, contact Support."},
 	ErrorPendingVpcPeeringConnectionLimitExceeded:              {HTTPCode: 409, Message: "You've reached the limit on the number of pending VPC peering connections that you can have."},
 	ErrorPlacementGroupLimitExceeded:                           {HTTPCode: 400, Message: "You've reached the limit on the number of placement groups that you can have."},
 	ErrorPrivateIpAddressLimitExceeded:                         {HTTPCode: 400, Message: "You've reached the limit on the number of private IP addresses that you can assign to the specified network interface for that type of instance. For more information, see IP addresses per network interface."},
+	ErrorRegionDisabled:                                        {HTTPCode: 403, Message: "STS is not activated in this region."},
 	ErrorRequestEntityTooLarge:                                 {HTTPCode: 413, Message: "Request body exceeds the maximum allowed size."},
 	ErrorRequestExpired:                                        {HTTPCode: 403, Message: "The request reached the service more than 15 minutes after the date stamp on the request or more than 15 minutes after the request expiration date (such as for presigned URLs), or the date stamp on the request is more than 15 minutes in the future. If you're using temporary security credentials, this error can also occur if the credentials have expired. For more information, see Temporary security credentials in the IAM User Guide."},
 	ErrorRequestLimitExceeded:                                  {HTTPCode: 503, Message: "The maximum request rate permitted by the Amazon EC2 APIs has been exceeded for your account. For best results, use an increasing or variable sleep interval between requests. For more information, see Query API request rate."},
@@ -816,6 +891,9 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorResourceCountExceeded:                                 {HTTPCode: 400, Message: "You have exceeded the number of resources allowed for this request; for example, if you try to launch more instances than AWS allows in a single request. This limit is separate from your individual resource limit. If you get this error, break up your request into smaller requests; for example, if you are launching 15 instances, try launching 5 instances in 3 separate requests."},
 	ErrorResourceCountLimitExceeded:                            {HTTPCode: 400, Message: "You have exceeded a resource limit for creating routes."},
 	ErrorResourceLimitExceeded:                                 {HTTPCode: 400, Message: "You have exceeded an Amazon EC2 resource limit. For example, you might have too many snapshot copies in progress."},
+	ErrorResourceNotFound:                                      {HTTPCode: 404, Message: "The specified resource was not found."},
+	ErrorEKSResourceInUse:                                      {HTTPCode: 409, Message: "A cluster with this name already exists in this account and Region. Delete the existing cluster, or choose a different name."},
+	ErrorEKSResourceNotFound:                                   {HTTPCode: 404, Message: "The specified cluster could not be found. You can view your available clusters with ListClusters. Amazon EKS clusters are Region specific."},
 	ErrorRetryableError:                                        {HTTPCode: 400, Message: "A request submitted by an AWS service on your behalf could not be completed. The requesting service might automatically retry the request."},
 	ErrorRouteAlreadyExists:                                    {HTTPCode: 409, Message: "A route for the specified CIDR block already exists in this route table."},
 	ErrorRouteLimitExceeded:                                    {HTTPCode: 400, Message: "You've reached the limit on the number of routes that you can add to a route table."},
@@ -894,6 +972,21 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorIAMMalformedPolicyDocument: {HTTPCode: 400, Message: "The policy document is malformed."},
 	ErrorAccessDenied:               {HTTPCode: 403, Message: "User is not authorized to perform this action."},
 
+	// ECR error codes
+	ErrorRepositoryNotFound:       {HTTPCode: 400, Message: "The repository could not be found. Check the spelling of the specified repository and ensure that you are performing operations on the correct registry."},
+	ErrorRepositoryPolicyNotFound: {HTTPCode: 400, Message: "The repository and registry do not have an associated repository policy."},
+	ErrorLifecyclePolicyNotFound:  {HTTPCode: 400, Message: "The lifecycle policy for the specified repository could not be found."},
+	ErrorRepositoryAlreadyExists:  {HTTPCode: 400, Message: "The repository already exists in the registry."},
+	ErrorRepositoryNotEmpty:       {HTTPCode: 400, Message: "The repository contains images. Either delete the images or use the force option to delete the repository."},
+	ErrorImageNotFound:            {HTTPCode: 400, Message: "The image requested does not exist in the specified repository."},
+	ErrorImageAlreadyExists:       {HTTPCode: 400, Message: "The specified image has already been pushed, and there were no changes to the manifest or image tag after the last push."},
+	ErrorImageTagAlreadyExists:    {HTTPCode: 400, Message: "The specified image is tagged with a tag that already exists. The repository is configured for tag immutability."},
+	ErrorImageDigestDoesNotMatch:  {HTTPCode: 400, Message: "The specified image digest does not match the digest of the supplied image manifest."},
+	ErrorLayersNotFound:           {HTTPCode: 400, Message: "The specified layers could not be found, or the specified layer is not valid for this repository."},
+	ErrorReferencedImagesNotFound: {HTTPCode: 400, Message: "The manifest list is referencing an image that does not exist."},
+	ErrorTooManyTags:              {HTTPCode: 400, Message: "The list of tags on the repository is over the limit. The maximum number of tags that can be applied to a repository is 50."},
+	ErrorOperationNotSupported:    {HTTPCode: 400, Message: "The specified operation is not supported in this registry."},
+
 	// ELBv2 error codes
 	ErrorELBv2LoadBalancerNotFound:         {HTTPCode: 400, Message: "One or more load balancers not found."},
 	ErrorELBv2TargetGroupNotFound:          {HTTPCode: 400, Message: "One or more target groups not found."},
@@ -911,5 +1004,13 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorELBv2InvalidScheme:                {HTTPCode: 400, Message: "The specified scheme is not valid. Specify 'internet-facing' or 'internal'."},
 	ErrorELBv2SubnetNotFound:               {HTTPCode: 400, Message: "The specified subnet does not exist."},
 	ErrorELBv2AvailabilityZoneNotSupported: {HTTPCode: 400, Message: "The specified Availability Zone is not supported."},
-	ErrorELBv2InvalidConfigurationRequest:  {HTTPCode: 400, Message: "Security groups are not supported for load balancers with type 'network'."},
+	ErrorELBv2InvalidConfigurationRequest:  {HTTPCode: 400, Message: "The requested configuration change is not valid."},
+	ErrorELBv2RuleNotFound:                 {HTTPCode: 400, Message: "One or more rules not found."},
+	ErrorELBv2PriorityInUse:                {HTTPCode: 400, Message: "The specified priority is in use."},
+	ErrorELBv2TooManyRules:                 {HTTPCode: 400, Message: "You've reached the limit on the number of rules per load balancer."},
+	ErrorELBv2TooManyActions:               {HTTPCode: 400, Message: "You've reached the limit on the number of actions per rule."},
+	ErrorELBv2InvalidRulePriority:          {HTTPCode: 400, Message: "The specified rule priority is not valid. Priority must be between 1 and 50000."},
+	ErrorELBv2IncompatibleProtocols:        {HTTPCode: 400, Message: "The listener protocol is incompatible with the target group protocol."},
+	ErrorELBv2CertificateNotFound:          {HTTPCode: 400, Message: "One or more specified certificates do not exist."},
+	ErrorELBv2SSLPolicyNotFound:            {HTTPCode: 400, Message: "The specified SSL policy does not exist."},
 }

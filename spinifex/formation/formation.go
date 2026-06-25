@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/mulgadc/spinifex/internal/tlsconfig"
 )
 
 // NodeInfo describes a node participating in cluster formation.
@@ -53,6 +55,7 @@ type StatusResponse struct {
 	CACert        string              `json:"ca_cert,omitempty"`
 	CAKey         string              `json:"ca_key,omitempty"`
 	MasterKey     string              `json:"master_key,omitempty"`
+	ViperblockKey string              `json:"viperblock_key,omitempty"`
 	NetworkConfig *NetworkConfig      `json:"network_config,omitempty"`
 }
 
@@ -60,15 +63,20 @@ type StatusResponse struct {
 // propagated from the init node to joining nodes during formation.
 type NetworkConfig struct {
 	ExternalMode   string   `json:"external_mode"`
-	ExternalDHCP   bool     `json:"external_dhcp,omitempty"`
 	PoolName       string   `json:"pool_name"`
 	PoolSource     string   `json:"pool_source,omitempty"`
+	PoolBindBridge string   `json:"pool_bind_bridge,omitempty"`
 	PoolStart      string   `json:"pool_start,omitempty"`
 	PoolEnd        string   `json:"pool_end,omitempty"`
 	PoolGateway    string   `json:"pool_gateway"`
 	PoolGatewayIP  string   `json:"pool_gateway_ip,omitempty"`
 	PoolPrefixLen  int      `json:"pool_prefix_len"`
 	PoolDNSServers []string `json:"pool_dns_servers,omitempty"`
+
+	// IPSecEnabled propagates the cluster-wide intra-AZ IPsec toggle so the
+	// joining node provisions strongSwan and flips OVS ipsec_encapsulation to
+	// match the rest of the cluster.
+	IPSecEnabled bool `json:"ipsec_enabled"`
 
 	BootstrapAccountId  string `json:"bootstrap_account_id,omitempty"`
 	BootstrapVpcId      string `json:"bootstrap_vpc_id,omitempty"`
@@ -92,10 +100,9 @@ type SharedCredentials struct {
 	AdminSecretKey string `json:"admin_secret_key,omitempty"`
 }
 
-// FormationServer is a lightweight HTTP server that coordinates cluster formation.
-// Nodes register themselves via POST /formation/join. Once the expected number of
-// nodes have joined, the done channel is closed and full cluster data (credentials,
-// CA, node list) becomes available via GET /formation/status.
+// FormationServer is a lightweight HTTPS server that coordinates cluster formation.
+// Nodes register via POST /formation/join; full cluster data is available via
+// GET /formation/status once the expected count is reached.
 type FormationServer struct {
 	mu            sync.RWMutex
 	expected      int
@@ -104,6 +111,7 @@ type FormationServer struct {
 	caCert        string
 	caKey         string
 	masterKey     string
+	viperblockKey string
 	networkConfig *NetworkConfig
 	joinToken     string
 	tokenExpiry   time.Time
@@ -212,6 +220,16 @@ func (fs *FormationServer) SetMasterKey(key string) {
 	fs.masterKey = key
 }
 
+// SetViperblockKey sets the base64-encoded cluster-wide viperblock at-rest
+// encryption key for distribution to joining nodes. Unlike the per-node
+// predastore key, this key is shared so a volume sealed on one node can be
+// opened on any other.
+func (fs *FormationServer) SetViperblockKey(key string) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.viperblockKey = key
+}
+
 // Start launches the HTTPS server on the given address (e.g. "10.0.0.1:4432")
 // using the cluster CA certificate and key for TLS.
 func (fs *FormationServer) Start(bindAddr string) error {
@@ -233,7 +251,9 @@ func (fs *FormationServer) Start(bindAddr string) error {
 		IdleTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{tlsCert},
+			Certificates:     []tls.Certificate{tlsCert},
+			MinVersion:       tls.VersionTLS13,
+			CurvePreferences: tlsconfig.Curves,
 		},
 	}
 
@@ -352,6 +372,7 @@ func (fs *FormationServer) handleStatus(w http.ResponseWriter, r *http.Request) 
 		resp.CACert = fs.caCert
 		resp.CAKey = fs.caKey
 		resp.MasterKey = fs.masterKey
+		resp.ViperblockKey = fs.viperblockKey
 		resp.NetworkConfig = fs.networkConfig
 	}
 

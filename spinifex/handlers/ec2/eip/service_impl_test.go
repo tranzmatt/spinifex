@@ -30,7 +30,7 @@ func setupTestEIP(t *testing.T) (*EIPServiceImpl, *handlers_ec2_vpc.ExternalIPAM
 	_, nc, js := testutil.StartTestJetStream(t)
 
 	pool := testPool()
-	ipam, err := handlers_ec2_vpc.NewExternalIPAM(nc, js, []handlers_ec2_vpc.ExternalPoolConfig{pool})
+	ipam, err := handlers_ec2_vpc.NewExternalIPAM(js, []handlers_ec2_vpc.ExternalPoolConfig{pool})
 	require.NoError(t, err)
 
 	svc, err := NewEIPServiceImpl(nc, ipam, nil)
@@ -82,22 +82,23 @@ func TestEIP_Release(t *testing.T) {
 	}, testAccountID)
 	require.NoError(t, err)
 
-	// Verify IP returned to pool by allocating again — should get same IP
+	// Round-robin: re-allocating does NOT hand back the just-released IP;
+	// the cursor advances, so the new EIP differs.
 	out2, err := svc.AllocateAddress(&ec2.AllocateAddressInput{}, testAccountID)
 	require.NoError(t, err)
-	assert.Equal(t, allocatedIP, *out2.PublicIp)
+	assert.NotEqual(t, allocatedIP, *out2.PublicIp, "released EIP must not be reused immediately")
 
-	// Verify the pool shows the IP was released and re-allocated
+	// The released IP stays free (not re-allocated) until the cursor cycles.
 	record, err := ipam.GetPoolRecord("test-pool")
 	require.NoError(t, err)
-	_, allocated := record.Allocated[allocatedIP]
-	// After re-allocation, IP should be allocated again by the EIP service
-	// but let's just verify the release worked by checking describe returns nothing for old alloc
+	_, stillAllocated := record.Allocated[allocatedIP]
+	assert.False(t, stillAllocated, "released IP stays free until the cursor cycles the range")
+
+	// The released allocation is gone; describing it by its old ID errors.
 	_, descErr := svc.DescribeAddresses(&ec2.DescribeAddressesInput{
 		AllocationIds: []*string{out.AllocationId},
 	}, testAccountID)
 	assert.Error(t, descErr)
-	_ = allocated // suppress unused
 }
 
 func TestEIP_ReleaseWhileAssociated(t *testing.T) {
@@ -137,6 +138,52 @@ func TestEIP_ReleaseWhileAssociated(t *testing.T) {
 	}, testAccountID)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "InvalidAddress.Locked")
+}
+
+func TestEIP_ReleaseByInstanceID_ReclaimsAssociatedEIP(t *testing.T) {
+	svc, _ := setupTestEIP(t)
+
+	out, err := svc.AllocateAddress(&ec2.AllocateAddressInput{}, testAccountID)
+	require.NoError(t, err)
+	allocID := *out.AllocationId
+
+	// Mark the EIP associated with a system instance, as an internet-facing ALB
+	// leaves it. ENIId stays empty so disassociate skips the VPC-service lookup.
+	entry, err := svc.eipKV.Get(testAccountID + "." + allocID)
+	require.NoError(t, err)
+	var record EIPRecord
+	require.NoError(t, json.Unmarshal(entry.Value(), &record))
+	record.State = "associated"
+	record.AssociationId = "eipassoc-test"
+	record.InstanceId = "i-alb-test"
+	data, err := json.Marshal(record)
+	require.NoError(t, err)
+	_, err = svc.eipKV.Update(testAccountID+"."+allocID, data, entry.Revision())
+	require.NoError(t, err)
+
+	// Backstop release by instance disassociates then frees the allocation.
+	require.NoError(t, svc.ReleaseAddressByInstanceID("i-alb-test"))
+
+	_, err = svc.ReleaseAddress(&ec2.ReleaseAddressInput{AllocationId: aws.String(allocID)}, testAccountID)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "InvalidAllocationID.NotFound")
+}
+
+func TestEIP_ReleaseByInstanceID_NoMatchIsNoOp(t *testing.T) {
+	svc, _ := setupTestEIP(t)
+
+	out, err := svc.AllocateAddress(&ec2.AllocateAddressInput{}, testAccountID)
+	require.NoError(t, err)
+	allocID := *out.AllocationId
+
+	// An instance with no recorded EIP must leave existing allocations untouched.
+	require.NoError(t, svc.ReleaseAddressByInstanceID("i-unrelated"))
+
+	_, err = svc.eipKV.Get(testAccountID + "." + allocID)
+	assert.NoError(t, err)
+
+	// Empty instance ID is a no-op too.
+	require.NoError(t, svc.ReleaseAddressByInstanceID(""))
 }
 
 func TestEIP_ReleaseMissingParams(t *testing.T) {
@@ -557,12 +604,9 @@ func TestEIP_DescribeAddresses_FilterByTag(t *testing.T) {
 	assert.Equal(t, *out.AllocationId, *desc.Addresses[0].AllocationId)
 }
 
-// TestEIP_PublishNATEvent_PortNameHasPortPrefix is a regression test for a bug
-// where EIPServiceImpl.publishNATEvent sent the raw ENI id as PortName. vpcd
-// writes PortName into NAT.LogicalPort in distributed NAT mode (direct bridge),
-// so a mismatch with the OVN logical switch port name ("port-<eni>") produces
-// a dnat_and_snat row pointing at a nonexistent port — OVN never programs the
-// flow and the EIP black-holes. See mulga-js-17.
+// TestEIP_PublishNATEvent_PortNameHasPortPrefix verifies that publishNATEvent
+// uses topology.Port(eniID) as PortName. A raw ENI id mismatch creates a
+// dnat_and_snat row pointing at a nonexistent OVN port, black-holing the EIP.
 func TestEIP_PublishNATEvent_PortNameHasPortPrefix(t *testing.T) {
 	svc, _ := setupTestEIP(t)
 
@@ -579,9 +623,7 @@ func TestEIP_PublishNATEvent_PortNameHasPortPrefix(t *testing.T) {
 	var got natEvent
 	require.NoError(t, json.Unmarshal(msg.Data, &got))
 	assert.Equal(t, "port-"+eniID, got.PortName,
-		"PortName must match the OVN logical switch port name (port-<eni>); "+
-			"otherwise vpcd's distributed NAT creates a dnat_and_snat rule "+
-			"pointing at a nonexistent logical port and the flow is never programmed")
+		"PortName must be port-<eni> to match the OVN logical switch port name")
 	assert.Equal(t, "10.0.0.5", got.LogicalIP)
 	assert.Equal(t, "198.51.100.10", got.ExternalIP)
 }

@@ -1,5 +1,4 @@
 import type { Subnet } from "@aws-sdk/client-ec2"
-import type { Tag } from "@aws-sdk/client-elastic-load-balancing-v2"
 import { useSuspenseQuery } from "@tanstack/react-query"
 import { useNavigate } from "@tanstack/react-router"
 import { Trash2 } from "lucide-react"
@@ -14,17 +13,26 @@ import {
   AttributesEditor,
 } from "@/components/elbv2/attributes-editor"
 import { ListenersTab } from "@/components/elbv2/listeners-tab"
+import { SecurityGroupsEditor } from "@/components/elbv2/security-groups-editor"
+import { SubnetsEditor } from "@/components/elbv2/subnets-editor"
+import { TagsEditor } from "@/components/elbv2/tags-editor"
 import { ErrorBanner } from "@/components/error-banner"
 import { PageHeading } from "@/components/page-heading"
 import { StateBadge } from "@/components/state-badge"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsList, TabsPanel, TabsTab } from "@/components/ui/tabs"
-import { getNameTag } from "@/lib/utils"
+import { formatDateTime, getNameTag } from "@/lib/utils"
 import {
   useDeleteLoadBalancer,
   useModifyLoadBalancerAttributes,
+  useSetSecurityGroups,
+  useSetSubnets,
+  useUpdateTags,
 } from "@/mutations/elbv2"
-import { ec2SubnetsQueryOptions } from "@/queries/ec2"
+import {
+  ec2SecurityGroupsQueryOptions,
+  ec2SubnetsQueryOptions,
+} from "@/queries/ec2"
 import {
   elbv2LoadBalancerAttributesQueryOptions,
   elbv2LoadBalancerQueryOptions,
@@ -43,9 +51,13 @@ export function LoadBalancerDetailPage({ arn }: Props) {
   )
   const { data: tagsData } = useSuspenseQuery(elbv2TagsQueryOptions([arn]))
   const { data: subnetsData } = useSuspenseQuery(ec2SubnetsQueryOptions)
+  const { data: sgsData } = useSuspenseQuery(ec2SecurityGroupsQueryOptions)
 
   const deleteMutation = useDeleteLoadBalancer()
   const modifyAttrsMutation = useModifyLoadBalancerAttributes()
+  const updateTagsMutation = useUpdateTags()
+  const setSecurityGroupsMutation = useSetSecurityGroups()
+  const setSubnetsMutation = useSetSubnets()
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const lb = lbData.LoadBalancers?.[0]
@@ -84,6 +96,18 @@ export function LoadBalancerDetailPage({ arn }: Props) {
   const attributes = attrsData.Attributes ?? []
   const lbTags =
     tagsData?.TagDescriptions?.find((td) => td.ResourceArn === arn)?.Tags ?? []
+  const currentSecurityGroups = (lb.SecurityGroups ?? []).filter(
+    (id): id is string => id !== undefined,
+  )
+  const vpcSecurityGroups = (sgsData.SecurityGroups ?? []).filter(
+    (sg) => sg.VpcId === lb.VpcId,
+  )
+  const vpcSubnets = subnets.filter((s) => s.VpcId === lb.VpcId)
+  const currentSubnets = (lb.AvailabilityZones ?? [])
+    .map((az) => az.SubnetId)
+    .filter((id): id is string => id !== undefined)
+  // NLBs carry no security groups, so the editor tab is hidden for them.
+  const isNlb = lb.Type === "network"
 
   return (
     <>
@@ -113,7 +137,7 @@ export function LoadBalancerDetailPage({ arn }: Props) {
               <StateBadge state={lb.State?.Code} />
             </div>
           }
-          subtitle="Load balancer details"
+          subtitle="Load Balancer Details"
           title={lb.LoadBalancerName ?? lb.LoadBalancerArn}
         />
 
@@ -121,6 +145,10 @@ export function LoadBalancerDetailPage({ arn }: Props) {
           <TabsList>
             <TabsTab value="overview">Overview</TabsTab>
             <TabsTab value="listeners">Listeners</TabsTab>
+            <TabsTab value="subnets">Subnets</TabsTab>
+            {!isNlb && (
+              <TabsTab value="security-groups">Security groups</TabsTab>
+            )}
             <TabsTab value="attributes">Attributes</TabsTab>
             <TabsTab value="tags">Tags</TabsTab>
           </TabsList>
@@ -145,11 +173,7 @@ export function LoadBalancerDetailPage({ arn }: Props) {
                 <DetailRow label="VPC" value={lb.VpcId} />
                 <DetailRow
                   label="Created at"
-                  value={
-                    lb.CreatedTime
-                      ? new Date(lb.CreatedTime).toLocaleString()
-                      : undefined
-                  }
+                  value={formatDateTime(lb.CreatedTime)}
                 />
               </DetailCard.Content>
             </DetailCard>
@@ -180,8 +204,46 @@ export function LoadBalancerDetailPage({ arn }: Props) {
           </TabsPanel>
 
           <TabsPanel value="listeners">
-            <ListenersTab loadBalancerArn={arn} vpcId={lb.VpcId} />
+            <ListenersTab
+              lbType={isNlb ? "network" : "application"}
+              loadBalancerArn={arn}
+              vpcId={lb.VpcId}
+            />
           </TabsPanel>
+
+          <TabsPanel value="subnets">
+            <SubnetsEditor
+              available={vpcSubnets}
+              current={currentSubnets}
+              error={setSubnetsMutation.error}
+              isPending={setSubnetsMutation.isPending}
+              isSuccess={setSubnetsMutation.isSuccess}
+              onSubmit={(subnetIds) =>
+                setSubnetsMutation.mutate({
+                  loadBalancerArn: arn,
+                  subnetIds,
+                })
+              }
+            />
+          </TabsPanel>
+
+          {!isNlb && (
+            <TabsPanel value="security-groups">
+              <SecurityGroupsEditor
+                available={vpcSecurityGroups}
+                current={currentSecurityGroups}
+                error={setSecurityGroupsMutation.error}
+                isPending={setSecurityGroupsMutation.isPending}
+                isSuccess={setSecurityGroupsMutation.isSuccess}
+                onSubmit={(securityGroupIds) =>
+                  setSecurityGroupsMutation.mutate({
+                    loadBalancerArn: arn,
+                    securityGroupIds,
+                  })
+                }
+              />
+            </TabsPanel>
+          )}
 
           <TabsPanel value="attributes">
             <AttributesEditor
@@ -200,22 +262,21 @@ export function LoadBalancerDetailPage({ arn }: Props) {
           </TabsPanel>
 
           <TabsPanel value="tags">
-            {lbTags.length > 0 ? (
-              <DetailCard>
-                <DetailCard.Header>Tags</DetailCard.Header>
-                <DetailCard.Content>
-                  {lbTags.map((tag: Tag) => (
-                    <DetailRow
-                      key={tag.Key ?? ""}
-                      label={tag.Key ?? ""}
-                      value={tag.Value}
-                    />
-                  ))}
-                </DetailCard.Content>
-              </DetailCard>
-            ) : (
-              <p className="text-muted-foreground">No tags.</p>
-            )}
+            <TagsEditor
+              error={updateTagsMutation.error}
+              isPending={updateTagsMutation.isPending}
+              isSuccess={updateTagsMutation.isSuccess}
+              onSubmit={(tags) =>
+                updateTagsMutation.mutate({
+                  resourceArn: arn,
+                  tags,
+                  initialKeys: lbTags
+                    .map((t) => t.Key ?? "")
+                    .filter((k) => k.length > 0),
+                })
+              }
+              tags={lbTags}
+            />
           </TabsPanel>
         </Tabs>
       </div>

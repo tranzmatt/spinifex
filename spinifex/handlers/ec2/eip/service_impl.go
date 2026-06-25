@@ -14,6 +14,7 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/filterutil"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
 	"github.com/mulgadc/spinifex/spinifex/migrate"
+	"github.com/mulgadc/spinifex/spinifex/network/topology"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go"
 )
@@ -73,7 +74,7 @@ func (s *EIPServiceImpl) AllocateAddress(input *ec2.AllocateAddressInput, accoun
 	if input.PublicIpv4Pool != nil && *input.PublicIpv4Pool != "" {
 		// Allocate from a specific named pool.
 		poolName = *input.PublicIpv4Pool
-		publicIP, err = s.externalIPAM.AllocateFromPool(poolName, "elastic_ip", allocID, "", "")
+		publicIP, err = s.externalIPAM.AllocateFromPool(poolName, handlers_ec2_vpc.PurposeEIP, allocID, "", "")
 		if err != nil {
 			slog.Error("AllocateAddress: IPAM pool allocation failed", "pool", poolName, "err", err)
 			return nil, errors.New(awserrors.ErrorInsufficientAddressCapacity)
@@ -82,7 +83,7 @@ func (s *EIPServiceImpl) AllocateAddress(input *ec2.AllocateAddressInput, accoun
 		// Allocate from the best pool matching region/AZ (empty strings = global fallback).
 		region := ""
 		az := ""
-		publicIP, poolName, err = s.externalIPAM.AllocateIP(region, az, "elastic_ip", allocID, "", "")
+		publicIP, poolName, err = s.externalIPAM.AllocateIP(region, az, handlers_ec2_vpc.PurposeEIP, allocID, "", "")
 		if err != nil {
 			slog.Error("AllocateAddress: IPAM allocation failed", "err", err)
 			return nil, errors.New(awserrors.ErrorInsufficientAddressCapacity)
@@ -140,8 +141,9 @@ func (s *EIPServiceImpl) ReleaseAddress(input *ec2.ReleaseAddressInput, accountI
 		return nil, errors.New(awserrors.ErrorInvalidAddressLocked)
 	}
 
-	// Release IP back to IPAM pool.
-	if err := s.externalIPAM.ReleaseIP(record.PoolName, record.PublicIp); err != nil {
+	// Release IP back to IPAM pool. User-driven release of an already-detached
+	// EIP — unconditional (no owner ENI to scope to).
+	if err := s.externalIPAM.ReleaseIP(record.PoolName, record.PublicIp, ""); err != nil {
 		slog.Warn("Failed to release IP back to IPAM pool", "allocationId", allocID, "ip", record.PublicIp, "pool", record.PoolName, "err", err)
 	}
 
@@ -212,6 +214,7 @@ func (s *EIPServiceImpl) AssociateAddress(input *ec2.AssociateAddressInput, acco
 	record.InstanceId = instanceID
 	record.PrivateIp = privateIP
 	record.VpcId = vpcID
+	record.MacAddress = macAddr
 	record.State = "associated"
 
 	data, err := json.Marshal(record)
@@ -269,6 +272,7 @@ func (s *EIPServiceImpl) DisassociateAddress(input *ec2.DisassociateAddressInput
 	record.InstanceId = ""
 	record.PrivateIp = ""
 	record.VpcId = ""
+	record.MacAddress = ""
 	record.State = "allocated"
 
 	data, err := json.Marshal(record)
@@ -409,15 +413,13 @@ func addressMatchesFilters(record *EIPRecord, filters map[string][]string) bool 
 	return filterutil.MatchesTags(filters, record.Tags)
 }
 
-// DescribeAddressesAttribute returns per-EIP attributes (e.g. domain-name).
-// Spinifex doesn't support reverse-DNS PTR records, so PtrRecord is left nil.
-// Unlike DescribeAddresses, this returns an empty list (not an error) when
-// requested AllocationIds are not found. This matches real AWS behavior.
+// DescribeAddressesAttribute returns per-EIP attributes. PtrRecord is always nil
+// (no reverse-DNS support). Returns an empty list, not an error, for missing IDs.
 func (s *EIPServiceImpl) DescribeAddressesAttribute(input *ec2.DescribeAddressesAttributeInput, accountID string) (*ec2.DescribeAddressesAttributeOutput, error) {
 	var addresses []*ec2.AddressAttribute
 
 	if len(input.AllocationIds) > 0 {
-		// Direct lookups — O(n) on requested IDs rather than scanning all EIPs.
+		// Direct lookups by requested IDs.
 		for _, id := range input.AllocationIds {
 			if id == nil {
 				continue
@@ -567,19 +569,99 @@ func (s *EIPServiceImpl) findByAssociationID(accountID, associationID string) (*
 	return nil, "", 0, errors.New(awserrors.ErrorInvalidAssociationIDNotFound)
 }
 
-// publishNATEvent publishes a NAT lifecycle event to NATS for vpcd consumption.
-// This is fire-and-forget; errors are logged but do not fail the API response.
-//
-// PortName must match the OVN logical switch port name ("port-<eni-id>") because
-// vpcd sets NAT.LogicalPort to this value in distributed NAT mode (direct
-// bridge). A mismatch creates a dnat_and_snat row pointing at a nonexistent
-// port, and OVN never programs the DNAT flow.
+// AssociatedPublicIPForInstance returns the public IP of the EIP associated with
+// instanceID, if any. Used by the daemon to re-announce dnat_and_snat on relaunch
+// when the instance's own PublicIP field is unset (EIP-assigned vs auto-assigned).
+func (s *EIPServiceImpl) AssociatedPublicIPForInstance(accountID, instanceID string) (string, bool) {
+	if instanceID == "" {
+		return "", false
+	}
+	prefix := accountID + "."
+	keys, err := s.eipKV.Keys()
+	if err != nil {
+		return "", false
+	}
+	for _, k := range keys {
+		if k == utils.VersionKey || !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		entry, err := s.eipKV.Get(k)
+		if err != nil {
+			continue
+		}
+		var record EIPRecord
+		if err := json.Unmarshal(entry.Value(), &record); err != nil {
+			continue
+		}
+		if record.State == "associated" && record.InstanceId == instanceID && record.PublicIp != "" {
+			return record.PublicIp, true
+		}
+	}
+	return "", false
+}
+
+// ReleaseAddressByInstanceID disassociates and releases every EIP still recorded
+// against instanceID, across all accounts. Idempotent backstop for system-VM
+// teardown paths that lose the cached allocation ID — when the VM is already
+// gone from the manager the per-instance release never runs, so an
+// internet-facing ALB's EIP would otherwise orphan. No-op when nothing matches.
+func (s *EIPServiceImpl) ReleaseAddressByInstanceID(instanceID string) error {
+	if instanceID == "" {
+		return nil
+	}
+	keys, err := s.eipKV.Keys()
+	if err != nil {
+		if errors.Is(err, nats.ErrNoKeysFound) {
+			return nil
+		}
+		return fmt.Errorf("list eip keys: %w", err)
+	}
+	var errs []error
+	for _, k := range keys {
+		if k == utils.VersionKey {
+			continue
+		}
+		entry, err := s.eipKV.Get(k)
+		if err != nil {
+			continue
+		}
+		var record EIPRecord
+		if err := json.Unmarshal(entry.Value(), &record); err != nil {
+			continue
+		}
+		if record.InstanceId != instanceID || record.AllocationId == "" {
+			continue
+		}
+		// Key is "{accountID}.{allocID}"; the account scopes the release calls.
+		accountID, _, found := strings.Cut(k, ".")
+		if !found {
+			continue
+		}
+		if record.AssociationId != "" {
+			if _, err := s.DisassociateAddress(&ec2.DisassociateAddressInput{
+				AssociationId: aws.String(record.AssociationId),
+			}, accountID); err != nil {
+				errs = append(errs, fmt.Errorf("disassociate %s: %w", record.AllocationId, err))
+			}
+		}
+		if _, err := s.ReleaseAddress(&ec2.ReleaseAddressInput{
+			AllocationId: aws.String(record.AllocationId),
+		}, accountID); err != nil {
+			errs = append(errs, fmt.Errorf("release %s: %w", record.AllocationId, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// publishNATEvent publishes a NAT lifecycle event to NATS for vpcd (fire-and-forget).
+// PortName must use topology.Port(eniID) to match the OVN logical switch port name;
+// a mismatch causes OVN to never program the DNAT flow.
 func (s *EIPServiceImpl) publishNATEvent(topic, vpcID, externalIP, logicalIP, eniID, mac string) {
 	utils.PublishEvent(s.natsConn, topic, natEvent{
 		VpcId:      vpcID,
 		ExternalIP: externalIP,
 		LogicalIP:  logicalIP,
-		PortName:   "port-" + eniID,
+		PortName:   topology.Port(eniID),
 		MAC:        mac,
 	})
 }

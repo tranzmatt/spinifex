@@ -29,7 +29,7 @@ export function useUploadObject() {
       return await upload.done()
     },
     onSuccess: (_, variables) => {
-      queryClient.invalidateQueries({
+      void queryClient.invalidateQueries({
         queryKey: ["s3", "buckets", variables.bucket, "objects"],
       })
     },
@@ -40,15 +40,15 @@ export function useCreateBucket() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: ({ bucketName }: CreateBucketFormData) => {
+    mutationFn: async ({ bucketName }: CreateBucketFormData) => {
       const command = new CreateBucketCommand({
         Bucket: bucketName,
       })
 
-      return getS3Client().send(command)
+      return await getS3Client().send(command)
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({
+      void queryClient.invalidateQueries({
         queryKey: ["s3", "buckets"],
       })
     },
@@ -59,16 +59,16 @@ export function useDeleteObject() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: ({ bucket, key }: { bucket: string; key: string }) => {
+    mutationFn: async ({ bucket, key }: { bucket: string; key: string }) => {
       const command = new DeleteObjectCommand({
         Bucket: bucket,
         Key: key,
       })
 
-      return getS3Client().send(command)
+      return await getS3Client().send(command)
     },
     onSuccess: (_, variables) => {
-      queryClient.invalidateQueries({
+      void queryClient.invalidateQueries({
         queryKey: ["s3", "buckets", variables.bucket, "objects"],
       })
     },

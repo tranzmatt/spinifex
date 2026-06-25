@@ -32,17 +32,31 @@ const (
 type IGWRecord struct {
 	InternetGatewayId string            `json:"internet_gateway_id"`
 	VpcId             string            `json:"vpc_id,omitempty"` // empty when detached
-	State             string            `json:"state"`            // "available", "attached", "detached"
+	State             string            `json:"state"`            // "available" — AWS attachment.state is "available" when attached
 	Tags              map[string]string `json:"tags"`
 	CreatedAt         time.Time         `json:"created_at"`
 }
 
+// GatePublisher recomputes per-subnet egress gate/ungate decisions for a VPC.
+// Wired by the daemon so IGW attach/detach triggers immediate OVN policy updates
+// rather than waiting for the reconciler's drift tick.
+type GatePublisher interface {
+	PublishGateDecisionsForVPC(accountID, vpcID, destCidr string)
+}
+
 // IGWServiceImpl implements Internet Gateway operations with NATS JetStream persistence
 type IGWServiceImpl struct {
-	config   *config.Config
-	igwKV    nats.KeyValue
-	vpcKV    nats.KeyValue
-	natsConn *nats.Conn
+	config        *config.Config
+	igwKV         nats.KeyValue
+	vpcKV         nats.KeyValue
+	natsConn      *nats.Conn
+	gatePublisher GatePublisher
+}
+
+// SetGatePublisher installs the cross-handler fan-out hook. Called by the
+// daemon after the RouteTable service is constructed.
+func (s *IGWServiceImpl) SetGatePublisher(p GatePublisher) {
+	s.gatePublisher = p
 }
 
 // NewIGWServiceImplWithNATS creates an Internet Gateway service with NATS JetStream for persistence
@@ -122,7 +136,13 @@ func (s *IGWServiceImpl) DeleteInternetGateway(input *ec2.DeleteInternetGatewayI
 
 	entry, err := s.igwKV.Get(key)
 	if err != nil {
-		return nil, errors.New(awserrors.ErrorInvalidInternetGatewayIDNotFound)
+		// AWS-faithful: an absent internet gateway is NotFound (provider
+		// tolerates it on destroy); destroy orchestration tolerates it too.
+		// A transient read error stays a server error.
+		if errors.Is(err, nats.ErrKeyNotFound) {
+			return nil, errors.New(awserrors.ErrorInvalidInternetGatewayIDNotFound)
+		}
+		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
 	var record IGWRecord
@@ -315,6 +335,9 @@ func (s *IGWServiceImpl) AttachInternetGateway(input *ec2.AttachInternetGatewayI
 		}
 	}
 
+	// Gate fan-out is intentionally skipped on attach to avoid a race with
+	// the bootstrap CreateRoute path. Detach triggers gate fan-out directly.
+
 	slog.Info("AttachInternetGateway completed", "internetGatewayId", igwID, "vpcId", vpcID, "accountID", accountID)
 
 	return &ec2.AttachInternetGatewayOutput{}, nil
@@ -371,6 +394,14 @@ func (s *IGWServiceImpl) DetachInternetGateway(input *ec2.DetachInternetGatewayI
 		} else if err := s.natsConn.Publish("vpc.igw-detach", eventData); err != nil {
 			slog.Warn("Failed to publish IGW detach event", "error", err)
 		}
+	}
+
+	// After detach the VPC's LR external gateway and router-wide default
+	// route are removed; any subnet whose effective RT still points at the
+	// (now-blackholed) IGW must surface the ungate→gate transition so the
+	// reconciler drops the previous ungate policy in favour of a DROP.
+	if s.gatePublisher != nil {
+		s.gatePublisher.PublishGateDecisionsForVPC(accountID, vpcID, "0.0.0.0/0")
 	}
 
 	slog.Info("DetachInternetGateway completed", "internetGatewayId", igwID, "vpcId", vpcID, "accountID", accountID)

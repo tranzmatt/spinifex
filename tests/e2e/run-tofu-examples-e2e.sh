@@ -46,6 +46,36 @@ install_tofu() {
     rm -rf "$tmp"
 }
 
+# dump_ovn_state captures OVN NB port_group/ACL state and the SB Address_Set
+# rows ovn-northd derives from port-group membership. Called inside run_workbook
+# on assertion failure (before destroy, while VMs still exist) and again from
+# the EXIT trap (after destroy, mostly for parity).
+#
+# SG-to-SG ACL matches like `ip4.src == $sg_<id>_ip4` resolve against SB
+# Address_Sets that ovn-northd auto-derives from port-group LSP addresses; if
+# this dump shows port groups with members but no matching `<pg>_ip4` address
+# set (or an empty one), that pinpoints the SG enforcement break.
+dump_ovn_state() {
+    local label="${1:-ovn-state}"
+    log "--- ${label}: ovn-nbctl ls-list ---"
+    sudo ovn-nbctl --no-leader-only ls-list 2>&1 | head -40 || true
+    log "--- ${label}: ovn-nbctl lr-list ---"
+    sudo ovn-nbctl --no-leader-only lr-list 2>&1 | head -40 || true
+    log "--- ${label}: port groups (name, ports, ACL count) ---"
+    sudo ovn-nbctl --no-leader-only --bare --columns=name,ports list port_group 2>&1 | head -200 || true
+    log "--- ${label}: logical_switch_port name/addresses/port_security ---"
+    sudo ovn-nbctl --no-leader-only --bare --columns=name,addresses,port_security \
+        list logical_switch_port 2>&1 | head -200 || true
+    log "--- ${label}: NB ACLs (priority, direction, match, action) ---"
+    sudo ovn-nbctl --no-leader-only --bare \
+        --columns=priority,direction,match,action,name list acl 2>&1 | head -200 || true
+    log "--- ${label}: SB address_sets (auto-derived from port groups) ---"
+    sudo ovn-sbctl --no-leader-only --bare --columns=name,addresses list address_set 2>&1 | head -200 || true
+    log "--- ${label}: SB port bindings (logical_port, mac, chassis, up) ---"
+    sudo ovn-sbctl --no-leader-only --bare \
+        --columns=logical_port,mac,chassis,up list port_binding 2>&1 | head -80 || true
+}
+
 cleanup() {
     EXIT_CODE=$?
     if [ "$EXIT_CODE" -ne 0 ]; then
@@ -138,9 +168,18 @@ assert_bastion_private_subnet() {
         log "  bastion: ~/.ssh/bastion-demo.pem never appeared (cloud-init stalled?)"
         return 1
     fi
-    ssh "${SSH_OPTS[@]}" -i "$key" "ec2-user@${bastion}" \
-        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/bastion-demo.pem ec2-user@${private} id" \
-        | grep -q '^uid='
+    local inner_ssh="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes -i ~/.ssh/bastion-demo.pem ec2-user@${private}"
+
+    local attempt
+    for attempt in $(seq 1 30); do
+        if ssh "${SSH_OPTS[@]}" -i "$key" "ec2-user@${bastion}" "${inner_ssh} true" 2>/dev/null; then
+            ssh "${SSH_OPTS[@]}" -i "$key" "ec2-user@${bastion}" "${inner_ssh} id" | grep -q '^uid='
+            return $?
+        fi
+        sleep 5
+    done
+    log "  bastion→private: SSH never reachable after 150s"
+    return 1
 }
 
 assert_nginx_alb() {
@@ -192,16 +231,56 @@ assert_nginx_webserver() {
     wait_for_http_200 "http://${ip}/"
 }
 
+# dump_s3_webapp_guest SSHes into the webapp instance and tails cloud-init's
+# output log plus the s3-webapp unit status, so a first-boot apt/pip/egress
+# failure is distinguishable from a control-plane regression in the bundle.
+# Best-effort: a missing key or unreachable SSH just logs and returns.
+dump_s3_webapp_guest() {
+    local host="$1" key="$(pwd)/s3-webapp-demo.pem"
+    if [ ! -f "$key" ]; then
+        log "  s3-webapp: ${key} missing, skipping guest cloud-init dump"
+        return 0
+    fi
+    chmod 600 "$key" 2>/dev/null || true
+    log "--- s3-webapp guest: cloud-init status + output log + unit status ---"
+    ssh "${SSH_OPTS[@]}" -i "$key" "ec2-user@${host}" '
+        echo "== cloud-init status =="; cloud-init status --long 2>/dev/null || true
+        echo "== /var/log/cloud-init-output.log (tail 80) =="
+        sudo tail -n 80 /var/log/cloud-init-output.log 2>/dev/null || true
+        echo "== s3-webapp.service =="
+        systemctl status s3-webapp --no-pager 2>/dev/null | head -20 || true
+    ' 2>&1 | sed "s|^|    |" || log "  s3-webapp: guest SSH unreachable for cloud-init dump"
+}
+
 assert_s3_webapp() {
-    # aws s3 goes to predastore on :8443, not the awsgw on :9999 the default
-    # profile points at — the workbook's provider sets s3 = predastore_endpoint
-    # but the CLI doesn't inherit that.
-    local bucket sentinel endpoint
-    bucket=$(tofu output -raw bucket_name)
-    endpoint="https://${WAN_IP}:8443"
+    # Prove the INSTANCE wrote to S3 with IMDS-sourced STS creds: upload a file
+    # through the app (PutObject), then read it back from the listing (ListBucket
+    # + GetObject link). This exercises the full IMDS -> STS -> IAM ->
+    # predastore-authz path and fails closed if any link regresses — a
+    # harness-side CLI upload would still pass with IMDS broken.
+    local ip sentinel tmp
+    ip=$(tofu output -raw public_ip)
     sentinel="spinifex-nightly-$(date +%s).txt"
-    echo "nightly-smoke" | aws s3 cp --endpoint-url "$endpoint" - "s3://${bucket}/${sentinel}" >/dev/null
-    aws s3 ls --endpoint-url "$endpoint" "s3://${bucket}/" | grep -q "$sentinel"
+
+    # 420s budget: this is the heaviest first-boot of any workbook — cloud-init
+    # runs apt-get install python3-pip/venv + pip install flask boto3 before the
+    # listener binds :80. The default 150s isn't enough on a slow runner / PyPI.
+    wait_for_http_200 "http://${ip}/" 420 || {
+        log "  s3-webapp: webapp not reachable on http://${ip}/ after 420s"
+        dump_s3_webapp_guest "$ip"
+        return 1
+    }
+
+    tmp=$(mktemp)
+    echo "nightly-smoke" > "$tmp"
+    if ! curl -sf -F "file=@${tmp};filename=${sentinel}" "http://${ip}/upload" >/dev/null; then
+        rm -f "$tmp"
+        log "  s3-webapp: upload via app failed (IMDS -> STS -> S3 PutObject?)"
+        return 1
+    fi
+    rm -f "$tmp"
+
+    curl -sf "http://${ip}/" | grep -q "$sentinel"
 }
 
 # Pick an instance type available on this cluster. Workbooks default to
@@ -245,8 +324,9 @@ run_workbook() {
         "-var=instance_type=${INSTANCE_TYPE}"
     )
 
-    # s3-webapp has three required-no-default vars; creds come from
-    # AWS_PROFILE=spinifex so the workbook's boto3 client authenticates.
+    # s3-webapp has three required-no-default vars. The s3_access/secret keys are
+    # the operator creds the provider uses to create the bucket + IAM role on
+    # predastore; the instance authenticates to S3 via IMDS, not these keys.
     if [ "$example" = "s3-webapp" ]; then
         local access_key secret_key
         access_key=$(aws configure get aws_access_key_id --profile spinifex)
@@ -275,6 +355,9 @@ run_workbook() {
         log "  PASS ${example}"
     else
         log "  FAIL ${example}: assertion"
+        # Capture OVN state while VMs still exist — the EXIT trap fires after
+        # destroy, by which point port groups, address sets, and ACLs are gone.
+        dump_ovn_state "post-fail ${example} (pre-destroy)"
         rc=1
     fi
 
@@ -296,12 +379,33 @@ if [ -z "$INSTANCE_TYPE" ] || [ "$INSTANCE_TYPE" = "None" ]; then
 fi
 log "Using instance_type=${INSTANCE_TYPE}"
 
+# Each workbook is emitted as a top-level `go test -v` testcase
+# (=== RUN / --- PASS|FAIL / package trailer) so go-junit-report converts the
+# tee'd log into junit-tofu.xml and the e2e-analyze action produces the same
+# RCA bundle the Go suites do (nightly cell 17). The per-workbook log() output
+# between RUN and the result line is captured as the failure diagnostics.
+SUITE_RC=0
 for workbook in nginx-alb bastion-private-subnet nginx-webserver s3-webapp; do
-    if ! run_workbook "$workbook"; then
+    tname="TestTofuWorkbook_${workbook//-/_}"
+    wb_start=$SECONDS
+    echo "=== RUN   ${tname}"
+    if run_workbook "$workbook"; then
+        printf -- '--- PASS: %s (%d.00s)\n' "$tname" "$((SECONDS - wb_start))"
+    else
+        printf -- '--- FAIL: %s (%d.00s)\n' "$tname" "$((SECONDS - wb_start))"
         log "FAIL ${workbook} — aborting remaining workbooks"
-        exit 1
+        SUITE_RC=1
+        break
     fi
 done
 
 CURRENT_WORKBOOK=""
-log "All workbooks passed"
+if [ "$SUITE_RC" -eq 0 ]; then
+    log "All workbooks passed"
+    echo "PASS"
+    printf 'ok  \ttofu-examples\t%d.000s\n' "$SECONDS"
+else
+    echo "FAIL"
+    printf 'FAIL\ttofu-examples\t%d.000s\n' "$SECONDS"
+fi
+exit "$SUITE_RC"

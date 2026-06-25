@@ -17,6 +17,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package cmd
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -45,8 +46,10 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/mulgadc/spinifex/spinifex/formation"
+	"github.com/mulgadc/spinifex/spinifex/gpu"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
+	"github.com/mulgadc/spinifex/spinifex/objectstore"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
@@ -83,6 +86,14 @@ var supportedPlatforms = map[string]bool{
 	"Windows":    true,
 }
 
+// Mirrors the gateway RegisterImage allowlist so admin imports can't write an
+// AMI with a boot mode that RegisterImage would reject.
+var supportedBootModes = map[string]bool{
+	"bios":           true,
+	"uefi":           true,
+	"uefi-preferred": true,
+}
+
 var adminCmd = &cobra.Command{
 	Use:   "admin",
 	Short: "Administrative commands for Spinifex platform management",
@@ -102,6 +113,16 @@ var clusterShutdownCmd = &cobra.Command{
 Phases execute in order: GATE (stop API/UI) → DRAIN (stop VMs) → STORAGE (stop viperblock) → PERSIST (stop predastore) → INFRA (stop NATS/daemon).
 Each phase waits for all nodes to ACK before proceeding to the next.`,
 	Run: runClusterShutdown,
+}
+
+var clusterDrainDHCPCmd = &cobra.Command{
+	Use:   "drain-dhcp",
+	Short: "Release all upstream DHCP leases held by vpcd",
+	Long: `Ask each vpcd to DHCPRELEASE every external-pool DHCP lease it currently
+holds, returning them to the upstream DHCP server. Run this on teardown before
+stopping services: an env reset otherwise strands held leases on the upstream
+server until their TTL expires, eventually exhausting the upstream scope.`,
+	Run: runClusterDrainDHCP,
 }
 
 var adminInitCmd = &cobra.Command{
@@ -140,6 +161,19 @@ var imagesListCmd = &cobra.Command{
 	Short: "List OS images to import or download",
 	Long:  `Query the remote endpoint for common OS images available for import as AMI or locally download.`,
 	Run:   runimagesListCmd,
+}
+
+var imagesRemoveCmd = &cobra.Command{
+	Use:   "remove",
+	Short: "Remove an admin-imported system AMI",
+	Long: `Delete an AMI imported via 'spx admin images import', including its
+backing block storage and snapshot artefacts. Only operates on AMIs with a
+non-account owner (e.g. "system"); account-owned AMIs must be removed via
+'aws ec2 deregister-image' followed by 'aws ec2 delete-snapshot'.
+
+Refuses to delete an AMI that has dependent volumes or copied snapshots/AMIs
+unless --force is passed. Prompts for confirmation unless --yes is passed.`,
+	Run: runimagesRemoveCmd,
 }
 
 var accountCmd = &cobra.Command{
@@ -199,13 +233,13 @@ spx admin images list
 - fetches from remote endpoint for common/trusted images to bootstrap environment, or baked in from compile.
 
 // If --name specified, download
-spx admin images import --name debian-12-x86_64
+spx admin images import --name debian-13-x86_64
 
 // List available images
 spx admin images list
 
 // Manually import a path
-spx admin images import --file /path/to/image --distro debian --version 12 --arch x86_64
+spx admin images import --file /path/to/image --distro debian --version 13 --arch x86_64
 
 -> x <-
 */
@@ -221,9 +255,13 @@ func init() {
 	clusterShutdownCmd.Flags().Duration("timeout", 120*time.Second, "Maximum time to wait per phase")
 	clusterShutdownCmd.Flags().Bool("dry-run", false, "Print phase plan without executing")
 
+	clusterCmd.AddCommand(clusterDrainDHCPCmd)
+	clusterDrainDHCPCmd.Flags().Duration("timeout", 30*time.Second, "Reply-collection window for vpcd drain responders")
+
 	adminCmd.AddCommand(imagesCmd)
 	imagesCmd.AddCommand(imagesImportCmd)
 	imagesCmd.AddCommand(imagesListCmd)
+	imagesCmd.AddCommand(imagesRemoveCmd)
 
 	adminCmd.AddCommand(accountCmd)
 	accountCmd.AddCommand(accountCreateCmd)
@@ -260,6 +298,7 @@ func init() {
 	adminInitCmd.Flags().String("predastore-nodes", "", "Comma-separated IPs for multi-node Predastore cluster (e.g., 10.11.12.1,10.11.12.2,10.11.12.3). Requires >= 3 nodes.")
 	adminInitCmd.Flags().String("formation-timeout", "10m", "Timeout for cluster formation (e.g., 5m, 30s)")
 	adminInitCmd.Flags().String("token-ttl", "30m", "Join token validity duration (e.g. 30m, 1h, 2h)")
+	adminInitCmd.Flags().Int("predastore-compaction-interval", 0, "Predastore compactor interval in seconds (0 = unset, uses built-in default). Test clusters set a short interval.")
 	adminInitCmd.Flags().String("cluster-name", "spinifex", "NATS cluster name")
 	adminInitCmd.Flags().Bool("no-telemetry", false, "Disable telemetry metrics sent during init (default: enabled)")
 	adminInitCmd.Flags().String("email", "", "Operator email address (used for update and security notifications)")
@@ -269,11 +308,14 @@ func init() {
 	adminInitCmd.Flags().String("external-mode", "", "External network mode: 'pool' (default when WAN detected) or '' (disabled)")
 	adminInitCmd.Flags().String("external-iface", "", "WAN NIC for br-external (auto-detected from default route)")
 	adminInitCmd.Flags().String("external-source", "", "Pool IP source: 'dhcp' (default when no --external-pool) or 'static' (uses --external-pool range)")
+	adminInitCmd.Flags().String("external-bind-bridge", "", "Linux bridge for upstream DHCP DORA (default 'br-wan' when --external-source=dhcp)")
 	adminInitCmd.Flags().String("external-pool", "", "External IP pool range as start-end (e.g., 192.168.1.150-192.168.1.250)")
 	adminInitCmd.Flags().String("external-gateway", "", "WAN gateway IP (auto-detected from default route)")
 	adminInitCmd.Flags().String("gateway-ip", "", "OVN gateway router's external IP for SNAT (default: pool range_start for pool mode, required for nat mode without DHCP)")
 	adminInitCmd.Flags().Int("external-prefix-len", 24, "External pool subnet prefix length (auto-detected)")
 	adminInitCmd.Flags().Bool("no-external", false, "Disable external networking (overlay-only, no internet for VMs)")
+	adminInitCmd.Flags().Bool("gpu-passthrough", false, "Enable VFIO GPU passthrough (sets gpu_passthrough = true in daemon config)")
+	adminInitCmd.Flags().Bool("ipsec", true, "Encrypt intra-AZ Geneve via OVN native IPsec (cluster-wide); disable only for trusted single-rack lab")
 
 	// Flags for admin join
 	adminJoinCmd.Flags().String("region", "ap-southeast-2", "Region for this node")
@@ -290,6 +332,7 @@ func init() {
 	adminJoinCmd.Flags().StringSlice("services", nil, "Services this node runs (default: all)")
 	adminJoinCmd.Flags().Bool("no-telemetry", false, "Disable telemetry metrics sent during join (default: enabled)")
 	adminJoinCmd.Flags().String("email", "", "Operator email address (used for update and security notifications)")
+	adminJoinCmd.Flags().Int("predastore-compaction-interval", 0, "Predastore compactor interval in seconds (0 = unset, uses built-in default). Test clusters set a short interval.")
 	adminJoinCmd.MarkFlagRequired("node")
 	adminJoinCmd.MarkFlagRequired("host")
 	adminJoinCmd.MarkFlagRequired("token")
@@ -297,14 +340,23 @@ func init() {
 	imagesImportCmd.Flags().String("tmp-dir", os.TempDir(), "Temporary directory for image import processing")
 
 	imagesImportCmd.Flags().String("name", "", "Import specified image by name")
+	imagesImportCmd.Flags().String("ami-name", "", "Override the registered AMI name (DescribeImages name). Defaults to ami-{distro}-{version}-{arch}. Use for locally-built appliances (e.g. --ami-name spinifex-eks-node).")
 	imagesImportCmd.Flags().String("file", "", "Import file from specified path (raw, qcow2, compressed)")
 	imagesImportCmd.Flags().String("distro", "", "Specified distro name (e.g debian)")
 	imagesImportCmd.Flags().String("version", "", "Specified distro version (e.g 12)")
 	imagesImportCmd.Flags().String("arch", "", "Specified distro arch (e.g aarch64, arm64, x86_64)")
 	imagesImportCmd.Flags().String("platform", "Linux/UNIX", "Specified platform (e.g Linux/UNIX, Windows)")
+	imagesImportCmd.Flags().String("boot-mode", "", "Boot mode for the imported AMI (bios|uefi|uefi-preferred). Required with --file. Overrides the catalog value when used with --name.")
 	imagesImportCmd.Flags().StringSlice("tag", nil, "Tag to apply to the imported AMI as key=value (repeatable; e.g. --tag spinifex:managed-by=elbv2)")
 	imagesImportCmd.Flags().Bool("force", false, "Force command execution (overwrites existing files)")
 	imagesImportCmd.Flags().Bool("skip-verify", false, "Skip catalog-image checksum verification (INSECURE; operator assumes integrity responsibility)")
+
+	imagesRemoveCmd.Flags().String("image-id", "", "AMI ID to remove (required)")
+	imagesRemoveCmd.Flags().Bool("force", false, "Bypass dependency, ownership and config-corrupt checks (salvage mode)")
+	imagesRemoveCmd.Flags().Bool("yes", false, "Skip interactive confirmation prompt")
+	if err := imagesRemoveCmd.MarkFlagRequired("image-id"); err != nil {
+		panic(err)
+	}
 }
 
 func runimagesImportCmd(cmd *cobra.Command, args []string) {
@@ -344,6 +396,7 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 	// and the file is used directly (no download). When only --file is set,
 	// metadata comes from flags and no catalog tags are applied.
 	imageName, _ := cmd.Flags().GetString("name")
+	amiNameOverride, _ := cmd.Flags().GetString("ami-name")
 	localFile, _ := cmd.Flags().GetString("file")
 
 	if imageName == "" && localFile == "" {
@@ -372,6 +425,22 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 			image.Arch, _ = cmd.Flags().GetString("arch")
 			image.Platform, _ = cmd.Flags().GetString("platform")
 		}
+	}
+
+	// --file imports have no catalog metadata to inherit from, so the operator
+	// must declare the boot mode explicitly — guessing would silently produce
+	// a BIOS AMI from a UEFI-only image (or vice versa) and fail at launch.
+	// --name imports inherit from the catalog; the flag overrides when set.
+	bootModeFlag, _ := cmd.Flags().GetString("boot-mode")
+	if bootModeFlag != "" {
+		if !supportedBootModes[bootModeFlag] {
+			fmt.Fprintf(os.Stderr, "Unsupported --boot-mode %q (expected bios|uefi|uefi-preferred)\n", bootModeFlag)
+			os.Exit(1)
+		}
+		image.BootMode = bootModeFlag
+	} else if imageName == "" {
+		fmt.Fprintf(os.Stderr, "--boot-mode is required when importing via --file (expected bios|uefi|uefi-preferred)\n")
+		os.Exit(1)
 	}
 
 	// --tag k=v (repeatable) merges user-supplied tags into the AMI. Overrides
@@ -483,6 +552,9 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 	// Calculate the size
 
 	manifest.AMIMetadata.Name = fmt.Sprintf("ami-%s-%s-%s", image.Distro, image.Version, image.Arch)
+	if amiNameOverride != "" {
+		manifest.AMIMetadata.Name = amiNameOverride
+	}
 	volumeId := utils.GenerateResourceID("ami")
 	manifest.AMIMetadata.ImageID = volumeId
 
@@ -494,6 +566,9 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 	manifest.AMIMetadata.Virtualization = "hvm"
 	manifest.AMIMetadata.ImageOwnerAlias = "system"
 	manifest.AMIMetadata.VolumeSizeGiB = utils.SafeInt64ToUint64(imageStat.Size() / 1024 / 1024 / 1024)
+	manifest.AMIMetadata.BootMode = image.BootMode
+	manifest.AMIMetadata.Distro = image.Distro
+	manifest.AMIMetadata.DistroFamily = utils.DistroFamily(image.Distro)
 
 	// Copy catalog-provided tags (e.g. spinifex:managed-by for system AMIs)
 	// onto the imported AMI so the UI can filter them out.
@@ -548,6 +623,12 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 		Host:       appConfig.Nodes[appConfig.Node].Predastore.Host,
 	}
 
+	mkey, err := utils.LoadViperblockMasterKey(appConfig.Nodes[appConfig.Node].Viperblock.EncryptionKeyFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Could not load viperblock encryption key: %v\n", err)
+		os.Exit(1)
+	}
+
 	vbConfig := viperblock.VB{
 		VolumeName: volumeId,
 		VolumeSize: utils.SafeInt64ToUint64(imageStat.Size()),
@@ -557,7 +638,9 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 				Size: 0,
 			},
 		},
-		VolumeConfig: manifest,
+		VolumeConfig:      manifest,
+		MasterKey:         mkey,
+		EncryptionEnabled: mkey != nil,
 	}
 
 	err = v_utils.ImportDiskImage(&s3Config, &vbConfig, extractedImagePath)
@@ -570,6 +653,136 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 	defer os.RemoveAll(tmpDir)
 
 	fmt.Printf("✅ Image import complete. Image-ID (AMI): %s\n", volumeId)
+}
+
+func runimagesRemoveCmd(cmd *cobra.Command, args []string) {
+	imageID, _ := cmd.Flags().GetString("image-id")
+	force, _ := cmd.Flags().GetBool("force")
+	yes, _ := cmd.Flags().GetBool("yes")
+
+	cfgFile, _ := cmd.Flags().GetString("config")
+	if cfgFile == "" {
+		cfgFile = DefaultConfigFile()
+	}
+
+	appConfig, err := config.LoadConfig(cfgFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error loading config file:", err)
+		os.Exit(1)
+	}
+
+	node := appConfig.Nodes[appConfig.Node]
+	store := objectstore.NewS3ObjectStoreFromConfig(
+		node.Predastore.Host,
+		node.Predastore.Region,
+		node.Predastore.AccessKey,
+		node.Predastore.SecretKey,
+	)
+	bucket := node.Predastore.Bucket
+
+	preview, err := admin.PreviewRemoveSystemImage(store, bucket, imageID)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to inspect AMI:", err)
+		os.Exit(1)
+	}
+
+	// Print metadata block.
+	fmt.Println("About to remove system AMI:")
+	fmt.Println()
+	fmt.Printf("  Image ID:        %s\n", preview.ImageID)
+	switch {
+	case !preview.ConfigPresent && !preview.ConfigCorrupt:
+		fmt.Println("  Name:            <unknown — config.json missing>")
+		fmt.Println("  Owner:           <unknown>")
+	case preview.ConfigCorrupt:
+		fmt.Println("  Name:            <unknown — config.json corrupt>")
+		fmt.Println("  Owner:           <unknown>")
+	default:
+		fmt.Printf("  Name:            %s\n", preview.Name)
+		fmt.Printf("  Owner:           %s\n", preview.Owner)
+		if !preview.Created.IsZero() {
+			fmt.Printf("  Created:         %s\n", preview.Created.UTC().Format("2006-01-02T15:04:05Z"))
+		}
+	}
+	fmt.Printf("  Backing storage: %s/      (%d objects, %s)\n",
+		preview.ImageID, preview.AMIObjectCount, utils.HumanBytes(utils.SafeInt64ToUint64(preview.AMIBytesTotal)))
+	fmt.Printf("                   %s/ (%d objects, %s)\n",
+		admin.SnapPrefix(preview.ImageID), preview.SnapObjectCount, utils.HumanBytes(utils.SafeInt64ToUint64(preview.SnapBytesTotal)))
+	fmt.Println()
+
+	// Account-owned guard before salvage / dependents — the AWS-flow hint is
+	// the most useful thing to surface for this kind of mistake.
+	if preview.ConfigPresent && !preview.IsSystemOwned && !force {
+		fmt.Fprintf(os.Stderr,
+			"Refusing to remove: %s is account-owned (%s).\n"+
+				"Use 'aws ec2 deregister-image --image-id %s' followed by 'aws ec2 delete-snapshot ...'.\n",
+			preview.ImageID, preview.Owner, preview.ImageID)
+		os.Exit(1)
+	}
+
+	if !preview.ConfigPresent && !force {
+		fmt.Fprintln(os.Stderr, "AMI config.json missing or corrupt; re-run with --force to salvage backing blocks.")
+		os.Exit(1)
+	}
+
+	if !preview.Dependents.Empty() && !force {
+		fmt.Fprintln(os.Stderr, "Refusing to remove: dependent resources reference this image.")
+		printDependents(os.Stderr, preview.Dependents)
+		fmt.Fprintln(os.Stderr, "Remove them first (e.g. 'aws ec2 terminate-instances', 'aws ec2 delete-snapshot', 'aws ec2 deregister-image') or re-run with --force.")
+		os.Exit(1)
+	}
+
+	if force && (!preview.ConfigPresent || !preview.Dependents.Empty()) {
+		fmt.Println("⚠️  --force: skipping dependency check and ownership check.")
+		if !preview.Dependents.Empty() {
+			printDependents(os.Stdout, preview.Dependents)
+		}
+		fmt.Println()
+	}
+
+	fmt.Println("This is permanent and cannot be undone.")
+	if !yes {
+		fmt.Print("Type 'yes' to proceed: ")
+		reader := bufio.NewReader(os.Stdin)
+		answer, _ := reader.ReadString('\n')
+		if strings.TrimSpace(answer) != "yes" {
+			fmt.Println("Aborted.")
+			return
+		}
+	}
+
+	res, err := admin.RemoveSystemImage(store, bucket, admin.RemoveImageOpts{
+		ImageID: imageID,
+		Force:   force,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Remove failed:", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✅ Removed AMI %s (freed %s across %d objects).\n",
+		imageID, utils.HumanBytes(utils.SafeInt64ToUint64(res.BytesFreed)), res.ObjectsDeleted)
+}
+
+func printDependents(w io.Writer, d admin.Dependents) {
+	if len(d.Volumes) > 0 {
+		fmt.Fprintf(w, "  Volumes (%d):\n", len(d.Volumes))
+		for _, v := range d.Volumes {
+			fmt.Fprintf(w, "    - %s\n", v)
+		}
+	}
+	if len(d.Snapshots) > 0 {
+		fmt.Fprintf(w, "  Snapshots (%d):\n", len(d.Snapshots))
+		for _, s := range d.Snapshots {
+			fmt.Fprintf(w, "    - %s\n", s)
+		}
+	}
+	if len(d.AMIs) > 0 {
+		fmt.Fprintf(w, "  AMIs (%d):\n", len(d.AMIs))
+		for _, a := range d.AMIs {
+			fmt.Fprintf(w, "    - %s\n", a)
+		}
+	}
 }
 
 // List remote images available
@@ -635,6 +848,7 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 	predastoreNodesStr, _ := cmd.Flags().GetString("predastore-nodes")
 	formationTimeoutStr, _ := cmd.Flags().GetString("formation-timeout")
 	tokenTTLStr, _ := cmd.Flags().GetString("token-ttl")
+	compactionInterval, _ := cmd.Flags().GetInt("predastore-compaction-interval")
 	clusterName, _ := cmd.Flags().GetString("cluster-name")
 	services, _ := cmd.Flags().GetStringSlice("services")
 
@@ -655,11 +869,14 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 	externalMode, _ := cmd.Flags().GetString("external-mode")
 	externalIface, _ := cmd.Flags().GetString("external-iface")
 	externalSource, _ := cmd.Flags().GetString("external-source")
+	externalBindBridge, _ := cmd.Flags().GetString("external-bind-bridge")
 	externalPool, _ := cmd.Flags().GetString("external-pool")
 	externalGateway, _ := cmd.Flags().GetString("external-gateway")
 	externalPrefixLen, _ := cmd.Flags().GetInt("external-prefix-len")
 	gatewayIP, _ := cmd.Flags().GetString("gateway-ip")
 	noExternal, _ := cmd.Flags().GetBool("no-external")
+	gpuPassthrough, _ := cmd.Flags().GetBool("gpu-passthrough")
+	ipsecEnabled, _ := cmd.Flags().GetBool("ipsec")
 
 	// Fire telemetry in background (completes during init work, waited at end)
 	noTelemetry, _ := cmd.Flags().GetBool("no-telemetry")
@@ -709,9 +926,9 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 				fmt.Printf("  %-14s %-18s %-20s %-16s %s\n", iface.Name, iface.IP, iface.Subnet, gw, strings.ToUpper(iface.Role))
 			}
 			if detected.LANCount == 0 {
-				fmt.Println("\n  Mode: single-NIC (macvlan for external bridge)")
+				fmt.Println("\n  Mode: single-NIC (veth-bridged external)")
 			} else {
-				fmt.Printf("\n  Mode: %d LAN + 1 WAN (macvlan for external bridge)\n", detected.LANCount)
+				fmt.Printf("\n  Mode: %d LAN + 1 WAN (veth-bridged external)\n", detected.LANCount)
 			}
 
 			// Apply auto-detected values when flags not explicitly set
@@ -726,13 +943,11 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 					externalPrefixLen = detected.WAN.PrefixLen
 				}
 
-				// Default mode: always "pool" — with static range if --external-pool
-				// is given, otherwise with source=dhcp (gateway IP from router DHCP)
+				// Default mode: always "pool". Source defaults to "static"; if
+				// --external-pool is omitted the validator below will error with
+				// a SuggestPoolRange hint.
 				if externalMode == "" && !cmd.Flags().Changed("external-mode") {
 					externalMode = "pool"
-					if externalPool == "" && externalSource == "" {
-						externalSource = "dhcp"
-					}
 				}
 			}
 		}
@@ -744,25 +959,30 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 	if externalMode == "pool" {
-		// Resolve source: if not explicitly set, infer from whether a pool range was given
+		// Default source: dhcp when no --external-pool, else static.
 		if externalSource == "" {
-			if externalPool != "" {
-				externalSource = "static"
-			} else {
+			if externalPool == "" {
 				externalSource = "dhcp"
+			} else {
+				externalSource = "static"
 			}
 		}
-		if externalSource == "dhcp" {
-			// DHCP source: no static range needed, just gateway
-			if externalGateway == "" {
-				fmt.Fprintf(os.Stderr, "❌ Error: --external-gateway is required when --external-mode=pool\n")
+		switch externalSource {
+		case "dhcp":
+			if externalPool != "" {
+				fmt.Fprintf(os.Stderr, "❌ Error: --external-pool not allowed with --external-source=dhcp (addresses come from upstream DHCP server)\n")
 				os.Exit(1)
 			}
-		} else {
-			// Static source: need pool range
+			if externalBindBridge == "" {
+				externalBindBridge = "br-wan"
+			}
+		case "static":
+			if externalBindBridge != "" {
+				fmt.Fprintf(os.Stderr, "❌ Error: --external-bind-bridge only valid with --external-source=dhcp\n")
+				os.Exit(1)
+			}
 			if externalPool == "" {
-				fmt.Fprintf(os.Stderr, "❌ Error: --external-pool is required when --external-mode=pool (e.g., 192.168.1.150-192.168.1.250)\n")
-				fmt.Fprintf(os.Stderr, "   Or use --external-source=dhcp to get IPs from router DHCP\n")
+				fmt.Fprintf(os.Stderr, "❌ Error: --external-pool is required with --external-source=static (e.g., 192.168.1.150-192.168.1.250)\n")
 				if detectedNet != nil && detectedNet.WAN != nil {
 					sugStart, sugEnd := admin.SuggestPoolRange(detectedNet.WAN)
 					fmt.Fprintf(os.Stderr, "   Suggested: --external-pool=%s-%s\n", sugStart, sugEnd)
@@ -770,7 +990,7 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 				os.Exit(1)
 			}
 			if externalGateway == "" {
-				fmt.Fprintf(os.Stderr, "❌ Error: --external-gateway is required when --external-mode=pool\n")
+				fmt.Fprintf(os.Stderr, "❌ Error: --external-gateway is required with --external-source=static\n")
 				os.Exit(1)
 			}
 			parts := strings.SplitN(externalPool, "-", 2)
@@ -779,6 +999,9 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 				os.Exit(1)
 			}
 			poolStart, poolEnd = parts[0], parts[1]
+		default:
+			fmt.Fprintf(os.Stderr, "❌ Error: --external-source must be 'static' or 'dhcp', got: %s\n", externalSource)
+			os.Exit(1)
 		}
 	}
 	if externalGateway != "" && net.ParseIP(externalGateway) == nil {
@@ -798,10 +1021,6 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 			fmt.Printf("  DNS servers: %s\n", strings.Join(dnsServers, ", "))
 		}
 	}
-
-	// For pool/dhcp source, the gateway IP is obtained via DHCP on the
-	// macvlan/bridge interface (no static pool range or explicit gateway-ip).
-	useExternalDHCP := externalMode == "pool" && externalSource == "dhcp" && gatewayIP == ""
 
 	// Validate IP address format
 	if net.ParseIP(bindIP) == nil {
@@ -901,6 +1120,27 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 	fmt.Printf("   Bootstrap: %s\n", filepath.Join(bootstrapDir, "bootstrap.json"))
 	fmt.Printf("   System creds: %s\n", filepath.Join(configDir, "system-credentials.json"))
 
+	// Predastore encryption key is per-node and never transmitted; generate
+	// it locally now so the service has it on first start.
+	predastoreKeyPath, err := writePredastoreEncryptionKey(configDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error generating predastore encryption key: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("\n🔐 Generated predastore encryption key (per-node, never transmitted)")
+	fmt.Printf("   Key: %s\n", predastoreKeyPath)
+
+	// Viperblock at-rest encryption key is cluster-wide; on a single-node init
+	// there are no joiners, so generate it locally and enable encryption by
+	// default for all volumes created on this install.
+	viperblockKeyPath, err := writeViperblockEncryptionKey(configDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error generating viperblock encryption key: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("\n🔐 Generated viperblock at-rest encryption key")
+	fmt.Printf("   Key: %s\n", viperblockKeyPath)
+
 	fmt.Printf("\n🔑 Generated admin credentials (save these — they won't be shown again):\n")
 	fmt.Printf("   Access Key:  %s\n", bootstrapResult.AdminAccessKey)
 	fmt.Printf("   Secret Key:  %s\n", bootstrapResult.AdminSecretKey)
@@ -908,7 +1148,19 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 	fmt.Printf("   AWS Profile: spinifex\n")
 
 	// Generate SSL certificates (with bind IP in SANs for multi-node support)
-	certPath := admin.GenerateCertificatesIfNeeded(configDir, force, bindIP)
+	certPath := admin.GenerateCertificatesIfNeeded(configDir, force, bindIP, region, config.DefaultAWSInternalSuffix)
+
+	// Generate per-node IPsec peer cert when cluster-wide IPsec is enabled
+	// (default true). Reuses the cluster CA — no intermediate strongSwan PKI.
+	if ipsecEnabled {
+		caCertPath := filepath.Join(configDir, "ca.pem")
+		caKeyPath := filepath.Join(configDir, "ca.key")
+		if err := admin.GenerateIPSecPeerCert(configDir, caCertPath, caKeyPath, node, bindIP); err != nil {
+			fmt.Fprintf(os.Stderr, "Error generating IPsec peer certificate: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("🔐 IPsec peer certificate generated (intra-AZ Geneve encryption ON)")
+	}
 
 	// Install CA certificate into system trust store
 	installCACertificate(filepath.Join(configDir, "ca.pem"))
@@ -931,30 +1183,32 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 	isMultiNode := nodes >= 2
 
 	if isMultiNode {
-		// Build cluster-wide network config for propagation to joining nodes
-		var networkConfig *formation.NetworkConfig
+		// Build cluster-wide network config for propagation to joining nodes.
+		// Always emit so the IPSecEnabled flag reaches joiners even when
+		// external networking is disabled.
+		networkConfig := &formation.NetworkConfig{
+			IPSecEnabled: ipsecEnabled,
+		}
 		if externalMode != "" {
 			bootstrapVpcId := utils.GenerateResourceID("vpc")
 			bootstrapSubnetId := utils.GenerateResourceID("subnet")
 			bootstrapIgwId := utils.GenerateResourceID("igw")
-			networkConfig = &formation.NetworkConfig{
-				ExternalMode:        externalMode,
-				ExternalDHCP:        useExternalDHCP,
-				PoolName:            "wan",
-				PoolSource:          externalSource,
-				PoolStart:           poolStart,
-				PoolEnd:             poolEnd,
-				PoolGateway:         externalGateway,
-				PoolGatewayIP:       gatewayIP,
-				PoolPrefixLen:       externalPrefixLen,
-				PoolDNSServers:      dnsServers,
-				BootstrapAccountId:  admin.DefaultAccountID(),
-				BootstrapVpcId:      bootstrapVpcId,
-				BootstrapSubnetId:   bootstrapSubnetId,
-				BootstrapIgwId:      bootstrapIgwId,
-				BootstrapCidr:       handlers_ec2_vpc.DefaultVPCCidr,
-				BootstrapSubnetCidr: handlers_ec2_vpc.DefaultSubnetCidr,
-			}
+			networkConfig.ExternalMode = externalMode
+			networkConfig.PoolName = "wan"
+			networkConfig.PoolSource = externalSource
+			networkConfig.PoolBindBridge = externalBindBridge
+			networkConfig.PoolStart = poolStart
+			networkConfig.PoolEnd = poolEnd
+			networkConfig.PoolGateway = externalGateway
+			networkConfig.PoolGatewayIP = gatewayIP
+			networkConfig.PoolPrefixLen = externalPrefixLen
+			networkConfig.PoolDNSServers = dnsServers
+			networkConfig.BootstrapAccountId = admin.DefaultAccountID()
+			networkConfig.BootstrapVpcId = bootstrapVpcId
+			networkConfig.BootstrapSubnetId = bootstrapSubnetId
+			networkConfig.BootstrapIgwId = bootstrapIgwId
+			networkConfig.BootstrapCidr = handlers_ec2_vpc.DefaultVPCCidr
+			networkConfig.BootstrapSubnetCidr = handlers_ec2_vpc.DefaultSubnetCidr
 		}
 
 		runAdminInitMultiNode(cmd, accessKey, secretKey, accountID, natsToken, clusterName,
@@ -980,8 +1234,8 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 	var predastoreNodeID int
 	if predastoreNodesStr != "" {
 		ips := strings.Split(predastoreNodesStr, ",")
-		if len(ips) < 3 {
-			fmt.Fprintf(os.Stderr, "❌ Error: --predastore-nodes requires at least 3 IPs, got %d\n", len(ips))
+		if len(ips) < 2 {
+			fmt.Fprintf(os.Stderr, "❌ Error: --predastore-nodes requires at least 2 IPs, got %d\n", len(ips))
 			os.Exit(1)
 		}
 
@@ -1005,7 +1259,7 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 		}
 
 		// Generate multi-node predastore.toml
-		predastoreContent, err := admin.GenerateMultiNodePredastoreConfig(predastoreMultiNodeTemplate, predastoreNodes, accessKey, secretKey, region, natsToken, configDir, bindIP)
+		predastoreContent, err := admin.GenerateMultiNodePredastoreConfig(predastoreMultiNodeTemplate, predastoreNodes, accessKey, secretKey, region, natsToken, configDir, bindIP, compactionInterval)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error generating multi-node predastore config: %v\n", err)
 			os.Exit(1)
@@ -1046,18 +1300,18 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 		ClusterRoutes: clusterRoutes,
 		ClusterName:   clusterName,
 
-		PredastoreNodeID: predastoreNodeID,
-		Services:         services,
+		PredastoreNodeID:          predastoreNodeID,
+		CompactionIntervalSeconds: compactionInterval,
+		Services:                  services,
 
 		OVNNBAddr: "tcp:127.0.0.1:6641",
 		OVNSBAddr: "tcp:127.0.0.1:6642",
 
 		ExternalMode:   externalMode,
 		ExternalIface:  externalIface,
-		DhcpBindBridge: detectedDhcpBindBridge(detectedNet),
-		ExternalDHCP:   useExternalDHCP,
 		PoolName:       "wan",
 		PoolSource:     externalSource,
+		PoolBindBridge: externalBindBridge,
 		PoolStart:      poolStart,
 		PoolEnd:        poolEnd,
 		PoolGateway:    externalGateway,
@@ -1072,20 +1326,27 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 		BootstrapIgwId:      bootstrapIgwId,
 		BootstrapCidr:       handlers_ec2_vpc.DefaultVPCCidr,
 		BootstrapSubnetCidr: handlers_ec2_vpc.DefaultSubnetCidr,
+
+		GPUPassthrough: gpuPassthrough,
+		IPSecEnabled:   ipsecEnabled,
+
+		EncryptionKeyFile: viperblockKeyPath,
 	}
 
 	// Print external networking summary
 	if externalMode != "" {
 		fmt.Printf("\n📡 External networking: %s\n", externalMode)
 		fmt.Printf("  WAN interface: %s\n", externalIface)
-		if poolStart != "" {
+		switch externalSource {
+		case "static":
 			fmt.Printf("  Source:        static (IP range)\n")
 			fmt.Printf("  IP pool:       %s - %s\n", poolStart, poolEnd)
 			fmt.Printf("  ⚠️  Ensure %s-%s is excluded from your router's DHCP range.\n", poolStart, poolEnd)
-		} else if useExternalDHCP {
-			fmt.Printf("  Source:        dhcp (from router DHCP)\n")
-			fmt.Println("  Gateway IP:    DHCP (obtained during OVN setup)")
-		} else if gatewayIP != "" {
+		case "dhcp":
+			fmt.Printf("  Source:        dhcp (upstream DHCP server)\n")
+			fmt.Printf("  Bind bridge:   %s\n", externalBindBridge)
+		}
+		if gatewayIP != "" {
 			fmt.Printf("  Gateway IP:    %s (static)\n", gatewayIP)
 		}
 	}
@@ -1097,6 +1358,20 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 	}
 
 	finalizeNodeSetup(spxRoot, certPath, bootstrapResult.AdminAccessKey, bootstrapResult.AdminSecretKey, region, bindIP, advertiseIP)
+
+	// Write node.conf so spx admin banner works on source installs (not just ISO).
+	nodeHostname, _ := os.Hostname()
+	if nodeHostname == "" {
+		nodeHostname = node
+	}
+	nodeConfPath := filepath.Join(configDir, "node.conf")
+	if err := writeNodeConf(nodeConfPath, map[string]string{
+		"MANAGEMENT_IP":    advertiseIP,
+		"MANAGEMENT_IFACE": "br-wan",
+		"NODE_HOSTNAME":    nodeHostname,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠️  Warning: could not write %s: %v\n", nodeConfPath, err)
+	}
 
 	// Print success message
 	fmt.Println("\n🎉 Spinifex initialization complete!")
@@ -1132,6 +1407,8 @@ func runAdminInitMultiNode(cmd *cobra.Command, accessKey, secretKey, accountID, 
 		os.Exit(1)
 	}
 
+	compactionInterval, _ := cmd.Flags().GetInt("predastore-compaction-interval")
+
 	joinToken, err := formation.GenerateJoinToken()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Error generating join token: %v\n", err)
@@ -1152,6 +1429,33 @@ func runAdminInitMultiNode(cmd *cobra.Command, accessKey, secretKey, accountID, 
 	}
 	fmt.Println("\n🔐 Generated IAM master key")
 	fmt.Printf("   Bootstrap: %s\n", filepath.Join(bootstrapDir, "bootstrap.json"))
+
+	// Predastore encryption key is per-node and never distributed via the
+	// formation server. Generate only the leader's own key here; each
+	// joiner generates its own during `spx admin join`.
+	predastoreKeyPath, err := writePredastoreEncryptionKey(configDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Error generating predastore encryption key: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("\n🔐 Generated predastore encryption key (per-node, never transmitted)")
+	fmt.Printf("   Key: %s\n", predastoreKeyPath)
+
+	// Viperblock at-rest encryption key is cluster-wide and shared: the leader
+	// generates it once and distributes it to joiners via the formation server
+	// so a volume sealed on any node can be opened on any other.
+	viperblockKey, err := handlers_iam.GenerateMasterKey()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Error generating viperblock encryption key: %v\n", err)
+		os.Exit(1)
+	}
+	viperblockKeyPath, err := saveViperblockEncryptionKey(configDir, viperblockKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Error saving viperblock encryption key: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("\n🔐 Generated viperblock at-rest encryption key (cluster-wide, shared with joiners)")
+	fmt.Printf("   Key: %s\n", viperblockKeyPath)
 
 	// Read CA cert/key for distribution to joining nodes
 	caCertData, err := os.ReadFile(filepath.Join(configDir, "ca.pem"))
@@ -1180,6 +1484,9 @@ func runAdminInitMultiNode(cmd *cobra.Command, accessKey, secretKey, accountID, 
 
 	// Include master key in formation server for distribution to joining nodes
 	fs.SetMasterKey(base64.StdEncoding.EncodeToString(masterKey))
+
+	// Distribute the cluster-wide viperblock encryption key to joiners
+	fs.SetViperblockKey(base64.StdEncoding.EncodeToString(viperblockKey))
 
 	// Register self (init node) as the first node
 	selfNode := formation.NodeInfo{
@@ -1243,9 +1550,9 @@ func runAdminInitMultiNode(cmd *cobra.Command, accessKey, secretKey, accountID, 
 
 	// Generate multi-node predastore config
 	var predastoreNodeID int
-	hasPredastoreConfig := len(predastoreNodes) >= 3
+	hasPredastoreConfig := len(predastoreNodes) >= 2
 	if hasPredastoreConfig {
-		predastoreContent, err := admin.GenerateMultiNodePredastoreConfig(predastoreMultiNodeTemplate, predastoreNodes, accessKey, secretKey, region, natsToken, configDir, bindIP)
+		predastoreContent, err := admin.GenerateMultiNodePredastoreConfig(predastoreMultiNodeTemplate, predastoreNodes, accessKey, secretKey, region, natsToken, configDir, bindIP, compactionInterval)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error generating multi-node predastore config: %v\n", err)
 			os.Exit(1)
@@ -1282,11 +1589,14 @@ func runAdminInitMultiNode(cmd *cobra.Command, accessKey, secretKey, accountID, 
 		ClusterRoutes: clusterRoutes,
 		ClusterName:   clusterName,
 
-		PredastoreNodeID: predastoreNodeID,
-		Services:         services,
-		RemoteNodes:      buildRemoteNodes(allNodes, node),
+		PredastoreNodeID:          predastoreNodeID,
+		CompactionIntervalSeconds: compactionInterval,
+		Services:                  services,
+		RemoteNodes:               buildRemoteNodes(allNodes, node),
 
 		OperatorEmail: email,
+
+		EncryptionKeyFile: viperblockKeyPath,
 
 		// Init node runs ovn-central locally
 		OVNNBAddr: "tcp:127.0.0.1:6641",
@@ -1329,7 +1639,7 @@ func runAdminInitMultiNode(cmd *cobra.Command, accessKey, secretKey, accountID, 
 	}
 	fmt.Println("\n📋 Next steps:")
 	fmt.Println("   1. Start services on ALL nodes:")
-	fmt.Println("      ./scripts/start-dev.sh")
+	fmt.Println("      sudo systemctl start spinifex.target")
 	fmt.Println()
 }
 
@@ -1352,6 +1662,7 @@ func runAdminJoin(cmd *cobra.Command, args []string) {
 	configDir, _ := cmd.Flags().GetString("config-dir")
 	clusterBind, _ := cmd.Flags().GetString("cluster-bind")
 	services, _ := cmd.Flags().GetStringSlice("services")
+	compactionInterval, _ := cmd.Flags().GetInt("predastore-compaction-interval")
 
 	email, _ := cmd.Flags().GetString("email")
 	email = strings.TrimSpace(email)
@@ -1532,7 +1843,7 @@ func runAdminJoin(cmd *cobra.Command, args []string) {
 		}
 
 		fmt.Printf("   Waiting for cluster formation... (%d/%d nodes joined)\n", statusResp.Joined, statusResp.Expected)
-		time.Sleep(2 * time.Second)
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	fmt.Printf("✅ Cluster formation complete! (%d nodes)\n\n", statusResp.Expected)
@@ -1623,12 +1934,62 @@ func runAdminJoin(cmd *cobra.Command, args []string) {
 	fmt.Println("✅ IAM master key received from leader")
 	fmt.Printf("✅ Bootstrap file written: %s\n", filepath.Join(bootstrapDir, "bootstrap.json"))
 
+	// Predastore encryption key is per-node: generate locally rather than
+	// receiving from the leader. Each node only opens fragments it sealed
+	// itself, so there is no cluster-wide predastore key to share.
+	predastoreKeyPath, err := writePredastoreEncryptionKey(configDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Error generating predastore encryption key: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("✅ Predastore encryption key generated: %s\n", predastoreKeyPath)
+
+	// Viperblock at-rest encryption key is cluster-wide: receive it from the
+	// leader rather than generating one, so this node can open volumes sealed
+	// elsewhere. Lenient on absence — an older leader that predates key
+	// distribution returns nothing; fall back to cleartext rather than fail
+	// the join.
+	var viperblockKeyPath string
+	if statusResp.ViperblockKey == "" {
+		fmt.Println("⚠️  Leader did not provide a viperblock encryption key; at-rest encryption disabled on this node")
+	} else {
+		viperblockKeyBytes, err := base64.StdEncoding.DecodeString(statusResp.ViperblockKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Error decoding viperblock encryption key: %v\n", err)
+			os.Exit(1)
+		}
+		viperblockKeyPath, err = saveViperblockEncryptionKey(configDir, viperblockKeyBytes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Error saving viperblock encryption key: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✅ Viperblock encryption key received from leader: %s\n", viperblockKeyPath)
+	}
+
 	// Generate server cert signed by CA with this node's bind IP
-	if err := admin.GenerateServerCertOnly(configDir, bindIP); err != nil {
+	if err := admin.GenerateServerCertOnly(configDir, bindIP, region, config.DefaultAWSInternalSuffix); err != nil {
 		fmt.Fprintf(os.Stderr, "Error generating server certificate: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("✅ Server certificate generated with bind IP: %s\n\n", bindIP)
+
+	// Match the leader's intra-AZ IPsec posture: NetworkConfig.IPSecEnabled is
+	// authoritative. When the formation response omits NetworkConfig entirely
+	// (no current code path; defensive guard against future regressions) fall
+	// back to the AWS-parity default of ON.
+	ipsecEnabled := true
+	if statusResp.NetworkConfig != nil {
+		ipsecEnabled = statusResp.NetworkConfig.IPSecEnabled
+	}
+	if ipsecEnabled {
+		caCertPath := filepath.Join(configDir, "ca.pem")
+		caKeyPath := filepath.Join(configDir, "ca.key")
+		if err := admin.GenerateIPSecPeerCert(configDir, caCertPath, caKeyPath, node, bindIP); err != nil {
+			fmt.Fprintf(os.Stderr, "Error generating IPsec peer certificate: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("🔐 IPsec peer certificate generated (intra-AZ Geneve encryption ON)")
+	}
 
 	// Build cluster topology from formation data
 	clusterRoutes := formation.BuildClusterRoutes(statusResp.Nodes)
@@ -1646,10 +2007,10 @@ func runAdminJoin(cmd *cobra.Command, args []string) {
 
 	// Generate multi-node predastore config
 	var predastoreNodeID int
-	hasPredastoreConfig := len(predastoreNodes) >= 3
+	hasPredastoreConfig := len(predastoreNodes) >= 2
 
 	if hasPredastoreConfig {
-		predastoreContent, err := admin.GenerateMultiNodePredastoreConfig(predastoreMultiNodeTemplate, predastoreNodes, creds.AccessKey, creds.SecretKey, creds.Region, creds.NatsToken, configDir, bindIP)
+		predastoreContent, err := admin.GenerateMultiNodePredastoreConfig(predastoreMultiNodeTemplate, predastoreNodes, creds.AccessKey, creds.SecretKey, creds.Region, creds.NatsToken, configDir, bindIP, compactionInterval)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error generating multi-node predastore config: %v\n", err)
 			os.Exit(1)
@@ -1690,11 +2051,14 @@ func runAdminJoin(cmd *cobra.Command, args []string) {
 		ClusterRoutes: clusterRoutes,
 		ClusterName:   creds.ClusterName,
 
-		PredastoreNodeID: predastoreNodeID,
-		Services:         services,
-		RemoteNodes:      buildRemoteNodes(statusResp.Nodes, node),
+		PredastoreNodeID:          predastoreNodeID,
+		CompactionIntervalSeconds: compactionInterval,
+		Services:                  services,
+		RemoteNodes:               buildRemoteNodes(statusResp.Nodes, node),
 
 		OperatorEmail: email,
+
+		EncryptionKeyFile: viperblockKeyPath,
 
 		// Joining nodes connect to the init node's OVN NB/SB DB
 		OVNNBAddr: fmt.Sprintf("tcp:%s:6641", leaderIP),
@@ -1981,6 +2345,7 @@ func runCertRenew(cmd *cobra.Command, _ []string) {
 type configDirs struct {
 	AWSGW      string
 	Predastore string
+	Viperblock string
 	NATS       string
 	Spinifex   string
 }
@@ -1990,10 +2355,11 @@ func createConfigSubdirs(configDir string) (configDirs, error) {
 	dirs := configDirs{
 		AWSGW:      filepath.Join(configDir, "awsgw"),
 		Predastore: filepath.Join(configDir, "predastore"),
+		Viperblock: filepath.Join(configDir, "viperblock"),
 		NATS:       filepath.Join(configDir, "nats"),
 		Spinifex:   filepath.Join(configDir, "spinifex"),
 	}
-	for _, dir := range []string{dirs.AWSGW, dirs.Predastore, dirs.NATS, dirs.Spinifex} {
+	for _, dir := range []string{dirs.AWSGW, dirs.Predastore, dirs.Viperblock, dirs.NATS, dirs.Spinifex} {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return configDirs{}, fmt.Errorf("create directory %s: %w", dir, err)
 		}
@@ -2039,10 +2405,11 @@ func finalizeNodeSetup(dataDir, certPath, adminAccessKey, adminSecretKey, region
 // applyNetworkConfig copies cluster-wide network settings from a formation
 // NetworkConfig into ConfigSettings and auto-detects the local WAN interface.
 func applyNetworkConfig(settings *admin.ConfigSettings, nc *formation.NetworkConfig) {
+	settings.IPSecEnabled = nc.IPSecEnabled
 	settings.ExternalMode = nc.ExternalMode
-	settings.ExternalDHCP = nc.ExternalDHCP
 	settings.PoolName = nc.PoolName
 	settings.PoolSource = nc.PoolSource
+	settings.PoolBindBridge = nc.PoolBindBridge
 	settings.PoolStart = nc.PoolStart
 	settings.PoolEnd = nc.PoolEnd
 	settings.PoolGateway = nc.PoolGateway
@@ -2061,7 +2428,6 @@ func applyNetworkConfig(settings *admin.ConfigSettings, nc *formation.NetworkCon
 		detected, err := admin.DetectNetwork()
 		if err == nil && detected.WAN != nil {
 			settings.ExternalIface = detected.WAN.Name
-			settings.DhcpBindBridge = detectedDhcpBindBridge(detected)
 		}
 	}
 }
@@ -2092,6 +2458,64 @@ func writeBootstrapFiles(configDir, bootstrapDir string, masterKey []byte, acces
 		AdminAccessKey: adminAccessKey,
 		AdminSecretKey: adminSecretKey,
 	}, nil
+}
+
+// writePredastoreEncryptionKey generates a fresh 32-byte AES-256 master key
+// for this node's predastore data dir and writes it to
+// <configDir>/predastore/encryption.key with mode 0600. The key is per-node:
+// every node generates its own at init/join time and never transmits it,
+// because predastore only opens fragments on the node that sealed them.
+func writePredastoreEncryptionKey(configDir string) (string, error) {
+	predastoreDir := filepath.Join(configDir, "predastore")
+	if err := os.MkdirAll(predastoreDir, 0750); err != nil {
+		return "", fmt.Errorf("create predastore config dir: %w", err)
+	}
+	key, err := handlers_iam.GenerateMasterKey()
+	if err != nil {
+		return "", fmt.Errorf("generate predastore encryption key: %w", err)
+	}
+	keyPath := filepath.Join(predastoreDir, "encryption.key")
+	if err := handlers_iam.SaveMasterKey(keyPath, key); err != nil {
+		return "", fmt.Errorf("save predastore encryption key: %w", err)
+	}
+	return keyPath, nil
+}
+
+// writeViperblockEncryptionKey generates a fresh 32-byte AES-256 master key for
+// viperblock at-rest encryption and writes it to
+// <configDir>/viperblock/encryption.key with mode 0600. Unlike the predastore
+// key, this key is cluster-wide and shared: the leader generates it once at init
+// and distributes it to joiners via the formation server, so a volume sealed on
+// any node can be opened on any other. Loaded at startup via masterkey.LoadShared.
+func writeViperblockEncryptionKey(configDir string) (string, error) {
+	viperblockDir := filepath.Join(configDir, "viperblock")
+	if err := os.MkdirAll(viperblockDir, 0750); err != nil {
+		return "", fmt.Errorf("create viperblock config dir: %w", err)
+	}
+	key, err := handlers_iam.GenerateMasterKey()
+	if err != nil {
+		return "", fmt.Errorf("generate viperblock encryption key: %w", err)
+	}
+	keyPath := filepath.Join(viperblockDir, "encryption.key")
+	if err := handlers_iam.SaveMasterKey(keyPath, key); err != nil {
+		return "", fmt.Errorf("save viperblock encryption key: %w", err)
+	}
+	return keyPath, nil
+}
+
+// saveViperblockEncryptionKey writes an already-generated 32-byte viperblock
+// master key (received from the formation leader) to
+// <configDir>/viperblock/encryption.key with mode 0600.
+func saveViperblockEncryptionKey(configDir string, key []byte) (string, error) {
+	viperblockDir := filepath.Join(configDir, "viperblock")
+	if err := os.MkdirAll(viperblockDir, 0750); err != nil {
+		return "", fmt.Errorf("create viperblock config dir: %w", err)
+	}
+	keyPath := filepath.Join(viperblockDir, "encryption.key")
+	if err := handlers_iam.SaveMasterKey(keyPath, key); err != nil {
+		return "", fmt.Errorf("save viperblock encryption key: %w", err)
+	}
+	return keyPath, nil
 }
 
 // writeSystemCredentials writes the system access key to a plaintext JSON file.
@@ -2147,29 +2571,6 @@ func writeBootstrapFilesWithAdmin(configDir, bootstrapDir string, masterKey []by
 	}
 
 	return handlers_iam.SaveBootstrapData(filepath.Join(bootstrapDir, "bootstrap.json"), bd)
-}
-
-// detectedDhcpBindBridge returns the bridge name where the vpcd DHCP client
-// should bind its AF_PACKET socket — i.e. the interface that physically sees
-// LAN DHCP traffic.
-//
-//   - Default route on a bridge (Linux or OVS, `br-*` prefix): return the
-//     bridge name verbatim. In veth mode this is the Linux bridge holding the
-//     WAN NIC; in direct mode this is the OVS bridge holding the WAN NIC.
-//   - Default route on a bare physical NIC: return "br-wan" as the name the
-//     installer will create.
-//
-// Never returns "br-ext". br-ext is the OVN-side bridge owned by
-// setup-ovn.sh's ovn-bridge-mappings and never sees LAN DHCP frames.
-func detectedDhcpBindBridge(detected *admin.DetectedNetwork) string {
-	if detected == nil || detected.WAN == nil {
-		return ""
-	}
-	name := detected.WAN.Name
-	if strings.HasPrefix(name, "br-") {
-		return name
-	}
-	return "br-wan"
 }
 
 // detectDNSServers auto-detects DNS servers from the host for the specified
@@ -2304,6 +2705,12 @@ func runAdminBanner(cmd *cobra.Command, _ []string) {
 	}
 
 	// Resolve current IP from the management interface at runtime.
+	// If node.conf is absent or has no MANAGEMENT_IFACE (source installs before
+	// the first spx admin init writes node.conf), fall back to br-wan which
+	// setup-ovn.sh always creates as the management bridge.
+	if iface == "" {
+		iface = "br-wan"
+	}
 	currentIP := resolveIfaceIP(iface)
 	if currentIP == "" {
 		currentIP = recordedIP // fall back to value recorded at install time
@@ -2331,17 +2738,17 @@ func runAdminBanner(cmd *cobra.Command, _ []string) {
 	}
 
 	banner := fmt.Sprintf(`
-  +----------------------------------------------------+
-  |         Spinifex  —  Mulga Defense Corporation     |
-  +----------------------------------------------------+
-  |  Node:      %-39s|
-  |  Login:     %-39s|
-  |  Dashboard: %-39s|
-  |  API:       %-39s|
-  |  SSH:       %-39s|
-  +----------------------------------------------------+
-  |  AWS credentials:  cat ~/.aws/credentials          |
-  +----------------------------------------------------+
+  +--------------------------------------------------------------+
+  |          Spinifex  —  Mulga Defense Corporation              |
+  +--------------------------------------------------------------+
+  |  Node:      %-49s|
+  |  Login:     %-49s|
+  |  Dashboard: %-49s|
+  |  API:       %-49s|
+  |  SSH:       %-49s|
+  +--------------------------------------------------------------+
+  |  AWS credentials:  cat ~/.aws/credentials                    |
+  +--------------------------------------------------------------+
 
 `,
 		hostname,
@@ -2350,6 +2757,8 @@ func runAdminBanner(cmd *cobra.Command, _ []string) {
 		"https://"+currentIP+":9999",
 		"spinifex@"+currentIP,
 	)
+
+	banner += gpuBannerSection()
 
 	// Write to /etc/issue — displayed on the console before the login prompt.
 	// Overwrite entirely; this is a purpose-built appliance so we own this file.
@@ -2388,6 +2797,81 @@ func appendBannerToMotd(banner string) error {
 		}
 	}
 	return os.WriteFile(motdPath, []byte(base+sentinel+banner), 0o644)
+}
+
+// gpuBannerSection returns an optional banner box section describing GPU state.
+// Returns "" when no GPU hardware is detected. Safe to call at boot before the
+// daemon starts — all checks are sysfs/file reads, no NATS required.
+func gpuBannerSection() string {
+	devices, err := gpu.Discover()
+	if err != nil || len(devices) == 0 {
+		return ""
+	}
+
+	iommuEntries, _ := os.ReadDir("/sys/kernel/iommu_groups/")
+	iommuActive := len(iommuEntries) > 0
+
+	_, vfioErr := os.Stat("/sys/module/vfio_pci")
+	vfioPresent := vfioErr == nil
+
+	passthroughEnabled := false
+	cfgPath := DefaultConfigFile()
+	if cfg, err := config.LoadConfig(cfgPath); err == nil {
+		if nodeCfg, ok := cfg.Nodes[cfg.Node]; ok {
+			passthroughEnabled = nodeCfg.Daemon.GPUPassthrough
+		}
+	}
+
+	models := gpuModelSummary(devices)
+
+	var statusLine, hintLine string
+	switch {
+	case passthroughEnabled:
+		statusLine = "Passthrough enabled"
+	case iommuActive && vfioPresent:
+		statusLine = "Ready to enable"
+		hintLine = "sudo spx admin gpu enable"
+	default:
+		statusLine = "Setup required"
+		hintLine = "sudo spx admin gpu setup"
+	}
+
+	const (
+		sep    = "  +--------------------------------------------------------------+\n"
+		maxVal = 55
+	)
+	if len([]rune(models)) > maxVal {
+		models = string([]rune(models)[:maxVal-3]) + "..."
+	}
+
+	section := sep +
+		fmt.Sprintf("  |  GPU: %-55s|\n", models) +
+		fmt.Sprintf("  |       %-55s|\n", statusLine)
+	if hintLine != "" {
+		section += fmt.Sprintf("  |       %-55s|\n", hintLine)
+	}
+	section += sep + "\n"
+	return section
+}
+
+func gpuModelSummary(devices []gpu.GPUDevice) string {
+	counts := make(map[string]int)
+	var order []string
+	for _, d := range devices {
+		if counts[d.Model] == 0 {
+			order = append(order, d.Model)
+		}
+		counts[d.Model]++
+	}
+	var parts []string
+	for _, m := range order {
+		if n := counts[m]; n > 1 {
+			parts = append(parts, fmt.Sprintf("%dx %s", n, m))
+		} else {
+			parts = append(parts, m)
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 // parseNodeConf reads a KEY=VALUE shell-format file and returns a map.

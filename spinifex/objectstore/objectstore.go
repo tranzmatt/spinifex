@@ -1,6 +1,5 @@
-// Package objectstore provides a common abstraction for S3-like object storage operations.
-// This package enables handlers to work with either real S3 backends (Predastore) or
-// in-memory stores for testing, without changing the handler implementation.
+// Package objectstore provides a common S3-like storage abstraction used by handlers
+// to work with real backends (Predastore) or in-memory stores for testing.
 package objectstore
 
 import (
@@ -30,30 +29,25 @@ func (e *NoSuchKeyError) Code() string {
 	return "NoSuchKey"
 }
 
-// IsNoSuchKeyError checks if an error is a NoSuchKey error
+// IsNoSuchKeyError reports whether err is a NoSuchKey error.
 func IsNoSuchKeyError(err error) bool {
 	var noSuchKey *NoSuchKeyError
 	return errors.As(err, &noSuchKey)
 }
 
 // ObjectStore defines the interface for S3-like object storage operations.
-// This abstraction allows for mocking in tests without requiring actual S3 connectivity.
 type ObjectStore interface {
-	// GetObject retrieves an object from storage
 	GetObject(input *s3.GetObjectInput) (*s3.GetObjectOutput, error)
-
-	// PutObject stores an object in storage
+	HeadObject(input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error)
 	PutObject(input *s3.PutObjectInput) (*s3.PutObjectOutput, error)
-
-	// DeleteObject removes an object from storage
 	DeleteObject(input *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error)
-
-	// ListObjectsV2 lists objects in a bucket using the V2 API
 	ListObjectsV2(input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error)
+	// EnsureBucket idempotently makes bucket exist. It is safe to call
+	// concurrently and on an already-present bucket.
+	EnsureBucket(bucket string) error
 }
 
-// NewS3ObjectStoreFromConfig creates an S3ObjectStore from Predastore connection parameters,
-// eliminating the duplicated TLS+HTTP/2+session boilerplate in each service.
+// NewS3ObjectStoreFromConfig creates an S3ObjectStore from Predastore connection parameters.
 func NewS3ObjectStoreFromConfig(host, region, accessKey, secretKey string) *S3ObjectStore {
 	sess := session.Must(session.NewSession(&aws.Config{
 		Endpoint:         aws.String(host),
@@ -89,6 +83,18 @@ func (s *S3ObjectStore) GetObject(input *s3.GetObjectInput) (*s3.GetObjectOutput
 	return out, nil
 }
 
+func (s *S3ObjectStore) HeadObject(input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+	out, err := s.client.HeadObject(input)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok &&
+			(aerr.Code() == s3.ErrCodeNoSuchKey || aerr.Code() == "NotFound") {
+			return nil, &NoSuchKeyError{Key: aws.StringValue(input.Key)}
+		}
+		return nil, err
+	}
+	return out, nil
+}
+
 func (s *S3ObjectStore) PutObject(input *s3.PutObjectInput) (*s3.PutObjectOutput, error) {
 	return s.client.PutObject(input)
 }
@@ -101,7 +107,27 @@ func (s *S3ObjectStore) ListObjectsV2(input *s3.ListObjectsV2Input) (*s3.ListObj
 	return s.client.ListObjectsV2(input)
 }
 
-// MemoryObjectStore implements ObjectStore using in-memory storage for testing
+// EnsureBucket creates bucket when absent. A successful HeadBucket short-circuits
+// the create; an already-owned/existing bucket from a racing creator is treated
+// as success so concurrent callers converge.
+func (s *S3ObjectStore) EnsureBucket(bucket string) error {
+	if _, err := s.client.HeadBucket(&s3.HeadBucketInput{Bucket: aws.String(bucket)}); err == nil {
+		return nil
+	}
+	_, err := s.client.CreateBucket(&s3.CreateBucketInput{Bucket: aws.String(bucket)})
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case s3.ErrCodeBucketAlreadyOwnedByYou, s3.ErrCodeBucketAlreadyExists:
+				return nil
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+// MemoryObjectStore implements ObjectStore using in-memory storage for testing.
 type MemoryObjectStore struct {
 	objects map[string][]byte // key: bucket/key -> value: object data
 	mu      sync.RWMutex
@@ -133,6 +159,21 @@ func (m *MemoryObjectStore) GetObject(input *s3.GetObjectInput) (*s3.GetObjectOu
 
 	return &s3.GetObjectOutput{
 		Body:          io.NopCloser(bytes.NewReader(data)),
+		ContentLength: aws.Int64(int64(len(data))),
+	}, nil
+}
+
+func (m *MemoryObjectStore) HeadObject(input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	storageKey := makeKey(*input.Bucket, *input.Key)
+	data, exists := m.objects[storageKey]
+	if !exists {
+		return nil, &NoSuchKeyError{Key: *input.Key}
+	}
+
+	return &s3.HeadObjectOutput{
 		ContentLength: aws.Int64(int64(len(data))),
 	}, nil
 }
@@ -181,25 +222,16 @@ func (m *MemoryObjectStore) ListObjectsV2(input *s3.ListObjectsV2Input) (*s3.Lis
 	prefixes := make(map[string]bool)
 
 	for key, data := range m.objects {
-		// Check if key belongs to this bucket
 		if !strings.HasPrefix(key, bucket+"/") {
 			continue
 		}
-
-		// Extract the key part (remove bucket/)
 		objectKey := key[len(bucket)+1:]
-
-		// Check prefix filter
 		if prefix != "" && !strings.HasPrefix(objectKey, prefix) {
 			continue
 		}
-
-		// Handle delimiter (common prefixes)
 		if delimiter != "" {
-			// Find the position after the prefix where delimiter appears
 			afterPrefix := objectKey[len(prefix):]
 			if idx := strings.Index(afterPrefix, delimiter); idx >= 0 {
-				// This object is in a "subdirectory", add to common prefixes
 				commonPrefix := objectKey[:len(prefix)+idx+len(delimiter)]
 				prefixes[commonPrefix] = true
 				continue
@@ -212,7 +244,6 @@ func (m *MemoryObjectStore) ListObjectsV2(input *s3.ListObjectsV2Input) (*s3.Lis
 		})
 	}
 
-	// Convert prefixes map to CommonPrefixes list
 	var commonPrefixes []*s3.CommonPrefix
 	for p := range prefixes {
 		commonPrefixes = append(commonPrefixes, &s3.CommonPrefix{
@@ -227,6 +258,10 @@ func (m *MemoryObjectStore) ListObjectsV2(input *s3.ListObjectsV2Input) (*s3.Lis
 		KeyCount:       aws.Int64(int64(len(contents))),
 	}, nil
 }
+
+// EnsureBucket is a no-op: the memory store has no bucket namespace, keys are
+// prefixed with the bucket name on write.
+func (m *MemoryObjectStore) EnsureBucket(bucket string) error { return nil }
 
 // Clear removes all objects from the memory store (useful for test cleanup)
 func (m *MemoryObjectStore) Clear() {

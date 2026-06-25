@@ -1,6 +1,6 @@
 # Predastore S3-compatible storage configuration file in TOML format.
 # Generated for multi-node cluster
-version = "3"
+version = "4"
 region = "{{.Region}}"
 
 host = "0.0.0.0"
@@ -9,8 +9,13 @@ port = 8443
 debug = false
 
 [rs]
+{{- if eq (len .Nodes) 2}}
+data = 1
+parity = 1
+{{- else}}
 data = 2
 parity = 1
+{{- end}}
 {{- range .Nodes}}
 
 [[db]]
@@ -39,10 +44,12 @@ region = "{{.Region}}"
 type = "distributed"
 public = false
 encryption = ""
+account_id = "000000000000"
 
 [[auth]]
 access_key_id = "{{.AccessKey}}"
 secret_access_key = "{{.SecretKey}}"
+account_id = "000000000000"
 policy = [
   { bucket = "predastore", actions = ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListAllMyBuckets"] },
 ]
@@ -68,3 +75,8 @@ nats_token = "{{.NatsToken}}"
 nats_ca_cert = "{{.ConfigDir}}/ca.pem"
 master_key_path = "{{.ConfigDir}}/master.key"
 access_keys_bucket = "spinifex-iam-access-keys"
+{{- if .CompactionIntervalSeconds}}
+
+[compaction]
+interval_seconds = {{.CompactionIntervalSeconds}}
+{{- end}}

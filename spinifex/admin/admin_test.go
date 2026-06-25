@@ -621,7 +621,7 @@ func TestGenerateCertificatesIfNeeded(t *testing.T) {
 	dir := t.TempDir()
 
 	// First call generates all certs
-	caCertPath := GenerateCertificatesIfNeeded(dir, false, "")
+	caCertPath := GenerateCertificatesIfNeeded(dir, false, "", "us-east-1", "spinifex.internal")
 	assert.Equal(t, filepath.Join(dir, "ca.pem"), caCertPath)
 	assert.True(t, FileExists(filepath.Join(dir, "ca.pem")))
 	assert.True(t, FileExists(filepath.Join(dir, "ca.key")))
@@ -632,7 +632,7 @@ func TestGenerateCertificatesIfNeeded(t *testing.T) {
 		caInfo, _ := os.Stat(filepath.Join(dir, "ca.pem"))
 		origModTime := caInfo.ModTime()
 
-		GenerateCertificatesIfNeeded(dir, false, "")
+		GenerateCertificatesIfNeeded(dir, false, "", "us-east-1", "spinifex.internal")
 		caInfo2, _ := os.Stat(filepath.Join(dir, "ca.pem"))
 		assert.Equal(t, origModTime, caInfo2.ModTime())
 	})
@@ -640,7 +640,7 @@ func TestGenerateCertificatesIfNeeded(t *testing.T) {
 	t.Run("ForceRegenerates", func(t *testing.T) {
 		origCA, _ := os.ReadFile(filepath.Join(dir, "ca.pem"))
 
-		GenerateCertificatesIfNeeded(dir, true, "")
+		GenerateCertificatesIfNeeded(dir, true, "", "us-east-1", "spinifex.internal")
 		newCA, _ := os.ReadFile(filepath.Join(dir, "ca.pem"))
 		assert.NotEqual(t, origCA, newCA)
 	})
@@ -660,7 +660,7 @@ func TestGenerateServerCertOnly(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "ca.pem"), caCert, 0600))
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "ca.key"), caKey, 0600))
 
-		err := GenerateServerCertOnly(dir, "10.0.0.5")
+		err := GenerateServerCertOnly(dir, "10.0.0.5", "us-east-1", "spinifex.internal")
 		require.NoError(t, err)
 		assert.True(t, FileExists(filepath.Join(dir, "server.pem")))
 		assert.True(t, FileExists(filepath.Join(dir, "server.key")))
@@ -676,14 +676,32 @@ func TestGenerateServerCertOnly(t *testing.T) {
 			}
 		}
 		assert.True(t, hasBindIP)
+
+		// AWS-parity ECR SANs must be present.
+		assert.Contains(t, cert.DNSNames, "ecr.us-east-1.spinifex.internal")
+		assert.Contains(t, cert.DNSNames, "*.dkr.ecr.us-east-1.spinifex.internal")
 	})
 
 	t.Run("MissingCA", func(t *testing.T) {
 		dir := t.TempDir()
-		err := GenerateServerCertOnly(dir, "10.0.0.5")
+		err := GenerateServerCertOnly(dir, "10.0.0.5", "us-east-1", "spinifex.internal")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "CA files not found")
 	})
+}
+
+func TestAWSGWServiceDNSNames(t *testing.T) {
+	t.Parallel()
+
+	got := AWSGWServiceDNSNames("us-east-1", "spinifex.internal")
+	assert.Equal(t, []string{
+		"ecr.us-east-1.spinifex.internal",
+		"*.dkr.ecr.us-east-1.spinifex.internal",
+	}, got)
+
+	assert.Nil(t, AWSGWServiceDNSNames("", "spinifex.internal"))
+	assert.Nil(t, AWSGWServiceDNSNames("us-east-1", ""))
+	assert.Nil(t, AWSGWServiceDNSNames("", ""))
 }
 
 // --- Directory creation ---
@@ -727,7 +745,7 @@ host = "{{.Host}}"
 		{ID: 3, Host: "10.0.0.3"},
 	}
 
-	result, err := GenerateMultiNodePredastoreConfig(tmpl, nodes, "AK", "SK", "us-east-1", "nats-token", "/config", "10.0.0.1")
+	result, err := GenerateMultiNodePredastoreConfig(tmpl, nodes, "AK", "SK", "us-east-1", "nats-token", "/config", "10.0.0.1", 0)
 	require.NoError(t, err)
 	assert.Contains(t, result, `host = "10.0.0.1"`)
 	assert.Contains(t, result, `host = "10.0.0.3"`)
@@ -738,16 +756,15 @@ func TestGenerateMultiNodePredastoreConfig_MinimumNodes(t *testing.T) {
 
 	_, err := GenerateMultiNodePredastoreConfig(tmpl, []PredastoreNodeConfig{
 		{ID: 1, Host: "10.0.0.1"},
-		{ID: 2, Host: "10.0.0.2"},
-	}, "AK", "SK", "us-east-1", "nats-token", "/config", "10.0.0.1")
+	}, "AK", "SK", "us-east-1", "nats-token", "/config", "10.0.0.1", 0)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "at least 3 nodes")
+	assert.Contains(t, err.Error(), "at least 2 nodes")
 }
 
 func TestGenerateMultiNodePredastoreConfig_InvalidTemplate(t *testing.T) {
 	_, err := GenerateMultiNodePredastoreConfig("{{.Unclosed", []PredastoreNodeConfig{
 		{ID: 1, Host: "a"}, {ID: 2, Host: "b"}, {ID: 3, Host: "c"},
-	}, "AK", "SK", "us-east-1", "nats-token", "/config", "10.0.0.1")
+	}, "AK", "SK", "us-east-1", "nats-token", "/config", "10.0.0.1", 0)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to parse")
 }
@@ -861,4 +878,111 @@ func TestChownRecursive_NonExistentPath(t *testing.T) {
 		t.Skip("USER env not set")
 	}
 	ChownRecursive("/tmp/nonexistent-path-12345", currentUser)
+}
+
+// --- SetGPUPassthrough ---
+
+func writeToml(t *testing.T, content string) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "spinifex*.toml")
+	require.NoError(t, err)
+	_, err = f.WriteString(content)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	return f.Name()
+}
+
+func readToml(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return string(b)
+}
+
+func TestSetGPUPassthrough_NoOp(t *testing.T) {
+	toml := "[nodes.node1.daemon]\ngpu_passthrough = true\n"
+	path := writeToml(t, toml)
+	require.NoError(t, SetGPUPassthrough(path, "node1", true))
+	assert.Equal(t, toml, readToml(t, path))
+}
+
+func TestSetGPUPassthrough_Flip(t *testing.T) {
+	path := writeToml(t, "[nodes.node1.daemon]\ngpu_passthrough = false\n")
+	require.NoError(t, SetGPUPassthrough(path, "node1", true))
+	assert.Contains(t, readToml(t, path), "gpu_passthrough = true")
+}
+
+func TestSetGPUPassthrough_AddKeyToSection(t *testing.T) {
+	path := writeToml(t, "[nodes.node1.daemon]\nsome_other = true\n")
+	require.NoError(t, SetGPUPassthrough(path, "node1", true))
+	got := readToml(t, path)
+	assert.Contains(t, got, "gpu_passthrough = true")
+	assert.Contains(t, got, "some_other = true")
+}
+
+func TestSetGPUPassthrough_AppendSection(t *testing.T) {
+	path := writeToml(t, "[nodes.node1.network]\ncidr = \"10.0.0.0/24\"\n")
+	require.NoError(t, SetGPUPassthrough(path, "node1", true))
+	got := readToml(t, path)
+	assert.Contains(t, got, "[nodes.node1.daemon]")
+	assert.Contains(t, got, "gpu_passthrough = true")
+}
+
+func TestSetGPUPassthrough_DisableNoOp(t *testing.T) {
+	toml := "[nodes.node1.daemon]\ngpu_passthrough = false\n"
+	path := writeToml(t, toml)
+	require.NoError(t, SetGPUPassthrough(path, "node1", false))
+	assert.Equal(t, toml, readToml(t, path))
+}
+
+func TestSetGPUPassthrough_ReadError(t *testing.T) {
+	err := SetGPUPassthrough("/nonexistent/path/spinifex.toml", "node1", true)
+	require.Error(t, err)
+}
+
+func TestSetGPUPassthrough_SectionBoundary(t *testing.T) {
+	// gpu_passthrough = true exists but in a DIFFERENT node's section; should still write.
+	path := writeToml(t, "[nodes.node2.daemon]\ngpu_passthrough = true\n[nodes.node1.daemon]\nsome_key = 1\n")
+	require.NoError(t, SetGPUPassthrough(path, "node1", true))
+	got := readToml(t, path)
+	// node1 section should now have the key
+	assert.Contains(t, got, "[nodes.node1.daemon]\ngpu_passthrough = true")
+}
+
+// --- SetMIGProfile ---
+
+func TestSetMIGProfile_SectionDoesNotExist_CreatesWithProfile(t *testing.T) {
+	path := writeToml(t, "[nodes.node1.network]\ncidr = \"10.0.0.0/24\"\n")
+	require.NoError(t, SetMIGProfile(path, "node1", "1g.10gb"))
+	got := readToml(t, path)
+	assert.Contains(t, got, "[nodes.node1.daemon]")
+	assert.Contains(t, got, `mig_profile = "1g.10gb"`)
+}
+
+func TestSetMIGProfile_SectionExistsMIGProfileMissing_AddsIt(t *testing.T) {
+	path := writeToml(t, "[nodes.node1.daemon]\nsome_other = true\n")
+	require.NoError(t, SetMIGProfile(path, "node1", "1g.10gb"))
+	got := readToml(t, path)
+	assert.Contains(t, got, `mig_profile = "1g.10gb"`)
+	assert.Contains(t, got, "some_other = true")
+}
+
+func TestSetMIGProfile_AlreadyCorrectValue_Idempotent(t *testing.T) {
+	toml := "[nodes.node1.daemon]\nmig_profile = \"1g.10gb\"\n"
+	path := writeToml(t, toml)
+	require.NoError(t, SetMIGProfile(path, "node1", "1g.10gb"))
+	assert.Equal(t, toml, readToml(t, path))
+}
+
+func TestSetMIGProfile_DifferentValue_UpdatesIt(t *testing.T) {
+	path := writeToml(t, "[nodes.node1.daemon]\nmig_profile = \"1g.10gb\"\n")
+	require.NoError(t, SetMIGProfile(path, "node1", "7g.80gb"))
+	got := readToml(t, path)
+	assert.Contains(t, got, `mig_profile = "7g.80gb"`)
+	assert.NotContains(t, got, `mig_profile = "1g.10gb"`)
+}
+
+func TestSetMIGProfile_FileDoesNotExist_ReturnsError(t *testing.T) {
+	err := SetMIGProfile(filepath.Join(t.TempDir(), "nonexistent.toml"), "node1", "1g.10gb")
+	require.Error(t, err)
 }

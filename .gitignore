@@ -17,6 +17,8 @@ go.work.sum
 # Build outputs
 bin/
 dist/
+build/microvm/vmlinuz
+build/microvm/initramfs.cpio.gz
 !spinifex/services/spinifexui/frontend/dist/
 tmp/
 *.test
@@ -35,13 +37,3 @@ Thumbs.db
 
 # Test reports
 *-report.txt
-
-# Internal docs (moved to private mulga repo)
-docs/INTERNAL.md
-docs/PRIVATE.md
-docs/DEVNOTES.md
-docs/PLAN.md
-docs/TODO.md
-docs/development/
-docs/internal/
-scripts/iac/aws/spinifex-test.pem

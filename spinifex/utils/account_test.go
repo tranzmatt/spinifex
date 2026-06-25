@@ -67,17 +67,8 @@ func startJSNATSServer(t *testing.T) (*nats.Conn, nats.JetStreamContext) {
 	return nc, js
 }
 
-// TestVersionStateMachine walks WriteVersion/ReadVersion through every state
-// transition the migration helper guarantees:
-//   - unset → ReadVersion returns 0 with no error
-//   - first write persists the value
-//   - same version is a no-op (idempotent)
-//   - higher version replaces the stored value (upgrade)
-//   - lower version is a no-op (no downgrade)
-//
-// One bucket is reused across steps so each Write is exercised against the
-// state the prior Write left behind — that's the only way to catch a
-// regression that, say, made WriteVersion unconditionally overwrite.
+// TestVersionStateMachine covers unset→0, first write, idempotent same write, upgrade, and no-downgrade.
+// One bucket is reused so each step runs against the prior state — the only way to catch unconditional-overwrite regressions.
 func TestVersionStateMachine(t *testing.T) {
 	_, js := startJSNATSServer(t)
 	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "test-version-fsm"})
@@ -113,4 +104,22 @@ func TestVersionStateMachine(t *testing.T) {
 	entry, err := kv.Get(VersionKey)
 	require.NoError(t, err)
 	assert.Equal(t, "5", string(entry.Value()))
+}
+
+func TestDeleteKVBucketIfExists(t *testing.T) {
+	_, js := startJSNATSServer(t)
+
+	// Missing bucket is a no-op.
+	require.NoError(t, DeleteKVBucketIfExists(js, "ghost-bucket"))
+
+	// Existing bucket gets deleted.
+	_, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "doomed-bucket"})
+	require.NoError(t, err)
+	require.NoError(t, DeleteKVBucketIfExists(js, "doomed-bucket"))
+
+	_, err = js.KeyValue("doomed-bucket")
+	require.Error(t, err, "bucket should be gone")
+
+	// Calling again on the now-missing bucket is still a no-op (idempotent).
+	require.NoError(t, DeleteKVBucketIfExists(js, "doomed-bucket"))
 }

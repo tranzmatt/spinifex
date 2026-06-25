@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"time"
 
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go"
@@ -112,21 +111,16 @@ func (d *Daemon) handleShutdownDrain(msg *nats.Msg) {
 
 	slog.Info("Shutdown DRAIN phase starting", "node", d.node)
 
-	// Count total VMs
-	d.Instances.Mu.Lock()
-	total := len(d.Instances.VMS)
-	d.Instances.Mu.Unlock()
+	total := d.vmMgr.Count()
 
 	// Publish initial progress
 	d.publishShutdownProgress("drain", total, total)
 
-	// Stop all instances (graceful shutdown, no volume deletion)
+	// Stop all instances (graceful shutdown, no volume deletion). StopAll
+	// fans out per-VM shutdown internally; the manager's snapshot decouples
+	// iteration from concurrent terminate handlers.
 	if total > 0 {
-		d.Instances.Mu.Lock()
-		vms := d.Instances.VMS
-		d.Instances.Mu.Unlock()
-
-		if err := d.stopInstance(vms, false); err != nil {
+		if err := d.vmMgr.StopAll(); err != nil {
 			slog.Error("Failed to stop instances during DRAIN", "error", err)
 			ack := ShutdownACK{
 				Node:  d.node,
@@ -268,8 +262,6 @@ func (d *Daemon) handleShutdownInfra(msg *nats.Msg) {
 
 	slog.Info("Shutdown INFRA phase complete, exiting", "node", d.node)
 
-	// Give a moment for log flush
-	time.Sleep(500 * time.Millisecond)
 	os.Exit(0)
 }
 

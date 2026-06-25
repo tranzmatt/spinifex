@@ -18,6 +18,10 @@ func (d *Daemon) handleELBv2CreateTargetGroup(msg *nats.Msg) {
 	handleNATSRequest(msg, d.elbv2Service.CreateTargetGroup)
 }
 
+func (d *Daemon) handleELBv2ModifyTargetGroup(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.ModifyTargetGroup)
+}
+
 func (d *Daemon) handleELBv2DeleteTargetGroup(msg *nats.Msg) {
 	handleNATSRequest(msg, d.elbv2Service.DeleteTargetGroup)
 }
@@ -46,12 +50,44 @@ func (d *Daemon) handleELBv2DeleteListener(msg *nats.Msg) {
 	handleNATSRequest(msg, d.elbv2Service.DeleteListener)
 }
 
+func (d *Daemon) handleELBv2ModifyListener(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.ModifyListener)
+}
+
 func (d *Daemon) handleELBv2DescribeListeners(msg *nats.Msg) {
 	handleNATSRequest(msg, d.elbv2Service.DescribeListeners)
 }
 
+func (d *Daemon) handleELBv2CreateRule(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.CreateRule)
+}
+
+func (d *Daemon) handleELBv2ModifyRule(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.ModifyRule)
+}
+
+func (d *Daemon) handleELBv2DeleteRule(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.DeleteRule)
+}
+
+func (d *Daemon) handleELBv2DescribeRules(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.DescribeRules)
+}
+
+func (d *Daemon) handleELBv2SetRulePriorities(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.SetRulePriorities)
+}
+
 func (d *Daemon) handleELBv2DescribeTags(msg *nats.Msg) {
 	handleNATSRequest(msg, d.elbv2Service.DescribeTags)
+}
+
+func (d *Daemon) handleELBv2AddTags(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.AddTags)
+}
+
+func (d *Daemon) handleELBv2RemoveTags(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.RemoveTags)
 }
 
 func (d *Daemon) handleELBv2LBAgentHeartbeat(msg *nats.Msg) {
@@ -76,4 +112,32 @@ func (d *Daemon) handleELBv2ModifyLoadBalancerAttributes(msg *nats.Msg) {
 
 func (d *Daemon) handleELBv2DescribeLoadBalancerAttributes(msg *nats.Msg) {
 	handleNATSRequest(msg, d.elbv2Service.DescribeLoadBalancerAttributes)
+}
+
+func (d *Daemon) handleELBv2SetSecurityGroups(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.SetSecurityGroups)
+}
+
+func (d *Daemon) handleELBv2SetIpAddressType(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.SetIpAddressType)
+}
+
+func (d *Daemon) handleELBv2SetSubnets(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.SetSubnets)
+}
+
+func (d *Daemon) handleELBv2AddListenerCertificates(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.AddListenerCertificates)
+}
+
+func (d *Daemon) handleELBv2RemoveListenerCertificates(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.RemoveListenerCertificates)
+}
+
+func (d *Daemon) handleELBv2DescribeListenerCertificates(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.DescribeListenerCertificates)
+}
+
+func (d *Daemon) handleELBv2DescribeSSLPolicies(msg *nats.Msg) {
+	handleNATSRequest(msg, d.elbv2Service.DescribeSSLPolicies)
 }

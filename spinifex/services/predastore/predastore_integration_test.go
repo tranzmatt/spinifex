@@ -1,9 +1,7 @@
 package predastore
 
-// Integration tests for predastore service
-//
-// These tests start a real predastore daemon and test S3 operations against it.
-// Tests use AWS SDK Go v1 to verify bucket operations, authentication, and file operations.
+// Integration tests for predastore: start a real daemon and verify S3 bucket,
+// auth, and file operations using AWS SDK Go v1.
 
 import (
 	"bytes"
@@ -32,6 +30,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -56,11 +55,12 @@ var (
 	sharedConfig     *Config
 )
 
-// generateTestCertificate generates a self-signed TLS certificate for testing
-func generateTestCertificate(certPath, keyPath string) error {
+// generateTestCertificate generates a self-signed TLS certificate for testing.
+// The CA must be injected via quicclient.SetDefaultRootCAs before any dial.
+func generateTestCertificate(certPath, keyPath string) (*x509.CertPool, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	notBefore := time.Now()
@@ -68,7 +68,7 @@ func generateTestCertificate(certPath, keyPath string) error {
 
 	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	template := x509.Certificate{
@@ -88,31 +88,40 @@ func generateTestCertificate(certPath, keyPath string) error {
 
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	certOut, err := os.Create(certPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer certOut.Close()
 
 	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
-		return err
+		return nil, err
 	}
 
 	keyOut, err := os.Create(keyPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer keyOut.Close()
 
 	privBytes, err := x509.MarshalECPrivateKey(priv)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if err := pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: privBytes}); err != nil {
+		return nil, err
 	}
 
-	return pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: privBytes})
+	parsed, err := x509.ParseCertificate(derBytes)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(parsed)
+	return pool, nil
 }
 
 // startPredastoreServer starts the predastore server once for all tests
@@ -142,15 +151,30 @@ func startPredastoreServer(t *testing.T) *Config {
 	certPath := filepath.Join(certDir, "test.crt")
 	keyPath := filepath.Join(certDir, "test.key")
 
-	err = generateTestCertificate(certPath, keyPath)
+	caPool, err := generateTestCertificate(certPath, keyPath)
 	if err != nil {
 		t.Fatalf("Failed to generate certificate: %v", err)
 	}
 
-	// Create config file. Five storage nodes are declared so predastore's dev-mode
-	// path launches all QUIC servers locally as goroutines (server.go:629). Buckets
-	// are created via the S3 API after startup — config buckets are no longer
-	// surfaced by ListBuckets (predastore commit 0711e7d, account-scoped auth).
+	// Inject the ephemeral cert for the QUIC client (s3d → shard nodes).
+	quicclient.SetDefaultRootCAs(caPool)
+
+	// SSL_CERT_FILE injects the cert for the s3db REST client's OS trust store
+	// (sync.Once-cached, must be set before the first dial).
+	t.Setenv("SSL_CERT_FILE", certPath)
+
+	// Predastore mandates a 32-byte master key at mode 0600 (rejected otherwise
+	// by internal/keyfile.Load).
+	encryptionKeyPath := filepath.Join(testDir, "encryption.key")
+	testEncryptionKey := make([]byte, 32)
+	if _, err := rand.Read(testEncryptionKey); err != nil {
+		t.Fatalf("Failed to generate test encryption key: %v", err)
+	}
+	if err := os.WriteFile(encryptionKeyPath, testEncryptionKey, 0600); err != nil {
+		t.Fatalf("Failed to write test encryption key: %v", err)
+	}
+
+	// Five nodes trigger dev-mode: all QUIC shards start as local goroutines.
 	configPath := filepath.Join(testDir, "predastore_test.toml")
 	configContent := `version = "1.0"
 region = "us-east-1"
@@ -197,6 +221,7 @@ path = "store/node-5/"
 [[auth]]
 access_key_id = "AKIAIOSFODNN7EXAMPLE"
 secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+account_id = "123456789012"
 `
 
 	err = os.WriteFile(configPath, []byte(configContent), 0644)
@@ -205,13 +230,16 @@ secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 	}
 
 	cfg := &Config{
-		ConfigPath: configPath,
-		Port:       18443,
-		Host:       "127.0.0.1",
-		Debug:      false,
-		BasePath:   testDir,
-		TlsCert:    certPath,
-		TlsKey:     keyPath,
+		ConfigPath:        configPath,
+		Port:              18443,
+		Host:              "127.0.0.1",
+		Debug:             false,
+		BasePath:          testDir,
+		TlsCert:           certPath,
+		TlsKey:            keyPath,
+		EncryptionKeyFile: encryptionKeyPath,
+		// NodeID -1 triggers dev mode: all QUIC nodes run in-process.
+		NodeID: -1,
 	}
 	sharedConfig = cfg
 
