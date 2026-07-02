@@ -351,12 +351,17 @@ func (m *Manager) shutdownAndUnmount(instance *VM) {
 		}
 	}
 
+	// The PID file persisting past the timeout means QEMU did not exit on its
+	// own; force-kill it then. A PID file that disappears is the clean-exit
+	// signal — do not kill on that path (the PID may be stale or reused). The
+	// wrong-node terminate case, where this never runs on the hosting node, is
+	// the OrphanQEMUReaper's job.
 	if err := utils.WaitForPidFileRemoval(instance.ID, pidFileRemovalTimeout); err != nil {
 		slog.Warn("Timeout waiting for PID file removal", "id", instance.ID, "err", err)
 		pid, readErr := utils.ReadPidFile(instance.ID)
 		if readErr != nil {
 			slog.Debug("No PID file found (VM likely already stopped)", "id", instance.ID)
-		} else {
+		} else if utils.ProcessAlive(pid) {
 			slog.Info("Force killing process", "pid", pid, "id", instance.ID)
 			if err := utils.KillProcess(pid); err != nil {
 				slog.Error("Failed to kill process", "pid", pid, "id", instance.ID, "err", err)
@@ -381,6 +386,9 @@ func (m *Manager) shutdownAndUnmount(instance *VM) {
 // the management TAP/IP allocation. Errors are logged and tolerated.
 func (m *Manager) cleanupTapDevices(instance *VM) {
 	if instance.ENIId != "" && m.deps.NetworkPlumber != nil {
+		// Detach the primary ENI's IMDS datapath before removing its tap, the
+		// inverse of the launch-time attach-after-SetupTap order.
+		m.detachPrimaryIMDSDatapath(instance)
 		if err := m.deps.NetworkPlumber.CleanupTap(TapDeviceName(instance.ENIId)); err != nil {
 			slog.Warn("Failed to clean up tap device", "eni", instance.ENIId, "err", err)
 		}

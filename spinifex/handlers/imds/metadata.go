@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -14,7 +15,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
-	"github.com/mulgadc/spinifex/spinifex/utils"
 )
 
 const (
@@ -26,6 +26,7 @@ const (
 	pathSecurityCredsDir = "/latest/meta-data/iam/security-credentials"  //nolint:gosec // URL path, not a credential
 	prefixPublicKeys     = "/latest/meta-data/public-keys/"
 	pathPublicKeysDir    = "/latest/meta-data/public-keys"
+	prefixNetworkMacs    = "/latest/meta-data/network/interfaces/macs/"
 
 	prefixDynamic        = "/latest/dynamic"
 	pathIdentityDir      = "/latest/dynamic/instance-identity"
@@ -99,6 +100,10 @@ func (s *IMDSServiceImpl) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// First-contact log: a guest reaching this proves its packets traverse the
+	// per-tap datapath; its absence (with the responder bound) points at the datapath.
+	slog.Info("IMDS: issued IMDSv2 token", "instance_id", eni.instanceID, "private_ip", eni.privateIP, "public_ip", eni.publicIP)
+
 	w.Header().Set("Content-Type", "text/plain")
 	w.Header().Set(hdrTokenTTL, strconv.Itoa(int(ttl.Seconds())))
 	_, _ = w.Write([]byte(token))
@@ -127,32 +132,22 @@ func (s *IMDSServiceImpl) handleMetadata(w http.ResponseWriter, r *http.Request)
 	s.dispatch(w, r, eni)
 }
 
-// resolveCaller maps (vpcID-from-context, source-IP) to the owning ENI.
-// Returns nil on miss or backend error, producing a 404 instead of 500.
+// resolveCaller returns the request's owning ENI, threaded in via ctxKeyENI by the
+// per-tap responder (resolved once from the tap's bound device). The tap is unique,
+// so source IP is never consulted. Returns nil on miss, producing a 404 not a 500.
 func (s *IMDSServiceImpl) resolveCaller(r *http.Request) *eniFacts {
-	vpcID, _ := r.Context().Value(ctxKeyVPCID).(string)
-	subnetID, _ := r.Context().Value(ctxKeySubnetID).(string)
-	srcIP := utils.ClientIP(r.RemoteAddr)
-	if vpcID == "" || srcIP == "" {
-		slog.Warn("IMDS: request missing VPC context or source IP", "vpc_id", vpcID, "subnet_id", subnetID, "remote_addr", r.RemoteAddr)
-		return nil
-	}
-
-	eni, err := s.resolver.resolveENI(vpcID, srcIP)
-	if err != nil {
-		slog.Error("IMDS: ENI resolution failed", "vpc_id", vpcID, "subnet_id", subnetID, "src_ip", srcIP, "err", err)
-		return nil
-	}
-	if eni == nil {
-		slog.Warn("IMDS: no ENI for source IP", "vpc_id", vpcID, "subnet_id", subnetID, "src_ip", srcIP)
-		return nil
-	}
+	eni, _ := r.Context().Value(ctxKeyENI).(*eniFacts)
 	return eni
 }
 
 // dispatch routes a token-validated GET to the right metadata producer.
 func (s *IMDSServiceImpl) dispatch(w http.ResponseWriter, r *http.Request, eni *eniFacts) {
 	path := r.URL.Path
+
+	// Boot-crawl access log: traces every metadata GET per ENI so a guest's
+	// cloud-init crawl is observable end-to-end (e.g. private vs public subnet).
+	slog.Info("IMDS: serving metadata request", "path", path,
+		"instance_id", eni.instanceID, "private_ip", eni.privateIP, "public_ip", eni.publicIP)
 
 	if strings.HasPrefix(path, prefixSecurityCreds) && len(path) > len(prefixSecurityCreds) {
 		s.serveRoleCredentials(w, eni, strings.TrimPrefix(path, prefixSecurityCreds))
@@ -161,6 +156,11 @@ func (s *IMDSServiceImpl) dispatch(w http.ResponseWriter, r *http.Request, eni *
 
 	if sub, ok := strings.CutPrefix(path, prefixPublicKeys); ok {
 		s.servePublicKeys(w, eni, sub)
+		return
+	}
+
+	if sub, ok := strings.CutPrefix(path, prefixNetworkMacs); ok {
+		s.serveNetworkInterface(w, eni, sub) // sub: "", "<mac>", "<mac>/", "<mac>/<key>"
 		return
 	}
 
@@ -176,7 +176,7 @@ func (s *IMDSServiceImpl) dispatch(w http.ResponseWriter, r *http.Request, eni *
 	case pathIdentityDocument:
 		s.serveInstanceIdentityDocument(w, eni)
 	case pathMetaDataRoot, prefixMetaData:
-		writeText(w, "ami-id\nami-launch-index\nhostname\niam/\ninstance-id\ninstance-life-cycle\ninstance-type\nlocal-hostname\nlocal-ipv4\nmac\nplacement/\npublic-hostname\npublic-ipv4\npublic-keys/\nreservation-id\nsecurity-groups\nservices/")
+		s.serveMetaDataRoot(w, eni)
 	case prefixMetaData + "instance-id":
 		writeText(w, eni.instanceID)
 	case prefixMetaData + "instance-life-cycle":
@@ -184,6 +184,10 @@ func (s *IMDSServiceImpl) dispatch(w http.ResponseWriter, r *http.Request, eni *
 	case prefixMetaData + "local-ipv4":
 		writeText(w, eni.privateIP)
 	case prefixMetaData + "public-ipv4":
+		if eni.publicIP == "" {
+			w.WriteHeader(http.StatusNotFound) // no public IP → 404, as on real EC2
+			return
+		}
 		writeText(w, eni.publicIP)
 	case prefixMetaData + "public-hostname":
 		if eni.publicIP == "" {
@@ -193,6 +197,12 @@ func (s *IMDSServiceImpl) dispatch(w http.ResponseWriter, r *http.Request, eni *
 		writeText(w, eni.publicIP) // mirror public-ipv4 until public DNS exists
 	case prefixMetaData + "mac":
 		writeText(w, eni.mac)
+	case prefixMetaData + "network", prefixMetaData + "network/":
+		writeText(w, "interfaces/")
+	case prefixMetaData + "network/interfaces", prefixMetaData + "network/interfaces/":
+		writeText(w, "macs/")
+	case prefixMetaData + "network/interfaces/macs":
+		writeText(w, eni.mac+"/")
 	case prefixMetaData + "security-groups":
 		writeText(w, strings.Join(s.resolver.resolveSGNames(eni.accountID, eni.securityGroupIDs), "\n"))
 	case prefixMetaData + "hostname", prefixMetaData + "local-hostname":
@@ -220,6 +230,13 @@ func (s *IMDSServiceImpl) dispatch(w http.ResponseWriter, r *http.Request, eni *
 	case prefixMetaData + "services/partition":
 		writeText(w, "aws")
 	case prefixMetaData + "iam", prefixMetaData + "iam/":
+		// A backend error counts as "no profile" so the iam/ subtree stays
+		// self-consistent — 404 here rather than advertised with 404ing leaves,
+		// which fails cloud-init's metadata crawl.
+		if profile, err := s.profileFor(eni); err != nil || profile == nil {
+			w.WriteHeader(http.StatusNotFound) // no profile → no iam/ subtree, as on real EC2
+			return
+		}
 		writeText(w, "info\nsecurity-credentials/")
 	case prefixMetaData + "iam/info":
 		s.serveIAMInfo(w, eni)
@@ -232,6 +249,38 @@ func (s *IMDSServiceImpl) dispatch(w http.ResponseWriter, r *http.Request, eni *
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+// serveMetaDataRoot writes the meta-data/ index, listing only children whose leaf
+// serves content for this instance so cloud-init's recursive crawl never 404s
+// mid-listing and falls back to DataSourceNone: public-hostname/public-ipv4 only
+// with a public IP, public-keys/ only with a key pair, iam/ only with an instance
+// profile — each omission matching real EC2, like the macs/ subtree in macKeys.
+func (s *IMDSServiceImpl) serveMetaDataRoot(w http.ResponseWriter, eni *eniFacts) {
+	keys := []string{
+		"ami-id", "ami-launch-index", "hostname", "instance-id",
+		"instance-life-cycle", "instance-type", "local-hostname", "local-ipv4",
+		"mac", "network/", "placement/", "reservation-id", "security-groups",
+		"services/",
+	}
+	if eni.publicIP != "" {
+		keys = append(keys, "public-hostname", "public-ipv4")
+	}
+	// Resolve the instance once: public-keys/ is listed only with a key pair, iam/
+	// only with a resolvable instance profile. A backend error counts as absent so
+	// the listing never advertises a child whose leaf would 404 and break the crawl.
+	if inst, err := s.resolver.resolveInstance(eni); err == nil && inst != nil {
+		if inst.keyName != "" {
+			keys = append(keys, "public-keys/")
+		}
+		if inst.iamInstanceProfileArn != "" {
+			if p, err := s.iam.ResolveInstanceProfile(eni.accountID, inst.iamInstanceProfileArn); err == nil && p != nil {
+				keys = append(keys, "iam/")
+			}
+		}
+	}
+	sort.Strings(keys)
+	writeText(w, strings.Join(keys, "\n"))
 }
 
 // serveInstanceField resolves the instance record and writes one of its
@@ -398,10 +447,116 @@ func (s *IMDSServiceImpl) servePublicKeys(w http.ResponseWriter, eni *eniFacts, 
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		slog.Info("IMDS: served SSH public key", "key_name", inst.keyName, "instance_id", eni.instanceID, "private_ip", eni.privateIP)
 		writeText(w, material+"\n")
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+// serveNetworkInterface serves the single primary ENI's subtree under
+// /network/interfaces/macs/. sub is the path after the macs/ prefix. An empty sub
+// is the macs/ directory listing; a MAC that is not the caller's is 404, since the
+// per-tap responder only ever resolves its own ENI (single-NIC; multi-ENI deferred).
+func (s *IMDSServiceImpl) serveNetworkInterface(w http.ResponseWriter, eni *eniFacts, sub string) {
+	if sub == "" {
+		writeText(w, eni.mac+"/")
+		return
+	}
+	mac, key, _ := strings.Cut(sub, "/")
+	if mac != eni.mac {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	switch key {
+	case "": // "<mac>" or "<mac>/" — the per-interface key listing
+		keys, err := s.macKeys(eni)
+		if err != nil {
+			slog.Error("IMDS: network-interface listing failed", "account_id", eni.accountID, "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		writeText(w, strings.Join(keys, "\n"))
+	case "mac":
+		writeText(w, eni.mac)
+	case "device-number":
+		writeText(w, "0") // primary ENI
+	case "interface-id":
+		writeText(w, eni.eniID)
+	case "owner-id":
+		writeText(w, eni.accountID)
+	case "subnet-id":
+		writeText(w, eni.subnetID)
+	case "vpc-id":
+		writeText(w, eni.vpcID)
+	case "local-ipv4s":
+		writeText(w, eni.privateIP)
+	case "local-hostname":
+		writeText(w, synthHostname(eni.privateIP, regionFromAZ(eni.availabilityZone)))
+	case "security-group-ids":
+		writeText(w, strings.Join(eni.securityGroupIDs, "\n"))
+	case "security-groups":
+		writeText(w, strings.Join(s.resolver.resolveSGNames(eni.accountID, eni.securityGroupIDs), "\n"))
+	case "subnet-ipv4-cidr-block":
+		s.serveCIDR(w, eni.accountID, eni.subnetID, s.resolver.resolveSubnetCIDR)
+	case "vpc-ipv4-cidr-block", "vpc-ipv4-cidr-blocks":
+		s.serveCIDR(w, eni.accountID, eni.vpcID, s.resolver.resolveVPCCIDR)
+	case "public-ipv4s", "public-hostname":
+		if eni.publicIP == "" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writeText(w, eni.publicIP)
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+// macKeys lists exactly the leaf keys served under macs/<mac>/ so cloud-init's
+// recursive crawl never lists a key that 404s: CIDR keys appear only when the CIDR
+// resolves, public keys only with a public IP. A resolver fault is propagated so the
+// listing 500s like the leaf, never silently dropping a key on a transient KV blip.
+func (s *IMDSServiceImpl) macKeys(eni *eniFacts) ([]string, error) {
+	keys := []string{
+		"device-number", "interface-id", "local-hostname", "local-ipv4s",
+		"mac", "owner-id", "security-group-ids", "security-groups",
+		"subnet-id", "vpc-id",
+	}
+	subnetCIDR, err := s.resolver.resolveSubnetCIDR(eni.accountID, eni.subnetID)
+	if err != nil {
+		return nil, err
+	}
+	if subnetCIDR != "" {
+		keys = append(keys, "subnet-ipv4-cidr-block")
+	}
+	vpcCIDR, err := s.resolver.resolveVPCCIDR(eni.accountID, eni.vpcID)
+	if err != nil {
+		return nil, err
+	}
+	if vpcCIDR != "" {
+		keys = append(keys, "vpc-ipv4-cidr-block", "vpc-ipv4-cidr-blocks")
+	}
+	if eni.publicIP != "" {
+		keys = append(keys, "public-hostname", "public-ipv4s")
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
+// serveCIDR resolves and writes a subnet/VPC CIDR: 404 on miss, 500 on a backend
+// fault, so a guest never renders network config from an empty CIDR.
+func (s *IMDSServiceImpl) serveCIDR(w http.ResponseWriter, accountID, id string, resolve func(string, string) (string, error)) {
+	cidr, err := resolve(accountID, id)
+	if err != nil {
+		slog.Error("IMDS: network-interface CIDR resolution failed", "account_id", accountID, "id", id, "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if cidr == "" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	writeText(w, cidr)
 }
 
 // instanceFor resolves the instance record for an ENI, writing the appropriate
@@ -511,10 +666,10 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_, _ = w.Write(data)
 }
 
-// ctxKey is the unexported context-key type used to thread subnet and VPC into each request.
+// ctxKey is the unexported context-key type used to thread the per-tap ENI
+// identity into each request.
 type ctxKey int
 
-const (
-	ctxKeyVPCID ctxKey = iota
-	ctxKeySubnetID
-)
+// ctxKeyENI carries a *eniFacts resolved once per per-tap responder — the
+// authoritative caller identity for every request it serves.
+const ctxKeyENI ctxKey = iota

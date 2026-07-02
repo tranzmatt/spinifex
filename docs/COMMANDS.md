@@ -66,6 +66,7 @@ Operational commands for inspecting cluster state. These fan out NATS requests t
 |---------|-------|-------------|
 | `spx admin cluster shutdown` | `--force` (shutdown even if nodes don't respond), `--timeout` (max wait per phase, default 120s), `--dry-run` (print phase plan without executing) | Performs coordinated, phased shutdown of entire cluster. Phases execute in order: GATE (stop API/UI) → DRAIN (stop VMs) → STORAGE (stop viperblock) → PERSIST (stop predastore) → INFRA (stop NATS/daemon). Each phase waits for all nodes to ACK before proceeding. Uses JetStream state tracking. |
 | `spx admin cluster drain-dhcp` | `--timeout` (reply-collection window, default 30s) | Asks each vpcd to DHCPRELEASE every external-pool DHCP lease it currently holds, returning them to the upstream DHCP server. Run on teardown before stopping services — an env reset otherwise strands held leases upstream until their TTL expires, eventually exhausting the upstream scope. Best-effort: warns and exits 0 if the cluster is already down. |
+| `spx admin node drain --local` | `--local` (drain the local node only, required), `--timeout` (max wait per phase, default 120s) | Runs the GATE and DRAIN phases against the local node only: powers down its guests via QMP and unmounts their volumes (flushing the viperblock WAL) while every service is still up. STORAGE/PERSIST/INFRA are left to systemd's ordered teardown. Wired as the `ExecStop` of `spinifex-shutdown.service`, so `systemctl stop spinifex.target` and host reboot/poweroff drain guests before any storage service stops. |
 
 ### Certificate Management
 
@@ -90,7 +91,7 @@ Operational commands for inspecting cluster state. These fan out NATS requests t
 
 | Command | Flags | Description |
 |---------|-------|-------------|
-| `spx admin images import` | `--name`, `--file`, `--distro`, `--version`, `--arch`, `--platform`, `--boot-mode` (bios/uefi/uefi-preferred), `--tag`, `--force`, `--skip-verify` | Catalog imports (`--name`) download the image, fetch the catalog `Checksum` URL, verify the SHA-256/SHA-512 digest, and inherit `BootMode` from the catalog entry. `--boot-mode` overrides the catalog value when set. Mismatch fails closed; the cached file is left on disk and `--force` re-downloads. `--file` imports skip checksum verification (operator-supplied media is outside Spinifex's trust boundary, the skip is logged at INFO for audit) and require an explicit `--boot-mode` because there is no catalog metadata to inherit from. `--skip-verify` bypasses verification for catalog imports and emits a WARN slog + stderr notice; use only for debugging or when upstream mirrors are confirmed-broken. |
+| `spx admin images import` | `--name`, `--file`, `--distro`, `--version`, `--arch`, `--platform`, `--boot-mode` (bios/uefi/uefi-preferred), `--tag`, `--force`, `--skip-verify` | Catalog imports (`--name`) download the image, fetch the catalog `Checksum` URL, verify the SHA-256/SHA-512 digest, and inherit `BootMode` from the catalog entry. `--boot-mode` overrides the catalog value when set. Mismatch fails closed; the cached file is left on disk and `--force` re-downloads. `--file` imports skip checksum verification (operator-supplied media is outside Spinifex's trust boundary, the skip is logged at INFO for audit) and require an explicit `--boot-mode` because there is no catalog metadata to inherit from. `--skip-verify` bypasses verification for catalog imports and emits a WARN slog + stderr notice; use only for debugging or when upstream mirrors are confirmed-broken. On every import a best-effort `virt-customize` step bakes the deployment CA (`<data-root>/config/ca.pem`) into the image's trust store before the block copy, so in-guest SDK-over-TLS calls to Spinifex endpoints trust the gateway from first boot; an image libguestfs cannot customize is imported as-is (CA-free) and logs a skip. Because the CA is fixed into the image, rotating the cluster CA requires re-importing affected images. |
 | `spx admin images list` | — | Lists available OS images that can be imported or downloaded |
 | `spx admin images remove` | `--image-id` (required), `--force`, `--yes` | Loads `ami-<id>/config.json`, walks transitive dependents — copied snapshots whose `VolumeID == imageID`, volumes whose `SnapshotID` references the internal `snap-ami-<id>` or any derived snap, and account AMIs created via `CopyImage` whose `SnapshotID` is a derived snap — then prompts (skipped with `--yes`) before deleting `ami-<id>/config.json` (the DescribeImages barrier) followed by the rest of `ami-<id>/` and `snap-ami-<id>/`. Account-owned AMIs are refused with a hint pointing at `aws ec2 deregister-image` + `aws ec2 delete-snapshot`. `--force` bypasses the dependency, ownership and config-corrupt checks for salvage of orphaned blocks. |
 
@@ -113,7 +114,7 @@ Operational commands for inspecting cluster state. These fan out NATS requests t
 
 | Command | Implemented Flags | Missing Flags | Status |
 |---------|-------------------|---------------|--------|
-| `run-instances` | `--image-id`, `--instance-type`, `--count`, `--key-name`, `--user-data`, `--subnet-id`, `--security-group-ids`, `--tag-specifications` (instance-scoped), `--block-device-mappings` (DeviceName, VolumeSize, VolumeType, Iops, DeleteOnTermination), `--placement` (GroupName), `--iam-instance-profile` (Name/Arn), `--capacity-reservation-specification` (CapacityReservationTarget.CapacityReservationId, targeted-by-id only) | `--dry-run`, `--client-token`, `--disable-api-termination`, `--ebs-optimized`, `--network-interfaces`, `--private-ip-address`, `--monitoring`, `--credit-specification`, `--cpu-options`, `--metadata-options`, `--launch-template`, `--hibernate-options` | **DONE** |
+| `run-instances` | `--image-id`, `--instance-type`, `--count`, `--key-name`, `--user-data`, `--subnet-id`, `--security-group-ids`, `--tag-specifications` (instance-scoped), `--block-device-mappings` (DeviceName, VolumeSize, VolumeType, Iops, DeleteOnTermination), `--placement` (GroupName), `--iam-instance-profile` (Name/Arn), `--capacity-reservation-specification` (CapacityReservationTarget.CapacityReservationId, targeted-by-id only), `--metadata-options` (HttpPutResponseHopLimit; IMDSv2-only enforced — rejects `http-tokens=optional`) | `--dry-run`, `--client-token`, `--disable-api-termination`, `--ebs-optimized`, `--network-interfaces`, `--private-ip-address`, `--monitoring`, `--credit-specification`, `--cpu-options`, `--launch-template`, `--hibernate-options` | **DONE** |
 | `describe-instances` | `--instance-ids`, `--filters` (instance-state-name, instance-id, instance-type, vpc-id, subnet-id, tag:*, tag-key, tag-value) | `--max-results`, `--next-token`, `--dry-run` | **DONE** |
 | `start-instances` | `--instance-ids` | `--dry-run`, `--force` | **DONE** |
 | `stop-instances` | `--instance-ids` | `--force`, `--hibernate`, `--dry-run` | **DONE** |
@@ -123,6 +124,7 @@ Operational commands for inspecting cluster state. These fan out NATS requests t
 | `modify-instance-attribute` | `--instance-id`, `--instance-type`, `--user-data`, `--disable-api-termination` | `--ebs-optimized`, `--source-dest-check`, `--instance-initiated-shutdown-behavior`, `--block-device-mappings`, `--groups`, `--ena-support`, `--sriov-net-support` | **DONE** |
 | `get-console-output` | `--instance-id` | `--latest`, `--dry-run` | **DONE** |
 | `describe-instance-attribute` | `--instance-id`, `--attribute` (instanceType, userData, disableApiTermination, instanceInitiatedShutdownBehavior, disableApiStop, ebsOptimized, enaSupport, sourceDestCheck, rootDeviceName, kernel, ramdisk) | `--dry-run` | **DONE** |
+| `modify-instance-metadata-options` | `--instance-id`, `--http-put-response-hop-limit` (1–64), `--http-tokens` (`required`), `--http-endpoint` (`enabled`), `--http-protocol-ipv6`/`--instance-metadata-tags` (`disabled`) — secure values are no-ops, downgrades return `UnsupportedOperation` | `--dry-run` | **DONE** |
 | `describe-instance-credit-specifications` | `--instance-ids` | `--filters`, `--max-results`, `--dry-run` | **DONE** (stub — always returns `standard`) |
 | `describe-instance-status` | `--instance-ids`, `--include-all-instances`, `--filters` (availability-zone, instance-state-code, instance-state-name, tag:*) | `--max-results`, `--next-token`, `--dry-run`, event/instance-status/system-status filters | **DONE** (static health) |
 | `monitor-instances` | — | `--instance-ids` | **NOT STARTED** |
@@ -136,6 +138,13 @@ role ARN and rejects cross-account profile ARNs. Placement strategies: `spread`
 the node owning the targeted reservation (targeted-by-id only; `open`
 auto-matching is not supported). The combination with `--placement` (group) is
 rejected. `describe-instances` then reports the instance's `CapacityReservationId`.
+
+`modify-instance-metadata-options` is the only metadata-options mutator — AWS has
+no `get-instance-metadata-options` API, so the per-instance block is read through
+`describe-instances`. Only the hop limit is mutable; `--http-tokens optional` and
+the other posture-weakening values are refused with `UnsupportedOperation`, since
+the platform enforces IMDSv2 permanently. `run-instances --metadata-options` runs
+the same validation at launch.
 
 ### EC2 — IAM Instance Profile Associations
 
@@ -238,6 +247,11 @@ by downstream services.
 | `get-image-block-public-access-state` | — | `--dry-run` | **NOT STARTED** |
 | `modify-instance-metadata-defaults` | — | `--http-tokens`, `--http-put-response-hop-limit`, `--http-endpoint`, `--instance-metadata-tags` | **NOT STARTED** |
 | `get-instance-metadata-defaults` | — | `--dry-run` | **NOT STARTED** |
+
+The account-level `modify-/get-instance-metadata-defaults` are blocked on an
+`aws-sdk-go` bump: the `InstanceMetadataDefaultsResponse` type is absent from the
+pinned v1.44.266 (these APIs landed ~March 2024), and the gateway's generic
+handler needs the typed input struct to route them.
 
 ### EC2 — VPC Core
 
@@ -514,8 +528,10 @@ bypasses policy evaluation entirely.
 | `attach-role-policy` | `--role-name`, `--policy-arn` | — | **DONE** |
 | `detach-role-policy` | `--role-name`, `--policy-arn` | — | **DONE** |
 | `list-attached-role-policies` | `--role-name`, `--path-prefix` | `--max-items`, `--marker` | **DONE** |
-| `list-role-policies` | `--role-name` | `--max-items`, `--marker` | **DONE** (gateway stub — inline policies unsupported, always returns empty) |
-| `get-role-policy` / `put-role-policy` / `delete-role-policy` | — | inline role policies | **NOT STARTED** |
+| `list-role-policies` | `--role-name` | `--max-items`, `--marker` | **DONE** |
+| `put-role-policy` | `--role-name`, `--policy-name`, `--policy-document` | — | **DONE** |
+| `get-role-policy` | `--role-name`, `--policy-name` | — | **DONE** (document returned as raw JSON, not URL-encoded) |
+| `delete-role-policy` | `--role-name`, `--policy-name` | — | **DONE** |
 
 ### IAM — Instance Profiles
 
@@ -582,6 +598,8 @@ Available at `169.254.169.254` from inside every running guest VM, matching AWS.
 
 **IMDSv2-only.** Every read requires a session token. A tokenless (v1-style) `GET` returns `401 Unauthorized` with an empty body. Obtain a token with a `PUT /latest/api/token` carrying `X-aws-ec2-metadata-token-ttl-seconds` (1–21600), then send it back in `X-aws-ec2-metadata-token` on every read.
 
+The EC2 control plane reports this posture faithfully: `describe-instances` returns `MetadataOptions.HttpTokens=required`, and `run-instances`/`modify-instance-metadata-options` reject `--http-tokens optional` (and `--http-endpoint disabled`) with `UnsupportedOperation` — exactly as AWS does under account-level IMDSv2 enforcement.
+
 ```bash
 # Inside the guest VM:
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
@@ -628,7 +646,7 @@ curl -i http://169.254.169.254/latest/meta-data/instance-id
 | `/latest/dynamic/instance-identity` | GET | Lists `document` (signed forms listed when the signing key lands) | **DONE** |
 | `/latest/dynamic/instance-identity/document` | GET | Unsigned identity document from resolved ENI + instance facts | **DONE** |
 | `/latest/dynamic/instance-identity/{signature,pkcs7,rsa2048}` | GET | Signed forms; need a per-cluster signing key | **NOT STARTED** (404; lands with EKS IRSA) |
-| `/latest/meta-data/network/interfaces/macs/<mac>/...` | GET | Multi-ENI rendering (subnet-id, vpc-id, ipv4s, security-group-ids, …) | **NOT STARTED** (404) |
+| `/latest/meta-data/network/interfaces/macs/<mac>/...` | GET | Primary ENI subtree: `mac`, `device-number`, `interface-id`, `owner-id`, `subnet-id`, `vpc-id`, `local-ipv4s`, `local-hostname`, `security-group-ids`, `security-groups`, `subnet-ipv4-cidr-block`, `vpc-ipv4-cidr-block(s)`, and `public-ipv4s`/`public-hostname` when an EIP is attached | **DONE** (single-NIC; multi-ENI deferred) |
 | `/latest/meta-data/tags/instance/<key>` | GET | Instance-tag metadata; gated on `InstanceMetadataTags` enablement | **NOT STARTED** (404) |
 | `/latest/meta-data/block-device-mapping/...` | GET | `ami`/`root`/`ebsN`/`ephemeralN` device map | **NOT STARTED** (404) |
 | `/latest/meta-data/placement/{group-name,partition-number,availability-zone-id,host-id}` | GET | Placement extras beyond `availability-zone`/`region` | **NOT STARTED** (404) |

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -234,11 +235,11 @@ func openVolumeVB(cfg *Config, volumeName string) (*viperblock.VB, error) {
 	return vb, nil
 }
 
-// isAuxVolume reports whether a volume is an -efi/-cloudinit auxiliary volume.
-// Auxiliary volumes are recreated on launch and carry no durable guest data, so
-// they never need sealing to predastore.
+// isAuxVolume reports whether a volume is an -efi auxiliary volume. Auxiliary
+// volumes are recreated on launch and carry no durable guest data, so they
+// never need sealing to predastore.
 func isAuxVolume(volumeName string) bool {
-	return strings.HasSuffix(volumeName, "-efi") || strings.HasSuffix(volumeName, "-cloudinit")
+	return strings.HasSuffix(volumeName, "-efi")
 }
 
 // volumeNeedsSeal reports whether an unmounted volume must be sealed to
@@ -712,10 +713,10 @@ func launchService(cfg *Config) (err error) {
 
 		vb, err := viperblock.New(&vbconfig, "s3", s3cfg)
 
-		// Enable 128MB cache for main volumes, disable for cloudinit/efi (small, rarely read)
+		// Enable 128MB cache for main volumes, disable for efi (small, rarely read)
 		// This cacheSize is passed to nbdkit plugin (separate viperblock instance)
 		var nbdCacheSize int
-		if strings.HasSuffix(ebsRequest.Name, "-cloudinit") || strings.HasSuffix(ebsRequest.Name, "-efi") {
+		if strings.HasSuffix(ebsRequest.Name, "-efi") {
 			slog.Info("Disabling cache for auxiliary volume", "volume", ebsRequest.Name)
 			if err := vb.SetCacheSize(0, 0); err != nil {
 				slog.Error("Failed to set cache size", "err", err)
@@ -945,15 +946,54 @@ func launchService(cfg *Config) (err error) {
 	cfg.MountedVolumes = nil
 	cfg.mu.Unlock()
 
+	shutdownVolumes(volumes, nbdkitInUse)
+
+	return nil
+}
+
+// shutdownVolumes flushes each mounted volume's WAL on SIGTERM but only reaps
+// nbdkit for volumes with no attached guest (inUse false). Killing an nbdkit a
+// guest is still writing through corrupts that guest's filesystem; the graceful
+// drain (or unmount) path owns reaping in-use nbdkit after the guest is gone.
+func shutdownVolumes(volumes []MountedVolume, inUse func(MountedVolume) bool) {
 	for _, volume := range volumes {
 		if volume.VB != nil {
 			volume.VB.StopWALSyncer()
 		}
-		slog.Info("Killing nbdkit process", "pid", volume.PID)
+		if inUse(volume) {
+			slog.Warn("nbdkit still serving a guest; leaving it for the drain/unmount path",
+				"pid", volume.PID, "name", volume.Name, "socket", volume.Socket)
+			continue
+		}
+		slog.Info("Killing idle nbdkit process", "pid", volume.PID, "name", volume.Name)
 		if err := utils.KillProcess(volume.PID); err != nil {
 			slog.Error("Failed to kill nbdkit process", "pid", volume.PID, "err", err)
 		}
 	}
+}
 
-	return nil
+// nbdkitInUse best-effort reports whether nbdkit's NBD endpoint still has a
+// connected client (a guest). On any uncertainty it returns true so the
+// shutdown path never tears a backing store out from under a running guest.
+func nbdkitInUse(vol MountedVolume) bool {
+	if vol.Socket == "" {
+		// TCP transport: cannot cheaply confirm idle — assume in use.
+		return true
+	}
+	out, err := exec.Command("ss", "-H", "-x", "-a").Output()
+	if err != nil {
+		return true
+	}
+	// ss -H rows are: <netid> <state> <recvq> <sendq> <local-addr> ...
+	// LISTEN is the idle server socket; ESTAB means a client is attached.
+	for line := range strings.SplitSeq(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[1] == "ESTAB" && strings.Contains(line, vol.Socket) {
+			return true
+		}
+	}
+	return false
 }

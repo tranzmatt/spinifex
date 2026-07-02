@@ -17,9 +17,6 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/tags"
 )
 
-// imdsServerIP is the link-local IMDS address (duplicated here to avoid an imds→sts→eks import cycle).
-const imdsServerIP = "169.254.169.254"
-
 // ErrEKSServerAMINotFound is returned when no AMI with the EKS managed-by tag
 // exists. Signals an operator/config gap (image not built/imported).
 var ErrEKSServerAMINotFound = errors.New("eks: eks-server AMI not found")
@@ -207,6 +204,7 @@ func LaunchK3sServerVM(
 		ENIID:        eniID,
 		ENIMac:       aws.StringValue(eniOut.NetworkInterface.MacAddress),
 		ENIIP:        eniIP,
+		SubnetID:     in.SubnetID,
 		UserData:     userData,
 	})
 	if err != nil {
@@ -432,7 +430,9 @@ func buildK3sUserData(in K3sServerInput) string {
 
 	// First server uses cluster-init (embedded etcd); join servers set `server: <first>` + token.
 	// etcd-expose-metrics: surfaces etcd fsync/commit latency on 127.0.0.1:2381/metrics.
-	// anonymous-auth=true: reconciler probes /healthz unauthenticated to gate ACTIVE; RBAC limits exposure.
+	// anonymous-auth=false (CIS): cluster health rides the authenticated NATS
+	// state-report (probes /healthz via the node's admin kubeconfig), not an
+	// unauthenticated apiserver probe; the NLB target group uses a TCP health check.
 	// traefik+servicelb+local-storage are always disabled for AWS LB Controller parity.
 	var configLines []string
 	if in.ServerURL == "" {
@@ -488,7 +488,7 @@ func buildK3sUserData(in K3sServerInput) string {
 		"  - service-account-signing-key-file="+k3sOIDCSigningKeyPath,
 		"  - service-account-issuer="+in.OIDCIssuer,
 		"  - api-audiences=sts.amazonaws.com",
-		"  - anonymous-auth=true",
+		"  - anonymous-auth=false",
 		"  - authentication-token-webhook-config-file="+k3sTokenWebhookKubeconfigPath,
 		"  - authentication-token-webhook-cache-ttl=5m",
 		// v1: default v1beta1 rejects authentication.k8s.io/v1 TokenReview response (401).
@@ -503,16 +503,6 @@ func buildK3sUserData(in K3sServerInput) string {
 		{Path: k3sOIDCPublicKeyPath, Perms: "0644", Body: strings.TrimRight(in.OIDCPublicKeyPEM, "\n")},
 		{Path: k3sConfigPath, Perms: "0644", Body: k3sConfig},
 		{Path: k3sGatewayCAPath, Perms: "0644", Body: strings.TrimRight(in.GatewayCACert, "\n")},
-		// IMDS on-link route via persistent local.d script: Alpine cloud-init crashes on a
-		// gateway-less network-config route, so it's written here instead. Uses default-route
-		// device (eth0 on Alpine, not vpc0) to ARP 169.254.169.254 directly on the VPC subnet.
-		{
-			Path:  "/etc/local.d/imds-onlink-route.start",
-			Perms: "0755",
-			Body: "#!/bin/sh\n" +
-				"dev=$(ip route show default | awk '{print $5; exit}')\n" +
-				"[ -n \"$dev\" ] && ip route replace " + imdsServerIP + "/32 dev \"$dev\" scope link",
-		},
 	}
 
 	var buf strings.Builder
@@ -536,13 +526,6 @@ func buildK3sUserData(in K3sServerInput) string {
 			buf.WriteString("\n")
 		}
 	}
-
-	// Enable OpenRC `local` for reboot persistence, then run the IMDS route script
-	// directly. Starting the service here would deadlock: runcmd runs inside
-	// cloud-final, but `local` is ordered after it — blocking until OpenRC times out.
-	buf.WriteString("runcmd:\n")
-	buf.WriteString("  - [ rc-update, add, local, default ]\n")
-	buf.WriteString("  - [ /etc/local.d/imds-onlink-route.start ]\n")
 
 	return buf.String()
 }

@@ -49,9 +49,9 @@ import (
 	handlers_ec2_volume "github.com/mulgadc/spinifex/spinifex/handlers/ec2/volume"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
 	handlers_ecr "github.com/mulgadc/spinifex/spinifex/handlers/ecr"
+	handlers_ecs "github.com/mulgadc/spinifex/spinifex/handlers/ecs"
 	handlers_eks "github.com/mulgadc/spinifex/spinifex/handlers/eks"
 	handlers_elbv2 "github.com/mulgadc/spinifex/spinifex/handlers/elbv2"
-	handlers_imds "github.com/mulgadc/spinifex/spinifex/handlers/imds"
 	"github.com/mulgadc/spinifex/spinifex/instancetypes"
 	"github.com/mulgadc/spinifex/spinifex/network/external/dhcp"
 	"github.com/mulgadc/spinifex/spinifex/network/host"
@@ -150,6 +150,8 @@ type Daemon struct {
 	eipService            *handlers_ec2_eip.EIPServiceImpl
 	elbv2Service          *handlers_elbv2.ELBv2ServiceImpl
 	eksService            *handlers_eks.EKSServiceImpl
+	ecsService            *handlers_ecs.Service
+	ecsScheduler          *handlers_ecs.Scheduler
 	acmService            *handlers_acm.ACMServiceImpl
 	ecrMetaService        *handlers_ecr.MetaServiceImpl
 	routeTableService     *handlers_ec2_routetable.RouteTableServiceImpl
@@ -824,6 +826,7 @@ func (d *Daemon) subscribeAll() error {
 		{"ec2.RevokeSecurityGroupIngress", d.handleEC2RevokeSecurityGroupIngress, "spinifex-workers"},
 		{"ec2.RevokeSecurityGroupEgress", d.handleEC2RevokeSecurityGroupEgress, "spinifex-workers"},
 		{"ec2.ModifyInstanceAttribute", d.handleEC2ModifyInstanceAttribute, "spinifex-workers"},
+		{"ec2.ModifyInstanceMetadataOptions", d.handleEC2ModifyInstanceMetadataOptions, "spinifex-workers"},
 		{"ec2.start", d.handleEC2StartStoppedInstance, "spinifex-workers"},
 		{fmt.Sprintf("ec2.start.%s", d.node), d.handleEC2StartStoppedInstanceDirect, ""},
 		{"ec2.terminate", d.handleEC2TerminateStoppedInstance, "spinifex-workers"},
@@ -945,6 +948,38 @@ func (d *Daemon) subscribeAll() error {
 			natsSub{"eks.TagResource", d.handleEKSTagResource, "spinifex-workers"},
 			natsSub{"eks.UntagResource", d.handleEKSUntagResource, "spinifex-workers"},
 			natsSub{"eks.ListTagsForResource", d.handleEKSListTagsForResource, "spinifex-workers"},
+		)
+	}
+
+	// ECS gateway → daemon subscriptions (control plane; per-account KV).
+	if d.ecsService != nil {
+		subs = append(subs,
+			natsSub{"ecs.CreateCluster", d.handleECSCreateCluster, "spinifex-workers"},
+			natsSub{"ecs.DeleteCluster", d.handleECSDeleteCluster, "spinifex-workers"},
+			natsSub{"ecs.DescribeClusters", d.handleECSDescribeClusters, "spinifex-workers"},
+			natsSub{"ecs.ListClusters", d.handleECSListClusters, "spinifex-workers"},
+			natsSub{"ecs.RegisterTaskDefinition", d.handleECSRegisterTaskDefinition, "spinifex-workers"},
+			natsSub{"ecs.DeregisterTaskDefinition", d.handleECSDeregisterTaskDefinition, "spinifex-workers"},
+			natsSub{"ecs.DescribeTaskDefinition", d.handleECSDescribeTaskDefinition, "spinifex-workers"},
+			natsSub{"ecs.ListTaskDefinitions", d.handleECSListTaskDefinitions, "spinifex-workers"},
+			natsSub{"ecs.RegisterContainerInstance", d.handleECSRegisterContainerInstance, "spinifex-workers"},
+			natsSub{"ecs.DeregisterContainerInstance", d.handleECSDeregisterContainerInstance, "spinifex-workers"},
+			natsSub{"ecs.UpdateContainerInstancesState", d.handleECSUpdateContainerInstancesState, "spinifex-workers"},
+			natsSub{"ecs.DescribeContainerInstances", d.handleECSDescribeContainerInstances, "spinifex-workers"},
+			natsSub{"ecs.ListContainerInstances", d.handleECSListContainerInstances, "spinifex-workers"},
+			natsSub{"ecs.RunTask", d.handleECSRunTask, "spinifex-workers"},
+			natsSub{"ecs.StartTask", d.handleECSStartTask, "spinifex-workers"},
+			natsSub{"ecs.StopTask", d.handleECSStopTask, "spinifex-workers"},
+			natsSub{"ecs.DescribeTasks", d.handleECSDescribeTasks, "spinifex-workers"},
+			natsSub{"ecs.ListTasks", d.handleECSListTasks, "spinifex-workers"},
+			natsSub{"ecs.CreateService", d.handleECSCreateService, "spinifex-workers"},
+			natsSub{"ecs.UpdateService", d.handleECSUpdateService, "spinifex-workers"},
+			natsSub{"ecs.DeleteService", d.handleECSDeleteService, "spinifex-workers"},
+			natsSub{"ecs.DescribeServices", d.handleECSDescribeServices, "spinifex-workers"},
+			natsSub{"ecs.ListServices", d.handleECSListServices, "spinifex-workers"},
+			natsSub{"ecs.SubmitTaskStateChange", d.handleECSSubmitTaskStateChange, "spinifex-workers"},
+			natsSub{"ecs.PollAssignments", d.handleECSPollAssignments, "spinifex-workers"},
+			natsSub{"ecs.ProvisionCapacity", d.handleECSProvisionCapacity, "spinifex-workers"},
 		)
 	}
 
@@ -1248,15 +1283,6 @@ func (d *Daemon) startCluster() error {
 		return fmt.Errorf("failed to initialize VPC service: %w", err)
 	}
 
-	// Wire eni-by-vpc-ip reverse index for IMDS source-IP→ENI lookup.
-	if vpcJS, jsErr := d.natsConn.JetStream(); jsErr != nil {
-		slog.Warn("Failed to get JetStream for eni-by-ip index", "err", jsErr)
-	} else if eniByIPKV, kvErr := handlers_imds.InitENIByIPBucket(vpcJS, 1); kvErr != nil {
-		slog.Warn("Failed to init eni-by-ip index bucket", "err", kvErr)
-	} else {
-		d.vpcService.SetENIByIPIndex(handlers_ec2_vpc.NewENIByIPIndex(eniByIPKV))
-	}
-
 	d.routeTableService, err = initServiceWithRetry("RouteTable service", func() (*handlers_ec2_routetable.RouteTableServiceImpl, error) {
 		return handlers_ec2_routetable.NewRouteTableServiceImplWithNATS(d.config, d.natsConn)
 	})
@@ -1387,6 +1413,27 @@ func (d *Daemon) startCluster() error {
 		return fmt.Errorf("failed to initialize EKS service: %w", err)
 	}
 
+	// ECS control plane: per-account KV-backed handlers + a leader-elected
+	// scheduler goroutine that owns the Layer-2 bus subscriptions and heartbeat
+	// reaper. The scheduler is disabled (handlers still serve) when JetStream is
+	// unavailable.
+	d.ecsService = handlers_ecs.NewService(d.natsConn, d.config.Region, d.clusterConfig.AWS.InternalSuffix).WithDeps(d.buildECSServiceDeps())
+	if js, jsErr := d.natsConn.JetStream(); jsErr != nil {
+		slog.Warn("ECS scheduler disabled: JetStream unavailable", "err", jsErr)
+	} else if _, lbErr := handlers_ecs.InitLeaderBucket(js); lbErr != nil {
+		slog.Warn("ECS scheduler disabled: leader bucket init failed", "err", lbErr)
+	} else {
+		d.ecsScheduler = handlers_ecs.NewScheduler(d.natsConn, d.ecsService, d.node)
+		d.shutdownWg.Go(func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("ECS scheduler goroutine panicked", "recover", r)
+				}
+			}()
+			d.ecsScheduler.Run(d.ctx)
+		})
+	}
+
 	d.acmService, err = initServiceWithRetry("ACM service", func() (*handlers_acm.ACMServiceImpl, error) {
 		return handlers_acm.NewACMServiceImplWithNATS(d.config, d.natsConn)
 	})
@@ -1460,7 +1507,13 @@ func (d *Daemon) startCluster() error {
 	// data-safety reaper (ADR-0005 §3) rides the same backstop but only marks +
 	// alarms — it never deletes volume data.
 	if d.jsManager != nil {
-		reapers := []vm.Reaper{d.vmMgr.NewTerminatedTeardownReaper()}
+		reapers := []vm.Reaper{
+			d.vmMgr.NewTerminatedTeardownReaper(),
+			d.vmMgr.NewOrphanQEMUReaper(),
+		}
+		if eniRec := d.newENIReconciler(); eniRec != nil {
+			reapers = append(reapers, eniRec)
+		}
 		if d.volumeService != nil {
 			reapers = append(reapers, d.volumeService.NewVolumeLeakReaper(d.leakedVolumeInstances))
 		}

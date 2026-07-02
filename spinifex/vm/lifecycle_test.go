@@ -128,16 +128,6 @@ func TestBuildDrives(t *testing.T) {
 			},
 		},
 		{
-			name: "cloud-init volume",
-			requests: []types.EBSRequest{
-				{Name: "vol-ci", NBDURI: "nbd:unix:/tmp/ci.sock", CloudInit: true},
-			},
-			cpuCount: 2,
-			wantDrives: []Drive{
-				{File: "nbd:unix:/tmp/ci.sock", Format: "raw", If: "virtio", Media: "cdrom", ID: "cloudinit"},
-			},
-		},
-		{
 			name: "EFI volume emits pflash unit=1",
 			requests: []types.EBSRequest{
 				{Name: "vol-efi", NBDURI: "nbd:unix:/tmp/efi.sock", EFI: true},
@@ -164,16 +154,14 @@ func TestBuildDrives(t *testing.T) {
 			wantErr:  "NBDURI not set for volume vol-efi-bad",
 		},
 		{
-			name: "mixed boot + cloud-init + EFI",
+			name: "mixed boot + EFI",
 			requests: []types.EBSRequest{
 				{Name: "vol-boot", NBDURI: "nbd:unix:/tmp/boot.sock", Boot: true},
-				{Name: "vol-ci", NBDURI: "nbd:unix:/tmp/ci.sock", CloudInit: true},
 				{Name: "vol-efi", NBDURI: "nbd:unix:/tmp/efi.sock", EFI: true},
 			},
 			cpuCount: 4,
 			wantDrives: []Drive{
 				{File: "nbd:unix:/tmp/boot.sock", Format: "raw", If: "none", Media: "disk", ID: "os", Cache: "none"},
-				{File: "nbd:unix:/tmp/ci.sock", Format: "raw", If: "virtio", Media: "cdrom", ID: "cloudinit"},
 				{File: "nbd:unix:/tmp/efi.sock", Format: "raw", If: "pflash", Unit: 1},
 			},
 			wantIOThreads: []IOThread{{ID: "ioth-os"}},
@@ -749,6 +737,29 @@ func TestStartQEMU_DirectBoot_PrimaryTapError(t *testing.T) {
 	require.Len(t, plumber.setupCalls, 1)
 }
 
+// TestStartQEMU_DirectBoot_BridgeEnsureError verifies that a failure to ensure
+// br-imds aborts the launch before the primary tap is created: the tap would
+// otherwise be placed on a missing (or wrong) bridge, black-holing the guest.
+func TestStartQEMU_DirectBoot_BridgeEnsureError(t *testing.T) {
+	plumber := &fakeNetworkPlumber{ensureBridgeErr: errors.New("add-br failed")}
+	m := directBootManager(t, plumber)
+
+	instance := &VM{
+		ID:           "i-db-bridge-err",
+		InstanceType: "t3.nano",
+		DirectBoot:   true,
+		ENIId:        "eni-000000000000dddd",
+		ENIMac:       "02:aa:bb:cc:dd:04",
+	}
+
+	err := m.startQEMU(instance)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ensure IMDS bridge")
+	// The tap must not be created when the bridge could not be ensured.
+	assert.Empty(t, plumber.setupCalls)
+}
+
 // TestStartQEMU_DirectBoot_ExtraENITapError verifies that a tap failure on a
 // secondary ENI returns an error without starting QEMU.
 func TestStartQEMU_DirectBoot_ExtraENITapError(t *testing.T) {
@@ -844,6 +855,12 @@ func (p *scriptedNetworkPlumber) SetupTap(spec TapSpec) error {
 }
 
 func (p *scriptedNetworkPlumber) CleanupTap(_ string) error { return nil }
+
+func (p *scriptedNetworkPlumber) AttachIMDSDatapath(_, _, _ string) error { return nil }
+
+func (p *scriptedNetworkPlumber) DetachIMDSDatapath(_ string) error { return nil }
+
+func (p *scriptedNetworkPlumber) EnsureIMDSDatapathBridge() error { return nil }
 
 var _ NetworkPlumber = (*scriptedNetworkPlumber)(nil)
 

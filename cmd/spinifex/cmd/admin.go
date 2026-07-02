@@ -35,6 +35,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -113,6 +114,23 @@ var clusterShutdownCmd = &cobra.Command{
 Phases execute in order: GATE (stop API/UI) → DRAIN (stop VMs) → STORAGE (stop viperblock) → PERSIST (stop predastore) → INFRA (stop NATS/daemon).
 Each phase waits for all nodes to ACK before proceeding to the next.`,
 	Run: runClusterShutdown,
+}
+
+var nodeCmd = &cobra.Command{
+	Use:   "node",
+	Short: "Node-local operations",
+	Long:  `Node-local administrative operations such as a graceful local guest drain.`,
+}
+
+var nodeDrainCmd = &cobra.Command{
+	Use:   "drain",
+	Short: "Gracefully drain guests on the local node",
+	Long: `Run the GATE and DRAIN shutdown phases against the local node only: power down
+its guests via QMP and unmount their volumes (flushing the viperblock WAL) while
+every service is still running. STORAGE/PERSIST/INFRA are left to systemd's
+ordered unit teardown. This is the ExecStop of spinifex-shutdown.service, so a
+systemctl stop or host reboot drains guests before any storage service stops.`,
+	Run: runNodeDrainLocal,
 }
 
 var clusterDrainDHCPCmd = &cobra.Command{
@@ -257,6 +275,11 @@ func init() {
 
 	clusterCmd.AddCommand(clusterDrainDHCPCmd)
 	clusterDrainDHCPCmd.Flags().Duration("timeout", 30*time.Second, "Reply-collection window for vpcd drain responders")
+
+	adminCmd.AddCommand(nodeCmd)
+	nodeCmd.AddCommand(nodeDrainCmd)
+	nodeDrainCmd.Flags().Bool("local", false, "Drain the local node only (required)")
+	nodeDrainCmd.Flags().Duration("timeout", 120*time.Second, "Maximum time to wait per phase")
 
 	adminCmd.AddCommand(imagesCmd)
 	imagesCmd.AddCommand(imagesImportCmd)
@@ -643,6 +666,13 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 		EncryptionEnabled: mkey != nil,
 	}
 
+	// Bake the deployment CA into the image trust store so a stock cloud image
+	// trusts the gateway from first boot. Best-effort: never fails the import.
+	// The CA path derives from the --spinifex-dir data root (its config/ symlink
+	// holds ca.pem), not NodeBaseDir(): node.BaseDir is unset in the import
+	// command, which would collapse the path to a relative config/ca.pem.
+	bakeCACertIntoImage(extractedImagePath, filepath.Join(baseDir, "config", "ca.pem"))
+
 	err = v_utils.ImportDiskImage(&s3Config, &vbConfig, extractedImagePath)
 
 	if err != nil {
@@ -653,6 +683,64 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 	defer os.RemoveAll(tmpDir)
 
 	fmt.Printf("✅ Image import complete. Image-ID (AMI): %s\n", volumeId)
+}
+
+// caBakeRunCommand installs the uploaded CA into the guest trust store across
+// the distro families, then removes the staged copy. Each branch is gated on its
+// updater existing so only the matching distro's branch writes anything (install
+// -D creates the anchor dir on minimal images). Debian/Ubuntu use
+// update-ca-certificates, RHEL/Rocky use update-ca-trust, and stock Alpine ships
+// only ca-certificates-bundle (no updater, no anchor dir) so it falls back to
+// appending the PEM to the static bundle. The install chain's exit code is
+// preserved past the cleanup rm so a failure surfaces instead of a false success.
+// The RHEL branch restorecon's only the trust-store paths it touched so the cert
+// is correctly labelled without the image-wide --no-selinux-relabel (below)
+// leaving an unlabelled bundle; restorecon is best-effort and never fails the bake.
+const caBakeRunCommand = `( { command -v update-ca-certificates >/dev/null && install -D -m644 /tmp/spinifex-ca.pem /usr/local/share/ca-certificates/spinifex.crt && update-ca-certificates; } || ` +
+	`{ command -v update-ca-trust >/dev/null && install -D -m644 /tmp/spinifex-ca.pem /etc/pki/ca-trust/source/anchors/spinifex.crt && update-ca-trust && ` +
+	`{ command -v restorecon >/dev/null 2>&1 && restorecon -RF /etc/pki/ca-trust/source/anchors/spinifex.crt /etc/pki/ca-trust/extracted >/dev/null 2>&1; true; }; } || ` +
+	`{ cat /tmp/spinifex-ca.pem >> /etc/ssl/certs/ca-certificates.crt; } ); ` +
+	`rc=$?; rm -f /tmp/spinifex-ca.pem; exit $rc`
+
+// caBakeTimeout bounds the virt-customize run so a stalled libguestfs appliance
+// cannot hang the import indefinitely; on timeout the bake degrades to a skip.
+const caBakeTimeout = 5 * time.Minute
+
+// caBakeCmd builds the virt-customize invocation that uploads the deployment CA
+// into the disk image at imagePath and installs it into the guest trust store.
+// --no-selinux-relabel stops virt-customize flagging the image for a first-boot
+// SELinux autorelabel: that relabel+reboot corrupts XFS roots (RHEL/Rocky) on the
+// reboot, so the run-command relabels only the touched trust paths instead.
+func caBakeCmd(ctx context.Context, imagePath, caCertPath string) *exec.Cmd {
+	return exec.CommandContext(ctx, "virt-customize", "-a", imagePath,
+		"--no-selinux-relabel",
+		"--upload", caCertPath+":/tmp/spinifex-ca.pem",
+		"--run-command", caBakeRunCommand)
+}
+
+// caBakeRunner resolves virt-customize and runs the CA bake; overridable in tests.
+var caBakeRunner = func(imagePath, caCertPath string) ([]byte, error) {
+	if _, err := exec.LookPath("virt-customize"); err != nil {
+		return nil, fmt.Errorf("virt-customize not found: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), caBakeTimeout)
+	defer cancel()
+	return caBakeCmd(ctx, imagePath, caCertPath).CombinedOutput()
+}
+
+// bakeCACertIntoImage uploads the deployment CA into the image's trust store via
+// virt-customize so an imported stock image trusts the gateway from first boot.
+// Best-effort: a missing CA, an absent virt-customize, or an image libguestfs
+// cannot inspect logs and continues — image import never fails on the CA.
+func bakeCACertIntoImage(imagePath, caCertPath string) {
+	if _, err := os.Stat(caCertPath); err != nil {
+		slog.Warn("CA bake skipped: deployment CA not found; imported image will not auto-trust the gateway", "ca", caCertPath, "err", err)
+		return
+	}
+	if out, err := caBakeRunner(imagePath, caCertPath); err != nil {
+		slog.Warn("CA bake skipped: virt-customize could not customize image; imported image will not auto-trust the gateway", "err", err, "output", string(out))
+		return
+	}
 }
 
 func runimagesRemoveCmd(cmd *cobra.Command, args []string) {
@@ -793,17 +881,8 @@ func runimagesListCmd(cmd *cobra.Command, args []string) {
 		{"NAME", "DISTRO", "VERSION", "ARCH", "BOOT"},
 	}
 
-	// Sort A .. Z
-	// 1. Collect keys
-	keys := make([]string, 0, len(utils.AvailableImages))
-	for k := range utils.AvailableImages {
-		keys = append(keys, k)
-	}
-
-	// 2. Sort keys alphabetically (A→Z)
-	sort.Strings(keys)
-
-	// 3. Iterate in sorted order
+	// Sort A→Z then iterate.
+	keys := slices.Sorted(maps.Keys(utils.AvailableImages))
 	for _, k := range keys {
 		img := utils.AvailableImages[k]
 

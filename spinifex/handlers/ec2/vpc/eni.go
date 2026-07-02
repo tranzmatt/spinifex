@@ -60,6 +60,10 @@ type ENIRecord struct {
 	// DetachForce records the force flag from the in-flight detach call so
 	// the reconciler can replay with the original semantics.
 	DetachForce bool `json:"detach_force,omitempty"`
+	// AttachmentStateAt timestamps the most recent AttachmentStatus
+	// transition. The reconciler ages transitions against this so it never
+	// rolls back a record a live attach/detach handler is mid-pipeline on.
+	AttachmentStateAt time.Time `json:"attachment_state_at,omitzero"`
 }
 
 // eniIsLiveAttachment reports whether the ENI record is a live attachment to
@@ -152,15 +156,6 @@ func (s *VPCServiceImpl) CreateNetworkInterface(input *ec2.CreateNetworkInterfac
 	}
 	if _, err := s.eniKV.Put(utils.AccountKey(accountID, eniId), data); err != nil {
 		return nil, errors.New(awserrors.ErrorServerInternal)
-	}
-
-	// Maintain the eni-by-vpc-ip reverse index after the source-of-truth ENI
-	// write. A failure here leaves IMDS returning safe 404s for this IP rather
-	// than phantom permissions, so it is logged, not fatal.
-	if s.eniIndex != nil {
-		if err := s.eniIndex.Put(subnet.VpcId, privateIP, eniId, accountID); err != nil {
-			slog.Warn("CreateNetworkInterface: eni-by-ip index write failed", "eniId", eniId, "vpcId", subnet.VpcId, "ip", privateIP, "err", err)
-		}
 	}
 
 	slog.Info("CreateNetworkInterface completed", "eniId", eniId, "subnetId", subnetId, "ip", privateIP, "accountID", accountID)
@@ -256,15 +251,6 @@ func (s *VPCServiceImpl) deleteNetworkInterface(eniId, accountID string, force b
 
 	if err := s.eniKV.Delete(key); err != nil {
 		return nil, errors.New(awserrors.ErrorServerInternal)
-	}
-
-	// Drop the eni-by-vpc-ip reverse index entry. Idempotent and non-fatal:
-	// the source-of-truth ENI is already gone, so a stale index entry would
-	// only resolve to a now-missing ENI and surface as a safe 404.
-	if s.eniIndex != nil {
-		if err := s.eniIndex.Delete(record.VpcId, record.PrivateIpAddress); err != nil {
-			slog.Warn("DeleteNetworkInterface: eni-by-ip index delete failed", "eniId", eniId, "vpcId", record.VpcId, "ip", record.PrivateIpAddress, "err", err)
-		}
 	}
 
 	slog.Info("DeleteNetworkInterface completed", "eniId", eniId, "accountID", accountID)
@@ -609,6 +595,38 @@ func (s *VPCServiceImpl) UpdateENI(accountID, eniId string, fn func(*ENIRecord))
 		return errors.New(awserrors.ErrorServerInternal)
 	}
 	return nil
+}
+
+// ListInstanceENIs returns every ENIRecord in accountID currently attached to
+// instanceID. Used by the hot-plug reconciler to converge a node's instances
+// against KV on restart.
+func (s *VPCServiceImpl) ListInstanceENIs(accountID, instanceID string) ([]ENIRecord, error) {
+	keys, err := s.eniKV.Keys()
+	if err != nil {
+		if errors.Is(err, nats.ErrNoKeysFound) {
+			return nil, nil
+		}
+		return nil, errors.New(awserrors.ErrorServerInternal)
+	}
+	prefix := accountID + "."
+	var out []ENIRecord
+	for _, key := range keys {
+		if key == utils.VersionKey || !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		entry, err := s.eniKV.Get(key)
+		if err != nil {
+			continue
+		}
+		var record ENIRecord
+		if err := json.Unmarshal(entry.Value(), &record); err != nil {
+			continue
+		}
+		if record.InstanceId == instanceID {
+			out = append(out, record)
+		}
+	}
+	return out, nil
 }
 
 // FindENIByAttachment scans the ENI bucket for the record with the given

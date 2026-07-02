@@ -23,6 +23,7 @@ import (
 	gateway_ecrauth "github.com/mulgadc/spinifex/spinifex/gateway/ecrauth"
 	"github.com/mulgadc/spinifex/spinifex/gateway/policy"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
+	handlers_quota "github.com/mulgadc/spinifex/spinifex/handlers/quota"
 	handlers_sts "github.com/mulgadc/spinifex/spinifex/handlers/sts"
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
@@ -91,8 +92,12 @@ type GatewayConfig struct {
 	STSService   handlers_sts.STSService
 	RateLimiter  *AuthRateLimiter     // Per-IP auth failure rate limiter
 	Throttler    *ratelimit.Throttler // Per-account+action API request throttler
-	Version      string               // Build-time version string (set from cmd.Version)
-	Commit       string               // Build-time commit hash (set from cmd.Commit)
+	// Quota enforces per-account service quotas. Built unconditionally; a disabled
+	// config yields a no-op Service whose Exempt always returns true. Nil only in
+	// unit tests of unrelated routes, where no handler reaches the quota checks.
+	Quota   *handlers_quota.Service
+	Version string // Build-time version string (set from cmd.Version)
+	Commit  string // Build-time commit hash (set from cmd.Commit)
 	// ECRRegistry serves the OCI Distribution v2 (/v2/*) surface. Nil falls back
 	// to the 501 stub (e.g. in unit tests of unrelated routes).
 	ECRRegistry *gateway_ecr.Registry
@@ -110,6 +115,7 @@ var supportedServices = map[string]bool{
 	"account":              true,
 	"elasticloadbalancing": true,
 	"eks":                  true,
+	"ecs":                  true,
 	"ecr":                  true,
 	"acm":                  true,
 	"tagging":              true,
@@ -228,8 +234,8 @@ const clusterUnavailableMsg = "cluster unavailable: NATS disconnected — check 
 func (gw *GatewayConfig) writeClusterUnavailable(w http.ResponseWriter, _ *http.Request, svc string) {
 	requestID := uuid.NewString()
 
-	// EKS uses AWS REST-JSON 1.1.
-	if svc == "eks" {
+	// EKS and ECS use AWS JSON 1.1.
+	if svc == "eks" || svc == "ecs" {
 		body := GenerateEKSErrorResponse(awserrors.ErrorServiceUnavailable, clusterUnavailableMsg, requestID)
 		w.Header().Set("Content-Type", eksJSONContentType)
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -280,8 +286,8 @@ func (gw *GatewayConfig) writeThrottleError(w http.ResponseWriter, r *http.Reque
 	}
 	errorMsg := awserrors.ErrorLookup[errorCode]
 
-	// EKS uses AWS REST-JSON 1.1.
-	if svc == "eks" {
+	// EKS and ECS use AWS JSON 1.1.
+	if svc == "eks" || svc == "ecs" {
 		body := GenerateEKSErrorResponse(errorCode, errorMsg.Message, requestID)
 		w.Header().Set("Content-Type", eksJSONContentType)
 		w.WriteHeader(errorMsg.HTTPCode)
@@ -335,6 +341,8 @@ func (gw *GatewayConfig) Request(w http.ResponseWriter, r *http.Request) {
 		err = gw.ELBv2_Request(w, r)
 	case "eks":
 		err = gw.EKS_Request(w, r)
+	case "ecs":
+		err = gw.ECS_Request(w, r)
 	case "ecr":
 		err = gw.ECR_Request(w, r)
 	case "acm":
@@ -494,8 +502,8 @@ func (gw *GatewayConfig) ErrorHandler(w http.ResponseWriter, r *http.Request, er
 		errorMsg.HTTPCode = 500
 	}
 
-	// EKS, ECR, ACM, and tagging use AWS JSON 1.1; query/XML services fall through.
-	if svc == "eks" || svc == "ecr" || svc == "acm" || svc == "tagging" {
+	// EKS, ECR, ACM, ECS, and tagging use AWS JSON 1.1; query/XML services fall through.
+	if svc == "eks" || svc == "ecr" || svc == "acm" || svc == "ecs" || svc == "tagging" {
 		body := GenerateEKSErrorResponse(err.Error(), errorMsg.Message, requestId)
 		slog.Debug("Generated JSON error response", "service", svc, "error", err.Error(), "json", string(body), "requestId", requestId)
 		w.Header().Set("Content-Type", eksJSONContentType)

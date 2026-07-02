@@ -306,7 +306,7 @@ func TestDetachVolume_VolumeNotAttached(t *testing.T) {
 
 // TestDetachVolume_DeviceGuards covers the four cross-check and undetachable
 // guards at the head of DetachVolume. Bypassing any of these is destructive:
-// detaching a boot/EFI/CloudInit volume kills the instance, and a device-name
+// detaching a boot/EFI volume kills the instance, and a device-name
 // mismatch silently rips out the wrong disk. The mismatch case additionally
 // pins the error text so an operator-visible diagnostic stays intact.
 func TestDetachVolume_DeviceGuards(t *testing.T) {
@@ -327,12 +327,6 @@ func TestDetachVolume_DeviceGuards(t *testing.T) {
 		{
 			name:          "EFI volume rejected",
 			req:           types.EBSRequest{Name: "vol-efi", EFI: true, DeviceName: "/dev/sdf"},
-			requestDevice: "",
-			wantErr:       ErrVolumeNotDetachable,
-		},
-		{
-			name:          "CloudInit volume rejected",
-			req:           types.EBSRequest{Name: "vol-ci", CloudInit: true, DeviceName: "/dev/sdf"},
 			requestDevice: "",
 			wantErr:       ErrVolumeNotDetachable,
 		},
@@ -622,7 +616,7 @@ func TestAttachVolume_ObjectAddFailure_TriggersUnmountOne(t *testing.T) {
 	_, err := m.AttachVolume("i-1", "vol-1", "/dev/sdf")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "object-add")
-	assert.Equal(t, []string{"query-block", "object-add"}, recorder.executes(),
+	assert.Equal(t, []string{"object-add"}, recorder.executes(),
 		"object-add failure must short-circuit before blockdev-add")
 	assert.Equal(t, []string{"vol-1"}, mounter.unmountedOne)
 }
@@ -650,7 +644,7 @@ func TestAttachVolume_BlockdevAddFailure_TriggersUnmountOne(t *testing.T) {
 	_, err := m.AttachVolume("i-1", "vol-1", "/dev/sdf")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "blockdev-add")
-	assert.Equal(t, []string{"query-block", "object-add", "blockdev-add", "object-del"}, recorder.executes())
+	assert.Equal(t, []string{"object-add", "blockdev-add", "object-del"}, recorder.executes())
 	assert.Equal(t, []string{"vol-1"}, mounter.unmountedOne)
 }
 
@@ -677,7 +671,7 @@ func TestAttachVolume_DeviceAddFailure_BlockdevDelOK_Unmounts(t *testing.T) {
 	_, err := m.AttachVolume("i-1", "vol-1", "/dev/sdf")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "device_add")
-	assert.Equal(t, []string{"query-block", "object-add", "blockdev-add", "device_add", "blockdev-del", "object-del"}, recorder.executes())
+	assert.Equal(t, []string{"object-add", "blockdev-add", "device_add", "blockdev-del", "object-del"}, recorder.executes())
 	assert.Equal(t, []string{"vol-1"}, mounter.unmountedOne,
 		"successful blockdev-del rollback must be followed by UnmountOne")
 }
@@ -710,7 +704,7 @@ func TestAttachVolume_DeviceAddFailure_BlockdevDelFails_SkipsUnmountOne(t *testi
 	_, err := m.AttachVolume("i-1", "vol-1", "/dev/sdf")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "device_add")
-	assert.Equal(t, []string{"query-block", "object-add", "blockdev-add", "device_add", "blockdev-del"}, recorder.executes())
+	assert.Equal(t, []string{"object-add", "blockdev-add", "device_add", "blockdev-del"}, recorder.executes())
 	assert.Empty(t, mounter.unmountedOne,
 		"failed blockdev-del must skip UnmountOne — unmounting under a live block node crashes QEMU")
 }
