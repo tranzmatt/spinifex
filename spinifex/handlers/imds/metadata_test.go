@@ -33,12 +33,15 @@ type fakeResolver struct {
 	vpcErr     error
 }
 
-func (f *fakeResolver) resolveENIByID(_ string) (*eniFacts, error) { return f.eni, f.eniErr }
-func (f *fakeResolver) resolveInstance(_ *eniFacts) (*instanceFacts, error) {
+func (f *fakeResolver) resolveENIByID(_ context.Context, _ string) (*eniFacts, error) {
+	return f.eni, f.eniErr
+}
+
+func (f *fakeResolver) resolveInstance(_ context.Context, _ *eniFacts) (*instanceFacts, error) {
 	return f.inst, f.instErr
 }
 
-func (f *fakeResolver) resolveSGNames(_ string, sgIDs []string) []string {
+func (f *fakeResolver) resolveSGNames(_ context.Context, _ string, sgIDs []string) []string {
 	out := make([]string, len(sgIDs))
 	for i, id := range sgIDs {
 		if name, ok := f.sgNames[id]; ok {
@@ -50,10 +53,13 @@ func (f *fakeResolver) resolveSGNames(_ string, sgIDs []string) []string {
 	return out
 }
 
-func (f *fakeResolver) resolveSubnetCIDR(_, _ string) (string, error) {
+func (f *fakeResolver) resolveSubnetCIDR(_ context.Context, _, _ string) (string, error) {
 	return f.subnetCIDR, f.subnetErr
 }
-func (f *fakeResolver) resolveVPCCIDR(_, _ string) (string, error) { return f.vpcCIDR, f.vpcErr }
+
+func (f *fakeResolver) resolveVPCCIDR(_ context.Context, _, _ string) (string, error) {
+	return f.vpcCIDR, f.vpcErr
+}
 
 type fakeIAM struct {
 	profile    *handlers_iam.InstanceProfile
@@ -62,11 +68,11 @@ type fakeIAM struct {
 	roleErr    error
 }
 
-func (f *fakeIAM) ResolveInstanceProfile(_, _ string) (*handlers_iam.InstanceProfile, error) {
+func (f *fakeIAM) ResolveInstanceProfile(_ context.Context, _, _ string) (*handlers_iam.InstanceProfile, error) {
 	return f.profile, f.profileErr
 }
 
-func (f *fakeIAM) GetRole(_ string, _ *iam.GetRoleInput) (*iam.GetRoleOutput, error) {
+func (f *fakeIAM) GetRole(_ context.Context, _ string, _ *iam.GetRoleInput) (*iam.GetRoleOutput, error) {
 	if f.roleErr != nil {
 		return nil, f.roleErr
 	}
@@ -82,7 +88,7 @@ type fakePublicKeys struct {
 	calls    int
 }
 
-func (f *fakePublicKeys) GetPublicKey(_, _ string) (string, error) {
+func (f *fakePublicKeys) GetPublicKey(_ context.Context, _, _ string) (string, error) {
 	f.calls++
 	return f.material, f.err
 }
@@ -124,12 +130,14 @@ func withTapENI(h http.Handler, eni *eniFacts) http.Handler {
 func newTestService(res eniResolver, fIAM profileLookup, assumer stsAssumer) (*IMDSServiceImpl, time.Time) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	return &IMDSServiceImpl{
-		resolver: res,
-		tokens:   newTokenStore(),
-		creds:    newCredCache(assumer),
-		iam:      fIAM,
-		pubKeys:  &fakePublicKeys{},
-		now:      func() time.Time { return now },
+		resolver:   res,
+		tokens:     newTokenStore(),
+		v1Allow:    newV1AllowCache(),
+		creds:      newCredCache(assumer),
+		iam:        fIAM,
+		pubKeys:    &fakePublicKeys{},
+		now:        func() time.Time { return now },
+		baseDomain: "spx3.net",
 	}, now
 }
 
@@ -405,13 +413,13 @@ func TestHTTP_MetadataPaths(t *testing.T) {
 		{prefixMetaData + "instance-life-cycle", "on-demand"},
 		{prefixMetaData + "local-ipv4", "10.0.1.5"},
 		{prefixMetaData + "public-ipv4", "203.0.113.7"},
-		{prefixMetaData + "public-hostname", "203.0.113.7"},
 		{prefixMetaData + "mac", "02:11:22:33:44:55"},
 		{prefixMetaData + "placement/availability-zone", "ap-southeast-2a"},
 		{prefixMetaData + "placement/region", "ap-southeast-2"},
 		{prefixMetaData + "security-groups", "web-sg\ndb-sg"},
 		{prefixMetaData + "hostname", "ip-10-0-1-5.ap-southeast-2.compute.internal"},
 		{prefixMetaData + "local-hostname", "ip-10-0-1-5.ap-southeast-2.compute.internal"},
+		{prefixMetaData + "public-hostname", "ec2-203-0-113-7.ap-southeast-2.compute.spx3.net"},
 		{prefixMetaData + "services", "domain\npartition"},
 		{prefixMetaData + "services/", "domain\npartition"},
 		{prefixMetaData + "services/domain", "amazonaws.com"},
@@ -434,6 +442,46 @@ func TestHTTP_PublicFieldsAbsent404(t *testing.T) {
 	h := withTapENI(svc.httpHandler(), eni)
 	token := issueToken(t, h)
 	for _, leaf := range []string{"public-hostname", "public-ipv4"} {
+		rec := get(t, h, prefixMetaData+leaf, token)
+		assert.Equal(t, http.StatusNotFound, rec.Code, "leaf=%s", leaf)
+	}
+}
+
+// instance-life-cycle is "spot" only for a spot-launched instance; it defaults to
+// "on-demand" for on-demand instances and — crucially — for a resolution miss or
+// error, since the leaf is advertised unconditionally and a 404 would break the crawl.
+func TestHTTP_InstanceLifecycle(t *testing.T) {
+	cases := []struct {
+		name string
+		res  *fakeResolver
+		want string
+	}{
+		{"Spot", &fakeResolver{eni: testENI(), inst: &instanceFacts{lifecycleType: "spot"}}, "spot"},
+		{"OnDemand", &fakeResolver{eni: testENI(), inst: &instanceFacts{}}, "on-demand"},
+		{"ResolutionMiss", &fakeResolver{eni: testENI()}, "on-demand"},
+		{"ResolutionError", &fakeResolver{eni: testENI(), instErr: errors.New("backend down")}, "on-demand"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			svc, _ := newTestService(c.res, &fakeIAM{}, &fakeAssumer{})
+			h := withTapENI(svc.httpHandler(), testENI())
+			token := issueToken(t, h)
+			rec := get(t, h, prefixMetaData+"instance-life-cycle", token)
+			assert.Equal(t, http.StatusOK, rec.Code)
+			assert.Equal(t, c.want, rec.Body.String())
+		})
+	}
+}
+
+// A never-interrupted spot instance has no scheduled action, so spot/instance-action
+// and spot/termination-time 404 (the dispatch default) — a 200 body would trigger
+// interruption handling in pollers like the AWS Node Termination Handler.
+func TestHTTP_SpotPathsReturn404(t *testing.T) {
+	res := &fakeResolver{eni: testENI(), inst: &instanceFacts{lifecycleType: "spot"}}
+	svc, _ := newTestService(res, &fakeIAM{}, &fakeAssumer{})
+	h := withTapENI(svc.httpHandler(), testENI())
+	token := issueToken(t, h)
+	for _, leaf := range []string{"spot/instance-action", "spot/termination-time"} {
 		rec := get(t, h, prefixMetaData+leaf, token)
 		assert.Equal(t, http.StatusNotFound, rec.Code, "leaf=%s", leaf)
 	}
@@ -658,12 +706,37 @@ func TestHTTP_NetworkInterfaceLeaves(t *testing.T) {
 		{"vpc-ipv4-cidr-block", testVPCCIDR},
 		{"vpc-ipv4-cidr-blocks", testVPCCIDR},
 		{"public-ipv4s", "203.0.113.7"},
-		{"public-hostname", "203.0.113.7"},
+		{"public-hostname", "ec2-203-0-113-7.ap-southeast-2.compute.spx3.net"},
 	}
 	for _, c := range cases {
 		rec := get(t, h, macPath(mac, c.key), token)
 		assert.Equal(t, http.StatusOK, rec.Code, "key=%s", c.key)
 		assert.Equal(t, c.want, rec.Body.String(), "key=%s", c.key)
+	}
+}
+
+// Real EC2 serves the same public DNS name at the top-level and per-ENI leaves, so the
+// two must agree on both the AWS-shaped name and the fallback to the raw IP when no
+// base domain is configured.
+func TestHTTP_PublicHostnameLeavesAgree(t *testing.T) {
+	cases := []struct{ name, baseDomain, want string }{
+		{"base domain configured", "spx3.net", "ec2-203-0-113-7.ap-southeast-2.compute.spx3.net"},
+		{"public DNS unconfigured", "", "203.0.113.7"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			eni := testENI()
+			svc, _ := newTestService(&fakeResolver{eni: eni}, &fakeIAM{}, &fakeAssumer{})
+			svc.baseDomain = c.baseDomain
+			h := withTapENI(svc.httpHandler(), eni)
+			token := issueToken(t, h)
+
+			for _, path := range []string{prefixMetaData + "public-hostname", macPath(eni.mac, "public-hostname")} {
+				rec := get(t, h, path, token)
+				assert.Equal(t, http.StatusOK, rec.Code, "path=%s", path)
+				assert.Equal(t, c.want, rec.Body.String(), "path=%s", path)
+			}
+		})
 	}
 }
 

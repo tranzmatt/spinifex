@@ -2,12 +2,15 @@ package handlers_ec2_snapshot
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"maps"
+	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,32 +22,37 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/mulgadc/spinifex/spinifex/filterutil"
+	"github.com/mulgadc/spinifex/spinifex/handlers/ec2/volumestate"
+	"github.com/mulgadc/spinifex/spinifex/kvutil"
 	"github.com/mulgadc/spinifex/spinifex/migrate"
 	"github.com/mulgadc/spinifex/spinifex/objectstore"
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/viperblock/viperblock"
+	vbs3 "github.com/mulgadc/viperblock/viperblock/backends/s3"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
-// Ensure SnapshotServiceImpl implements SnapshotService
+// Ensure SnapshotServiceImpl implements SnapshotService.
 var _ SnapshotService = (*SnapshotServiceImpl)(nil)
 
 const (
 	KVBucketVolumeSnapshots        = "spinifex-volume-snapshots"
 	KVBucketVolumeSnapshotsVersion = 1
+	snapshotCleanupTimeout         = 5 * time.Second
 )
 
-// SnapshotServiceImpl implements SnapshotService with S3-backed storage
+// SnapshotServiceImpl implements SnapshotService with S3-backed storage.
 type SnapshotServiceImpl struct {
 	config   *config.Config
 	store    objectstore.ObjectStore
 	natsConn *nats.Conn
-	snapKV   nats.KeyValue
+	snapKV   jetstream.KeyValue
 	mutex    sync.RWMutex
 }
 
-// SnapshotConfig represents snapshot metadata stored in S3
+// SnapshotConfig represents snapshot metadata stored in S3.
 type SnapshotConfig struct {
 	SnapshotID       string            `json:"snapshot_id"`
 	VolumeID         string            `json:"volume_id"`
@@ -59,8 +67,8 @@ type SnapshotConfig struct {
 	Tags             map[string]string `json:"tags"`
 }
 
-// NewSnapshotServiceImplWithNATS creates a snapshot service with JetStream KV for volume-snapshot tracking
-func NewSnapshotServiceImplWithNATS(cfg *config.Config, natsConn *nats.Conn) (*SnapshotServiceImpl, nats.KeyValue, error) {
+// NewSnapshotServiceImplWithNATS creates a snapshot service with JetStream KV for volume-snapshot tracking.
+func NewSnapshotServiceImplWithNATS(ctx context.Context, cfg *config.Config, natsConn *nats.Conn) (*SnapshotServiceImpl, jetstream.KeyValue, error) {
 	store := objectstore.NewS3ObjectStoreFromConfig(
 		cfg.Predastore.Host,
 		cfg.Predastore.Region,
@@ -68,16 +76,16 @@ func NewSnapshotServiceImplWithNATS(cfg *config.Config, natsConn *nats.Conn) (*S
 		cfg.Predastore.SecretKey,
 	)
 
-	js, err := natsConn.JetStream()
+	js, err := jetstream.New(natsConn)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get JetStream context: %w", err)
+		return nil, nil, fmt.Errorf("create JetStream: %w", err)
 	}
 
-	kv, err := utils.GetOrCreateKVBucket(js, KVBucketVolumeSnapshots, 10)
+	kv, err := kvutil.GetOrCreateBucket(ctx, js, KVBucketVolumeSnapshots, 10)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create KV bucket %s: %w", KVBucketVolumeSnapshots, err)
+		return nil, nil, fmt.Errorf("create KV bucket %s: %w", KVBucketVolumeSnapshots, err)
 	}
-	if err := migrate.DefaultRegistry.RunKV(KVBucketVolumeSnapshots, kv, KVBucketVolumeSnapshotsVersion); err != nil {
+	if err := migrate.DefaultRegistry.RunKV(ctx, KVBucketVolumeSnapshots, kv, KVBucketVolumeSnapshotsVersion); err != nil {
 		return nil, nil, fmt.Errorf("migrate %s: %w", KVBucketVolumeSnapshots, err)
 	}
 
@@ -93,7 +101,7 @@ func NewSnapshotServiceImplWithNATS(cfg *config.Config, natsConn *nats.Conn) (*S
 
 // NewSnapshotServiceImplWithStore creates a snapshot service with a custom ObjectStore (for testing).
 // An optional snapshotKV can be provided for KV-backed volume-snapshot tracking.
-func NewSnapshotServiceImplWithStore(cfg *config.Config, store objectstore.ObjectStore, natsConn *nats.Conn, snapshotKV ...nats.KeyValue) *SnapshotServiceImpl {
+func NewSnapshotServiceImplWithStore(cfg *config.Config, store objectstore.ObjectStore, natsConn *nats.Conn, snapshotKV ...jetstream.KeyValue) *SnapshotServiceImpl {
 	svc := &SnapshotServiceImpl{
 		config:   cfg,
 		store:    store,
@@ -120,7 +128,7 @@ var ErrCorruptSnapshotMetadata = errors.New("corrupt snapshot metadata")
 // Decode failures wrap ErrCorruptSnapshotMetadata.
 func ReadSnapshotConfig(store objectstore.ObjectStore, bucket, snapshotID string) (*SnapshotConfig, error) {
 	key := GetSnapshotKey(snapshotID)
-	result, err := store.GetObject(&s3.GetObjectInput{
+	result, err := store.GetObject(context.Background(), &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})
@@ -131,7 +139,7 @@ func ReadSnapshotConfig(store objectstore.ObjectStore, bucket, snapshotID string
 
 	var cfg SnapshotConfig
 	if err := json.NewDecoder(result.Body).Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrCorruptSnapshotMetadata, err)
+		return nil, fmt.Errorf("%w: %w", ErrCorruptSnapshotMetadata, err)
 	}
 	return &cfg, nil
 }
@@ -142,7 +150,7 @@ func WriteSnapshotConfig(store objectstore.ObjectStore, bucket, snapshotID strin
 	if err != nil {
 		return err
 	}
-	_, err = store.PutObject(&s3.PutObjectInput{
+	_, err = store.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket:      aws.String(bucket),
 		Key:         aws.String(GetSnapshotKey(snapshotID)),
 		Body:        bytes.NewReader(data),
@@ -163,12 +171,12 @@ func (s *SnapshotServiceImpl) getSnapshotConfig(snapshotID string) (*SnapshotCon
 	return cfg, nil
 }
 
-// putSnapshotConfig stores snapshot config to S3
+// putSnapshotConfig stores snapshot config to S3.
 func (s *SnapshotServiceImpl) putSnapshotConfig(snapshotID string, cfg *SnapshotConfig) error {
 	return WriteSnapshotConfig(s.store, s.config.Predastore.Bucket, snapshotID, cfg)
 }
 
-// snapshotConfigToEC2 converts a SnapshotConfig to an EC2 Snapshot response object
+// snapshotConfigToEC2 converts a SnapshotConfig to an EC2 Snapshot response object.
 func snapshotConfigToEC2(cfg *SnapshotConfig) *ec2.Snapshot {
 	snapshot := &ec2.Snapshot{
 		SnapshotId:  aws.String(cfg.SnapshotID),
@@ -187,32 +195,32 @@ func snapshotConfigToEC2(cfg *SnapshotConfig) *ec2.Snapshot {
 	return snapshot
 }
 
-// CreateSnapshot creates a new snapshot from a volume
-func (s *SnapshotServiceImpl) CreateSnapshot(input *ec2.CreateSnapshotInput, accountID string) (*ec2.Snapshot, error) {
+// CreateSnapshot creates a new snapshot from a volume.
+func (s *SnapshotServiceImpl) CreateSnapshot(ctx context.Context, input *ec2.CreateSnapshotInput, accountID string) (*ec2.Snapshot, error) {
 	if input == nil || input.VolumeId == nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 
 	volumeID := *input.VolumeId
 
-	slog.Info("CreateSnapshot request", "volumeId", volumeID)
+	slog.InfoContext(ctx, "CreateSnapshot request", "volumeId", volumeID)
 
 	snapshotID := utils.GenerateResourceID("snap")
 
 	volumeConfigKey := fmt.Sprintf("%s/config.json", volumeID)
-	volumeResult, err := s.store.GetObject(&s3.GetObjectInput{
+	volumeResult, err := s.store.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.config.Predastore.Bucket),
 		Key:    aws.String(volumeConfigKey),
 	})
 	if err != nil {
-		slog.Error("CreateSnapshot failed to get volume config", "volumeId", volumeID, "err", err)
+		slog.ErrorContext(ctx, "CreateSnapshot failed to get volume config", "volumeId", volumeID, "err", err)
 		return nil, errors.New(awserrors.ErrorInvalidVolumeNotFound)
 	}
 	defer volumeResult.Body.Close()
 
 	volumeBody, err := io.ReadAll(volumeResult.Body)
 	if err != nil {
-		slog.Error("CreateSnapshot failed to read volume config", "volumeId", volumeID, "err", err)
+		slog.ErrorContext(ctx, "CreateSnapshot failed to read volume config", "volumeId", volumeID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
@@ -221,56 +229,40 @@ func (s *SnapshotServiceImpl) CreateSnapshot(input *ec2.CreateSnapshotInput, acc
 	// (SizeGiB==0), which the size guard below would reject as a 500.
 	var volumeState viperblock.VBState
 	if err := json.Unmarshal(viperblock.StateBody(volumeBody), &volumeState); err != nil {
-		slog.Error("CreateSnapshot failed to decode volume config", "volumeId", volumeID, "err", err)
+		slog.ErrorContext(ctx, "CreateSnapshot failed to decode volume config", "volumeId", volumeID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 	volumeConfig := volumeState.VolumeConfig
 
 	// Verify the caller owns the source volume
 	if accountID != "" && volumeConfig.VolumeMetadata.TenantID != "" && volumeConfig.VolumeMetadata.TenantID != accountID {
-		slog.Warn("CreateSnapshot: account does not own volume", "volumeId", volumeID, "accountID", accountID, "tenantID", volumeConfig.VolumeMetadata.TenantID)
+		slog.WarnContext(ctx, "CreateSnapshot: account does not own volume", "volumeId", volumeID, "accountID", accountID, "tenantID", volumeConfig.VolumeMetadata.TenantID)
 		return nil, errors.New(awserrors.ErrorInvalidVolumeNotFound)
 	}
 
 	if volumeConfig.VolumeMetadata.SizeGiB == 0 {
-		slog.Error("CreateSnapshot: source volume has zero size in config", "volumeId", volumeID)
+		slog.ErrorContext(ctx, "CreateSnapshot: source volume has zero size in config", "volumeId", volumeID)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
-	// Trigger viperblock to flush data and create a frozen block map checkpoint.
-	// This sends a NATS message to the EBS daemon that owns the volume, which
-	// calls vb.CreateSnapshot() on the live viperblock instance.
-	if s.natsConn != nil {
-		snapReq := types.EBSSnapshotRequest{Volume: volumeID, SnapshotID: snapshotID}
-		snapData, err := json.Marshal(snapReq)
-		if err != nil {
-			slog.Error("CreateSnapshot: failed to marshal ebs.snapshot request", "volumeId", volumeID, "err", err)
-			return nil, errors.New(awserrors.ErrorServerInternal)
-		}
-
-		msg, err := s.natsConn.Request(fmt.Sprintf("ebs.snapshot.%s", volumeID), snapData, 30*time.Second)
-		if errors.Is(err, nats.ErrNoResponders) {
-			// Volume is not mounted — data is already persisted to S3, proceed with metadata-only snapshot.
-			slog.Info("CreateSnapshot: volume not mounted, creating metadata-only snapshot", "volumeId", volumeID, "snapshotId", snapshotID)
-		} else if err != nil {
-			slog.Error("CreateSnapshot: ebs.snapshot NATS request failed", "volumeId", volumeID, "snapshotId", snapshotID, "err", err)
-			return nil, errors.New(awserrors.ErrorServerInternal)
-		} else {
-			var snapResp types.EBSSnapshotResponse
-			if err := json.Unmarshal(msg.Data, &snapResp); err != nil {
-				slog.Error("CreateSnapshot: failed to unmarshal ebs.snapshot response", "volumeId", volumeID, "snapshotId", snapshotID, "err", err)
-				return nil, errors.New(awserrors.ErrorServerInternal)
-			}
-			if !snapResp.Success || snapResp.Error != "" {
-				slog.Error("CreateSnapshot: viperblock snapshot failed", "volumeId", volumeID, "snapshotId", snapshotID, "err", snapResp.Error)
-				return nil, errors.New(awserrors.ErrorServerInternal)
-			}
-
-			slog.Info("CreateSnapshot: viperblock snapshot created", "volumeId", volumeID, "snapshotId", snapshotID)
-		}
-	} else {
-		slog.Warn("CreateSnapshot: natsConn is nil, skipping viperblock snapshot (metadata-only)", "volumeId", volumeID)
+	// Flush the writes still buffered by whichever node serves the volume, so the
+	// live checkpoint this snapshot is about to read is current. An attached
+	// volume that cannot be drained fails here rather than silently producing a
+	// snapshot of an older checkpoint.
+	if err := s.drainVolume(ctx, volumeID, volumeConfig.VolumeMetadata, accountID); err != nil {
+		slog.ErrorContext(ctx, "CreateSnapshot: drain failed", "volumeId", volumeID, "snapshotId", snapshotID, "err", err)
+		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
+
+	// Snapshot the viperblock volume by reading the live checkpoint from S3.
+	// The live checkpoint is updated on every NBD Flush by the running nbdkit process.
+	// If the volume is not mounted (stopped), LoadLiveCheckpoint falls back to the
+	// numbered checkpoint written by Close.
+	if err := s.snapshotVolume(volumeID, snapshotID, volumeConfig.VolumeMetadata.SizeGiB*1024*1024*1024); err != nil {
+		slog.ErrorContext(ctx, "CreateSnapshot: viperblock snapshot failed", "volumeId", volumeID, "snapshotId", snapshotID, "err", err)
+		return nil, errors.New(awserrors.ErrorServerInternal)
+	}
+	slog.InfoContext(ctx, "CreateSnapshot: viperblock snapshot created", "volumeId", volumeID, "snapshotId", snapshotID)
 
 	now := time.Now()
 
@@ -293,20 +285,252 @@ func (s *SnapshotServiceImpl) CreateSnapshot(input *ec2.CreateSnapshotInput, acc
 
 	// Track the volume→snapshot dependency in KV before persisting to S3.
 	// This ensures we never have an untracked snapshot in S3.
-	if err := s.addSnapshotRef(volumeID, snapshotID); err != nil {
-		slog.Error("CreateSnapshot failed to add snapshot ref to KV", "snapshotId", snapshotID, "volumeId", volumeID, "err", err)
+	if err := s.addSnapshotRef(ctx, volumeID, snapshotID); err != nil {
+		slog.ErrorContext(ctx, "CreateSnapshot failed to add snapshot ref to KV", "snapshotId", snapshotID, "volumeId", volumeID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
 	if err := s.putSnapshotConfig(snapshotID, snapshotCfg); err != nil {
-		slog.Error("CreateSnapshot failed to write config", "snapshotId", snapshotID, "err", err)
-		_ = s.removeSnapshotRef(volumeID, snapshotID) // best-effort cleanup
+		slog.ErrorContext(ctx, "CreateSnapshot failed to write config", "snapshotId", snapshotID, "err", err)
+		if cleanupErr := s.removeSnapshotRefForCleanup(ctx, volumeID, snapshotID); cleanupErr != nil {
+			slog.Error("CreateSnapshot failed to roll back snapshot reference", "snapshotId", snapshotID, "volumeId", volumeID, "err", cleanupErr)
+		}
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
-	slog.Info("CreateSnapshot completed", "snapshotId", snapshotID, "volumeId", volumeID)
+	slog.InfoContext(ctx, "CreateSnapshot completed", "snapshotId", snapshotID, "volumeId", volumeID)
 
 	return snapshotConfigToEC2(snapshotCfg), nil
+}
+
+const (
+	// drainDialTimeout bounds the connect to the local drain socket. The socket
+	// is either being served on this node or it is not, so a slow connect means
+	// a wedged plugin rather than a busy one.
+	drainDialTimeout = time.Second
+
+	// drainAckTimeout bounds DrainToBackend on the hosting node: it flushes the
+	// WAL and the live checkpoint to S3, so it scales with the dirty set rather
+	// than with a fixed unit of work.
+	drainAckTimeout = 30 * time.Second
+
+	// drainRequestTimeout bounds the ec2.cmd round-trip. It exceeds
+	// drainAckTimeout so a slow drain surfaces as the hosting node's error
+	// instead of an opaque NATS timeout here.
+	drainRequestTimeout = 35 * time.Second
+)
+
+// ErrNoDrainSocket reports that this node has no drain socket for the volume,
+// which is how a node learns it does not serve it. It is deliberately distinct
+// from a socket that answered badly: only the former is worth routing onward,
+// and conflating the two makes a node re-run a drain that has already failed.
+var ErrNoDrainSocket = errors.New("no drain socket on this node")
+
+// DrainVolumeSocket asks the NBD plugin serving volumeID on this node to flush
+// its WAL chunks and live checkpoint to S3, then waits for the ack. The plugin
+// creates the socket under {dataDir}/viperblock/{volumeID}/, so this only
+// succeeds on the node hosting the volume; the daemon calls it when a drain
+// command is routed to it.
+func DrainVolumeSocket(dataDir, volumeID string) error {
+	sockPath := filepath.Join(dataDir, "viperblock", volumeID, "snapshot.sock")
+	conn, err := net.DialTimeout("unix", sockPath, drainDialTimeout)
+	if err != nil {
+		return fmt.Errorf("%w: dial %s: %w", ErrNoDrainSocket, sockPath, err)
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(drainAckTimeout))
+	buf := make([]byte, 8)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("read drain ack for %s: %w", volumeID, err)
+	}
+	if !strings.HasPrefix(string(buf[:n]), "OK") {
+		return fmt.Errorf("drain of %s did not ack OK: %q", volumeID, string(buf[:n]))
+	}
+	return nil
+}
+
+// drainVolume flushes the volume's in-flight writes to S3 before the snapshot
+// reads the live checkpoint from there.
+func (s *SnapshotServiceImpl) drainVolume(ctx context.Context, volumeID string, meta viperblock.VolumeMetadata, accountID string) error {
+	return DrainVolume(ctx, s.config, s.store, s.natsConn, volumeID, meta, accountID)
+}
+
+// DrainVolume flushes the volume's in-flight writes to S3 before a live
+// checkpoint is read from there. Shared by ec2.CreateSnapshot and
+// ec2.CreateImage's running-instance path (handlers/ec2/image) so the two
+// live-snapshot call sites cannot diverge on when a drain is required.
+//
+// The drain socket lives on the node serving the volume, but both callers are
+// queue-grouped across every node, so the node answering the request usually
+// is not that node. Whether a drain is required is therefore decided from the
+// volume's attachment record, never from whether the socket happens to be
+// local: an attached volume is being written to right now, and reading its
+// checkpoint without draining silently captures an older one.
+func DrainVolume(ctx context.Context, cfg *config.Config, store objectstore.ObjectStore, natsConn *nats.Conn, volumeID string, meta viperblock.VolumeMetadata, accountID string) error {
+	// A metadata-only snapshot never reads the live checkpoint, so there is
+	// nothing for a drain to make current.
+	if cfg == nil || cfg.Predastore.Host == "" {
+		return nil
+	}
+
+	state, instanceID, err := volumeAttachment(ctx, store, cfg.Predastore.Bucket, volumeID, meta)
+	if err != nil {
+		return err
+	}
+
+	// Nothing is writing to an unattached volume: the checkpoint its Close()
+	// left behind is the current one. Decide this before touching the socket —
+	// dialing it is not a probe, it makes the plugin run a full flush.
+	if state != "in-use" || instanceID == "" {
+		slog.InfoContext(ctx, "DrainVolume: volume not attached, snapshotting the checkpoint left by Close (stopped instance path)",
+			"volumeId", volumeID, "state", state, "attachedInstance", instanceID)
+		return nil
+	}
+
+	// Fast path: the volume is served by this node, so no hop is needed. This is
+	// every single-node deployment, and the node hosting the instance on a
+	// cluster.
+	localErr := DrainVolumeSocket(cfg.DataDir, volumeID)
+	if localErr == nil {
+		return nil
+	}
+
+	// A socket that answered but did not ack means this node does serve the
+	// volume and the flush itself failed. Routing that onward would land back on
+	// this same node and repeat the drain that has already failed.
+	if !errors.Is(localErr, ErrNoDrainSocket) {
+		return fmt.Errorf("drain volume %s on this node: %w", volumeID, localErr)
+	}
+
+	slog.InfoContext(ctx, "DrainVolume: volume attached, routing drain to the node hosting it",
+		"volumeId", volumeID, "instanceId", instanceID)
+	return drainOnHostNode(ctx, natsConn, volumeID, instanceID, accountID)
+}
+
+// volumeAttachment returns the volume's authoritative state and attached
+// instance. state.json is control-plane-owned and authoritative; the copy in
+// config.json (passed in as meta) is rewritten by the live NBD plugin from its
+// stale in-memory state and is only used for volumes predating the split.
+func volumeAttachment(ctx context.Context, store objectstore.ObjectStore, bucket, volumeID string, meta viperblock.VolumeMetadata) (state, instanceID string, err error) {
+	rec, found, err := volumestate.Read(ctx, store, bucket, volumeID)
+	if err != nil {
+		return "", "", fmt.Errorf("read volume state for %s: %w", volumeID, err)
+	}
+	if found {
+		return rec.State, rec.AttachedInstance, nil
+	}
+	return meta.State, meta.AttachedInstance, nil
+}
+
+// drainOnHostNode issues the drain on the node hosting instanceID. Only that
+// node subscribes ec2.cmd.{instanceID}, so the command is self-routing and no
+// volume-to-node resolution is needed here.
+//
+// An attachment record is not proof of a live writer: stop deliberately leaves
+// a boot volume attached (daemon/vm_adapters.go's volumeMounterAdapter.Unmount)
+// while tearing down both the NBD plugin and this subscription. The two
+// not-running signals below are therefore the stopped-instance path, not a
+// failure — treating them as one would make every stopped instance's root
+// volume permanently unsnapshottable.
+func drainOnHostNode(ctx context.Context, natsConn *nats.Conn, volumeID, instanceID, accountID string) error {
+	command := types.EC2InstanceCommand{
+		ID:              instanceID,
+		Attributes:      types.EC2CommandAttributes{DrainVolume: true},
+		DrainVolumeData: &types.DrainVolumeData{VolumeID: volumeID},
+	}
+
+	resp, err := utils.NATSRequest[types.DrainVolumeResponse](ctx, natsConn,
+		"ec2.cmd."+instanceID, command, drainRequestTimeout, accountID)
+	if err != nil {
+		// No subscriber at all: the instance runs nowhere in the cluster, so it
+		// was stopped (stop migrates it to shared KV before unsubscribing) and
+		// its volumes were sealed by Close. Warn rather than Info because the
+		// same shape appears if the hosting node has lost NATS while its VM
+		// keeps writing, which yields a stale snapshot as it did before routing
+		// existed. A live host that answers and fails is still a hard error.
+		if errors.Is(err, nats.ErrNoResponders) {
+			slog.WarnContext(ctx, "drainVolume: no node hosts the instance, treating the volume as stopped and snapshotting its sealed checkpoint",
+				"volumeId", volumeID, "instanceId", instanceID)
+			return nil
+		}
+		return fmt.Errorf("drain volume %s on the node hosting %s: %w", volumeID, instanceID, err)
+	}
+
+	switch resp.Status {
+	case types.DrainVolumeStatusDrained:
+		return nil
+	// The host still holds the instance but it is not running: nothing is
+	// writing, so there is nothing to flush. This is a host-drain stop, which
+	// keeps the VM (and this subscription) in place after unmounting.
+	case types.DrainVolumeStatusNotRunning:
+		slog.InfoContext(ctx, "drainVolume: instance is not running on its host, snapshotting the volume's sealed checkpoint",
+			"volumeId", volumeID, "instanceId", instanceID)
+		return nil
+	default:
+		return fmt.Errorf("drain volume %s on the node hosting %s: unexpected ack %q", volumeID, instanceID, resp.Status)
+	}
+}
+
+// snapshotVolume opens a read-only viperblock instance, reads the live checkpoint from S3
+// (written by nbdkit on every NBD Flush, and by the drain the caller has already run),
+// and calls CreateSnapshot. Falls back to the numbered checkpoint from Close if no live
+// checkpoint exists (stopped volume path).
+// If Predastore is not configured the snapshot proceeds as metadata-only.
+func (s *SnapshotServiceImpl) snapshotVolume(volumeID, snapshotID string, volumeSize uint64) error {
+	if s.config == nil || s.config.Predastore.Host == "" {
+		slog.Warn("snapshotVolume: Predastore not configured, skipping viperblock snapshot (metadata-only)", "volumeId", volumeID)
+		return nil
+	}
+
+	cfg := vbs3.S3Config{
+		VolumeName: volumeID,
+		VolumeSize: volumeSize,
+		Bucket:     s.config.Predastore.Bucket,
+		Region:     s.config.Predastore.Region,
+		AccessKey:  s.config.Predastore.AccessKey,
+		SecretKey:  s.config.Predastore.SecretKey,
+		Host:       s.config.Predastore.Host,
+	}
+
+	mkey, err := utils.LoadViperblockMasterKey(s.config.Viperblock.EncryptionKeyFile)
+	if err != nil {
+		return fmt.Errorf("load encryption key: %w", err)
+	}
+
+	vbconfig := viperblock.VB{
+		VolumeName:        volumeID,
+		VolumeSize:        volumeSize,
+		BaseDir:           s.config.WalDir,
+		Cache:             viperblock.Cache{Config: viperblock.CacheConfig{Size: 0}},
+		MasterKey:         mkey,
+		EncryptionEnabled: mkey != nil,
+	}
+
+	vb, err := viperblock.New(&vbconfig, "s3", cfg)
+	if err != nil {
+		return fmt.Errorf("new viperblock: %w", err)
+	}
+	defer func() {
+		vb.StopChunkUploader()
+		vb.StopWALSyncer()
+	}()
+
+	if err := vb.Backend.Init(); err != nil {
+		return fmt.Errorf("backend init: %w", err)
+	}
+	if err := vb.LoadState(); err != nil {
+		return fmt.Errorf("load state: %w", err)
+	}
+
+	if err := vb.LoadLiveCheckpoint(); err != nil {
+		return fmt.Errorf("load live checkpoint: %w", err)
+	}
+	if _, err := vb.CreateSnapshot(snapshotID); err != nil {
+		return fmt.Errorf("create snapshot: %w", err)
+	}
+	return nil
 }
 
 // describeSnapshotsValidFilters defines the set of filter names accepted by DescribeSnapshots.
@@ -319,11 +543,23 @@ var describeSnapshotsValidFilters = map[string]bool{
 }
 
 // DescribeSnapshots lists snapshots matching the specified criteria, scoped to the caller's account.
-func (s *SnapshotServiceImpl) DescribeSnapshots(input *ec2.DescribeSnapshotsInput, accountID string) (*ec2.DescribeSnapshotsOutput, error) {
+func (s *SnapshotServiceImpl) DescribeSnapshots(ctx context.Context, input *ec2.DescribeSnapshotsInput, accountID string) (*ec2.DescribeSnapshotsOutput, error) {
+	return s.describeSnapshots(ctx, input, accountID, false)
+}
+
+// DescribeSnapshotsStrict is the control-plane lookup contract. A metadata read
+// failure makes the result non-authoritative, so it is returned rather than
+// hidden as an absent snapshot.
+func (s *SnapshotServiceImpl) DescribeSnapshotsStrict(ctx context.Context, input *ec2.DescribeSnapshotsInput, accountID string) (*ec2.DescribeSnapshotsOutput, error) {
+	return s.describeSnapshots(ctx, input, accountID, true)
+}
+
+func (s *SnapshotServiceImpl) describeSnapshots(ctx context.Context, input *ec2.DescribeSnapshotsInput,
+	accountID string, strict bool) (*ec2.DescribeSnapshotsOutput, error) {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
-	slog.Info("DescribeSnapshots request", "snapshotIds", input.SnapshotIds, "accountID", accountID)
+	slog.InfoContext(ctx, "DescribeSnapshots request", "snapshotIds", input.SnapshotIds, "accountID", accountID)
 
 	snapshotIDFilter := make(map[string]bool)
 	for _, id := range input.SnapshotIds {
@@ -334,17 +570,17 @@ func (s *SnapshotServiceImpl) DescribeSnapshots(input *ec2.DescribeSnapshotsInpu
 
 	parsedFilters, err := filterutil.ParseFilters(input.Filters, describeSnapshotsValidFilters)
 	if err != nil {
-		slog.Warn("DescribeSnapshots: invalid filter", "err", err)
+		slog.WarnContext(ctx, "DescribeSnapshots: invalid filter", "err", err)
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 
-	listResult, err := s.store.ListObjectsV2(&s3.ListObjectsV2Input{
+	listResult, err := s.store.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(s.config.Predastore.Bucket),
 		Prefix:    aws.String("snap-"),
 		Delimiter: aws.String("/"),
 	})
 	if err != nil {
-		slog.Error("DescribeSnapshots failed to list objects", "err", err)
+		slog.ErrorContext(ctx, "DescribeSnapshots failed to list objects", "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
@@ -377,7 +613,10 @@ func (s *SnapshotServiceImpl) DescribeSnapshots(input *ec2.DescribeSnapshotsInpu
 
 		cfg, err := s.getSnapshotConfig(snapshotID)
 		if err != nil {
-			slog.Warn("DescribeSnapshots failed to get config", "snapshotId", snapshotID, "err", err)
+			slog.WarnContext(ctx, "DescribeSnapshots failed to get config", "snapshotId", snapshotID, "err", err)
+			if strict {
+				return nil, fmt.Errorf("describe snapshot %s metadata: %w", snapshotID, err)
+			}
 			continue
 		}
 
@@ -393,7 +632,23 @@ func (s *SnapshotServiceImpl) DescribeSnapshots(input *ec2.DescribeSnapshotsInpu
 		snapshots = append(snapshots, snapshotConfigToEC2(cfg))
 	}
 
-	slog.Info("DescribeSnapshots completed", "count", len(snapshots))
+	// Naming a specific, nonexistent snapshot ID is an error, unlike an
+	// unfiltered list or a --filters query that simply matches nothing.
+	if len(snapshotIDFilter) > 0 {
+		found := make(map[string]bool, len(snapshots))
+		for _, snap := range snapshots {
+			if snap.SnapshotId != nil {
+				found[*snap.SnapshotId] = true
+			}
+		}
+		for id := range snapshotIDFilter {
+			if !found[id] {
+				return nil, errors.New(awserrors.ErrorInvalidSnapshotNotFound)
+			}
+		}
+	}
+
+	slog.InfoContext(ctx, "DescribeSnapshots completed", "count", len(snapshots))
 
 	return &ec2.DescribeSnapshotsOutput{
 		Snapshots: snapshots,
@@ -432,8 +687,8 @@ func snapshotMatchesFilters(cfg *SnapshotConfig, filters map[string][]string) bo
 }
 
 // snapshotInUseByVolumes checks if any volume was created from the given snapshot.
-func (s *SnapshotServiceImpl) snapshotInUseByVolumes(snapshotID string) (bool, error) {
-	listResult, err := s.store.ListObjectsV2(&s3.ListObjectsV2Input{
+func (s *SnapshotServiceImpl) snapshotInUseByVolumes(ctx context.Context, snapshotID string) (bool, error) {
+	listResult, err := s.store.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(s.config.Predastore.Bucket),
 		Prefix:    aws.String("vol-"),
 		Delimiter: aws.String("/"),
@@ -449,7 +704,7 @@ func (s *SnapshotServiceImpl) snapshotInUseByVolumes(snapshotID string) (bool, e
 		volumeID := strings.TrimSuffix(*prefix.Prefix, "/")
 		configKey := fmt.Sprintf("%s/config.json", volumeID)
 
-		result, err := s.store.GetObject(&s3.GetObjectInput{
+		result, err := s.store.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(s.config.Predastore.Bucket),
 			Key:    aws.String(configKey),
 		})
@@ -478,44 +733,44 @@ func (s *SnapshotServiceImpl) snapshotInUseByVolumes(snapshotID string) (bool, e
 }
 
 // DeleteSnapshot deletes a snapshot after verifying the caller owns it.
-func (s *SnapshotServiceImpl) DeleteSnapshot(input *ec2.DeleteSnapshotInput, accountID string) (*ec2.DeleteSnapshotOutput, error) {
+func (s *SnapshotServiceImpl) DeleteSnapshot(ctx context.Context, input *ec2.DeleteSnapshotInput, accountID string) (*ec2.DeleteSnapshotOutput, error) {
 	if input == nil || input.SnapshotId == nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 
 	snapshotID := *input.SnapshotId
 
-	slog.Info("DeleteSnapshot request", "snapshotId", snapshotID, "accountID", accountID)
+	slog.InfoContext(ctx, "DeleteSnapshot request", "snapshotId", snapshotID, "accountID", accountID)
 
 	cfg, err := s.getSnapshotConfig(snapshotID)
 	if err != nil {
-		slog.Error("DeleteSnapshot snapshot not found", "snapshotId", snapshotID, "err", err)
+		slog.ErrorContext(ctx, "DeleteSnapshot snapshot not found", "snapshotId", snapshotID, "err", err)
 		return nil, err
 	}
 
 	// Verify ownership: caller must own the snapshot
 	if accountID != "" && cfg.OwnerID != "" && cfg.OwnerID != accountID {
-		slog.Warn("DeleteSnapshot: account does not own snapshot", "snapshotId", snapshotID, "accountID", accountID, "ownerID", cfg.OwnerID)
+		slog.WarnContext(ctx, "DeleteSnapshot: account does not own snapshot", "snapshotId", snapshotID, "accountID", accountID, "ownerID", cfg.OwnerID)
 		return nil, errors.New(awserrors.ErrorUnauthorizedOperation)
 	}
 
 	// Check if any volumes were created from this snapshot
-	inUse, err := s.snapshotInUseByVolumes(snapshotID)
+	inUse, err := s.snapshotInUseByVolumes(ctx, snapshotID)
 	if err != nil {
-		slog.Error("DeleteSnapshot failed to check snapshot usage", "snapshotId", snapshotID, "err", err)
+		slog.ErrorContext(ctx, "DeleteSnapshot failed to check snapshot usage", "snapshotId", snapshotID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 	if inUse {
-		slog.Info("DeleteSnapshot blocked: snapshot in use by volume", "snapshotId", snapshotID)
+		slog.InfoContext(ctx, "DeleteSnapshot blocked: snapshot in use by volume", "snapshotId", snapshotID)
 		return nil, errors.New(awserrors.ErrorInvalidSnapshotInUse)
 	}
 
-	listResult, err := s.store.ListObjectsV2(&s3.ListObjectsV2Input{
+	listResult, err := s.store.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.config.Predastore.Bucket),
 		Prefix: aws.String(snapshotID + "/"),
 	})
 	if err != nil {
-		slog.Error("DeleteSnapshot failed to list objects", "snapshotId", snapshotID, "err", err)
+		slog.ErrorContext(ctx, "DeleteSnapshot failed to list objects", "snapshotId", snapshotID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
@@ -523,46 +778,46 @@ func (s *SnapshotServiceImpl) DeleteSnapshot(input *ec2.DeleteSnapshotInput, acc
 		if obj.Key == nil {
 			continue
 		}
-		_, err := s.store.DeleteObject(&s3.DeleteObjectInput{
+		_, err := s.store.DeleteObject(ctx, &s3.DeleteObjectInput{
 			Bucket: aws.String(s.config.Predastore.Bucket),
 			Key:    obj.Key,
 		})
 		if err != nil {
-			slog.Warn("DeleteSnapshot failed to delete object", "key", *obj.Key, "err", err)
+			slog.WarnContext(ctx, "DeleteSnapshot failed to delete object", "key", *obj.Key, "err", err)
 		}
 	}
 
 	// Remove from KV after S3 cleanup. Failure is logged but not fatal —
 	// a phantom entry safely blocks volume deletion rather than allowing it.
-	if err := s.removeSnapshotRef(cfg.VolumeID, snapshotID); err != nil {
+	if err := s.removeSnapshotRefForCleanup(ctx, cfg.VolumeID, snapshotID); err != nil {
 		slog.Warn("DeleteSnapshot failed to remove snapshot ref from KV", "snapshotId", snapshotID, "volumeId", cfg.VolumeID, "err", err)
 	}
 
-	slog.Info("DeleteSnapshot completed", "snapshotId", snapshotID)
+	slog.InfoContext(ctx, "DeleteSnapshot completed", "snapshotId", snapshotID)
 
 	return &ec2.DeleteSnapshotOutput{}, nil
 }
 
 // CopySnapshot copies a snapshot (within same region for now).
 // The copied snapshot is owned by the caller's account.
-func (s *SnapshotServiceImpl) CopySnapshot(input *ec2.CopySnapshotInput, accountID string) (*ec2.CopySnapshotOutput, error) {
+func (s *SnapshotServiceImpl) CopySnapshot(ctx context.Context, input *ec2.CopySnapshotInput, accountID string) (*ec2.CopySnapshotOutput, error) {
 	if input == nil || input.SourceSnapshotId == nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 
 	sourceSnapshotID := *input.SourceSnapshotId
 
-	slog.Info("CopySnapshot request", "sourceSnapshotId", sourceSnapshotID, "accountID", accountID)
+	slog.InfoContext(ctx, "CopySnapshot request", "sourceSnapshotId", sourceSnapshotID, "accountID", accountID)
 
 	sourceCfg, err := s.getSnapshotConfig(sourceSnapshotID)
 	if err != nil {
-		slog.Error("CopySnapshot source snapshot not found", "snapshotId", sourceSnapshotID, "err", err)
+		slog.ErrorContext(ctx, "CopySnapshot source snapshot not found", "snapshotId", sourceSnapshotID, "err", err)
 		return nil, err
 	}
 
 	// Verify the caller owns the source snapshot
 	if accountID != "" && sourceCfg.OwnerID != "" && sourceCfg.OwnerID != accountID {
-		slog.Warn("CopySnapshot: account does not own source snapshot", "snapshotId", sourceSnapshotID, "accountID", accountID, "ownerID", sourceCfg.OwnerID)
+		slog.WarnContext(ctx, "CopySnapshot: account does not own source snapshot", "snapshotId", sourceSnapshotID, "accountID", accountID, "ownerID", sourceCfg.OwnerID)
 		return nil, errors.New(awserrors.ErrorUnauthorizedOperation)
 	}
 
@@ -589,18 +844,20 @@ func (s *SnapshotServiceImpl) CopySnapshot(input *ec2.CopySnapshotInput, account
 	maps.Copy(newCfg.Tags, sourceCfg.Tags)
 
 	// Track the volume→snapshot dependency in KV before persisting to S3.
-	if err := s.addSnapshotRef(sourceCfg.VolumeID, newSnapshotID); err != nil {
-		slog.Error("CopySnapshot failed to add snapshot ref to KV", "snapshotId", newSnapshotID, "volumeId", sourceCfg.VolumeID, "err", err)
+	if err := s.addSnapshotRef(ctx, sourceCfg.VolumeID, newSnapshotID); err != nil {
+		slog.ErrorContext(ctx, "CopySnapshot failed to add snapshot ref to KV", "snapshotId", newSnapshotID, "volumeId", sourceCfg.VolumeID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
 	if err := s.putSnapshotConfig(newSnapshotID, newCfg); err != nil {
-		slog.Error("CopySnapshot failed to write config", "snapshotId", newSnapshotID, "err", err)
-		_ = s.removeSnapshotRef(sourceCfg.VolumeID, newSnapshotID) // best-effort cleanup
+		slog.ErrorContext(ctx, "CopySnapshot failed to write config", "snapshotId", newSnapshotID, "err", err)
+		if cleanupErr := s.removeSnapshotRefForCleanup(ctx, sourceCfg.VolumeID, newSnapshotID); cleanupErr != nil {
+			slog.Error("CopySnapshot failed to roll back snapshot reference", "snapshotId", newSnapshotID, "volumeId", sourceCfg.VolumeID, "err", cleanupErr)
+		}
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
-	slog.Info("CopySnapshot completed", "sourceSnapshotId", sourceSnapshotID, "newSnapshotId", newSnapshotID)
+	slog.InfoContext(ctx, "CopySnapshot completed", "sourceSnapshotId", sourceSnapshotID, "newSnapshotId", newSnapshotID)
 
 	return &ec2.CopySnapshotOutput{
 		SnapshotId: aws.String(newSnapshotID),
@@ -609,7 +866,7 @@ func (s *SnapshotServiceImpl) CopySnapshot(input *ec2.CopySnapshotInput, account
 
 // addSnapshotRef adds snapshotID to the volume's snapshot list in KV.
 // Uses CAS (Create/Update with revision) to prevent lost updates under concurrency.
-func (s *SnapshotServiceImpl) addSnapshotRef(volumeID, snapshotID string) error {
+func (s *SnapshotServiceImpl) addSnapshotRef(ctx context.Context, volumeID, snapshotID string) error {
 	if s.snapKV == nil {
 		slog.Debug("addSnapshotRef: snapshotKV is nil, skipping", "volumeId", volumeID, "snapshotId", snapshotID)
 		return nil
@@ -617,11 +874,11 @@ func (s *SnapshotServiceImpl) addSnapshotRef(volumeID, snapshotID string) error 
 
 	const maxRetries = 5
 	for attempt := range maxRetries {
-		entry, err := s.snapKV.Get(volumeID)
+		entry, err := s.snapKV.Get(ctx, volumeID)
 		var snapshots []string
 
 		if err != nil {
-			if !errors.Is(err, nats.ErrKeyNotFound) {
+			if !errors.Is(err, jetstream.ErrKeyNotFound) {
 				return fmt.Errorf("addSnapshotRef: failed to get KV key %s: %w", volumeID, err)
 			}
 			// Key doesn't exist yet — create with just this snapshot
@@ -629,7 +886,7 @@ func (s *SnapshotServiceImpl) addSnapshotRef(volumeID, snapshotID string) error 
 			if err != nil {
 				return fmt.Errorf("addSnapshotRef: failed to marshal snapshot list: %w", err)
 			}
-			if _, err := s.snapKV.Create(volumeID, data); err != nil {
+			if _, err := s.snapKV.Create(ctx, volumeID, data); err != nil {
 				if attempt < maxRetries-1 {
 					continue // concurrent Create/Update — retry
 				}
@@ -650,7 +907,7 @@ func (s *SnapshotServiceImpl) addSnapshotRef(volumeID, snapshotID string) error 
 			return fmt.Errorf("addSnapshotRef: failed to marshal snapshot list: %w", err)
 		}
 
-		if _, err := s.snapKV.Update(volumeID, data, entry.Revision()); err != nil {
+		if _, err := s.snapKV.Update(ctx, volumeID, data, entry.Revision()); err != nil {
 			if attempt < maxRetries-1 {
 				continue // concurrent update — retry
 			}
@@ -664,10 +921,18 @@ func (s *SnapshotServiceImpl) addSnapshotRef(volumeID, snapshotID string) error 
 	return fmt.Errorf("addSnapshotRef: exhausted retries for KV key %s", volumeID)
 }
 
+// removeSnapshotRefForCleanup removes a reference with a bounded context that
+// survives request cancellation after the snapshot operation has committed.
+func (s *SnapshotServiceImpl) removeSnapshotRefForCleanup(ctx context.Context, volumeID, snapshotID string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotCleanupTimeout)
+	defer cancel()
+	return s.removeSnapshotRef(cleanupCtx, volumeID, snapshotID)
+}
+
 // removeSnapshotRef removes snapshotID from the volume's snapshot list in KV.
 // Deletes the key if the list becomes empty.
 // Uses CAS (Update with revision) to prevent lost updates under concurrency.
-func (s *SnapshotServiceImpl) removeSnapshotRef(volumeID, snapshotID string) error {
+func (s *SnapshotServiceImpl) removeSnapshotRef(ctx context.Context, volumeID, snapshotID string) error {
 	if s.snapKV == nil {
 		slog.Debug("removeSnapshotRef: snapshotKV is nil, skipping", "volumeId", volumeID, "snapshotId", snapshotID)
 		return nil
@@ -675,9 +940,9 @@ func (s *SnapshotServiceImpl) removeSnapshotRef(volumeID, snapshotID string) err
 
 	const maxRetries = 5
 	for attempt := range maxRetries {
-		entry, err := s.snapKV.Get(volumeID)
+		entry, err := s.snapKV.Get(ctx, volumeID)
 		if err != nil {
-			if errors.Is(err, nats.ErrKeyNotFound) {
+			if errors.Is(err, jetstream.ErrKeyNotFound) {
 				return nil
 			}
 			return fmt.Errorf("removeSnapshotRef: failed to get KV key %s: %w", volumeID, err)
@@ -696,7 +961,7 @@ func (s *SnapshotServiceImpl) removeSnapshotRef(volumeID, snapshotID string) err
 		}
 
 		if len(filtered) == 0 {
-			if err := s.snapKV.Delete(volumeID); err != nil && !errors.Is(err, nats.ErrKeyNotFound) {
+			if err := s.snapKV.Delete(ctx, volumeID); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
 				return fmt.Errorf("removeSnapshotRef: failed to delete KV key %s: %w", volumeID, err)
 			}
 		} else {
@@ -704,7 +969,7 @@ func (s *SnapshotServiceImpl) removeSnapshotRef(volumeID, snapshotID string) err
 			if err != nil {
 				return fmt.Errorf("removeSnapshotRef: failed to marshal snapshot list: %w", err)
 			}
-			if _, err := s.snapKV.Update(volumeID, data, entry.Revision()); err != nil {
+			if _, err := s.snapKV.Update(ctx, volumeID, data, entry.Revision()); err != nil {
 				if attempt < maxRetries-1 {
 					continue // concurrent update — retry
 				}
@@ -720,14 +985,14 @@ func (s *SnapshotServiceImpl) removeSnapshotRef(volumeID, snapshotID string) err
 }
 
 // volumeHasSnapshots returns true if the volume has any snapshots in KV.
-func (s *SnapshotServiceImpl) volumeHasSnapshots(volumeID string) (bool, error) {
+func (s *SnapshotServiceImpl) volumeHasSnapshots(ctx context.Context, volumeID string) (bool, error) {
 	if s.snapKV == nil {
 		return false, nil
 	}
 
-	entry, err := s.snapKV.Get(volumeID)
+	entry, err := s.snapKV.Get(ctx, volumeID)
 	if err != nil {
-		if errors.Is(err, nats.ErrKeyNotFound) {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			return false, nil
 		}
 		return false, fmt.Errorf("volumeHasSnapshots: failed to get KV key %s: %w", volumeID, err)
@@ -739,4 +1004,53 @@ func (s *SnapshotServiceImpl) volumeHasSnapshots(volumeID string) (bool, error) 
 	}
 
 	return len(snapshots) > 0, nil
+}
+
+// ApplyRecordTags mirrors CreateTags into the owning snapshot metadata so
+// DescribeSnapshots observes tags added after create. Non-snap ids, snapshots
+// absent from this store, and snapshots the caller does not own are skipped.
+func (s *SnapshotServiceImpl) ApplyRecordTags(input *ec2.CreateTagsInput, accountID string) error {
+	if input == nil {
+		return nil
+	}
+	return s.mirrorSnapshotTags(input.Resources, accountID, utils.MergeTagsMut(input))
+}
+
+// RemoveRecordTags mirrors DeleteTags into the owning snapshot metadata with
+// AWS-faithful delete semantics.
+func (s *SnapshotServiceImpl) RemoveRecordTags(input *ec2.DeleteTagsInput, accountID string) error {
+	if input == nil {
+		return nil
+	}
+	return s.mirrorSnapshotTags(input.Resources, accountID, utils.RemoveTagsMut(input))
+}
+
+// mirrorSnapshotTags read-modify-writes SnapshotConfig.Tags for each snap- id.
+// metadata.json lives at a global ID-keyed path, so the mutation is gated on
+// the caller owning the snapshot (OwnerID match); mismatch or absence no-ops.
+func (s *SnapshotServiceImpl) mirrorSnapshotTags(resources []*string, accountID string, mut func(map[string]string)) error {
+	for _, res := range resources {
+		if res == nil || !strings.HasPrefix(*res, "snap-") {
+			continue
+		}
+		cfg, err := ReadSnapshotConfig(s.store, s.config.Predastore.Bucket, *res)
+		if err != nil {
+			if objectstore.IsNoSuchKeyError(err) {
+				continue
+			}
+			return err
+		}
+		if cfg.OwnerID != accountID {
+			slog.Debug("mirrorSnapshotTags: skipping snapshot not owned by caller", "snapshotId", *res)
+			continue
+		}
+		if cfg.Tags == nil {
+			cfg.Tags = map[string]string{}
+		}
+		mut(cfg.Tags)
+		if err := s.putSnapshotConfig(*res, cfg); err != nil {
+			return err
+		}
+	}
+	return nil
 }

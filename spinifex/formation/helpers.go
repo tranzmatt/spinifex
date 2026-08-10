@@ -1,10 +1,23 @@
 package formation
 
 import (
+	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/mulgadc/spinifex/spinifex/admin"
+)
+
+// ovnDBQuorum is the number of nodes that host the clustered OVN NB/SB
+// databases. The first ovnDBQuorum nodes (by sorted name) form the RAFT
+// quorum; every other node is OVN compute-only and dials these endpoints.
+const ovnDBQuorum = 3
+
+// OVN database client ports served by each RAFT quorum node.
+const (
+	ovnNBPort = 6641
+	ovnSBPort = 6642
 )
 
 // hasService reports whether the node's service list includes name.
@@ -55,6 +68,36 @@ func BuildPredastoreNodes(nodes map[string]NodeInfo) []admin.PredastoreNodeConfi
 		}
 	}
 	return out
+}
+
+// OVNDBQuorumNames returns the sorted names of the nodes that host the
+// clustered OVN NB/SB databases: the first ovnDBQuorum names (sorted). Every
+// other node is OVN compute-only and does not run the DB servers. Endpoint
+// construction (BuildOVNDBAddrs) and role probing both route through this so
+// they can never disagree on membership; callers test membership with
+// slices.Contains.
+func OVNDBQuorumNames(nodeNames []string) []string {
+	sorted := slices.Sorted(slices.Values(nodeNames))
+	if len(sorted) > ovnDBQuorum {
+		sorted = sorted[:ovnDBQuorum]
+	}
+	return sorted
+}
+
+// BuildOVNDBAddrs returns comma-separated OVN NB and SB endpoint lists for the
+// RAFT quorum nodes (first ovnDBQuorum by sorted name). Every node — quorum and
+// compute alike — points its OVN client at the full list so libovsdb fails over
+// across the cluster. BindIP is the cross-node dial address.
+func BuildOVNDBAddrs(nodes map[string]NodeInfo) (nbAddr, sbAddr string) {
+	members := OVNDBQuorumNames(slices.Collect(maps.Keys(nodes)))
+	nb := make([]string, len(members))
+	sb := make([]string, len(members))
+	for i, name := range members {
+		n := nodes[name]
+		nb[i] = fmt.Sprintf("tcp:%s:%d", n.BindIP, ovnNBPort)
+		sb[i] = fmt.Sprintf("tcp:%s:%d", n.BindIP, ovnSBPort)
+	}
+	return strings.Join(nb, ","), strings.Join(sb, ",")
 }
 
 // sortedNodes returns nodes sorted by name.

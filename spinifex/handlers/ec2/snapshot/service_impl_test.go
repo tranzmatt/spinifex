@@ -1,10 +1,13 @@
 package handlers_ec2_snapshot
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -12,9 +15,9 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/mulgadc/spinifex/spinifex/objectstore"
+	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/mulgadc/viperblock/viperblock"
-	"github.com/nats-io/nats-server/v2/server"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -22,7 +25,7 @@ import (
 const testAccountID = "111122223333"
 const otherAccountID = "444455556666"
 
-// setupTestSnapshotService creates a snapshot service with in-memory storage for testing
+// setupTestSnapshotService creates a snapshot service with in-memory storage for testing.
 func setupTestSnapshotService(t *testing.T) (*SnapshotServiceImpl, *objectstore.MemoryObjectStore) {
 	store := objectstore.NewMemoryObjectStore()
 	cfg := &config.Config{
@@ -50,7 +53,7 @@ func createTestVolume(t *testing.T, store *objectstore.MemoryObjectStore, volume
 	data, err := json.Marshal(volumeState)
 	require.NoError(t, err)
 
-	_, err = store.PutObject(&s3.PutObjectInput{
+	_, err = store.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket:      aws.String("test-bucket"),
 		Key:         aws.String(volumeID + "/config.json"),
 		Body:        strings.NewReader(string(data)),
@@ -59,7 +62,7 @@ func createTestVolume(t *testing.T, store *objectstore.MemoryObjectStore, volume
 	require.NoError(t, err)
 }
 
-// TestCreateSnapshot tests creating a snapshot from a volume
+// TestCreateSnapshot tests creating a snapshot from a volume.
 func TestCreateSnapshot(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 
@@ -68,7 +71,7 @@ func TestCreateSnapshot(t *testing.T) {
 	createTestVolume(t, store, volumeID, 100)
 
 	// Create snapshot
-	result, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	result, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId:    aws.String(volumeID),
 		Description: aws.String("Test snapshot"),
 		TagSpecifications: []*ec2.TagSpecification{
@@ -97,16 +100,16 @@ func TestCreateSnapshot(t *testing.T) {
 	assert.Equal(t, "test-snap", *result.Tags[0].Value)
 }
 
-// TestCreateSnapshot_MissingVolumeId tests creating a snapshot without volume ID
+// TestCreateSnapshot_MissingVolumeId tests creating a snapshot without volume ID.
 func TestCreateSnapshot_MissingVolumeId(t *testing.T) {
 	svc, _ := setupTestSnapshotService(t)
 
-	_, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{}, testAccountID)
+	_, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{}, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), awserrors.ErrorInvalidParameterValue)
 }
 
-// TestCreateSnapshot_VolumeZeroSize tests that creating a snapshot from a volume with zero SizeGiB fails
+// TestCreateSnapshot_VolumeZeroSize tests that creating a snapshot from a volume with zero SizeGiB fails.
 func TestCreateSnapshot_VolumeZeroSize(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 
@@ -121,14 +124,14 @@ func TestCreateSnapshot_VolumeZeroSize(t *testing.T) {
 	data, err := json.Marshal(volumeState)
 	require.NoError(t, err)
 
-	_, err = store.PutObject(&s3.PutObjectInput{
+	_, err = store.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket: aws.String("test-bucket"),
 		Key:    aws.String("vol-zerosize/config.json"),
 		Body:   strings.NewReader(string(data)),
 	})
 	require.NoError(t, err)
 
-	_, err = svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	_, err = svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String("vol-zerosize"),
 	}, testAccountID)
 	require.Error(t, err)
@@ -157,7 +160,7 @@ func createEncryptedTestVolume(t *testing.T, store *objectstore.MemoryObjectStor
 	})
 	require.NoError(t, err)
 
-	_, err = store.PutObject(&s3.PutObjectInput{
+	_, err = store.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket: aws.String("test-bucket"),
 		Key:    aws.String(volumeID + "/config.json"),
 		Body:   strings.NewReader(string(envelope)),
@@ -174,7 +177,7 @@ func TestCreateSnapshot_EncryptedVolumeEnvelope(t *testing.T) {
 	volumeID := "vol-enc-snap"
 	createEncryptedTestVolume(t, store, volumeID, 100)
 
-	result, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	result, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String(volumeID),
 	}, testAccountID)
 	require.NoError(t, err)
@@ -202,30 +205,30 @@ func TestSnapshotInUseByVolumes_EncryptedVolume(t *testing.T) {
 		"authtag": "deadbeefdeadbeefdeadbeefdeadbeef",
 	})
 	require.NoError(t, err)
-	_, err = store.PutObject(&s3.PutObjectInput{
+	_, err = store.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket: aws.String("test-bucket"),
 		Key:    aws.String("vol-fromsnap/config.json"),
 		Body:   strings.NewReader(string(envelope)),
 	})
 	require.NoError(t, err)
 
-	inUse, err := svc.snapshotInUseByVolumes("snap-src")
+	inUse, err := svc.snapshotInUseByVolumes(context.Background(), "snap-src")
 	require.NoError(t, err)
 	assert.True(t, inUse, "encrypted volume's SnapshotID must be visible through the envelope")
 }
 
-// TestCreateSnapshot_VolumeNotFound tests creating a snapshot from non-existent volume
+// TestCreateSnapshot_VolumeNotFound tests creating a snapshot from non-existent volume.
 func TestCreateSnapshot_VolumeNotFound(t *testing.T) {
 	svc, _ := setupTestSnapshotService(t)
 
-	_, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	_, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String("vol-nonexistent"),
 	}, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), awserrors.ErrorInvalidVolumeNotFound)
 }
 
-// TestDescribeSnapshots tests listing all snapshots
+// TestDescribeSnapshots tests listing all snapshots.
 func TestDescribeSnapshots(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 
@@ -234,20 +237,20 @@ func TestDescribeSnapshots(t *testing.T) {
 	createTestVolume(t, store, "vol-2", 100)
 
 	// Create multiple snapshots
-	snap1, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snap1, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId:    aws.String("vol-1"),
 		Description: aws.String("Snapshot 1"),
 	}, testAccountID)
 	require.NoError(t, err)
 
-	snap2, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snap2, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId:    aws.String("vol-2"),
 		Description: aws.String("Snapshot 2"),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Describe all snapshots
-	result, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{}, testAccountID)
+	result, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{}, testAccountID)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.Len(t, result.Snapshots, 2)
@@ -261,7 +264,28 @@ func TestDescribeSnapshots(t *testing.T) {
 	assert.True(t, snapshotIDs[*snap2.SnapshotId])
 }
 
-// TestDescribeSnapshots_ByID tests listing specific snapshots by ID
+func TestDescribeSnapshotsStrict_RejectsPartialMetadataResults(t *testing.T) {
+	svc, store := setupTestSnapshotService(t)
+	_, err := store.PutObject(t.Context(), &s3.PutObjectInput{
+		Bucket: aws.String("test-bucket"),
+		Key:    aws.String(GetSnapshotKey("snap-corrupt")),
+		Body:   strings.NewReader("not-json"),
+	})
+	require.NoError(t, err)
+
+	// The customer-facing list retains its historical best-effort behavior.
+	out, err := svc.DescribeSnapshots(t.Context(), &ec2.DescribeSnapshotsInput{}, testAccountID)
+	require.NoError(t, err)
+	assert.Empty(t, out.Snapshots)
+
+	// Reconciliation cannot interpret that partial result as authoritative
+	// absence, so its internal lookup surfaces the metadata failure.
+	_, err = svc.DescribeSnapshotsStrict(t.Context(), &ec2.DescribeSnapshotsInput{}, testAccountID)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrCorruptSnapshotMetadata)
+}
+
+// TestDescribeSnapshots_ByID tests listing specific snapshots by ID.
 func TestDescribeSnapshots_ByID(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 
@@ -269,18 +293,18 @@ func TestDescribeSnapshots_ByID(t *testing.T) {
 	createTestVolume(t, store, "vol-1", 50)
 
 	// Create multiple snapshots
-	snap1, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snap1, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String("vol-1"),
 	}, testAccountID)
 	require.NoError(t, err)
 
-	_, err = svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	_, err = svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String("vol-1"),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Describe only the first snapshot
-	result, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	result, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		SnapshotIds: []*string{snap1.SnapshotId},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -289,111 +313,137 @@ func TestDescribeSnapshots_ByID(t *testing.T) {
 	assert.Equal(t, *snap1.SnapshotId, *result.Snapshots[0].SnapshotId)
 }
 
-// TestDescribeSnapshots_Empty tests listing snapshots when none exist
+// TestDescribeSnapshots_NotFound asserts that naming a specific, nonexistent
+// snapshot ID errors, matching real AWS: naming a missing resource is a
+// failure, unlike a --filters query that simply matches nothing (see
+// TestDescribeSnapshots_FilterNoResults).
+func TestDescribeSnapshots_NotFound(t *testing.T) {
+	svc, store := setupTestSnapshotService(t)
+	createTestVolume(t, store, "vol-1", 50)
+
+	snap1, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
+		VolumeId: aws.String("vol-1"),
+	}, testAccountID)
+	require.NoError(t, err)
+
+	_, err = svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
+		SnapshotIds: []*string{snap1.SnapshotId, aws.String("snap-0000000000000000")},
+	}, testAccountID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "InvalidSnapshot.NotFound")
+}
+
+// TestDescribeSnapshots_Empty tests listing snapshots when none exist.
 func TestDescribeSnapshots_Empty(t *testing.T) {
 	svc, _ := setupTestSnapshotService(t)
 
-	result, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{}, testAccountID)
+	result, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{}, testAccountID)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.Empty(t, result.Snapshots)
 }
 
-// TestDescribeSnapshots_AccountScoping tests that account A cannot see account B's snapshots
+// TestDescribeSnapshots_AccountScoping tests that account A cannot see account B's snapshots.
 func TestDescribeSnapshots_AccountScoping(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 
 	createTestVolume(t, store, "vol-1", 50)
 
 	// Account A creates a snapshot
-	snapA, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snapA, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String("vol-1"),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Account B creates a snapshot
-	snapB, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snapB, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String("vol-1"),
 	}, otherAccountID)
 	require.NoError(t, err)
 
 	// Account A should only see its own snapshot
-	resultA, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{}, testAccountID)
+	resultA, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, resultA.Snapshots, 1)
 	assert.Equal(t, *snapA.SnapshotId, *resultA.Snapshots[0].SnapshotId)
 
 	// Account B should only see its own snapshot
-	resultB, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{}, otherAccountID)
+	resultB, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{}, otherAccountID)
 	require.NoError(t, err)
 	require.Len(t, resultB.Snapshots, 1)
 	assert.Equal(t, *snapB.SnapshotId, *resultB.Snapshots[0].SnapshotId)
 }
 
-// TestDeleteSnapshot tests deleting a snapshot
+// TestDeleteSnapshot tests deleting a snapshot.
 func TestDeleteSnapshot(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 
 	// Create test volume and snapshot
 	createTestVolume(t, store, "vol-1", 50)
-	snap, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snap, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String("vol-1"),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Verify snapshot exists
-	result, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	result, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		SnapshotIds: []*string{snap.SnapshotId},
 	}, testAccountID)
 	require.NoError(t, err)
 	assert.Len(t, result.Snapshots, 1)
 
 	// Delete snapshot
-	_, err = svc.DeleteSnapshot(&ec2.DeleteSnapshotInput{
+	_, err = svc.DeleteSnapshot(context.Background(), &ec2.DeleteSnapshotInput{
 		SnapshotId: snap.SnapshotId,
 	}, testAccountID)
 	require.NoError(t, err)
 
-	// Verify snapshot is gone
-	result, err = svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	// Verify snapshot is gone: describing it by its now-deleted ID errors,
+	// matching real AWS (naming a specific missing resource is a failure).
+	_, err = svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		SnapshotIds: []*string{snap.SnapshotId},
 	}, testAccountID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "InvalidSnapshot.NotFound")
+
+	// An unfiltered list, unlike naming the deleted ID, is still empty with no error.
+	result, err = svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{}, testAccountID)
 	require.NoError(t, err)
 	assert.Empty(t, result.Snapshots)
 }
 
-// TestDeleteSnapshot_WrongAccount tests that account B cannot delete account A's snapshot
+// TestDeleteSnapshot_WrongAccount tests that account B cannot delete account A's snapshot.
 func TestDeleteSnapshot_WrongAccount(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 
 	createTestVolume(t, store, "vol-1", 50)
-	snap, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snap, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String("vol-1"),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Account B tries to delete account A's snapshot — should fail
-	_, err = svc.DeleteSnapshot(&ec2.DeleteSnapshotInput{
+	_, err = svc.DeleteSnapshot(context.Background(), &ec2.DeleteSnapshotInput{
 		SnapshotId: snap.SnapshotId,
 	}, otherAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), awserrors.ErrorUnauthorizedOperation)
 
 	// Verify snapshot still exists
-	result, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	result, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		SnapshotIds: []*string{snap.SnapshotId},
 	}, testAccountID)
 	require.NoError(t, err)
 	assert.Len(t, result.Snapshots, 1)
 }
 
-// TestDeleteSnapshot_InUseByVolume tests that deleting a snapshot fails when a volume was created from it
+// TestDeleteSnapshot_InUseByVolume tests that deleting a snapshot fails when a volume was created from it.
 func TestDeleteSnapshot_InUseByVolume(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 
 	// Create a test volume and snapshot
 	createTestVolume(t, store, "vol-source", 50)
-	snap, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snap, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String("vol-source"),
 	}, testAccountID)
 	require.NoError(t, err)
@@ -409,7 +459,7 @@ func TestDeleteSnapshot_InUseByVolume(t *testing.T) {
 	}
 	data, err := json.Marshal(volumeState)
 	require.NoError(t, err)
-	_, err = store.PutObject(&s3.PutObjectInput{
+	_, err = store.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket: aws.String("test-bucket"),
 		Key:    aws.String("vol-cloned/config.json"),
 		Body:   strings.NewReader(string(data)),
@@ -417,54 +467,54 @@ func TestDeleteSnapshot_InUseByVolume(t *testing.T) {
 	require.NoError(t, err)
 
 	// Attempt to delete the snapshot — should fail
-	_, err = svc.DeleteSnapshot(&ec2.DeleteSnapshotInput{
+	_, err = svc.DeleteSnapshot(context.Background(), &ec2.DeleteSnapshotInput{
 		SnapshotId: snap.SnapshotId,
 	}, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), awserrors.ErrorInvalidSnapshotInUse)
 
 	// Verify snapshot still exists
-	result, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	result, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		SnapshotIds: []*string{snap.SnapshotId},
 	}, testAccountID)
 	require.NoError(t, err)
 	assert.Len(t, result.Snapshots, 1)
 }
 
-// TestDeleteSnapshot_NotFound tests deleting a non-existent snapshot
+// TestDeleteSnapshot_NotFound tests deleting a non-existent snapshot.
 func TestDeleteSnapshot_NotFound(t *testing.T) {
 	svc, _ := setupTestSnapshotService(t)
 
-	_, err := svc.DeleteSnapshot(&ec2.DeleteSnapshotInput{
+	_, err := svc.DeleteSnapshot(context.Background(), &ec2.DeleteSnapshotInput{
 		SnapshotId: aws.String("snap-nonexistent"),
 	}, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), awserrors.ErrorInvalidSnapshotNotFound)
 }
 
-// TestDeleteSnapshot_MissingID tests deleting without snapshot ID
+// TestDeleteSnapshot_MissingID tests deleting without snapshot ID.
 func TestDeleteSnapshot_MissingID(t *testing.T) {
 	svc, _ := setupTestSnapshotService(t)
 
-	_, err := svc.DeleteSnapshot(&ec2.DeleteSnapshotInput{}, testAccountID)
+	_, err := svc.DeleteSnapshot(context.Background(), &ec2.DeleteSnapshotInput{}, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), awserrors.ErrorInvalidParameterValue)
 }
 
-// TestCopySnapshot tests copying a snapshot
+// TestCopySnapshot tests copying a snapshot.
 func TestCopySnapshot(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 
 	// Create test volume and snapshot
 	createTestVolume(t, store, "vol-1", 50)
-	snap, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snap, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId:    aws.String("vol-1"),
 		Description: aws.String("Original snapshot"),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Copy snapshot
-	copyResult, err := svc.CopySnapshot(&ec2.CopySnapshotInput{
+	copyResult, err := svc.CopySnapshot(context.Background(), &ec2.CopySnapshotInput{
 		SourceSnapshotId: snap.SnapshotId,
 		Description:      aws.String("Copied snapshot"),
 	}, testAccountID)
@@ -474,29 +524,29 @@ func TestCopySnapshot(t *testing.T) {
 	assert.NotEqual(t, *snap.SnapshotId, *copyResult.SnapshotId)
 
 	// Verify both snapshots exist
-	result, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{}, testAccountID)
+	result, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{}, testAccountID)
 	require.NoError(t, err)
 	assert.Len(t, result.Snapshots, 2)
 }
 
-// TestCopySnapshot_SetsCallerAsOwner tests that copied snapshot is owned by the caller
+// TestCopySnapshot_SetsCallerAsOwner tests that copied snapshot is owned by the caller.
 func TestCopySnapshot_SetsCallerAsOwner(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 
 	createTestVolume(t, store, "vol-1", 50)
-	snap, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snap, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String("vol-1"),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Copy snapshot as the same account
-	copyResult, err := svc.CopySnapshot(&ec2.CopySnapshotInput{
+	copyResult, err := svc.CopySnapshot(context.Background(), &ec2.CopySnapshotInput{
 		SourceSnapshotId: snap.SnapshotId,
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Verify copied snapshot owner is the caller
-	result, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	result, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		SnapshotIds: []*string{copyResult.SnapshotId},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -504,56 +554,56 @@ func TestCopySnapshot_SetsCallerAsOwner(t *testing.T) {
 	assert.Equal(t, testAccountID, *result.Snapshots[0].OwnerId)
 }
 
-// TestCopySnapshot_WrongAccount tests that account B cannot copy account A's snapshot
+// TestCopySnapshot_WrongAccount tests that account B cannot copy account A's snapshot.
 func TestCopySnapshot_WrongAccount(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 
 	createTestVolume(t, store, "vol-1", 50)
-	_, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	_, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String("vol-1"),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Get the snapshot ID
-	result, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{}, testAccountID)
+	result, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, result.Snapshots, 1)
 
 	// Account B tries to copy account A's snapshot — should fail
-	_, err = svc.CopySnapshot(&ec2.CopySnapshotInput{
+	_, err = svc.CopySnapshot(context.Background(), &ec2.CopySnapshotInput{
 		SourceSnapshotId: result.Snapshots[0].SnapshotId,
 	}, otherAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), awserrors.ErrorUnauthorizedOperation)
 }
 
-// TestCopySnapshot_NotFound tests copying a non-existent snapshot
+// TestCopySnapshot_NotFound tests copying a non-existent snapshot.
 func TestCopySnapshot_NotFound(t *testing.T) {
 	svc, _ := setupTestSnapshotService(t)
 
-	_, err := svc.CopySnapshot(&ec2.CopySnapshotInput{
+	_, err := svc.CopySnapshot(context.Background(), &ec2.CopySnapshotInput{
 		SourceSnapshotId: aws.String("snap-nonexistent"),
 	}, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), awserrors.ErrorInvalidSnapshotNotFound)
 }
 
-// TestCopySnapshot_MissingSourceID tests copying without source snapshot ID
+// TestCopySnapshot_MissingSourceID tests copying without source snapshot ID.
 func TestCopySnapshot_MissingSourceID(t *testing.T) {
 	svc, _ := setupTestSnapshotService(t)
 
-	_, err := svc.CopySnapshot(&ec2.CopySnapshotInput{}, testAccountID)
+	_, err := svc.CopySnapshot(context.Background(), &ec2.CopySnapshotInput{}, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), awserrors.ErrorInvalidParameterValue)
 }
 
-// TestCopySnapshot_PreservesTags tests that tags are copied
+// TestCopySnapshot_PreservesTags tests that tags are copied.
 func TestCopySnapshot_PreservesTags(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 
 	// Create test volume and snapshot with tags
 	createTestVolume(t, store, "vol-1", 50)
-	snap, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snap, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String("vol-1"),
 		TagSpecifications: []*ec2.TagSpecification{
 			{
@@ -567,13 +617,13 @@ func TestCopySnapshot_PreservesTags(t *testing.T) {
 	require.NoError(t, err)
 
 	// Copy snapshot
-	copyResult, err := svc.CopySnapshot(&ec2.CopySnapshotInput{
+	copyResult, err := svc.CopySnapshot(context.Background(), &ec2.CopySnapshotInput{
 		SourceSnapshotId: snap.SnapshotId,
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Verify copied snapshot has tags
-	result, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	result, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		SnapshotIds: []*string{copyResult.SnapshotId},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -584,30 +634,12 @@ func TestCopySnapshot_PreservesTags(t *testing.T) {
 }
 
 // setupTestNATSKV creates a NATS JetStream test server and returns a KV bucket for testing.
-func setupTestNATSKV(t *testing.T) nats.KeyValue {
+func setupTestNATSKV(t *testing.T) jetstream.KeyValue {
 	t.Helper()
-	opts := &server.Options{
-		Host:      "127.0.0.1",
-		Port:      -1,
-		JetStream: true,
-		StoreDir:  t.TempDir(),
-		NoLog:     true,
-		NoSigs:    true,
-	}
-	ns, err := server.NewServer(opts)
-	require.NoError(t, err)
-	go ns.Start()
-	require.True(t, ns.ReadyForConnections(5*time.Second))
-	t.Cleanup(func() { ns.Shutdown() })
+	_, nc, _ := testutil.StartTestJetStream(t)
+	js := testutil.NewJetStream(t, nc)
 
-	nc, err := nats.Connect(ns.ClientURL())
-	require.NoError(t, err)
-	t.Cleanup(func() { nc.Close() })
-
-	js, err := nc.JetStream()
-	require.NoError(t, err)
-
-	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{
+	kv, err := js.CreateKeyValue(t.Context(), jetstream.KeyValueConfig{
 		Bucket: KVBucketVolumeSnapshots,
 	})
 	require.NoError(t, err)
@@ -618,10 +650,10 @@ func TestAddSnapshotRef(t *testing.T) {
 	kv := setupTestNATSKV(t)
 	svc := &SnapshotServiceImpl{snapKV: kv}
 
-	require.NoError(t, svc.addSnapshotRef("vol-1", "snap-a"))
-	require.NoError(t, svc.addSnapshotRef("vol-1", "snap-b"))
+	require.NoError(t, svc.addSnapshotRef(t.Context(), "vol-1", "snap-a"))
+	require.NoError(t, svc.addSnapshotRef(t.Context(), "vol-1", "snap-b"))
 
-	entry, err := kv.Get("vol-1")
+	entry, err := kv.Get(t.Context(), "vol-1")
 	require.NoError(t, err)
 	var snapshots []string
 	require.NoError(t, json.Unmarshal(entry.Value(), &snapshots))
@@ -632,23 +664,23 @@ func TestRemoveSnapshotRef(t *testing.T) {
 	kv := setupTestNATSKV(t)
 	svc := &SnapshotServiceImpl{snapKV: kv}
 
-	require.NoError(t, svc.addSnapshotRef("vol-1", "snap-a"))
-	require.NoError(t, svc.addSnapshotRef("vol-1", "snap-b"))
+	require.NoError(t, svc.addSnapshotRef(t.Context(), "vol-1", "snap-a"))
+	require.NoError(t, svc.addSnapshotRef(t.Context(), "vol-1", "snap-b"))
 
 	// Remove one
-	require.NoError(t, svc.removeSnapshotRef("vol-1", "snap-a"))
+	require.NoError(t, svc.removeSnapshotRef(t.Context(), "vol-1", "snap-a"))
 
-	entry, err := kv.Get("vol-1")
+	entry, err := kv.Get(t.Context(), "vol-1")
 	require.NoError(t, err)
 	var snapshots []string
 	require.NoError(t, json.Unmarshal(entry.Value(), &snapshots))
 	assert.Equal(t, []string{"snap-b"}, snapshots)
 
 	// Remove last — key should be deleted
-	require.NoError(t, svc.removeSnapshotRef("vol-1", "snap-b"))
+	require.NoError(t, svc.removeSnapshotRef(t.Context(), "vol-1", "snap-b"))
 
-	_, err = kv.Get("vol-1")
-	assert.ErrorIs(t, err, nats.ErrKeyNotFound)
+	_, err = kv.Get(t.Context(), "vol-1")
+	assert.ErrorIs(t, err, jetstream.ErrKeyNotFound)
 }
 
 func TestRemoveSnapshotRef_NonExistentKey(t *testing.T) {
@@ -656,7 +688,20 @@ func TestRemoveSnapshotRef_NonExistentKey(t *testing.T) {
 	svc := &SnapshotServiceImpl{snapKV: kv}
 
 	// Should not error on non-existent key
-	require.NoError(t, svc.removeSnapshotRef("vol-nonexistent", "snap-x"))
+	require.NoError(t, svc.removeSnapshotRef(t.Context(), "vol-nonexistent", "snap-x"))
+}
+
+func TestRemoveSnapshotRefForCleanupSurvivesCancellation(t *testing.T) {
+	kv := setupTestNATSKV(t)
+	svc := &SnapshotServiceImpl{snapKV: kv}
+	require.NoError(t, svc.addSnapshotRef(t.Context(), "vol-1", "snap-a"))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.NoError(t, svc.removeSnapshotRefForCleanup(ctx, "vol-1", "snap-a"))
+
+	_, err := kv.Get(t.Context(), "vol-1")
+	require.ErrorIs(t, err, jetstream.ErrKeyNotFound)
 }
 
 func TestVolumeHasSnapshots(t *testing.T) {
@@ -664,19 +709,19 @@ func TestVolumeHasSnapshots(t *testing.T) {
 	svc := &SnapshotServiceImpl{snapKV: kv}
 
 	// No entry → false
-	has, err := svc.volumeHasSnapshots("vol-1")
+	has, err := svc.volumeHasSnapshots(t.Context(), "vol-1")
 	require.NoError(t, err)
 	assert.False(t, has)
 
 	// Add one → true
-	require.NoError(t, svc.addSnapshotRef("vol-1", "snap-a"))
-	has, err = svc.volumeHasSnapshots("vol-1")
+	require.NoError(t, svc.addSnapshotRef(t.Context(), "vol-1", "snap-a"))
+	has, err = svc.volumeHasSnapshots(t.Context(), "vol-1")
 	require.NoError(t, err)
 	assert.True(t, has)
 
 	// Remove it → false
-	require.NoError(t, svc.removeSnapshotRef("vol-1", "snap-a"))
-	has, err = svc.volumeHasSnapshots("vol-1")
+	require.NoError(t, svc.removeSnapshotRef(t.Context(), "vol-1", "snap-a"))
+	has, err = svc.volumeHasSnapshots(t.Context(), "vol-1")
 	require.NoError(t, err)
 	assert.False(t, has)
 }
@@ -685,9 +730,9 @@ func TestKVNilFallback(t *testing.T) {
 	svc := &SnapshotServiceImpl{snapKV: nil}
 
 	// All methods should be no-ops when KV is nil
-	require.NoError(t, svc.addSnapshotRef("vol-1", "snap-a"))
-	require.NoError(t, svc.removeSnapshotRef("vol-1", "snap-a"))
-	has, err := svc.volumeHasSnapshots("vol-1")
+	require.NoError(t, svc.addSnapshotRef(t.Context(), "vol-1", "snap-a"))
+	require.NoError(t, svc.removeSnapshotRef(t.Context(), "vol-1", "snap-a"))
+	has, err := svc.volumeHasSnapshots(t.Context(), "vol-1")
 	require.NoError(t, err)
 	assert.False(t, has)
 }
@@ -706,18 +751,18 @@ func TestCreateSnapshot_WritesKVEntry(t *testing.T) {
 	volumeID := "vol-kvtest"
 	createTestVolume(t, store, volumeID, 10)
 
-	snap, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snap, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String(volumeID),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Verify KV entry exists
-	has, err := svc.volumeHasSnapshots(volumeID)
+	has, err := svc.volumeHasSnapshots(t.Context(), volumeID)
 	require.NoError(t, err)
 	assert.True(t, has)
 
 	// Verify snapshot ID is in the list
-	entry, err := kv.Get(volumeID)
+	entry, err := kv.Get(t.Context(), volumeID)
 	require.NoError(t, err)
 	var snapshots []string
 	require.NoError(t, json.Unmarshal(entry.Value(), &snapshots))
@@ -738,19 +783,19 @@ func TestDeleteSnapshot_RemovesKVEntry(t *testing.T) {
 	volumeID := "vol-kvdelete"
 	createTestVolume(t, store, volumeID, 10)
 
-	snap, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snap, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String(volumeID),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Delete the snapshot
-	_, err = svc.DeleteSnapshot(&ec2.DeleteSnapshotInput{
+	_, err = svc.DeleteSnapshot(context.Background(), &ec2.DeleteSnapshotInput{
 		SnapshotId: snap.SnapshotId,
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// KV should now be empty for this volume
-	has, err := svc.volumeHasSnapshots(volumeID)
+	has, err := svc.volumeHasSnapshots(t.Context(), volumeID)
 	require.NoError(t, err)
 	assert.False(t, has)
 }
@@ -769,18 +814,18 @@ func TestCopySnapshot_AddsKVEntry(t *testing.T) {
 	volumeID := "vol-kvcopy"
 	createTestVolume(t, store, volumeID, 10)
 
-	snap, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	snap, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String(volumeID),
 	}, testAccountID)
 	require.NoError(t, err)
 
-	copyResult, err := svc.CopySnapshot(&ec2.CopySnapshotInput{
+	copyResult, err := svc.CopySnapshot(context.Background(), &ec2.CopySnapshotInput{
 		SourceSnapshotId: snap.SnapshotId,
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Both snapshot IDs should be in KV
-	entry, err := kv.Get(volumeID)
+	entry, err := kv.Get(t.Context(), volumeID)
 	require.NoError(t, err)
 	var snapshots []string
 	require.NoError(t, json.Unmarshal(entry.Value(), &snapshots))
@@ -806,7 +851,7 @@ func TestCreateSnapshot_CrossAccountVolumeRejected(t *testing.T) {
 	}
 	data, err := json.Marshal(volumeState)
 	require.NoError(t, err)
-	_, err = store.PutObject(&s3.PutObjectInput{
+	_, err = store.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket: aws.String("test-bucket"),
 		Key:    aws.String(volumeID + "/config.json"),
 		Body:   strings.NewReader(string(data)),
@@ -814,14 +859,14 @@ func TestCreateSnapshot_CrossAccountVolumeRejected(t *testing.T) {
 	require.NoError(t, err)
 
 	// Another account tries to snapshot the volume — should fail
-	_, err = svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	_, err = svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String(volumeID),
 	}, otherAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), awserrors.ErrorInvalidVolumeNotFound)
 
 	// Same account can snapshot — should succeed
-	result, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	result, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String(volumeID),
 	}, testAccountID)
 	require.NoError(t, err)
@@ -837,7 +882,7 @@ func TestCreateSnapshot_PrePhase4VolumeAllowed(t *testing.T) {
 	createTestVolume(t, store, volumeID, 50)
 
 	// Any account can snapshot — backward compatibility
-	result, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	result, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId: aws.String(volumeID),
 	}, otherAccountID)
 	require.NoError(t, err)
@@ -863,7 +908,7 @@ func createTestSnapshot(t *testing.T, svc *SnapshotServiceImpl, store *objectsto
 		})
 	}
 
-	result, err := svc.CreateSnapshot(&ec2.CreateSnapshotInput{
+	result, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
 		VolumeId:          aws.String(volumeID),
 		TagSpecifications: tagSpecs,
 	}, testAccountID)
@@ -875,7 +920,7 @@ func TestDescribeSnapshots_FilterByStatus(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 	createTestSnapshot(t, svc, store, "vol-1", 10, nil)
 
-	out, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	out, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("status"), Values: []*string{aws.String("completed")}},
 		},
@@ -883,7 +928,7 @@ func TestDescribeSnapshots_FilterByStatus(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, out.Snapshots, 1)
 
-	out, err = svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	out, err = svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("status"), Values: []*string{aws.String("pending")}},
 		},
@@ -897,7 +942,7 @@ func TestDescribeSnapshots_FilterByVolumeId(t *testing.T) {
 	createTestSnapshot(t, svc, store, "vol-a", 10, nil)
 	createTestSnapshot(t, svc, store, "vol-b", 20, nil)
 
-	out, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	out, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("volume-id"), Values: []*string{aws.String("vol-a")}},
 		},
@@ -912,7 +957,7 @@ func TestDescribeSnapshots_FilterByVolumeSize(t *testing.T) {
 	createTestSnapshot(t, svc, store, "vol-small", 10, nil)
 	createTestSnapshot(t, svc, store, "vol-big", 100, nil)
 
-	out, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	out, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("volume-size"), Values: []*string{aws.String("100")}},
 		},
@@ -927,7 +972,7 @@ func TestDescribeSnapshots_FilterBySnapshotId(t *testing.T) {
 	snapID := createTestSnapshot(t, svc, store, "vol-1", 10, nil)
 	createTestSnapshot(t, svc, store, "vol-2", 20, nil)
 
-	out, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	out, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("snapshot-id"), Values: []*string{aws.String(snapID)}},
 		},
@@ -941,7 +986,7 @@ func TestDescribeSnapshots_FilterByOwnerId(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 	createTestSnapshot(t, svc, store, "vol-1", 10, nil)
 
-	out, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	out, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("owner-id"), Values: []*string{aws.String(testAccountID)}},
 		},
@@ -949,7 +994,7 @@ func TestDescribeSnapshots_FilterByOwnerId(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, out.Snapshots, 1)
 
-	out, err = svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	out, err = svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("owner-id"), Values: []*string{aws.String("999999999999")}},
 		},
@@ -964,7 +1009,7 @@ func TestDescribeSnapshots_FilterMultipleValues_OR(t *testing.T) {
 	createTestSnapshot(t, svc, store, "vol-b", 20, nil)
 	createTestSnapshot(t, svc, store, "vol-c", 30, nil)
 
-	out, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	out, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("volume-id"), Values: []*string{aws.String("vol-a"), aws.String("vol-c")}},
 		},
@@ -979,7 +1024,7 @@ func TestDescribeSnapshots_FilterMultipleFilters_AND(t *testing.T) {
 	createTestSnapshot(t, svc, store, "vol-b", 20, nil)
 
 	// Both match
-	out, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	out, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("volume-id"), Values: []*string{aws.String("vol-a")}},
 			{Name: aws.String("volume-size"), Values: []*string{aws.String("10")}},
@@ -989,7 +1034,7 @@ func TestDescribeSnapshots_FilterMultipleFilters_AND(t *testing.T) {
 	assert.Len(t, out.Snapshots, 1)
 
 	// Mismatch
-	out, err = svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	out, err = svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("volume-id"), Values: []*string{aws.String("vol-a")}},
 			{Name: aws.String("volume-size"), Values: []*string{aws.String("20")}},
@@ -1002,7 +1047,7 @@ func TestDescribeSnapshots_FilterMultipleFilters_AND(t *testing.T) {
 func TestDescribeSnapshots_FilterUnknownName_Error(t *testing.T) {
 	svc, _ := setupTestSnapshotService(t)
 
-	_, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	_, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("bogus-filter"), Values: []*string{aws.String("x")}},
 		},
@@ -1015,7 +1060,7 @@ func TestDescribeSnapshots_FilterWildcard(t *testing.T) {
 	createTestSnapshot(t, svc, store, "vol-prod-1", 10, nil)
 	createTestSnapshot(t, svc, store, "vol-staging-1", 20, nil)
 
-	out, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	out, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("volume-id"), Values: []*string{aws.String("vol-prod-*")}},
 		},
@@ -1028,7 +1073,7 @@ func TestDescribeSnapshots_FilterNoResults(t *testing.T) {
 	svc, store := setupTestSnapshotService(t)
 	createTestSnapshot(t, svc, store, "vol-1", 10, nil)
 
-	out, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	out, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("volume-id"), Values: []*string{aws.String("vol-nonexistent")}},
 		},
@@ -1042,7 +1087,7 @@ func TestDescribeSnapshots_FilterByTag(t *testing.T) {
 	createTestSnapshot(t, svc, store, "vol-tagged", 10, map[string]string{"Env": "prod"})
 	createTestSnapshot(t, svc, store, "vol-untagged", 20, nil)
 
-	out, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
+	out, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("tag:Env"), Values: []*string{aws.String("prod")}},
 		},
@@ -1056,7 +1101,99 @@ func TestDescribeSnapshots_FilterNoFilters(t *testing.T) {
 	createTestSnapshot(t, svc, store, "vol-1", 10, nil)
 	createTestSnapshot(t, svc, store, "vol-2", 20, nil)
 
-	out, err := svc.DescribeSnapshots(&ec2.DescribeSnapshotsInput{}, testAccountID)
+	out, err := svc.DescribeSnapshots(context.Background(), &ec2.DescribeSnapshotsInput{}, testAccountID)
 	require.NoError(t, err)
 	assert.Len(t, out.Snapshots, 2)
+}
+
+// TestCreateSnapshot_PredastoreInitFails exercises snapshotVolume past the nil-host guard.
+// The viperblock S3 backend fails at Init() when the test server returns 403, covering the
+// snapshotVolume body (S3Config build, LoadViperblockMasterKey, viperblock.New, Backend.Init)
+// and the CreateSnapshot error return path.
+func TestCreateSnapshot_PredastoreInitFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	store := objectstore.NewMemoryObjectStore()
+	cfg := &config.Config{
+		Predastore: config.PredastoreConfig{
+			Host:   srv.URL,
+			Region: "us-east-1",
+			Bucket: "test-bucket",
+		},
+	}
+	svc := NewSnapshotServiceImplWithStore(cfg, store, nil)
+	createTestVolume(t, store, "vol-initfail", 10)
+
+	_, err := svc.CreateSnapshot(context.Background(), &ec2.CreateSnapshotInput{
+		VolumeId: aws.String("vol-initfail"),
+	}, testAccountID)
+	require.Error(t, err)
+	assert.Equal(t, awserrors.ErrorServerInternal, err.Error())
+}
+
+// s3MockServer returns a test server that passes ListObjectsV2 (Backend.Init) but
+// returns 404 for every other request (GetObject, PutObject, etc.).
+func s3MockServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.RawQuery, "list-type=2") {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?>`+
+				`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`+
+				`<Name>test-bucket</Name><KeyCount>0</KeyCount>`+
+				`<MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?>`+
+			`<Error><Code>NoSuchKey</Code>`+
+			`<Message>The specified key does not exist.</Message></Error>`)
+	}))
+}
+
+func TestSnapshotVolume_EncryptionKeyLoadError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		Predastore: config.PredastoreConfig{
+			Host:   srv.URL,
+			Region: "us-east-1",
+			Bucket: "test-bucket",
+		},
+		Viperblock: config.ViperblockConfig{
+			EncryptionKeyFile: "/nonexistent-snap-test-key.bin",
+		},
+	}
+	svc := NewSnapshotServiceImplWithStore(cfg, objectstore.NewMemoryObjectStore(), nil)
+
+	err := svc.snapshotVolume("vol-enckey", "snap-enckey", 10*1024*1024*1024)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "load encryption key")
+}
+
+func TestSnapshotVolume_LoadStateFails(t *testing.T) {
+	srv := s3MockServer(t)
+	defer srv.Close()
+
+	cfg := &config.Config{
+		Predastore: config.PredastoreConfig{
+			Host:      srv.URL,
+			Region:    "us-east-1",
+			Bucket:    "test-bucket",
+			AccessKey: "test-key",
+			SecretKey: "test-secret",
+		},
+	}
+	svc := NewSnapshotServiceImplWithStore(cfg, objectstore.NewMemoryObjectStore(), nil)
+
+	err := svc.snapshotVolume("vol-lsf", "snap-lsf", 10*1024*1024*1024)
+	require.Error(t, err)
 }

@@ -54,7 +54,7 @@ func TestCreateRole(t *testing.T) {
 	assert.Equal(t, "Role for app servers", *out.Role.Description)
 	assert.Equal(t, int64(7200), *out.Role.MaxSessionDuration)
 	assert.Equal(t, "arn:aws:iam::"+testAccountID+":role/service-roles/app-role", *out.Role.Arn)
-	require.True(t, len(*out.Role.RoleId) > 4)
+	require.Greater(t, len(*out.Role.RoleId), 4)
 	assert.Equal(t, "AROA", (*out.Role.RoleId)[:4])
 	require.Len(t, out.Role.Tags, 1)
 	assert.Equal(t, "team", *out.Role.Tags[0].Key)
@@ -271,7 +271,7 @@ func TestListRoles_Empty(t *testing.T) {
 
 	out, err := svc.ListRoles(testAccountID, &iam.ListRolesInput{})
 	require.NoError(t, err)
-	assert.Len(t, out.Roles, 0)
+	assert.Empty(t, out.Roles)
 }
 
 func TestListRoles_PathPrefix(t *testing.T) {
@@ -575,7 +575,7 @@ func TestDetachRolePolicy(t *testing.T) {
 		RoleName: role.RoleName,
 	})
 	require.NoError(t, err)
-	assert.Len(t, out.AttachedPolicies, 0)
+	assert.Empty(t, out.AttachedPolicies)
 }
 
 func TestDetachRolePolicy_NotAttached(t *testing.T) {
@@ -643,7 +643,7 @@ func TestListAttachedRolePolicies_Empty(t *testing.T) {
 		RoleName: role.RoleName,
 	})
 	require.NoError(t, err)
-	assert.Len(t, out.AttachedPolicies, 0)
+	assert.Empty(t, out.AttachedPolicies)
 }
 
 // ============================================================================
@@ -684,7 +684,7 @@ func TestGetRolePolicies_NoPolicies(t *testing.T) {
 
 	docs, err := svc.GetRolePolicies(testAccountID, "bare-role")
 	require.NoError(t, err)
-	assert.Len(t, docs, 0)
+	assert.Empty(t, docs)
 }
 
 func TestGetRolePolicies_NonexistentRole(t *testing.T) {
@@ -705,12 +705,12 @@ func TestGetRolePolicies_UnresolvablePolicy(t *testing.T) {
 	// Overwrite the role record with an attachment to a policy that does not
 	// exist, simulating a managed policy deleted out from under a live
 	// attachment.
-	role, err := svc.getRole(testAccountID, "dangling-role")
+	role, err := svc.getRole(t.Context(), testAccountID, "dangling-role")
 	require.NoError(t, err)
 	role.AttachedPolicies = []string{"arn:aws:iam::" + testAccountID + ":policy/Ghost"}
 	data, err := json.Marshal(role)
 	require.NoError(t, err)
-	_, err = svc.rolesBucket.Put(testAccountID+".dangling-role", data)
+	_, err = svc.rolesBucket.Put(t.Context(), testAccountID+".dangling-role", data)
 	require.NoError(t, err)
 
 	_, err = svc.GetRolePolicies(testAccountID, "dangling-role")
@@ -720,7 +720,7 @@ func TestGetRolePolicies_UnresolvablePolicy(t *testing.T) {
 // TestGetRolePolicies_AWSManagedResolved proves a stock EKS node role — whose
 // grants come entirely from AWS-managed policies — resolves to the builtin
 // grant documents, so assumed-role authorization honours them instead of
-// denying every call (the regression behind mulga-siv-297).
+// denying every call.
 func TestGetRolePolicies_AWSManagedResolved(t *testing.T) {
 	svc := setupTestIAMService(t)
 	role := createTestRole(t, svc, "eks-node-role")
@@ -945,7 +945,7 @@ func TestListRolePolicies_Empty(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.NotNil(t, out.PolicyNames)
-	assert.Len(t, out.PolicyNames, 0)
+	assert.Empty(t, out.PolicyNames)
 	assert.False(t, *out.IsTruncated)
 }
 
@@ -987,7 +987,7 @@ func TestDeleteRolePolicy(t *testing.T) {
 		RoleName: aws.String("del-inline"),
 	})
 	require.NoError(t, err)
-	assert.Len(t, list.PolicyNames, 0)
+	assert.Empty(t, list.PolicyNames)
 }
 
 func TestDeleteRolePolicy_DoubleDelete(t *testing.T) {
@@ -1099,6 +1099,7 @@ func TestGetRolePolicies_ManagedAndInline(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, docs, 2)
 	assert.True(t, policiesGrant(docs, "ec2:DescribeInstances"), "managed Allow surfaced")
+	assert.True(t, policiesGrant(docs, "s3:DeleteObject"), "inline doc surfaced")
 }
 
 // ============================================================================

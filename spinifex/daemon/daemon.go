@@ -34,6 +34,8 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/mulgadc/spinifex/spinifex/gpu"
 	handlers_acm "github.com/mulgadc/spinifex/spinifex/handlers/acm"
+	handlers_bedrock "github.com/mulgadc/spinifex/spinifex/handlers/bedrock"
+	handlers_dns "github.com/mulgadc/spinifex/spinifex/handlers/dns"
 	handlers_ec2_account "github.com/mulgadc/spinifex/spinifex/handlers/ec2/account"
 	handlers_ec2_eigw "github.com/mulgadc/spinifex/spinifex/handlers/ec2/eigw"
 	handlers_ec2_eip "github.com/mulgadc/spinifex/spinifex/handlers/ec2/eip"
@@ -41,10 +43,12 @@ import (
 	handlers_ec2_image "github.com/mulgadc/spinifex/spinifex/handlers/ec2/image"
 	handlers_ec2_instance "github.com/mulgadc/spinifex/spinifex/handlers/ec2/instance"
 	handlers_ec2_key "github.com/mulgadc/spinifex/spinifex/handlers/ec2/key"
+	handlers_ec2_launchtemplate "github.com/mulgadc/spinifex/spinifex/handlers/ec2/launchtemplate"
 	handlers_ec2_natgw "github.com/mulgadc/spinifex/spinifex/handlers/ec2/natgw"
 	handlers_ec2_placementgroup "github.com/mulgadc/spinifex/spinifex/handlers/ec2/placementgroup"
 	handlers_ec2_routetable "github.com/mulgadc/spinifex/spinifex/handlers/ec2/routetable"
 	handlers_ec2_snapshot "github.com/mulgadc/spinifex/spinifex/handlers/ec2/snapshot"
+	handlers_ec2_spotinstance "github.com/mulgadc/spinifex/spinifex/handlers/ec2/spotinstance"
 	handlers_ec2_tags "github.com/mulgadc/spinifex/spinifex/handlers/ec2/tags"
 	handlers_ec2_volume "github.com/mulgadc/spinifex/spinifex/handlers/ec2/volume"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
@@ -52,33 +56,21 @@ import (
 	handlers_ecs "github.com/mulgadc/spinifex/spinifex/handlers/ecs"
 	handlers_eks "github.com/mulgadc/spinifex/spinifex/handlers/eks"
 	handlers_elbv2 "github.com/mulgadc/spinifex/spinifex/handlers/elbv2"
+	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
+	handlers_rds "github.com/mulgadc/spinifex/spinifex/handlers/rds"
 	"github.com/mulgadc/spinifex/spinifex/instancetypes"
+	"github.com/mulgadc/spinifex/spinifex/kvutil"
+	"github.com/mulgadc/spinifex/spinifex/network/external"
 	"github.com/mulgadc/spinifex/spinifex/network/external/dhcp"
 	"github.com/mulgadc/spinifex/spinifex/network/host"
 	"github.com/mulgadc/spinifex/spinifex/objectstore"
+	"github.com/mulgadc/spinifex/spinifex/otelsetup"
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/spinifex/spinifex/vm"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
-
-type BlockDeviceMapping struct {
-	DeviceName string `json:"DeviceName"`
-	EBS        EBS    `json:"EBS"`
-}
-
-type EBS struct {
-	DeleteOnTermination      bool
-	Encrypted                bool
-	Iops                     int
-	KmsKeyId                 string
-	OutpostArn               string
-	SnapshotId               string
-	Throughput               int
-	VolumeInitializationRate int
-	VolumeSize               int
-	VolumeType               string
-}
 
 // ResourceManager handles the allocation and tracking of system resources.
 // It dynamically manages per-instance-type NATS subscriptions: when capacity
@@ -129,7 +121,7 @@ type ResourceManager struct {
 // handler's GatePublisher hook — the two services are wired together below.
 var _ handlers_ec2_igw.GatePublisher = (*handlers_ec2_routetable.RouteTableServiceImpl)(nil)
 
-// Daemon represents the main daemon service
+// Daemon represents the main daemon service.
 type Daemon struct {
 	node                  string
 	clusterConfig         *config.ClusterConfig
@@ -137,6 +129,10 @@ type Daemon struct {
 	natsConn              *nats.Conn
 	resourceMgr           *ResourceManager
 	instanceService       *handlers_ec2_instance.InstanceServiceImpl
+	dnsWriter             *handlers_dns.Writer
+	dnsReconciler         *handlers_dns.Reconciler
+	dnsBaseDomain         string
+	dnsInternalDomain     string
 	keyService            *handlers_ec2_key.KeyServiceImpl
 	imageService          *handlers_ec2_image.ImageServiceImpl
 	volumeService         *handlers_ec2_volume.VolumeServiceImpl
@@ -146,13 +142,19 @@ type Daemon struct {
 	eigwService           *handlers_ec2_eigw.EgressOnlyIGWServiceImpl
 	igwService            *handlers_ec2_igw.IGWServiceImpl
 	placementGroupService *handlers_ec2_placementgroup.PlacementGroupServiceImpl
+	launchTemplateService *handlers_ec2_launchtemplate.LaunchTemplateServiceImpl
+	spotInstanceService   *handlers_ec2_spotinstance.SpotInstanceServiceImpl
 	vpcService            *handlers_ec2_vpc.VPCServiceImpl
-	eipService            *handlers_ec2_eip.EIPServiceImpl
+	eipService            handlers_ec2_eip.EIPService
 	elbv2Service          *handlers_elbv2.ELBv2ServiceImpl
 	eksService            *handlers_eks.EKSServiceImpl
 	ecsService            *handlers_ecs.Service
 	ecsScheduler          *handlers_ecs.Scheduler
+	rdsService            *handlers_rds.Service
+	rdsReconciler         *handlers_rds.Reconciler
+	bedrockService        *handlers_bedrock.Service
 	acmService            *handlers_acm.ACMServiceImpl
+	acmRenewalWorker      *handlers_acm.Worker
 	ecrMetaService        *handlers_ecr.MetaServiceImpl
 	routeTableService     *handlers_ec2_routetable.RouteTableServiceImpl
 	natGatewayService     *handlers_ec2_natgw.NatGatewayServiceImpl
@@ -188,8 +190,14 @@ type Daemon struct {
 	// initJetStream succeeds.
 	stateStore vm.StateStore
 
-	// Delay after QMP device_del before blockdev-del (default 1s, 0 in tests)
+	// Delay after QMP device_del before blockdev-del (default 1s, 0 in tests).
+	// Only used as a fallback when deviceDeletedTimeout is 0.
 	detachDelay time.Duration
+
+	// deviceDeletedTimeout bounds how long DetachVolume waits for QEMU's
+	// DEVICE_DELETED event after device_del before falling back to the
+	// blockdev-del retry loop (default 15s, 0 disables the wait in tests).
+	deviceDeletedTimeout time.Duration
 
 	// NATS connect retry options (nil uses defaults: 5min max, 500ms initial delay)
 	natsRetryOpts []utils.RetryOption
@@ -249,6 +257,10 @@ type Daemon struct {
 	reconciling atomic.Bool
 	// stateWriteMu: serialises WriteState to prevent races on the .tmp staging file.
 	stateWriteMu sync.Mutex
+
+	// iamEnsurerMu guards the lazily-built system-role IAM service (systemRoleEnsurer).
+	iamEnsurerMu     sync.Mutex
+	iamEnsurerCached handlers_iam.SystemInstanceRoleEnsurer
 
 	mu sync.Mutex
 }
@@ -344,7 +356,7 @@ func (d *Daemon) onNATSReconnect(_ *nats.Conn) {
 // execCommand wraps exec.Command so tests can substitute a fake implementation.
 var execCommand = exec.Command
 
-// getSystemMemory returns the total system memory in GB
+// getSystemMemory returns the total system memory in GB.
 func getSystemMemory() (float64, error) {
 	switch runtime.GOOS {
 	case "darwin":
@@ -524,7 +536,7 @@ func (rm *ResourceManager) instanceMemChargeMiB(it *ec2.InstanceTypeInfo) int64 
 		nbdkitChargeMiB(defaultMainVolumes, defaultAuxVolumes, rm.nbdkitMainMiB, rm.nbdkitAuxMiB)
 }
 
-// GetInstanceTypeInfos returns all instance types as ec2.InstanceTypeInfo for AWS API compatibility
+// GetInstanceTypeInfos returns all instance types as ec2.InstanceTypeInfo for AWS API compatibility.
 func (rm *ResourceManager) GetInstanceTypeInfos() []*ec2.InstanceTypeInfo {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
@@ -639,7 +651,7 @@ func (rm *ResourceManager) GetResourceStats() (totalVCPU int, totalMemGB float64
 	totalVCPU = rm.hostVCPU
 	totalMemGB = rm.hostMemGB
 	// Fold the capacity-reservation carve-out into the reported reserve figures;
-	// Phase 1 has no separate status field for it.
+	// The probe has no separate status field for it.
 	reservedVCPU = rm.reservedVCPU + rm.reservedCRVCPU
 	reservedMemGB = rm.reservedMem + rm.reservedCRMem
 	allocVCPU = rm.allocatedVCPU
@@ -667,12 +679,12 @@ func (rm *ResourceManager) GetResourceStats() (totalVCPU int, totalMemGB float64
 	return totalVCPU, totalMemGB, reservedVCPU, reservedMemGB, allocVCPU, allocMemGB, caps
 }
 
-// SetConfigPath sets the configuration file path for cluster management
+// SetConfigPath sets the configuration file path for cluster management.
 func (d *Daemon) SetConfigPath(path string) {
 	d.configPath = path
 }
 
-// NewDaemon creates a new daemon instance
+// NewDaemon creates a new daemon instance.
 func NewDaemon(cfg *config.ClusterConfig) (*Daemon, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -683,10 +695,10 @@ func NewDaemon(cfg *config.ClusterConfig) (*Daemon, error) {
 		cfg.Nodes[cfg.Node] = nodeCfg
 	}
 
-	// Phase 1: always probe GPU hardware (no side effects, no config required).
+	// Always probe GPU hardware (no side effects, no config required).
 	gpuProbe := probeGPU()
 
-	// Phase 2: activate GPU passthrough only when the operator has opted in.
+	// Activate GPU passthrough only when the operator has opted in.
 	var gpuModels []instancetypes.GPUModel
 	var gpuMigProfiles []instancetypes.MIGProfileSpec
 	var gpuMgr *gpu.Manager
@@ -710,26 +722,59 @@ func NewDaemon(cfg *config.ClusterConfig) (*Daemon, error) {
 	}
 
 	d := &Daemon{
-		node:               cfg.Node,
-		clusterConfig:      cfg,
-		config:             &nodeCfg,
-		resourceMgr:        rm,
-		gpuProbe:           gpuProbe,
-		gpuManager:         gpuMgr,
-		ctx:                ctx,
-		cancel:             cancel,
-		vmMgr:              vm.NewManager(),
-		natsSubscriptions:  make(map[string]*nats.Subscription),
-		startTime:          time.Now(),
-		detachDelay:        1 * time.Second,
-		requireNATSTimeout: 30 * time.Second,
-		exitFunc:           os.Exit,
+		node:                 cfg.Node,
+		clusterConfig:        cfg,
+		config:               &nodeCfg,
+		resourceMgr:          rm,
+		gpuProbe:             gpuProbe,
+		gpuManager:           gpuMgr,
+		ctx:                  ctx,
+		cancel:               cancel,
+		vmMgr:                vm.NewManager(),
+		natsSubscriptions:    make(map[string]*nats.Subscription),
+		startTime:            time.Now(),
+		detachDelay:          1 * time.Second,
+		deviceDeletedTimeout: 15 * time.Second,
+		requireNATSTimeout:   30 * time.Second,
+		exitFunc:             os.Exit,
 	}
 	// Initialise peersReachable true so the first probe tick never fires a
 	// spurious reconcileOnHeal at startup. Mode() still requires natsConnected
 	// (starts false), so this can't falsely report cluster mode.
 	d.peersReachable.Store(true)
 	return d, nil
+}
+
+// natsMetricsHandler wraps a NATS handler to record request count and
+// duration under the given action. Handler outcome is not observable at
+// this chokepoint, so the outcome attribute is omitted.
+func natsMetricsHandler(action string, h nats.MsgHandler) nats.MsgHandler {
+	return func(msg *nats.Msg) {
+		start := time.Now()
+		h(msg)
+		otelsetup.RecordRequest(context.Background(), action, "", time.Since(start))
+	}
+}
+
+// natsMetricAction strips the node name from a topic so node-targeted
+// subjects share one low-cardinality metric action across the cluster.
+func natsMetricAction(topic, node string) string {
+	if node == "" {
+		return topic
+	}
+	action := strings.ReplaceAll(topic, "."+node+".", ".")
+	return strings.TrimSuffix(action, "."+node)
+}
+
+// clusterCAKeyPath derives the CA private key path from the configured CA
+// certificate path — they are written as a pair into the same config directory.
+// Returns "" when no CA cert is configured, which disables cert minting rather
+// than guessing at a path.
+func clusterCAKeyPath(caCertPath string) string {
+	if caCertPath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(caCertPath), "ca.key")
 }
 
 // natsSub defines a single NATS subscription entry for the table-driven setup.
@@ -744,118 +789,131 @@ func (d *Daemon) subscribeAll() error {
 	subs := []natsSub{
 		// ec2.RunInstances is handled by dynamic per-instance-type subscriptions
 		// managed by ResourceManager.initSubscriptions()
-		{"ec2.CreateKeyPair", d.handleEC2CreateKeyPair, "spinifex-workers"},
-		{"ec2.DeleteKeyPair", d.handleEC2DeleteKeyPair, "spinifex-workers"},
-		{"ec2.DescribeKeyPairs", d.handleEC2DescribeKeyPairs, "spinifex-workers"},
-		{"ec2.ImportKeyPair", d.handleEC2ImportKeyPair, "spinifex-workers"},
+		{"ec2.CreateKeyPair", handleNATSRequest(d.keyService.CreateKeyPair), "spinifex-workers"},
+		{"ec2.DeleteKeyPair", handleNATSRequest(d.keyService.DeleteKeyPair), "spinifex-workers"},
+		{"ec2.DescribeKeyPairs", handleNATSRequest(d.keyService.DescribeKeyPairs), "spinifex-workers"},
+		{"ec2.ImportKeyPair", handleNATSRequest(d.keyService.ImportKeyPair), "spinifex-workers"},
 		{"imds.ec2.get_public_key", d.handleIMDSGetPublicKey, "spinifex-workers"},
-		{"ec2.DescribeImages", d.handleEC2DescribeImages, "spinifex-workers"},
+		{"ec2.DescribeImages", handleNATSRequest(d.imageService.DescribeImages), "spinifex-workers"},
 		{"ec2.CreateImage", d.handleEC2CreateImage, ""},
-		{"ec2.DeregisterImage", d.handleEC2DeregisterImage, "spinifex-workers"},
-		{"ec2.RegisterImage", d.handleEC2RegisterImage, "spinifex-workers"},
-		{"ec2.CopyImage", d.handleEC2CopyImage, "spinifex-workers"},
-		{"ec2.DescribeImageAttribute", d.handleEC2DescribeImageAttribute, "spinifex-workers"},
-		{"ec2.ModifyImageAttribute", d.handleEC2ModifyImageAttribute, "spinifex-workers"},
-		{"ec2.ResetImageAttribute", d.handleEC2ResetImageAttribute, "spinifex-workers"},
-		{"ec2.CreateVolume", d.handleEC2CreateVolume, "spinifex-workers"},
-		{"ec2.DescribeVolumes", d.handleEC2DescribeVolumes, "spinifex-workers"},
+		{"ec2.DeregisterImage", handleNATSRequest(d.imageService.DeregisterImage), "spinifex-workers"},
+		{"ec2.RegisterImage", handleNATSRequest(d.imageService.RegisterImage), "spinifex-workers"},
+		{"ec2.CopyImage", handleNATSRequest(d.imageService.CopyImage), "spinifex-workers"},
+		{"ec2.DescribeImageAttribute", handleNATSRequest(d.imageService.DescribeImageAttribute), "spinifex-workers"},
+		{"ec2.ModifyImageAttribute", handleNATSRequest(d.imageService.ModifyImageAttribute), "spinifex-workers"},
+		{"ec2.ResetImageAttribute", handleNATSRequest(d.imageService.ResetImageAttribute), "spinifex-workers"},
+		{"ec2.CreateVolume", handleNATSRequest(d.volumeService.CreateVolume), "spinifex-workers"},
+		{"ec2.DescribeVolumes", handleNATSRequest(d.volumeService.DescribeVolumes), "spinifex-workers"},
 		{"ec2.ModifyVolume", d.handleEC2ModifyVolume, "spinifex-workers"},
-		{"ec2.DeleteVolume", d.handleEC2DeleteVolume, "spinifex-workers"},
-		{"ec2.DescribeVolumeStatus", d.handleEC2DescribeVolumeStatus, "spinifex-workers"},
-		{"ec2.DescribeVolumesModifications", d.handleEC2DescribeVolumesModifications, "spinifex-workers"},
-		{"ec2.CreateSnapshot", d.handleEC2CreateSnapshot, "spinifex-workers"},
-		{"ec2.DescribeSnapshots", d.handleEC2DescribeSnapshots, "spinifex-workers"},
-		{"ec2.DeleteSnapshot", d.handleEC2DeleteSnapshot, "spinifex-workers"},
-		{"ec2.CopySnapshot", d.handleEC2CopySnapshot, "spinifex-workers"},
-		{"ec2.CreateTags", d.handleEC2CreateTags, "spinifex-workers"},
-		{"ec2.DeleteTags", d.handleEC2DeleteTags, "spinifex-workers"},
-		{"ec2.DescribeTags", d.handleEC2DescribeTags, "spinifex-workers"},
-		{"ec2.CreateEgressOnlyInternetGateway", d.handleEC2CreateEgressOnlyInternetGateway, "spinifex-workers"},
-		{"ec2.DeleteEgressOnlyInternetGateway", d.handleEC2DeleteEgressOnlyInternetGateway, "spinifex-workers"},
-		{"ec2.DescribeEgressOnlyInternetGateways", d.handleEC2DescribeEgressOnlyInternetGateways, "spinifex-workers"},
-		{"ec2.CreateInternetGateway", d.handleEC2CreateInternetGateway, "spinifex-workers"},
-		{"ec2.DeleteInternetGateway", d.handleEC2DeleteInternetGateway, "spinifex-workers"},
-		{"ec2.DescribeInternetGateways", d.handleEC2DescribeInternetGateways, "spinifex-workers"},
-		{"ec2.AttachInternetGateway", d.handleEC2AttachInternetGateway, "spinifex-workers"},
-		{"ec2.DetachInternetGateway", d.handleEC2DetachInternetGateway, "spinifex-workers"},
-		{"ec2.CreatePlacementGroup", d.handleEC2CreatePlacementGroup, "spinifex-workers"},
-		{"ec2.DeletePlacementGroup", d.handleEC2DeletePlacementGroup, "spinifex-workers"},
-		{"ec2.DescribePlacementGroups", d.handleEC2DescribePlacementGroups, "spinifex-workers"},
-		{"ec2.ReserveSpreadNodes", d.handleEC2ReserveSpreadNodes, "spinifex-workers"},
-		{"ec2.FinalizeSpreadInstances", d.handleEC2FinalizeSpreadInstances, "spinifex-workers"},
-		{"ec2.ReleaseSpreadNodes", d.handleEC2ReleaseSpreadNodes, "spinifex-workers"},
-		{"ec2.RemoveInstanceFromPlacementGroup", d.handleEC2RemoveInstanceFromPlacementGroup, "spinifex-workers"},
-		{"ec2.ReserveClusterNode", d.handleEC2ReserveClusterNode, "spinifex-workers"},
-		{"ec2.FinalizeClusterInstances", d.handleEC2FinalizeClusterInstances, "spinifex-workers"},
+		{"ec2.DeleteVolume", handleNATSRequest(d.volumeService.DeleteVolume), "spinifex-workers"},
+		{"ec2.DescribeVolumeStatus", handleNATSRequest(d.volumeService.DescribeVolumeStatus), "spinifex-workers"},
+		{"ec2.DescribeVolumesModifications", handleNATSRequest(d.volumeService.DescribeVolumesModifications), "spinifex-workers"},
+		{"ec2.CreateSnapshot", handleNATSRequest(d.snapshotService.CreateSnapshot), "spinifex-workers"},
+		{"ec2.DescribeSnapshots", handleNATSRequest(d.snapshotService.DescribeSnapshots), "spinifex-workers"},
+		{"ec2.DeleteSnapshot", handleNATSRequest(d.snapshotService.DeleteSnapshot), "spinifex-workers"},
+		{"ec2.CopySnapshot", handleNATSRequest(d.snapshotService.CopySnapshot), "spinifex-workers"},
+		{"ec2.CreateTags", handleNATSRequest(d.createTags), "spinifex-workers"},
+		{"ec2.DeleteTags", handleNATSRequest(d.deleteTags), "spinifex-workers"},
+		{"ec2.DescribeTags", handleNATSRequest(d.tagsService.DescribeTags), "spinifex-workers"},
+		{"ec2.CreateEgressOnlyInternetGateway", handleNATSRequest(d.eigwService.CreateEgressOnlyInternetGateway), "spinifex-workers"},
+		{"ec2.DeleteEgressOnlyInternetGateway", handleNATSRequest(d.eigwService.DeleteEgressOnlyInternetGateway), "spinifex-workers"},
+		{"ec2.DescribeEgressOnlyInternetGateways", handleNATSRequest(d.eigwService.DescribeEgressOnlyInternetGateways), "spinifex-workers"},
+		{"ec2.CreateInternetGateway", handleNATSRequest(d.igwService.CreateInternetGateway), "spinifex-workers"},
+		{"ec2.DeleteInternetGateway", handleNATSRequest(d.igwService.DeleteInternetGateway), "spinifex-workers"},
+		{"ec2.DescribeInternetGateways", handleNATSRequest(d.igwService.DescribeInternetGateways), "spinifex-workers"},
+		{"ec2.AttachInternetGateway", handleNATSRequest(d.igwService.AttachInternetGateway), "spinifex-workers"},
+		{"ec2.DetachInternetGateway", handleNATSRequest(d.igwService.DetachInternetGateway), "spinifex-workers"},
+		{"ec2.CreatePlacementGroup", handleNATSRequest(d.placementGroupService.CreatePlacementGroup), "spinifex-workers"},
+		{"ec2.DeletePlacementGroup", handleNATSRequest(d.placementGroupService.DeletePlacementGroup), "spinifex-workers"},
+		{"ec2.DescribePlacementGroups", handleNATSRequest(d.placementGroupService.DescribePlacementGroups), "spinifex-workers"},
+		{"ec2.ReserveSpreadNodes", handleNATSRequest(d.placementGroupService.ReserveSpreadNodes), "spinifex-workers"},
+		{"ec2.FinalizeSpreadInstances", handleNATSRequest(d.placementGroupService.FinalizeSpreadInstances), "spinifex-workers"},
+		{"ec2.ReleaseSpreadNodes", handleNATSRequest(d.placementGroupService.ReleaseSpreadNodes), "spinifex-workers"},
+		{"ec2.RemoveInstanceFromPlacementGroup", handleNATSRequest(d.placementGroupService.RemoveInstance), "spinifex-workers"},
+		{"ec2.ReserveClusterNode", handleNATSRequest(d.placementGroupService.ReserveClusterNode), "spinifex-workers"},
+		{"ec2.FinalizeClusterInstances", handleNATSRequest(d.placementGroupService.FinalizeClusterInstances), "spinifex-workers"},
+		{"ec2.CreateLaunchTemplate", handleNATSRequest(d.launchTemplateService.CreateLaunchTemplate), "spinifex-workers"},
+		{"ec2.CreateLaunchTemplateVersion", handleNATSRequest(d.launchTemplateService.CreateLaunchTemplateVersion), "spinifex-workers"},
+		{"ec2.DeleteLaunchTemplate", handleNATSRequest(d.launchTemplateService.DeleteLaunchTemplate), "spinifex-workers"},
+		{"ec2.DeleteLaunchTemplateVersions", handleNATSRequest(d.launchTemplateService.DeleteLaunchTemplateVersions), "spinifex-workers"},
+		{"ec2.ModifyLaunchTemplate", handleNATSRequest(d.launchTemplateService.ModifyLaunchTemplate), "spinifex-workers"},
+		{"ec2.DescribeLaunchTemplates", handleNATSRequest(d.launchTemplateService.DescribeLaunchTemplates), "spinifex-workers"},
+		{"ec2.DescribeLaunchTemplateVersions", handleNATSRequest(d.launchTemplateService.DescribeLaunchTemplateVersions), "spinifex-workers"},
+		{"ec2.PutSpotInstanceRequests", handleNATSRequest(d.spotInstanceService.PutSpotInstanceRequests), "spinifex-workers"},
+		{"ec2.DescribeSpotInstanceRequests", handleNATSRequest(d.spotInstanceService.DescribeSpotInstanceRequests), "spinifex-workers"},
+		{"ec2.CancelSpotInstanceRequests", handleNATSRequest(d.spotInstanceService.CancelSpotInstanceRequests), "spinifex-workers"},
 		// Capacity reservations: Create is node-targeted (gateway pins one node);
 		// Describe fans out and Cancel broadcasts, so both use plain Subscribe.
 		{fmt.Sprintf("ec2.CreateCapacityReservation.%s", d.node), d.handleEC2CreateCapacityReservation, ""},
 		{"ec2.DescribeCapacityReservations", d.handleEC2DescribeCapacityReservations, ""},
 		{"ec2.CancelCapacityReservation", d.handleEC2CancelCapacityReservation, ""},
-		{"ec2.CreateNatGateway", d.handleEC2CreateNatGateway, "spinifex-workers"},
-		{"ec2.DeleteNatGateway", d.handleEC2DeleteNatGateway, "spinifex-workers"},
-		{"ec2.DescribeNatGateways", d.handleEC2DescribeNatGateways, "spinifex-workers"},
-		{"ec2.CreateRouteTable", d.handleEC2CreateRouteTable, "spinifex-workers"},
-		{"ec2.DeleteRouteTable", d.handleEC2DeleteRouteTable, "spinifex-workers"},
-		{"ec2.DescribeRouteTables", d.handleEC2DescribeRouteTables, "spinifex-workers"},
-		{"ec2.CreateRoute", d.handleEC2CreateRoute, "spinifex-workers"},
-		{"ec2.DeleteRoute", d.handleEC2DeleteRoute, "spinifex-workers"},
-		{"ec2.ReplaceRoute", d.handleEC2ReplaceRoute, "spinifex-workers"},
-		{"ec2.AssociateRouteTable", d.handleEC2AssociateRouteTable, "spinifex-workers"},
-		{"ec2.DisassociateRouteTable", d.handleEC2DisassociateRouteTable, "spinifex-workers"},
-		{"ec2.ReplaceRouteTableAssociation", d.handleEC2ReplaceRouteTableAssociation, "spinifex-workers"},
-		{"ec2.CreateVpc", d.handleEC2CreateVpc, "spinifex-workers"},
-		{"ec2.DeleteVpc", d.handleEC2DeleteVpc, "spinifex-workers"},
-		{"ec2.DescribeVpcs", d.handleEC2DescribeVpcs, "spinifex-workers"},
-		{"ec2.CreateSubnet", d.handleEC2CreateSubnet, "spinifex-workers"},
-		{"ec2.DeleteSubnet", d.handleEC2DeleteSubnet, "spinifex-workers"},
-		{"ec2.DescribeSubnets", d.handleEC2DescribeSubnets, "spinifex-workers"},
-		{"ec2.ModifySubnetAttribute", d.handleEC2ModifySubnetAttribute, "spinifex-workers"},
-		{"ec2.ModifyVpcAttribute", d.handleEC2ModifyVpcAttribute, "spinifex-workers"},
-		{"ec2.DescribeVpcAttribute", d.handleEC2DescribeVpcAttribute, "spinifex-workers"},
-		{"ec2.CreateNetworkInterface", d.handleEC2CreateNetworkInterface, "spinifex-workers"},
-		{"ec2.DeleteNetworkInterface", d.handleEC2DeleteNetworkInterface, "spinifex-workers"},
-		{"ec2.DescribeNetworkInterfaces", d.handleEC2DescribeNetworkInterfaces, "spinifex-workers"},
-		{"ec2.ModifyNetworkInterfaceAttribute", d.handleEC2ModifyNetworkInterfaceAttribute, "spinifex-workers"},
-		{"ec2.CreateSecurityGroup", d.handleEC2CreateSecurityGroup, "spinifex-workers"},
-		{"ec2.DeleteSecurityGroup", d.handleEC2DeleteSecurityGroup, "spinifex-workers"},
-		{"ec2.DescribeSecurityGroups", d.handleEC2DescribeSecurityGroups, "spinifex-workers"},
-		{"ec2.DescribeSecurityGroupRules", d.handleEC2DescribeSecurityGroupRules, "spinifex-workers"},
-		{"ec2.AuthorizeSecurityGroupIngress", d.handleEC2AuthorizeSecurityGroupIngress, "spinifex-workers"},
-		{"ec2.AuthorizeSecurityGroupEgress", d.handleEC2AuthorizeSecurityGroupEgress, "spinifex-workers"},
-		{"ec2.RevokeSecurityGroupIngress", d.handleEC2RevokeSecurityGroupIngress, "spinifex-workers"},
-		{"ec2.RevokeSecurityGroupEgress", d.handleEC2RevokeSecurityGroupEgress, "spinifex-workers"},
-		{"ec2.ModifyInstanceAttribute", d.handleEC2ModifyInstanceAttribute, "spinifex-workers"},
-		{"ec2.ModifyInstanceMetadataOptions", d.handleEC2ModifyInstanceMetadataOptions, "spinifex-workers"},
+		{"ec2.CreateNatGateway", handleNATSRequest(d.natGatewayService.CreateNatGateway), "spinifex-workers"},
+		{"ec2.DeleteNatGateway", handleNATSRequest(d.natGatewayService.DeleteNatGateway), "spinifex-workers"},
+		{"ec2.DescribeNatGateways", handleNATSRequest(d.natGatewayService.DescribeNatGateways), "spinifex-workers"},
+		{"ec2.CreateRouteTable", handleNATSRequest(d.routeTableService.CreateRouteTable), "spinifex-workers"},
+		{"ec2.DeleteRouteTable", handleNATSRequest(d.routeTableService.DeleteRouteTable), "spinifex-workers"},
+		{"ec2.DescribeRouteTables", handleNATSRequest(d.routeTableService.DescribeRouteTables), "spinifex-workers"},
+		{"ec2.CreateRoute", handleNATSRequest(d.routeTableService.CreateRoute), "spinifex-workers"},
+		{"ec2.DeleteRoute", handleNATSRequest(d.routeTableService.DeleteRoute), "spinifex-workers"},
+		{"ec2.ReplaceRoute", handleNATSRequest(d.routeTableService.ReplaceRoute), "spinifex-workers"},
+		{"ec2.AssociateRouteTable", handleNATSRequest(d.routeTableService.AssociateRouteTable), "spinifex-workers"},
+		{"ec2.DisassociateRouteTable", handleNATSRequest(d.routeTableService.DisassociateRouteTable), "spinifex-workers"},
+		{"ec2.ReplaceRouteTableAssociation", handleNATSRequest(d.routeTableService.ReplaceRouteTableAssociation), "spinifex-workers"},
+		{"ec2.CreateVpc", handleNATSRequest(d.vpcService.CreateVpc), "spinifex-workers"},
+		{"ec2.DeleteVpc", handleNATSRequest(d.vpcService.DeleteVpc), "spinifex-workers"},
+		{"ec2.DescribeVpcs", handleNATSRequest(d.vpcService.DescribeVpcs), "spinifex-workers"},
+		{"ec2.CreateSubnet", handleNATSRequest(d.vpcService.CreateSubnet), "spinifex-workers"},
+		{"ec2.DeleteSubnet", handleNATSRequest(d.vpcService.DeleteSubnet), "spinifex-workers"},
+		{"ec2.DescribeSubnets", handleNATSRequest(d.vpcService.DescribeSubnets), "spinifex-workers"},
+		{"ec2.ModifySubnetAttribute", handleNATSRequest(d.vpcService.ModifySubnetAttribute), "spinifex-workers"},
+		{"ec2.ModifyVpcAttribute", handleNATSRequest(d.vpcService.ModifyVpcAttribute), "spinifex-workers"},
+		{"ec2.DescribeVpcAttribute", handleNATSRequest(d.vpcService.DescribeVpcAttribute), "spinifex-workers"},
+		{"ec2.CreateNetworkInterface", handleNATSRequest(d.vpcService.CreateNetworkInterface), "spinifex-workers"},
+		{"ec2.DeleteNetworkInterface", handleNATSRequest(d.vpcService.DeleteNetworkInterface), "spinifex-workers"},
+		{"ec2.DescribeNetworkInterfaces", handleNATSRequest(d.vpcService.DescribeNetworkInterfaces), "spinifex-workers"},
+		{"ec2.ModifyNetworkInterfaceAttribute", handleNATSRequest(d.vpcService.ModifyNetworkInterfaceAttribute), "spinifex-workers"},
+		{"ec2.CreateSecurityGroup", handleNATSRequest(d.vpcService.CreateSecurityGroup), "spinifex-workers"},
+		{"ec2.DeleteSecurityGroup", handleNATSRequest(d.vpcService.DeleteSecurityGroup), "spinifex-workers"},
+		{"ec2.DescribeSecurityGroups", handleNATSRequest(d.vpcService.DescribeSecurityGroups), "spinifex-workers"},
+		{"ec2.DescribeSecurityGroupRules", handleNATSRequest(d.vpcService.DescribeSecurityGroupRules), "spinifex-workers"},
+		{"ec2.AuthorizeSecurityGroupIngress", handleNATSRequest(d.vpcService.AuthorizeSecurityGroupIngress), "spinifex-workers"},
+		{"ec2.AuthorizeSecurityGroupEgress", handleNATSRequest(d.vpcService.AuthorizeSecurityGroupEgress), "spinifex-workers"},
+		{"ec2.RevokeSecurityGroupIngress", handleNATSRequest(d.vpcService.RevokeSecurityGroupIngress), "spinifex-workers"},
+		{"ec2.RevokeSecurityGroupEgress", handleNATSRequest(d.vpcService.RevokeSecurityGroupEgress), "spinifex-workers"},
+		{"ec2.ModifyInstanceAttribute", handleNATSRequest(d.instanceService.ModifyInstanceAttribute), "spinifex-workers"},
+		{"ec2.ModifyInstanceMetadataOptions", handleNATSRequest(d.instanceService.ModifyInstanceMetadataOptions), "spinifex-workers"},
 		{"ec2.start", d.handleEC2StartStoppedInstance, "spinifex-workers"},
-		{fmt.Sprintf("ec2.start.%s", d.node), d.handleEC2StartStoppedInstanceDirect, ""},
-		{"ec2.terminate", d.handleEC2TerminateStoppedInstance, "spinifex-workers"},
-		{"ec2.DescribeStoppedInstances", d.handleEC2DescribeStoppedInstances, "spinifex-workers"},
-		{"ec2.DescribeTerminatedInstances", d.handleEC2DescribeTerminatedInstances, "spinifex-workers"},
+		// ec2.start.{node} is the node-targeted variant: it always starts locally
+		// and never re-forwards, so it goes straight to the service (no routing loop).
+		{fmt.Sprintf("ec2.start.%s", d.node), handleNATSRequest(d.instanceService.StartStoppedInstance), ""},
+		{"ec2.terminate", handleNATSRequest(d.instanceService.TerminateStoppedInstance), "spinifex-workers"},
+		{"ec2.DescribeStoppedInstances", handleNATSRequest(d.instanceService.DescribeStoppedInstances), "spinifex-workers"},
+		{"ec2.DescribeTerminatedInstances", handleNATSRequest(d.instanceService.DescribeTerminatedInstances), "spinifex-workers"},
 		// these fan out to all nodes and gateway aggregates the results. The
 		// handler only sees per-daemon local state (vmMgr/stoppedStore), so
 		// any queue-grouped routing produces 1/N false NotFound responses.
-		{"ec2.DescribeInstances", d.handleEC2DescribeInstances, ""},
-		{"ec2.DescribeInstanceStatus", d.handleEC2DescribeInstanceStatus, ""},
-		{"ec2.DescribeInstanceTypes", d.handleEC2DescribeInstanceTypes, ""},
-		{"ec2.DescribeInstanceAttribute", d.handleEC2DescribeInstanceAttribute, ""},
+		{"ec2.DescribeInstances", handleNATSRequest(d.instanceService.DescribeInstances), ""},
+		{"ec2.DescribeInstanceStatus", handleNATSRequest(d.instanceService.DescribeInstanceStatus), ""},
+		{"ec2.DescribeInstanceTypes", handleNATSRequest(d.instanceService.DescribeInstanceTypes), ""},
+		{"ec2.DescribeInstanceAttribute", handleNATSRequest(d.instanceService.DescribeInstanceAttribute), ""},
 		// IAM instance profile associations: Disassociate/Replace mutate the
 		// owning daemon's vm.VM (non-owners NoOp with Found=false); Describe
 		// returns per-daemon matches that the gateway concatenates.
-		{"ec2.IamProfileAssociation.disassociate", d.handleIamProfileDisassociate, ""},
-		{"ec2.IamProfileAssociation.replace", d.handleIamProfileReplace, ""},
-		{"ec2.IamProfileAssociation.describe", d.handleIamProfileDescribe, ""},
-		{"ec2.EnableEbsEncryptionByDefault", d.handleEC2EnableEbsEncryptionByDefault, "spinifex-workers"},
-		{"ec2.DisableEbsEncryptionByDefault", d.handleEC2DisableEbsEncryptionByDefault, "spinifex-workers"},
-		{"ec2.GetEbsEncryptionByDefault", d.handleEC2GetEbsEncryptionByDefault, "spinifex-workers"},
-		{"ec2.GetSerialConsoleAccessStatus", d.handleEC2GetSerialConsoleAccessStatus, "spinifex-workers"},
-		{"ec2.EnableSerialConsoleAccess", d.handleEC2EnableSerialConsoleAccess, "spinifex-workers"},
-		{"ec2.DisableSerialConsoleAccess", d.handleEC2DisableSerialConsoleAccess, "spinifex-workers"},
+		{"ec2.IamProfileAssociation.disassociate", handleNATSRequest(d.instanceService.DisassociateIamProfileAssociation), ""},
+		{"ec2.IamProfileAssociation.replace", handleNATSRequest(d.instanceService.ReplaceIamProfileAssociation), ""},
+		{"ec2.IamProfileAssociation.describe", handleNATSRequest(d.instanceService.DescribeIamProfileAssociations), ""},
+		{"ec2.EnableEbsEncryptionByDefault", handleNATSRequest(d.accountService.EnableEbsEncryptionByDefault), "spinifex-workers"},
+		{"ec2.DisableEbsEncryptionByDefault", handleNATSRequest(d.accountService.DisableEbsEncryptionByDefault), "spinifex-workers"},
+		{"ec2.GetEbsEncryptionByDefault", handleNATSRequest(d.accountService.GetEbsEncryptionByDefault), "spinifex-workers"},
+		{"ec2.GetSerialConsoleAccessStatus", handleNATSRequest(d.accountService.GetSerialConsoleAccessStatus), "spinifex-workers"},
+		{"ec2.EnableSerialConsoleAccess", handleNATSRequest(d.accountService.EnableSerialConsoleAccess), "spinifex-workers"},
+		{"ec2.DisableSerialConsoleAccess", handleNATSRequest(d.accountService.DisableSerialConsoleAccess), "spinifex-workers"},
 		{fmt.Sprintf("spinifex.admin.%s.health", d.node), d.handleHealthCheck, ""},
 		{"spinifex.nodes.discover", d.handleNodeDiscover, ""},
 		{"spinifex.node.status", d.handleNodeStatus, ""},
 		{"spinifex.node.vms", d.handleNodeVMs, ""},
 		{"spinifex.storage.config", d.handleStorageConfig, ""},
+		{"spinifex.image.promote", d.handleSpinifexPromoteImage, "spinifex-workers"},
 		// Account creation → create default VPC for new account
 		{"iam.account.created", d.handleAccountCreated, "spinifex-workers"},
 		// Coordinated cluster shutdown phases (fan-out, no queue group)
@@ -870,41 +928,41 @@ func (d *Daemon) subscribeAll() error {
 	// Without a subscriber the gateway returns nats.ErrNoResponders → ServiceUnavailable.
 	if d.elbv2Service.GatewayURL != "" {
 		subs = append(subs,
-			natsSub{"elbv2.CreateLoadBalancer", d.handleELBv2CreateLoadBalancer, "spinifex-workers"},
-			natsSub{"elbv2.DeleteLoadBalancer", d.handleELBv2DeleteLoadBalancer, "spinifex-workers"},
-			natsSub{"elbv2.DescribeLoadBalancers", d.handleELBv2DescribeLoadBalancers, "spinifex-workers"},
-			natsSub{"elbv2.CreateTargetGroup", d.handleELBv2CreateTargetGroup, "spinifex-workers"},
-			natsSub{"elbv2.ModifyTargetGroup", d.handleELBv2ModifyTargetGroup, "spinifex-workers"},
-			natsSub{"elbv2.DeleteTargetGroup", d.handleELBv2DeleteTargetGroup, "spinifex-workers"},
-			natsSub{"elbv2.DescribeTargetGroups", d.handleELBv2DescribeTargetGroups, "spinifex-workers"},
-			natsSub{"elbv2.RegisterTargets", d.handleELBv2RegisterTargets, "spinifex-workers"},
-			natsSub{"elbv2.DeregisterTargets", d.handleELBv2DeregisterTargets, "spinifex-workers"},
-			natsSub{"elbv2.DescribeTargetHealth", d.handleELBv2DescribeTargetHealth, "spinifex-workers"},
-			natsSub{"elbv2.CreateListener", d.handleELBv2CreateListener, "spinifex-workers"},
-			natsSub{"elbv2.DeleteListener", d.handleELBv2DeleteListener, "spinifex-workers"},
-			natsSub{"elbv2.ModifyListener", d.handleELBv2ModifyListener, "spinifex-workers"},
-			natsSub{"elbv2.DescribeListeners", d.handleELBv2DescribeListeners, "spinifex-workers"},
-			natsSub{"elbv2.CreateRule", d.handleELBv2CreateRule, "spinifex-workers"},
-			natsSub{"elbv2.ModifyRule", d.handleELBv2ModifyRule, "spinifex-workers"},
-			natsSub{"elbv2.DeleteRule", d.handleELBv2DeleteRule, "spinifex-workers"},
-			natsSub{"elbv2.DescribeRules", d.handleELBv2DescribeRules, "spinifex-workers"},
-			natsSub{"elbv2.SetRulePriorities", d.handleELBv2SetRulePriorities, "spinifex-workers"},
-			natsSub{"elbv2.DescribeTags", d.handleELBv2DescribeTags, "spinifex-workers"},
-			natsSub{"elbv2.AddTags", d.handleELBv2AddTags, "spinifex-workers"},
-			natsSub{"elbv2.RemoveTags", d.handleELBv2RemoveTags, "spinifex-workers"},
-			natsSub{"elbv2.LBAgentHeartbeat", d.handleELBv2LBAgentHeartbeat, "spinifex-workers"},
-			natsSub{"elbv2.GetLBConfig", d.handleELBv2GetLBConfig, "spinifex-workers"},
-			natsSub{"elbv2.ModifyTargetGroupAttributes", d.handleELBv2ModifyTargetGroupAttributes, "spinifex-workers"},
-			natsSub{"elbv2.DescribeTargetGroupAttributes", d.handleELBv2DescribeTargetGroupAttributes, "spinifex-workers"},
-			natsSub{"elbv2.ModifyLoadBalancerAttributes", d.handleELBv2ModifyLoadBalancerAttributes, "spinifex-workers"},
-			natsSub{"elbv2.DescribeLoadBalancerAttributes", d.handleELBv2DescribeLoadBalancerAttributes, "spinifex-workers"},
-			natsSub{"elbv2.SetSecurityGroups", d.handleELBv2SetSecurityGroups, "spinifex-workers"},
-			natsSub{"elbv2.SetIpAddressType", d.handleELBv2SetIpAddressType, "spinifex-workers"},
-			natsSub{"elbv2.SetSubnets", d.handleELBv2SetSubnets, "spinifex-workers"},
-			natsSub{"elbv2.AddListenerCertificates", d.handleELBv2AddListenerCertificates, "spinifex-workers"},
-			natsSub{"elbv2.RemoveListenerCertificates", d.handleELBv2RemoveListenerCertificates, "spinifex-workers"},
-			natsSub{"elbv2.DescribeListenerCertificates", d.handleELBv2DescribeListenerCertificates, "spinifex-workers"},
-			natsSub{"elbv2.DescribeSSLPolicies", d.handleELBv2DescribeSSLPolicies, "spinifex-workers"},
+			natsSub{"elbv2.CreateLoadBalancer", handleNATSRequest(d.elbv2Service.CreateLoadBalancer), "spinifex-workers"},
+			natsSub{"elbv2.DeleteLoadBalancer", handleNATSRequest(d.elbv2Service.DeleteLoadBalancer), "spinifex-workers"},
+			natsSub{"elbv2.DescribeLoadBalancers", handleNATSRequest(d.elbv2Service.DescribeLoadBalancers), "spinifex-workers"},
+			natsSub{"elbv2.CreateTargetGroup", handleNATSRequest(d.elbv2Service.CreateTargetGroup), "spinifex-workers"},
+			natsSub{"elbv2.ModifyTargetGroup", handleNATSRequest(d.elbv2Service.ModifyTargetGroup), "spinifex-workers"},
+			natsSub{"elbv2.DeleteTargetGroup", handleNATSRequest(d.elbv2Service.DeleteTargetGroup), "spinifex-workers"},
+			natsSub{"elbv2.DescribeTargetGroups", handleNATSRequest(d.elbv2Service.DescribeTargetGroups), "spinifex-workers"},
+			natsSub{"elbv2.RegisterTargets", handleNATSRequest(d.elbv2Service.RegisterTargets), "spinifex-workers"},
+			natsSub{"elbv2.DeregisterTargets", handleNATSRequest(d.elbv2Service.DeregisterTargets), "spinifex-workers"},
+			natsSub{"elbv2.DescribeTargetHealth", handleNATSRequest(d.elbv2Service.DescribeTargetHealth), "spinifex-workers"},
+			natsSub{"elbv2.CreateListener", handleNATSRequest(d.elbv2Service.CreateListener), "spinifex-workers"},
+			natsSub{"elbv2.DeleteListener", handleNATSRequest(d.elbv2Service.DeleteListener), "spinifex-workers"},
+			natsSub{"elbv2.ModifyListener", handleNATSRequest(d.elbv2Service.ModifyListener), "spinifex-workers"},
+			natsSub{"elbv2.DescribeListeners", handleNATSRequest(d.elbv2Service.DescribeListeners), "spinifex-workers"},
+			natsSub{"elbv2.CreateRule", handleNATSRequest(d.elbv2Service.CreateRule), "spinifex-workers"},
+			natsSub{"elbv2.ModifyRule", handleNATSRequest(d.elbv2Service.ModifyRule), "spinifex-workers"},
+			natsSub{"elbv2.DeleteRule", handleNATSRequest(d.elbv2Service.DeleteRule), "spinifex-workers"},
+			natsSub{"elbv2.DescribeRules", handleNATSRequest(d.elbv2Service.DescribeRules), "spinifex-workers"},
+			natsSub{"elbv2.SetRulePriorities", handleNATSRequest(d.elbv2Service.SetRulePriorities), "spinifex-workers"},
+			natsSub{"elbv2.DescribeTags", handleNATSRequest(d.elbv2Service.DescribeTags), "spinifex-workers"},
+			natsSub{"elbv2.AddTags", handleNATSRequest(d.elbv2Service.AddTags), "spinifex-workers"},
+			natsSub{"elbv2.RemoveTags", handleNATSRequest(d.elbv2Service.RemoveTags), "spinifex-workers"},
+			natsSub{"elbv2.LBAgentHeartbeat", handleNATSRequest(d.elbv2Service.LBAgentHeartbeat), "spinifex-workers"},
+			natsSub{"elbv2.GetLBConfig", handleNATSRequest(d.elbv2Service.GetLBConfig), "spinifex-workers"},
+			natsSub{"elbv2.ModifyTargetGroupAttributes", handleNATSRequest(d.elbv2Service.ModifyTargetGroupAttributes), "spinifex-workers"},
+			natsSub{"elbv2.DescribeTargetGroupAttributes", handleNATSRequest(d.elbv2Service.DescribeTargetGroupAttributes), "spinifex-workers"},
+			natsSub{"elbv2.ModifyLoadBalancerAttributes", handleNATSRequest(d.elbv2Service.ModifyLoadBalancerAttributes), "spinifex-workers"},
+			natsSub{"elbv2.DescribeLoadBalancerAttributes", handleNATSRequest(d.elbv2Service.DescribeLoadBalancerAttributes), "spinifex-workers"},
+			natsSub{"elbv2.SetSecurityGroups", handleNATSRequest(d.elbv2Service.SetSecurityGroups), "spinifex-workers"},
+			natsSub{"elbv2.SetIpAddressType", handleNATSRequest(d.elbv2Service.SetIpAddressType), "spinifex-workers"},
+			natsSub{"elbv2.SetSubnets", handleNATSRequest(d.elbv2Service.SetSubnets), "spinifex-workers"},
+			natsSub{"elbv2.AddListenerCertificates", handleNATSRequest(d.elbv2Service.AddListenerCertificates), "spinifex-workers"},
+			natsSub{"elbv2.RemoveListenerCertificates", handleNATSRequest(d.elbv2Service.RemoveListenerCertificates), "spinifex-workers"},
+			natsSub{"elbv2.DescribeListenerCertificates", handleNATSRequest(d.elbv2Service.DescribeListenerCertificates), "spinifex-workers"},
+			natsSub{"elbv2.DescribeSSLPolicies", handleNATSRequest(d.elbv2Service.DescribeSSLPolicies), "spinifex-workers"},
 		)
 	}
 
@@ -913,86 +971,151 @@ func (d *Daemon) subscribeAll() error {
 	// stable while real bodies land.
 	if d.eksService != nil {
 		subs = append(subs,
-			natsSub{"eks.CreateCluster", d.handleEKSCreateCluster, "spinifex-workers"},
-			natsSub{"eks.DescribeCluster", d.handleEKSDescribeCluster, "spinifex-workers"},
-			natsSub{"eks.ListClusters", d.handleEKSListClusters, "spinifex-workers"},
-			natsSub{"eks.UpdateClusterConfig", d.handleEKSUpdateClusterConfig, "spinifex-workers"},
-			natsSub{"eks.UpdateClusterVersion", d.handleEKSUpdateClusterVersion, "spinifex-workers"},
-			natsSub{"eks.DeleteCluster", d.handleEKSDeleteCluster, "spinifex-workers"},
-			natsSub{"eks.CreateNodegroup", d.handleEKSCreateNodegroup, "spinifex-workers"},
-			natsSub{"eks.DescribeNodegroup", d.handleEKSDescribeNodegroup, "spinifex-workers"},
-			natsSub{"eks.ListNodegroups", d.handleEKSListNodegroups, "spinifex-workers"},
-			natsSub{"eks.UpdateNodegroupConfig", d.handleEKSUpdateNodegroupConfig, "spinifex-workers"},
-			natsSub{"eks.UpdateNodegroupVersion", d.handleEKSUpdateNodegroupVersion, "spinifex-workers"},
-			natsSub{"eks.DeleteNodegroup", d.handleEKSDeleteNodegroup, "spinifex-workers"},
-			natsSub{"eks.CreateAccessEntry", d.handleEKSCreateAccessEntry, "spinifex-workers"},
-			natsSub{"eks.DescribeAccessEntry", d.handleEKSDescribeAccessEntry, "spinifex-workers"},
-			natsSub{"eks.ListAccessEntries", d.handleEKSListAccessEntries, "spinifex-workers"},
-			natsSub{"eks.UpdateAccessEntry", d.handleEKSUpdateAccessEntry, "spinifex-workers"},
-			natsSub{"eks.DeleteAccessEntry", d.handleEKSDeleteAccessEntry, "spinifex-workers"},
-			natsSub{"eks.AssociateAccessPolicy", d.handleEKSAssociateAccessPolicy, "spinifex-workers"},
-			natsSub{"eks.DisassociateAccessPolicy", d.handleEKSDisassociateAccessPolicy, "spinifex-workers"},
-			natsSub{"eks.ListAssociatedAccessPolicies", d.handleEKSListAssociatedAccessPolicies, "spinifex-workers"},
-			natsSub{"eks.ListAccessPolicies", d.handleEKSListAccessPolicies, "spinifex-workers"},
-			natsSub{"eks.ListAddons", d.handleEKSListAddons, "spinifex-workers"},
-			natsSub{"eks.DescribeAddonVersions", d.handleEKSDescribeAddonVersions, "spinifex-workers"},
-			natsSub{"eks.CreateAddon", d.handleEKSCreateAddon, "spinifex-workers"},
-			natsSub{"eks.DeleteAddon", d.handleEKSDeleteAddon, "spinifex-workers"},
-			natsSub{"eks.DescribeAddon", d.handleEKSDescribeAddon, "spinifex-workers"},
-			natsSub{"eks.UpdateAddon", d.handleEKSUpdateAddon, "spinifex-workers"},
-			natsSub{"eks.ListStagedAddonManifests", d.handleEKSListStagedAddonManifests, "spinifex-workers"},
-			natsSub{"eks.AssociateIdentityProviderConfig", d.handleEKSAssociateIdentityProviderConfig, "spinifex-workers"},
-			natsSub{"eks.DescribeIdentityProviderConfig", d.handleEKSDescribeIdentityProviderConfig, "spinifex-workers"},
-			natsSub{"eks.ListIdentityProviderConfigs", d.handleEKSListIdentityProviderConfigs, "spinifex-workers"},
-			natsSub{"eks.DisassociateIdentityProviderConfig", d.handleEKSDisassociateIdentityProviderConfig, "spinifex-workers"},
-			natsSub{"eks.TagResource", d.handleEKSTagResource, "spinifex-workers"},
-			natsSub{"eks.UntagResource", d.handleEKSUntagResource, "spinifex-workers"},
-			natsSub{"eks.ListTagsForResource", d.handleEKSListTagsForResource, "spinifex-workers"},
+			natsSub{"eks.CreateCluster", handleNATSRequestWithPrincipal(d.eksService.CreateCluster), "spinifex-workers"},
+			natsSub{"eks.DescribeCluster", handleNATSRequest(d.eksService.DescribeCluster), "spinifex-workers"},
+			natsSub{"eks.ListClusters", handleNATSRequest(d.eksService.ListClusters), "spinifex-workers"},
+			natsSub{"eks.UpdateClusterConfig", handleNATSRequest(d.eksService.UpdateClusterConfig), "spinifex-workers"},
+			natsSub{"eks.UpdateClusterVersion", handleNATSRequest(d.eksService.UpdateClusterVersion), "spinifex-workers"},
+			natsSub{"eks.DeleteCluster", handleNATSRequest(d.eksService.DeleteCluster), "spinifex-workers"},
+			natsSub{"eks.CreateNodegroup", handleNATSRequest(d.eksService.CreateNodegroup), "spinifex-workers"},
+			natsSub{"eks.DescribeNodegroup", handleNATSRequest(d.eksService.DescribeNodegroup), "spinifex-workers"},
+			natsSub{"eks.ListNodegroups", handleNATSRequest(d.eksService.ListNodegroups), "spinifex-workers"},
+			natsSub{"eks.UpdateNodegroupConfig", handleNATSRequest(d.eksService.UpdateNodegroupConfig), "spinifex-workers"},
+			natsSub{"eks.UpdateNodegroupVersion", handleNATSRequest(d.eksService.UpdateNodegroupVersion), "spinifex-workers"},
+			natsSub{"eks.DeleteNodegroup", handleNATSRequest(d.eksService.DeleteNodegroup), "spinifex-workers"},
+			natsSub{"eks.CreateAccessEntry", handleNATSRequest(d.eksService.CreateAccessEntry), "spinifex-workers"},
+			natsSub{"eks.DescribeAccessEntry", handleNATSRequest(d.eksService.DescribeAccessEntry), "spinifex-workers"},
+			natsSub{"eks.ListAccessEntries", handleNATSRequest(d.eksService.ListAccessEntries), "spinifex-workers"},
+			natsSub{"eks.UpdateAccessEntry", handleNATSRequest(d.eksService.UpdateAccessEntry), "spinifex-workers"},
+			natsSub{"eks.DeleteAccessEntry", handleNATSRequest(d.eksService.DeleteAccessEntry), "spinifex-workers"},
+			natsSub{"eks.AssociateAccessPolicy", handleNATSRequest(d.eksService.AssociateAccessPolicy), "spinifex-workers"},
+			natsSub{"eks.DisassociateAccessPolicy", handleNATSRequest(d.eksService.DisassociateAccessPolicy), "spinifex-workers"},
+			natsSub{"eks.ListAssociatedAccessPolicies", handleNATSRequest(d.eksService.ListAssociatedAccessPolicies), "spinifex-workers"},
+			natsSub{"eks.ListAccessPolicies", handleNATSRequest(d.eksService.ListAccessPolicies), "spinifex-workers"},
+			natsSub{"eks.ListAddons", handleNATSRequest(d.eksService.ListAddons), "spinifex-workers"},
+			natsSub{"eks.DescribeAddonVersions", handleNATSRequest(d.eksService.DescribeAddonVersions), "spinifex-workers"},
+			natsSub{"eks.CreateAddon", handleNATSRequest(d.eksService.CreateAddon), "spinifex-workers"},
+			natsSub{"eks.DeleteAddon", handleNATSRequest(d.eksService.DeleteAddon), "spinifex-workers"},
+			natsSub{"eks.DescribeAddon", handleNATSRequest(d.eksService.DescribeAddon), "spinifex-workers"},
+			natsSub{"eks.UpdateAddon", handleNATSRequest(d.eksService.UpdateAddon), "spinifex-workers"},
+			natsSub{"eks.ListStagedAddonManifests", handleNATSRequest(d.eksService.ListStagedAddonManifests), "spinifex-workers"},
+			natsSub{"eks.GetRecoveryDirective", handleNATSRequest(d.eksService.GetRecoveryDirective), "spinifex-workers"},
+			natsSub{"eks.SetRecoveryDirective", handleNATSRequest(d.eksService.SetRecoveryDirective), "spinifex-workers"},
+			natsSub{"eks.RestoreSnapshot", handleNATSRequest(d.eksService.RestoreSnapshot), "spinifex-workers"},
+			natsSub{"eks.AssociateIdentityProviderConfig", handleNATSRequest(d.eksService.AssociateIdentityProviderConfig), "spinifex-workers"},
+			natsSub{"eks.DescribeIdentityProviderConfig", handleNATSRequest(d.eksService.DescribeIdentityProviderConfig), "spinifex-workers"},
+			natsSub{"eks.ListIdentityProviderConfigs", handleNATSRequest(d.eksService.ListIdentityProviderConfigs), "spinifex-workers"},
+			natsSub{"eks.DisassociateIdentityProviderConfig", handleNATSRequest(d.eksService.DisassociateIdentityProviderConfig), "spinifex-workers"},
+			natsSub{"eks.TagResource", handleNATSRequest(d.eksService.TagResource), "spinifex-workers"},
+			natsSub{"eks.UntagResource", handleNATSRequest(d.eksService.UntagResource), "spinifex-workers"},
+			natsSub{"eks.ListTagsForResource", handleNATSRequest(d.eksService.ListTagsForResource), "spinifex-workers"},
 		)
 	}
 
 	// ECS gateway → daemon subscriptions (control plane; per-account KV).
 	if d.ecsService != nil {
 		subs = append(subs,
-			natsSub{"ecs.CreateCluster", d.handleECSCreateCluster, "spinifex-workers"},
-			natsSub{"ecs.DeleteCluster", d.handleECSDeleteCluster, "spinifex-workers"},
-			natsSub{"ecs.DescribeClusters", d.handleECSDescribeClusters, "spinifex-workers"},
-			natsSub{"ecs.ListClusters", d.handleECSListClusters, "spinifex-workers"},
-			natsSub{"ecs.RegisterTaskDefinition", d.handleECSRegisterTaskDefinition, "spinifex-workers"},
-			natsSub{"ecs.DeregisterTaskDefinition", d.handleECSDeregisterTaskDefinition, "spinifex-workers"},
-			natsSub{"ecs.DescribeTaskDefinition", d.handleECSDescribeTaskDefinition, "spinifex-workers"},
-			natsSub{"ecs.ListTaskDefinitions", d.handleECSListTaskDefinitions, "spinifex-workers"},
-			natsSub{"ecs.RegisterContainerInstance", d.handleECSRegisterContainerInstance, "spinifex-workers"},
-			natsSub{"ecs.DeregisterContainerInstance", d.handleECSDeregisterContainerInstance, "spinifex-workers"},
-			natsSub{"ecs.UpdateContainerInstancesState", d.handleECSUpdateContainerInstancesState, "spinifex-workers"},
-			natsSub{"ecs.DescribeContainerInstances", d.handleECSDescribeContainerInstances, "spinifex-workers"},
-			natsSub{"ecs.ListContainerInstances", d.handleECSListContainerInstances, "spinifex-workers"},
-			natsSub{"ecs.RunTask", d.handleECSRunTask, "spinifex-workers"},
-			natsSub{"ecs.StartTask", d.handleECSStartTask, "spinifex-workers"},
-			natsSub{"ecs.StopTask", d.handleECSStopTask, "spinifex-workers"},
-			natsSub{"ecs.DescribeTasks", d.handleECSDescribeTasks, "spinifex-workers"},
-			natsSub{"ecs.ListTasks", d.handleECSListTasks, "spinifex-workers"},
-			natsSub{"ecs.CreateService", d.handleECSCreateService, "spinifex-workers"},
-			natsSub{"ecs.UpdateService", d.handleECSUpdateService, "spinifex-workers"},
-			natsSub{"ecs.DeleteService", d.handleECSDeleteService, "spinifex-workers"},
-			natsSub{"ecs.DescribeServices", d.handleECSDescribeServices, "spinifex-workers"},
-			natsSub{"ecs.ListServices", d.handleECSListServices, "spinifex-workers"},
-			natsSub{"ecs.SubmitTaskStateChange", d.handleECSSubmitTaskStateChange, "spinifex-workers"},
-			natsSub{"ecs.PollAssignments", d.handleECSPollAssignments, "spinifex-workers"},
-			natsSub{"ecs.ProvisionCapacity", d.handleECSProvisionCapacity, "spinifex-workers"},
+			natsSub{"ecs.CreateCluster", handleNATSRequest(d.ecsService.CreateCluster), "spinifex-workers"},
+			natsSub{"ecs.DeleteCluster", handleNATSRequest(d.ecsService.DeleteCluster), "spinifex-workers"},
+			natsSub{"ecs.DescribeClusters", handleNATSRequest(d.ecsService.DescribeClusters), "spinifex-workers"},
+			natsSub{"ecs.ListClusters", handleNATSRequest(d.ecsService.ListClusters), "spinifex-workers"},
+			natsSub{"ecs.RegisterTaskDefinition", handleNATSRequest(d.ecsService.RegisterTaskDefinition), "spinifex-workers"},
+			natsSub{"ecs.DeregisterTaskDefinition", handleNATSRequest(d.ecsService.DeregisterTaskDefinition), "spinifex-workers"},
+			natsSub{"ecs.DescribeTaskDefinition", handleNATSRequest(d.ecsService.DescribeTaskDefinition), "spinifex-workers"},
+			natsSub{"ecs.ListTaskDefinitions", handleNATSRequest(d.ecsService.ListTaskDefinitions), "spinifex-workers"},
+			natsSub{"ecs.RegisterContainerInstance", handleNATSRequest(d.ecsService.RegisterContainerInstance), "spinifex-workers"},
+			natsSub{"ecs.DeregisterContainerInstance", handleNATSRequest(d.ecsService.DeregisterContainerInstance), "spinifex-workers"},
+			natsSub{"ecs.UpdateContainerInstancesState", handleNATSRequest(d.ecsService.UpdateContainerInstancesState), "spinifex-workers"},
+			natsSub{"ecs.DescribeContainerInstances", handleNATSRequest(d.ecsService.DescribeContainerInstances), "spinifex-workers"},
+			natsSub{"ecs.ListContainerInstances", handleNATSRequest(d.ecsService.ListContainerInstances), "spinifex-workers"},
+			natsSub{"ecs.RunTask", handleNATSRequest(d.ecsService.RunTask), "spinifex-workers"},
+			natsSub{"ecs.StartTask", handleNATSRequest(d.ecsService.StartTask), "spinifex-workers"},
+			natsSub{"ecs.StopTask", handleNATSRequest(d.ecsService.StopTask), "spinifex-workers"},
+			natsSub{"ecs.DescribeTasks", handleNATSRequest(d.ecsService.DescribeTasks), "spinifex-workers"},
+			natsSub{"ecs.ListTasks", handleNATSRequest(d.ecsService.ListTasks), "spinifex-workers"},
+			natsSub{"ecs.CreateService", handleNATSRequest(d.ecsService.CreateService), "spinifex-workers"},
+			natsSub{"ecs.UpdateService", handleNATSRequest(d.ecsService.UpdateService), "spinifex-workers"},
+			natsSub{"ecs.DeleteService", handleNATSRequest(d.ecsService.DeleteService), "spinifex-workers"},
+			natsSub{"ecs.DescribeServices", handleNATSRequest(d.ecsService.DescribeServices), "spinifex-workers"},
+			natsSub{"ecs.ListServices", handleNATSRequest(d.ecsService.ListServices), "spinifex-workers"},
+			natsSub{"ecs.SubmitTaskStateChange", handleNATSRequest(d.ecsService.SubmitTaskStateChange), "spinifex-workers"},
+			natsSub{"ecs.PollAssignments", handleNATSRequest(d.ecsService.PollAssignments), "spinifex-workers"},
+			natsSub{"ecs.ReportTaskGPU", handleNATSRequest(d.ecsService.ReportTaskGPU), "spinifex-workers"},
+			natsSub{"ecs.ProvisionCapacity", handleNATSRequest(d.ecsService.ProvisionCapacity), "spinifex-workers"},
+			natsSub{"ecs.TagResource", handleNATSRequest(d.ecsService.TagResource), "spinifex-workers"},
+			natsSub{"ecs.UntagResource", handleNATSRequest(d.ecsService.UntagResource), "spinifex-workers"},
+			natsSub{"ecs.ListTagsForResource", handleNATSRequest(d.ecsService.ListTagsForResource), "spinifex-workers"},
+			natsSub{"ecs.PutClusterCapacityProviders", handleNATSRequest(d.ecsService.PutClusterCapacityProviders), "spinifex-workers"},
+			natsSub{"ecs.CreateCapacityProvider", handleNATSRequest(d.ecsService.CreateCapacityProvider), "spinifex-workers"},
+			natsSub{"ecs.DescribeCapacityProviders", handleNATSRequest(d.ecsService.DescribeCapacityProviders), "spinifex-workers"},
+			natsSub{"ecs.DeleteCapacityProvider", handleNATSRequest(d.ecsService.DeleteCapacityProvider), "spinifex-workers"},
 		)
 	}
 
-	// ACM gateway → daemon subscriptions (minimal certificate store).
+	// RDS agent protocol. The register/health subjects are Layer-2 bus wildcards
+	// the gateway relays onto, addressing only — the payload is authoritative.
+	if d.rdsService != nil {
+		subs = append(subs,
+			natsSub{handlers_rds.SubjectRegisterWildcard, handleNATSRequest(d.rdsService.RegisterDBInstance), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectHealthWildcard, handleNATSRequest(d.rdsService.SubmitDBStateChange), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectGetDBBootstrapConfig, handleNATSRequest(d.rdsService.GetDBBootstrapConfig), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectCreateDBInstance, handleNATSRequest(d.rdsService.CreateDBInstance), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectDescribeDBInstances, handleNATSRequest(d.rdsService.DescribeDBInstances), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectRebootDBInstance, handleNATSRequest(d.rdsService.RebootDBInstance), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectStartDBInstance, handleNATSRequest(d.rdsService.StartDBInstance), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectStopDBInstance, handleNATSRequest(d.rdsService.StopDBInstance), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectModifyDBInstance, handleNATSRequest(d.rdsService.ModifyDBInstance), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectDeleteDBInstance, handleNATSRequest(d.rdsService.DeleteDBInstance), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectCreateDBSnapshot, handleNATSRequest(d.rdsService.CreateDBSnapshot), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectDescribeDBSnapshots, handleNATSRequest(d.rdsService.DescribeDBSnapshots), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectDeleteDBSnapshot, handleNATSRequest(d.rdsService.DeleteDBSnapshot), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectRestoreDBInstanceFromDBSnapshot, handleNATSRequest(d.rdsService.RestoreDBInstanceFromDBSnapshot), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectDescribeDBInstanceAutomatedBackups, handleNATSRequest(d.rdsService.DescribeDBInstanceAutomatedBackups), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectDescribeEvents, handleNATSRequest(d.rdsService.DescribeEvents), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectAddTagsToResource, handleNATSRequest(d.rdsService.AddTagsToResource), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectRemoveTagsFromResource, handleNATSRequest(d.rdsService.RemoveTagsFromResource), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectListTagsForResource, handleNATSRequest(d.rdsService.ListTagsForResource), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectCreateDBSubnetGroup, handleNATSRequest(d.rdsService.CreateDBSubnetGroup), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectDescribeDBSubnetGroups, handleNATSRequest(d.rdsService.DescribeDBSubnetGroups), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectDeleteDBSubnetGroup, handleNATSRequest(d.rdsService.DeleteDBSubnetGroup), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectCreateDBParameterGroup, handleNATSRequest(d.rdsService.CreateDBParameterGroup), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectDescribeDBParameterGroups, handleNATSRequest(d.rdsService.DescribeDBParameterGroups), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectModifyDBParameterGroup, handleNATSRequest(d.rdsService.ModifyDBParameterGroup), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectDescribeDBParameters, handleNATSRequest(d.rdsService.DescribeDBParameters), "spinifex-workers"},
+			natsSub{handlers_rds.SubjectDeleteDBParameterGroup, handleNATSRequest(d.rdsService.DeleteDBParameterGroup), "spinifex-workers"},
+		)
+	}
+
+	// Bedrock serving-endpoint lifecycle (daemon is the sole KV writer; the
+	// gateway reads/requests transitions over these subjects instead of
+	// touching JetStream directly).
+	if d.bedrockService != nil {
+		subs = append(subs,
+			natsSub{handlers_bedrock.SubjectEnsureEndpoint, handleNATSRequest(d.bedrockService.Ensure), "spinifex-workers"},
+			natsSub{handlers_bedrock.SubjectDescribeEndpoint, handleNATSRequest(d.bedrockService.Describe), "spinifex-workers"},
+			natsSub{handlers_bedrock.SubjectListEndpoints, handleNATSRequest(d.bedrockService.List), "spinifex-workers"},
+			natsSub{handlers_bedrock.SubjectDeleteEndpoint, handleNATSRequest(d.bedrockService.Delete), "spinifex-workers"},
+		)
+	}
+
+	// ACM gateway → daemon subscriptions (certificate import and managed issuance).
 	if d.acmService != nil {
 		subs = append(subs,
-			natsSub{"acm.ImportCertificate", d.handleACMImportCertificate, "spinifex-workers"},
-			natsSub{"acm.DescribeCertificate", d.handleACMDescribeCertificate, "spinifex-workers"},
-			natsSub{"acm.ListCertificates", d.handleACMListCertificates, "spinifex-workers"},
-			natsSub{"acm.DeleteCertificate", d.handleACMDeleteCertificate, "spinifex-workers"},
-			natsSub{"acm.ListTagsForCertificate", d.handleACMListTagsForCertificate, "spinifex-workers"},
-			natsSub{"acm.AddTagsToCertificate", d.handleACMAddTagsToCertificate, "spinifex-workers"},
-			natsSub{"acm.RemoveTagsFromCertificate", d.handleACMRemoveTagsFromCertificate, "spinifex-workers"},
+			natsSub{"acm.ImportCertificate", handleNATSRequest(d.acmService.ImportCertificate), "spinifex-workers"},
+			natsSub{"acm.RequestCertificate", handleNATSRequest(d.acmService.RequestCertificate), "spinifex-workers"},
+			natsSub{"acm.DescribeCertificate", handleNATSRequest(d.acmService.DescribeCertificate), "spinifex-workers"},
+			natsSub{"acm.GetCertificate", handleNATSRequest(d.acmService.GetCertificate), "spinifex-workers"},
+			natsSub{"acm.ListCertificates", handleNATSRequest(d.acmService.ListCertificates), "spinifex-workers"},
+			natsSub{"acm.DeleteCertificate", handleNATSRequest(d.acmService.DeleteCertificate), "spinifex-workers"},
+			natsSub{"acm.ListTagsForCertificate", handleNATSRequest(d.acmService.ListTagsForCertificate), "spinifex-workers"},
+			natsSub{"acm.AddTagsToCertificate", handleNATSRequest(d.acmService.AddTagsToCertificate), "spinifex-workers"},
+			natsSub{"acm.RemoveTagsFromCertificate", handleNATSRequest(d.acmService.RemoveTagsFromCertificate), "spinifex-workers"},
+			// ForceRenewCertificate is not an AWS API — it is the operator-
+			// triggered path `spx admin cert force-renew` uses to reissue a
+			// PRIVATE_CA certificate immediately, bypassing the renewal worker's
+			// window and failure backoff, primarily to verify the ELBv2 fan-out
+			// without waiting out the proportional window.
+			natsSub{"acm.ForceRenewCertificate", handleNATSRequest(d.acmRenewalWorker.ForceRenewCertificate), "spinifex-workers"},
 		)
 	}
 
@@ -1000,51 +1123,55 @@ func (d *Daemon) subscribeAll() error {
 	// JetStream KV metadata; blob/manifest bytes never traverse these subjects.
 	if d.ecrMetaService != nil {
 		subs = append(subs,
-			natsSub{handlers_ecr.SubjectRepoCreate, d.handleECRRepoCreate, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectRepoDescribe, d.handleECRRepoDescribe, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectRepoList, d.handleECRRepoList, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectRepoDelete, d.handleECRRepoDelete, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectPolicyPut, d.handleECRPolicyPut, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectPolicyGet, d.handleECRPolicyGet, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectPolicyDelete, d.handleECRPolicyDelete, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectLifecyclePut, d.handleECRLifecyclePut, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectLifecycleGet, d.handleECRLifecycleGet, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectLifecycleDelete, d.handleECRLifecycleDelete, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectTagPut, d.handleECRTagPut, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectTagGet, d.handleECRTagGet, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectTagList, d.handleECRTagList, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectTagDelete, d.handleECRTagDelete, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectManifestPut, d.handleECRManifestPut, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectManifestDescribe, d.handleECRManifestDescribe, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectManifestList, d.handleECRManifestList, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectManifestDelete, d.handleECRManifestDelete, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectUploadCreate, d.handleECRUploadCreate, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectUploadGet, d.handleECRUploadGet, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectUploadUpdate, d.handleECRUploadUpdate, "spinifex-workers"},
-			natsSub{handlers_ecr.SubjectUploadDelete, d.handleECRUploadDelete, "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectRepoCreate, handleNATSRequest(d.ecrMetaService.RepoCreate), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectRepoDescribe, handleNATSRequest(d.ecrMetaService.RepoDescribe), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectRepoList, handleNATSRequest(d.ecrMetaService.RepoList), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectRepoDelete, handleNATSRequest(d.ecrMetaService.RepoDelete), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectPolicyPut, handleNATSRequest(d.ecrMetaService.PolicyPut), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectPolicyGet, handleNATSRequest(d.ecrMetaService.PolicyGet), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectPolicyDelete, handleNATSRequest(d.ecrMetaService.PolicyDelete), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectLifecyclePut, handleNATSRequest(d.ecrMetaService.LifecyclePut), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectLifecycleGet, handleNATSRequest(d.ecrMetaService.LifecycleGet), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectLifecycleDelete, handleNATSRequest(d.ecrMetaService.LifecycleDelete), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectTagPut, handleNATSRequest(d.ecrMetaService.TagPut), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectTagGet, handleNATSRequest(d.ecrMetaService.TagGet), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectTagList, handleNATSRequest(d.ecrMetaService.TagList), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectTagDelete, handleNATSRequest(d.ecrMetaService.TagDelete), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectManifestPut, handleNATSRequest(d.ecrMetaService.ManifestPut), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectManifestDescribe, handleNATSRequest(d.ecrMetaService.ManifestDescribe), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectManifestList, handleNATSRequest(d.ecrMetaService.ManifestList), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectManifestDelete, handleNATSRequest(d.ecrMetaService.ManifestDelete), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectUploadCreate, handleNATSRequest(d.ecrMetaService.UploadCreate), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectUploadGet, handleNATSRequest(d.ecrMetaService.UploadGet), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectUploadUpdate, handleNATSRequest(d.ecrMetaService.UploadUpdate), "spinifex-workers"},
+			natsSub{handlers_ecr.SubjectUploadDelete, handleNATSRequest(d.ecrMetaService.UploadDelete), "spinifex-workers"},
 		)
 	}
 
-	// EIP operations require external IPAM (pool mode). Only subscribe when available;
-	// without a subscriber the gateway returns a NATS timeout → clean error to the client.
-	if d.eipService != nil {
-		subs = append(subs,
-			natsSub{"ec2.AllocateAddress", d.handleEC2AllocateAddress, "spinifex-workers"},
-			natsSub{"ec2.ReleaseAddress", d.handleEC2ReleaseAddress, "spinifex-workers"},
-			natsSub{"ec2.AssociateAddress", d.handleEC2AssociateAddress, "spinifex-workers"},
-			natsSub{"ec2.DisassociateAddress", d.handleEC2DisassociateAddress, "spinifex-workers"},
-			natsSub{"ec2.DescribeAddresses", d.handleEC2DescribeAddresses, "spinifex-workers"},
-			natsSub{"ec2.DescribeAddressesAttribute", d.handleEC2DescribeAddressesAttribute, "spinifex-workers"},
-		)
-	}
+	// EIP handlers are always registered: without external IPAM d.eipService is
+	// the disabled stub, so reads return empty lists and mutations a clean
+	// UnsupportedOperation instead of a NATS timeout.
+	subs = append(subs,
+		natsSub{"ec2.AllocateAddress", handleNATSRequest(d.eipService.AllocateAddress), "spinifex-workers"},
+		natsSub{"ec2.ReleaseAddress", handleNATSRequest(d.eipService.ReleaseAddress), "spinifex-workers"},
+		natsSub{"ec2.AssociateAddress", handleNATSRequest(d.eipService.AssociateAddress), "spinifex-workers"},
+		natsSub{"ec2.DisassociateAddress", handleNATSRequest(d.eipService.DisassociateAddress), "spinifex-workers"},
+		natsSub{"ec2.DescribeAddresses", handleNATSRequest(d.eipService.DescribeAddresses), "spinifex-workers"},
+		natsSub{"ec2.DescribeAddressesAttribute", handleNATSRequest(d.eipService.DescribeAddressesAttribute), "spinifex-workers"},
+		// vpcd holds the leases, but the records naming those addresses live
+		// here, so the reconcile request flows daemon-ward.
+		natsSub{dhcp.TopicLeaseChanged, d.handleDHCPLeaseChanged, "spinifex-workers"},
+		natsSub{dhcp.TopicOwnerCheck, d.handleDHCPOwnerCheck, "spinifex-workers"},
+	)
 
 	for _, s := range subs {
 		var sub *nats.Subscription
 		var err error
+		handler := natsMetricsHandler(natsMetricAction(s.topic, d.node), s.handler)
 		if s.queueGroup != "" {
-			sub, err = d.natsConn.QueueSubscribe(s.topic, s.queueGroup, s.handler)
+			sub, err = d.natsConn.QueueSubscribe(s.topic, s.queueGroup, handler)
 		} else {
-			sub, err = d.natsConn.Subscribe(s.topic, s.handler)
+			sub, err = d.natsConn.Subscribe(s.topic, handler)
 		}
 		if err != nil {
 			return fmt.Errorf("failed to subscribe to %s: %w", s.topic, err)
@@ -1143,6 +1270,34 @@ func (d *Daemon) startLocal() error {
 	return nil
 }
 
+// publicExternalPools filters out the routed-NAT transit pool: it carries
+// gateway plumbing addresses, never allocatable public IPs.
+func publicExternalPools(pools []config.ExternalPool) []config.ExternalPool {
+	var public []config.ExternalPool
+	for _, p := range pools {
+		if p.Name == host.NATTransitPoolName {
+			continue
+		}
+		public = append(public, p)
+	}
+	return public
+}
+
+// hasPublicIPPools reports whether the cluster can allocate routable public
+// IPs: pool mode always, nat mode only with a public pool beside the transit.
+func (d *Daemon) hasPublicIPPools() bool {
+	if d.clusterConfig == nil {
+		return false
+	}
+	switch d.clusterConfig.Network.ExternalMode {
+	case "pool":
+		return true
+	case "nat":
+		return len(publicExternalPools(d.clusterConfig.Network.ExternalPools)) > 0
+	}
+	return false
+}
+
 // assertNoClusterServicesInitialised enforces the DDIL §1e-audit invariant:
 // no NATS-dependent handle may exist at the end of startLocal.
 func (d *Daemon) assertNoClusterServicesInitialised() error {
@@ -1165,6 +1320,10 @@ func (d *Daemon) assertNoClusterServicesInitialised() error {
 		return errors.New("d.igwService must be nil before startCluster")
 	case d.placementGroupService != nil:
 		return errors.New("d.placementGroupService must be nil before startCluster")
+	case d.launchTemplateService != nil:
+		return errors.New("d.launchTemplateService must be nil before startCluster")
+	case d.spotInstanceService != nil:
+		return errors.New("d.spotInstanceService must be nil before startCluster")
 	case d.vpcService != nil:
 		return errors.New("d.vpcService must be nil before startCluster")
 	case d.routeTableService != nil:
@@ -1207,9 +1366,15 @@ func (d *Daemon) startCluster() error {
 		return fmt.Errorf("initialize JetStream: %w", err)
 	}
 
+	// Set the default KV replica count before any handler creates a bucket, so
+	// lazily-created buckets are born at cluster-size replication instead of R1.
+	if d.clusterConfig != nil {
+		utils.SetDefaultKVReplicas(len(d.clusterConfig.Nodes))
+	}
+
 	// Remove the obsolete spinifex-dhcp-leases bucket (idempotent).
-	if js, jsErr := d.natsConn.JetStream(); jsErr == nil {
-		if err := utils.DeleteKVBucketIfExists(js, "spinifex-dhcp-leases"); err != nil {
+	if js, jsErr := jetstream.New(d.natsConn); jsErr == nil {
+		if err := kvutil.DeleteBucketIfExists(d.ctx, js, "spinifex-dhcp-leases"); err != nil {
 			slog.Warn("Failed to delete obsolete spinifex-dhcp-leases KV bucket", "err", err)
 		}
 	}
@@ -1236,15 +1401,19 @@ func (d *Daemon) startCluster() error {
 	// Create services before loading/launching instances, since LaunchInstance depends on them
 	store := objectstore.NewS3ObjectStoreFromConfig(admin.DialTarget(d.config.Predastore.Host), d.config.Predastore.Region, d.config.Predastore.AccessKey, d.config.Predastore.SecretKey)
 	d.instanceService = handlers_ec2_instance.NewInstanceServiceImpl(d.config, d.resourceMgr.instanceTypes, d.natsConn, store, d.vmMgr, d.resourceMgr, d.jsManager)
+	d.dnsWriter = handlers_dns.NewWriter(d.config, d.clusterConfig, d.natsConn)
+	d.dnsReconciler = handlers_dns.NewReconciler(d.config, d.natsConn, d.dnsDesiredSet)
+	d.dnsBaseDomain = handlers_dns.ResolveBaseDomain(d.config)
+	d.dnsInternalDomain = handlers_dns.ResolveInternalDomain(d.config)
 	d.keyService = handlers_ec2_key.NewKeyServiceImpl(d.config)
 	d.imageService = handlers_ec2_image.NewImageServiceImpl(d.config, d.natsConn)
 
 	type snapResult struct {
 		svc *handlers_ec2_snapshot.SnapshotServiceImpl
-		kv  nats.KeyValue
+		kv  jetstream.KeyValue
 	}
 	snap, err := initServiceWithRetry("snapshot service", func() (snapResult, error) {
-		svc, kv, err := handlers_ec2_snapshot.NewSnapshotServiceImplWithNATS(d.config, d.natsConn)
+		svc, kv, err := handlers_ec2_snapshot.NewSnapshotServiceImplWithNATS(d.ctx, d.config, d.natsConn)
 		return snapResult{svc, kv}, err
 	})
 	if err != nil {
@@ -1256,35 +1425,53 @@ func (d *Daemon) startCluster() error {
 	d.tagsService = handlers_ec2_tags.NewTagsServiceImpl(d.config)
 
 	d.eigwService, err = initServiceWithRetry("EIGW service", func() (*handlers_ec2_eigw.EgressOnlyIGWServiceImpl, error) {
-		return handlers_ec2_eigw.NewEgressOnlyIGWServiceImplWithNATS(d.config, d.natsConn)
+		return handlers_ec2_eigw.NewEgressOnlyIGWServiceImplWithNATS(d.ctx, d.config, d.natsConn)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize EIGW service: %w", err)
 	}
 
 	d.igwService, err = initServiceWithRetry("IGW service", func() (*handlers_ec2_igw.IGWServiceImpl, error) {
-		return handlers_ec2_igw.NewIGWServiceImplWithNATS(d.config, d.natsConn)
+		return handlers_ec2_igw.NewIGWServiceImplWithNATS(d.ctx, d.config, d.natsConn)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize IGW service: %w", err)
 	}
 
 	d.placementGroupService, err = initServiceWithRetry("placement group service", func() (*handlers_ec2_placementgroup.PlacementGroupServiceImpl, error) {
-		return handlers_ec2_placementgroup.NewPlacementGroupServiceImplWithNATS(d.config, d.natsConn)
+		return handlers_ec2_placementgroup.NewPlacementGroupServiceImplWithNATS(d.ctx, d.config, d.natsConn)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize placement group service: %w", err)
 	}
 
+	d.launchTemplateService, err = initServiceWithRetry("launch template service", func() (*handlers_ec2_launchtemplate.LaunchTemplateServiceImpl, error) {
+		return handlers_ec2_launchtemplate.NewLaunchTemplateServiceImplWithNATS(d.ctx, d.config, d.natsConn)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to initialize launch template service: %w", err)
+	}
+
+	d.spotInstanceService, err = initServiceWithRetry("spot instance service", func() (*handlers_ec2_spotinstance.SpotInstanceServiceImpl, error) {
+		return handlers_ec2_spotinstance.NewSpotInstanceServiceImplWithNATS(d.ctx, d.config, d.natsConn)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to initialize spot instance service: %w", err)
+	}
+
 	d.vpcService, err = initServiceWithRetry("VPC service", func() (*handlers_ec2_vpc.VPCServiceImpl, error) {
-		return handlers_ec2_vpc.NewVPCServiceImplWithNATS(d.config, d.natsConn)
+		return handlers_ec2_vpc.NewVPCServiceImplWithNATS(d.ctx, d.config, d.natsConn)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize VPC service: %w", err)
 	}
+	// Default subnets request a public IP on launch only when the cluster has
+	// pools that hand out routable public IPs (pool mode always; nat mode only
+	// when a public pool rides alongside the transit segment).
+	d.vpcService.SetDefaultPublicIPMapping(d.hasPublicIPPools())
 
 	d.routeTableService, err = initServiceWithRetry("RouteTable service", func() (*handlers_ec2_routetable.RouteTableServiceImpl, error) {
-		return handlers_ec2_routetable.NewRouteTableServiceImplWithNATS(d.config, d.natsConn)
+		return handlers_ec2_routetable.NewRouteTableServiceImplWithNATS(d.ctx, d.config, d.natsConn)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize RouteTable service: %w", err)
@@ -1294,25 +1481,28 @@ func (d *Daemon) startCluster() error {
 	d.igwService.SetGatePublisher(d.routeTableService)
 
 	d.natGatewayService, err = initServiceWithRetry("NatGateway service", func() (*handlers_ec2_natgw.NatGatewayServiceImpl, error) {
-		return handlers_ec2_natgw.NewNatGatewayServiceImplWithNATS(d.natsConn)
+		return handlers_ec2_natgw.NewNatGatewayServiceImplWithNATS(d.ctx, d.natsConn)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize NatGateway service: %w", err)
 	}
 
-	// Initialize external IPAM for pool mode (per-VM public IPs).
-	if d.clusterConfig != nil && d.clusterConfig.Network.ExternalMode == "pool" {
-		js, jsErr := d.natsConn.JetStream()
+	// Initialize external IPAM when public IP pools exist (pool mode, or nat
+	// mode with a public pool alongside the transit segment). The transit pool
+	// never enters IPAM — its addresses are gateway-LRP plumbing, not EIPs.
+	if d.hasPublicIPPools() {
+		js, jsErr := jetstream.New(d.natsConn)
 		if jsErr != nil {
 			slog.Warn("Failed to get JetStream for external IPAM", "err", jsErr)
 		} else {
-			var pools []handlers_ec2_vpc.ExternalPoolConfig
+			var pools []external.ExternalPoolConfig
 			anyDHCP := false
-			for _, p := range d.clusterConfig.Network.ExternalPools {
-				pools = append(pools, handlers_ec2_vpc.ExternalPoolConfig{
+			for _, p := range publicExternalPools(d.clusterConfig.Network.ExternalPools) {
+				pools = append(pools, external.ExternalPoolConfig{
 					Name:            p.Name,
 					Source:          p.Source,
 					BindBridge:      p.BindBridge,
+					DHCPMAC:         p.DHCPMAC,
 					RangeStart:      p.RangeStart,
 					RangeEnd:        p.RangeEnd,
 					Gateway:         p.Gateway,
@@ -1327,7 +1517,7 @@ func (d *Daemon) startCluster() error {
 					anyDHCP = true
 				}
 			}
-			d.externalIPAM, err = handlers_ec2_vpc.NewExternalIPAM(js, pools)
+			d.externalIPAM, err = handlers_ec2_vpc.NewExternalIPAM(d.ctx, js, pools)
 			if err != nil {
 				slog.Warn("Failed to initialize external IPAM", "err", err)
 			} else {
@@ -1344,7 +1534,7 @@ func (d *Daemon) startCluster() error {
 
 	// Initialize EIP service if external IPAM is available
 	if d.externalIPAM != nil && d.vpcService != nil {
-		eipSvc, eipErr := handlers_ec2_eip.NewEIPServiceImpl(d.natsConn, d.externalIPAM, d.vpcService)
+		eipSvc, eipErr := handlers_ec2_eip.NewEIPServiceImpl(d.ctx, d.natsConn, d.externalIPAM, d.vpcService)
 		if eipErr != nil {
 			slog.Warn("Failed to initialize EIP service", "err", eipErr)
 		} else {
@@ -1354,11 +1544,11 @@ func (d *Daemon) startCluster() error {
 
 		// Inject external IPAM + EIP KV into VPC service so DeleteNetworkInterface
 		// can release auto-assigned public IPs and NAT rules.
-		eipJS, eipJSErr := d.natsConn.JetStream()
+		eipJS, eipJSErr := jetstream.New(d.natsConn)
 		if eipJSErr != nil {
 			slog.Warn("Failed to get JetStream for VPC external IPAM injection", "err", eipJSErr)
 		} else {
-			eipKV, eipKVErr := utils.GetOrCreateKVBucket(eipJS, handlers_ec2_eip.KVBucketEIPs, 10)
+			eipKV, eipKVErr := kvutil.GetOrCreateBucket(d.ctx, eipJS, handlers_ec2_eip.KVBucketEIPs, 10)
 			if eipKVErr != nil {
 				slog.Warn("Failed to get EIP KV bucket for VPC service", "err", eipKVErr)
 			} else {
@@ -1367,7 +1557,14 @@ func (d *Daemon) startCluster() error {
 		}
 	}
 
-	d.instanceService.SetTerminationDeps(d.volumeService, d.vpcService, d.externalIPAM)
+	// Without external IPAM (nat mode or external disabled) serve EIP requests
+	// from the disabled stub so the API surface stays registered.
+	if d.eipService == nil {
+		d.eipService = handlers_ec2_eip.NewDisabledEIPService()
+		slog.Info("EIP service disabled — no external IPAM; serving empty/unsupported responses")
+	}
+
+	d.instanceService.SetTerminationDeps(d.volumeService, d.vpcService, d.externalIPAM, d.tagsService)
 	d.instanceService.SetRunInstancesDeps(d.imageService, d.keyService, &daemonENICreator{d: d}, d.externalIPAM)
 
 	if d.gpuManager != nil {
@@ -1375,24 +1572,50 @@ func (d *Daemon) startCluster() error {
 	}
 
 	d.accountService, err = initServiceWithRetry("account settings service", func() (*handlers_ec2_account.AccountSettingsServiceImpl, error) {
-		return handlers_ec2_account.NewAccountSettingsServiceImplWithNATS(d.config, d.natsConn)
+		return handlers_ec2_account.NewAccountSettingsServiceImplWithNATS(d.ctx, d.config, d.natsConn)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize account settings service: %w", err)
 	}
 
+	// ELBv2 resolves listener certificate private keys through its own ACM
+	// Store over the same JetStream bucket the ACM service writes, so it needs
+	// the identical master key: unlike EKS/ECS's IAM dependency, there is no
+	// safe degraded mode for certificate private keys, so a missing key must
+	// fail daemon startup rather than leave HTTPS listeners uncreatable.
 	d.elbv2Service, err = initServiceWithRetry("ELBv2 service", func() (*handlers_elbv2.ELBv2ServiceImpl, error) {
-		return handlers_elbv2.NewELBv2ServiceImplWithNATS(d.config, d.natsConn)
+		masterKey, mkErr := handlers_iam.LoadMasterKey(filepath.Join(filepath.Dir(d.configPath), "master.key"))
+		if mkErr != nil {
+			return nil, fmt.Errorf("load ELBv2 master key: %w", mkErr)
+		}
+		return handlers_elbv2.NewELBv2ServiceImplWithNATS(d.config, d.natsConn, masterKey)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize ELBv2 service: %w", err)
 	}
+
+	// The InUseBy index is otherwise only written by listener mutations, so
+	// listeners created before it existed would never fan out a renewed
+	// certificate. Not fatal: a stale index degrades renewal, which beats
+	// refusing to start. Every node reconciles the shared bucket at its own
+	// startup; the index writes are CAS-guarded, so concurrent runs converge.
+	if err := d.elbv2Service.ReconcileCertInUseIndex(d.ctx); err != nil {
+		slog.Error("failed to reconcile the ACM InUseBy index", "err", err)
+	}
+
 	if d.vpcService != nil {
 		d.elbv2Service.VPCService = d.vpcService
 	}
 
 	// Route system VM launches through NATS so they fan out across the cluster.
 	d.elbv2Service.InstanceLauncher = handlers_elbv2.NewNATSSystemInstanceLauncher(d.natsConn, 0)
+
+	// Provide a lazily-built KV-backed IAM service so an LB VM gets a system
+	// instance profile and authenticates with IMDS instance-role creds. The
+	// provider is resolved at LB-launch time, not now, so it cannot race the
+	// NATS KV backend coming up; absent (no master key) the LB VM falls back to
+	// baked static creds.
+	d.elbv2Service.IAMProvider = d.systemRoleEnsurer
 
 	d.wireLBAgentConfig()
 
@@ -1406,6 +1629,8 @@ func (d *Daemon) startCluster() error {
 			"err", err)
 	}
 
+	d.elbv2Service.StartLifecycleReaper(context.Background())
+
 	d.eksService, err = initServiceWithRetry("EKS service", func() (*handlers_eks.EKSServiceImpl, error) {
 		return handlers_eks.NewEKSServiceImpl(d.buildEKSServiceDeps())
 	})
@@ -1418,9 +1643,9 @@ func (d *Daemon) startCluster() error {
 	// reaper. The scheduler is disabled (handlers still serve) when JetStream is
 	// unavailable.
 	d.ecsService = handlers_ecs.NewService(d.natsConn, d.config.Region, d.clusterConfig.AWS.InternalSuffix).WithDeps(d.buildECSServiceDeps())
-	if js, jsErr := d.natsConn.JetStream(); jsErr != nil {
+	if js, jsErr := jetstream.New(d.natsConn); jsErr != nil {
 		slog.Warn("ECS scheduler disabled: JetStream unavailable", "err", jsErr)
-	} else if _, lbErr := handlers_ecs.InitLeaderBucket(js); lbErr != nil {
+	} else if _, lbErr := handlers_ecs.InitLeaderBucket(d.ctx, js); lbErr != nil {
 		slog.Warn("ECS scheduler disabled: leader bucket init failed", "err", lbErr)
 	} else {
 		d.ecsScheduler = handlers_ecs.NewScheduler(d.natsConn, d.ecsService, d.node)
@@ -1434,17 +1659,101 @@ func (d *Daemon) startCluster() error {
 		})
 	}
 
+	// RDS control plane: KV-backed agent-protocol handlers plus the customer
+	// actions. The cluster CA signs the per-instance serving certs, minted per
+	// bootstrap fetch and never persisted; ca.key sits beside the configured ca.pem.
+	d.rdsService = handlers_rds.NewService(d.natsConn, d.config.Region).WithDeps(d.buildRDSDeps())
+
+	// One leader across the cluster derives DB instance status from the agent
+	// heartbeat; every node keeps serving the API.
+	d.rdsReconciler = handlers_rds.NewReconciler(d.rdsService, d.node)
+	d.shutdownWg.Go(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("RDS reconciler goroutine panicked", "recover", r)
+			}
+		}()
+		d.rdsReconciler.Run(d.ctx)
+	})
+
+	// Bedrock serving-endpoint lifecycle: no reconciler yet (no idle-reclaim or
+	// health sweep), just the request-driven
+	// ensure/describe/list/delete surface RDS-style, constructed synchronously
+	// since it touches no JetStream KV until its first request.
+	d.bedrockService = handlers_bedrock.NewService(d.natsConn, d.buildBedrockServiceDeps())
+
+	// ACM certificates hold private keys, so unlike EKS/ECS's IAM dependency
+	// (which degrades to "feature disabled" without a master key) there is no
+	// safe degraded mode here: a missing key must fail daemon startup, not
+	// silently persist keys unencrypted. initServiceWithRetry still retries with
+	// backoff — the key file can legitimately not be written yet during a
+	// concurrent boot — but a master key that never arrives fails startCluster
+	// after the retry window instead of leaving acmService permanently nil.
 	d.acmService, err = initServiceWithRetry("ACM service", func() (*handlers_acm.ACMServiceImpl, error) {
-		return handlers_acm.NewACMServiceImplWithNATS(d.config, d.natsConn)
+		masterKey, mkErr := handlers_iam.LoadMasterKey(filepath.Join(filepath.Dir(d.configPath), "master.key"))
+		if mkErr != nil {
+			return nil, fmt.Errorf("load ACM master key: %w", mkErr)
+		}
+		return handlers_acm.NewACMServiceImplWithNATS(d.ctx, d.config, d.natsConn, masterKey)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize ACM service: %w", err)
 	}
+	// Re-importing to an existing ARN must fan out to every load balancer that
+	// references it; otherwise HAProxy keeps serving the old leaf until it
+	// expires while the API reports success. ELBv2 is already up (above).
+	d.acmService.CertMaterialUpdated = d.elbv2Service.UpdateStoredConfigForCert
+
+	// deriveValidationMode needs to know whether northstar hosts a zone for a
+	// requested domain. handlers/acm deliberately does not import handlers/dns
+	// (which would pull its S3/northstar-config dependencies into every acm
+	// test) — wired as a func field instead, the same pattern CertMaterialUpdated
+	// uses above to keep acm decoupled from elbv2.
+	d.acmService.NorthstarHostsZone = func(domain string) bool {
+		return handlers_dns.HostsZone(d.config, domain)
+	}
+
+	// The tenant private CA is optional, unlike the master key above: a
+	// deployment issuing only public (PROVIDER_API/MANUAL_TXT) certificates has
+	// no reason to have one, so its absence must not block daemon startup.
+	// LoadTenantCA (load-only — see privateca.go) leaves TenantCA nil rather
+	// than creating a root here, because creation needs an explicit permitted-
+	// domains list that has no safe default; a PRIVATE_CA RequestCertificate
+	// against a nil TenantCA already fails loudly with an actionable error
+	// (see ACMServiceImpl.RequestCertificate). Both states are logged here so an
+	// operator can tell at a glance, from daemon startup logs alone, which one
+	// they are in.
+	configDir := filepath.Dir(d.configPath)
+	tenantCA, tenantCAErr := handlers_acm.LoadTenantCA(admin.TenantCACertPath(configDir), admin.TenantCAKeyPath(configDir))
+	if tenantCAErr != nil {
+		slog.Warn("ACM: tenant private CA not found; PRIVATE_CA certificate requests will fail until one is created",
+			"err", tenantCAErr)
+	} else {
+		d.acmService.TenantCA = tenantCA
+		slog.Info("ACM: tenant private CA wired", "permitted_domains", tenantCA.PermittedDomains())
+	}
+
+	// The renewal worker scans for PRIVATE_CA certificates past their
+	// proportional renewal window and reissues them under their existing ARN.
+	// It reads d.acmService.TenantCA/CertMaterialUpdated live on every scan
+	// rather than a snapshot taken here, so it starts unconditionally: a
+	// tenant CA loaded later (or never, on a public-certificates-only
+	// deployment) is not a startup dependency — the worker just finds
+	// nothing to renew until one is wired.
+	d.acmRenewalWorker = handlers_acm.NewWorker(d.acmService, d.node)
+	d.shutdownWg.Go(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("ACM renewal worker goroutine panicked", "recover", r)
+			}
+		}()
+		d.acmRenewalWorker.Run(d.ctx)
+	})
 
 	// ECR metadata service: owns per-account JetStream KV for repos, tags,
 	// manifest records and upload-state CAS. Disabled (gateway returns NATS
 	// timeouts) when JetStream is unavailable.
-	if js, jsErr := d.natsConn.JetStream(); jsErr != nil {
+	if js, jsErr := jetstream.New(d.natsConn); jsErr != nil {
 		slog.Warn("ECR metadata service disabled: JetStream unavailable", "err", jsErr)
 	} else {
 		d.ecrMetaService = handlers_ecr.NewKVMetaService(js)
@@ -1486,14 +1795,38 @@ func (d *Daemon) startCluster() error {
 		return fmt.Errorf("restore instances: %w", err)
 	}
 
-	// Rebuild mgmt IP allocator so already-allocated IPs aren't reused.
-	if d.mgmtIPAllocator != nil {
+	// Bind the mgmt IP allocator to cluster KV now that JetStream is up (DDIL
+	// §1e-audit: startLocal built it KV-less). Rebuild then reconciles this
+	// node's already-running VMs into the cluster-wide record instead of
+	// just refreshing the local cache, so already-allocated IPs aren't
+	// reused by another node either.
+	if d.mgmtIPAllocator != nil && d.jsManager != nil {
+		d.mgmtIPAllocator.BindKV(d.jsManager, d.node)
 		d.mgmtIPAllocator.Rebuild(d.vmMgr.SnapshotMap())
 		slog.Info("Rebuilt mgmt IP allocator from restored instances", "allocated", d.mgmtIPAllocator.AllocatedCount())
 	}
 
 	if err := d.subscribeAll(); err != nil {
 		return fmt.Errorf("failed to subscribe to NATS topics: %w", err)
+	}
+
+	// DNS record writer: a queue-group consumer of dns.recordset.change. Every
+	// node subscribes, so the writer locks each zone before its
+	// read-modify-write. No-op when northstar S3 is not configured.
+	if sub, err := d.dnsWriter.Subscribe(d.natsConn); err != nil {
+		return fmt.Errorf("failed to subscribe DNS record writer: %w", err)
+	} else if sub != nil {
+		d.natsSubscriptions[handlers_dns.SubjectRecordsetChange] = sub
+		slog.Info("Subscribed DNS record writer", "subject", handlers_dns.SubjectRecordsetChange, "queue", handlers_dns.QueueGroup)
+	}
+
+	// DNS drift backstop: periodically rebuild managed records from the live
+	// cross-tenant inventory and converge the zone. Started on every node but
+	// gated on a per-cycle leader election, so one node publishes per interval.
+	// No-op when northstar is not configured.
+	if d.dnsReconciler.Enabled() {
+		go d.dnsReconciler.Run(d.ctx)
+		slog.Info("Started DNS reconcile backstop", "interval", handlers_dns.DefaultReconcileInterval)
 	}
 
 	// Initialize per-instance-type NATS subscriptions for capacity-aware routing.
@@ -1510,9 +1843,13 @@ func (d *Daemon) startCluster() error {
 		reapers := []vm.Reaper{
 			d.vmMgr.NewTerminatedTeardownReaper(),
 			d.vmMgr.NewOrphanQEMUReaper(),
+			d.vmMgr.NewStuckTerminateReaper(),
 		}
 		if eniRec := d.newENIReconciler(); eniRec != nil {
 			reapers = append(reapers, eniRec)
+		}
+		if gpuRec := d.newGPUPoolReconciler(); gpuRec != nil {
+			reapers = append(reapers, gpuRec)
 		}
 		if d.volumeService != nil {
 			reapers = append(reapers, d.volumeService.NewVolumeLeakReaper(d.leakedVolumeInstances))
@@ -1521,18 +1858,38 @@ func (d *Daemon) startCluster() error {
 			reapers = append(reapers, d.eksService.NewBillableReaper(d.nodeRunningVMs))
 			reapers = append(reapers, d.eksService.NewDeletingReaper())
 		}
-		gc := vm.NewGarbageCollector(d.jsManager.KVHealthy, reapers...)
+		// The RDS automated-backup retention sweep is the one reaper here that
+		// deletes customer data, which is why it rides this backstop rather than the
+		// RDS reconciler: the KV-health gate above is what stops it reaping against a
+		// desired state it cannot read.
+		if d.rdsService != nil {
+			reapers = append(reapers, d.rdsService.NewBackupRetentionReaper())
+		}
+		gc := vm.NewGarbageCollector(d.jsManager.KVHealthy, reapers...).
+			WithLeaderElection(d.clusterSweepLease)
 		gc.Start(d.ctx)
 	}
 
 	d.ready.Store(true)
 	slog.Info("Daemon fully initialized", "node", d.node, "startupTime", time.Since(d.startTime).Round(time.Second))
 
+	// Return once bootstrap is done. Start already installed the signal handler
+	// and owns the single awaitShutdown; waiting here would block on the wait
+	// group this goroutine is itself a member of, which never resolves.
 	d.setupReload()
-	d.setupShutdown()
-	d.awaitShutdown()
 
 	return nil
+}
+
+// clusterSweepLease gates the GC's cluster-wide reapers so exactly one node runs
+// them. The RDS reconciler's lease is that election — cluster-singular, held
+// continuously, and re-evaluated on its own ticker — so being its holder is the
+// whole answer. Without it every ClusterWide reaper is skipped outright.
+func (d *Daemon) clusterSweepLease() (func(), bool) {
+	if d.rdsReconciler == nil {
+		return func() {}, false
+	}
+	return d.rdsReconciler.AcquireClusterLease()
 }
 
 // leakedVolumeInstances returns the set of instance IDs this node owns whose
@@ -1728,17 +2085,36 @@ func (d *Daemon) checkViperblockReady() bool {
 	return d.natsConn.IsConnected()
 }
 
-// checkPredastoreReady checks if predastore is reachable via TCP.
+// predastoreReadinessClient is hoisted to package scope so the 2s readiness
+// poll loop doesn't build a fresh transport every call. Verification is off
+// because the probe authenticates nothing and reads no data.
+var predastoreReadinessClient = &http.Client{
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // readiness probe only, no data exchanged
+	},
+}
+
+// checkPredastoreReady reports whether predastore is serving HTTPS, not just
+// listening. Any response counts as ready, including the 401/403 an S3
+// endpoint returns for this deliberately unsigned request.
 func (d *Daemon) checkPredastoreReady() bool {
 	host := admin.DialTarget(d.config.Predastore.Host)
 	if host == "" {
 		return true // no predastore configured, skip check
 	}
-	conn, err := net.DialTimeout("tcp", host, 3*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+"/", nil)
 	if err != nil {
 		return false
 	}
-	_ = conn.Close()
+	resp, err := predastoreReadinessClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
 	return true
 }
 
@@ -1799,6 +2175,19 @@ func (d *Daemon) computeConfigHash() (string, error) {
 	return hex.EncodeToString(hash[:]), nil
 }
 
+// routeActionMiddleware names cluster API requests by chi route pattern for
+// request metrics, keeping metric attribute cardinality bounded.
+func routeActionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r)
+		if rc := chi.RouteContext(r.Context()); rc != nil {
+			if pattern := rc.RoutePattern(); pattern != "" {
+				otelsetup.SetRequestAction(r.Context(), r.Method+" "+pattern)
+			}
+		}
+	})
+}
+
 // ClusterManager starts the HTTPS cluster management server.
 func (d *Daemon) ClusterManager() error {
 	daemonHost := d.config.Daemon.Host
@@ -1807,6 +2196,8 @@ func (d *Daemon) ClusterManager() error {
 	}
 
 	r := chi.NewRouter()
+	r.Use(otelsetup.HTTPMiddleware("spinifex-daemon"))
+	r.Use(routeActionMiddleware)
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		configHash, err := d.computeConfigHash()
@@ -1944,17 +2335,25 @@ func (d *Daemon) WriteState() error {
 		return fmt.Errorf("marshal state: %w", marshalErr)
 	}
 
+	// The KV write is independent of local disk health (JetStream, not this
+	// disk), so a local failure must not skip it — attempt both, then report
+	// the local failure. Revision only advances when the local write (the
+	// source of truth Revision() describes) actually landed.
 	path := d.localStatePath()
-	if err := WriteLocalStateBytes(path, localData); err != nil {
-		slog.Error("Local state write failed", "path", path, "error", err)
-		return fmt.Errorf("write local state: %w", err)
+	localErr := WriteLocalStateBytes(path, localData)
+	if localErr != nil {
+		slog.Error("Local state write failed", "path", path, "error", localErr)
+	} else {
+		d.stateRevision.Add(1)
 	}
-	d.stateRevision.Add(1)
 
 	if d.jsManager != nil {
 		d.jsManager.WriteStateBytesBestEffort(d.node, kvData, kvSyncTimeout)
 	}
 
+	if localErr != nil {
+		return fmt.Errorf("write local state: %w", localErr)
+	}
 	return nil
 }
 
@@ -2062,7 +2461,11 @@ func (d *Daemon) setupShutdown() {
 		for _, sub := range d.natsSubscriptions {
 			slog.Info("Unsubscribing from NATS", "subject", sub.Subject)
 			if err := sub.Unsubscribe(); err != nil {
-				slog.Error("Error unsubscribing from NATS", "err", err)
+				if errors.Is(err, nats.ErrBadSubscription) {
+					slog.Debug("NATS subscription already invalid during shutdown", "subject", sub.Subject)
+				} else {
+					slog.Error("Error unsubscribing from NATS", "err", err)
+				}
 			}
 		}
 
@@ -2128,11 +2531,26 @@ func (rm *ResourceManager) canAllocate(instanceType *ec2.InstanceTypeInfo, count
 // canAllocateLocked is the lock-free body of canAllocate. Caller must already
 // hold rm.mu for read or write. Extracted so allocate can re-check capacity
 // while holding the write lock without dropping it.
+//
+// GPU instance types (whole-GPU and MIG alike) are gated on BOTH the cpu/mem
+// calc AND GPU-slot availability. cpu/mem still applies to whole-GPU types —
+// the guest still consumes real host vCPU/RAM even though a GPU backs it —
+// and GPU-slot count is an additional hard constraint layered on top, so
+// admission never advertises more instances than there are GPU slots to
+// back them.
 func (rm *ResourceManager) canAllocateLocked(instanceType *ec2.InstanceTypeInfo, count int) int {
-	// GPU capacity is managed exclusively by gpuManager.Claim; don't double-gate
-	// on host CPU/memory which is always abundant on GPU-class hardware.
-	if instancetypes.IsGPUType(instanceType) {
-		return count
+	instanceTypeName := ""
+	if instanceType.InstanceType != nil {
+		instanceTypeName = *instanceType.InstanceType
+	}
+
+	requiresGPU := instancetypes.IsGPUType(instanceType)
+	availGPU := 0
+	if requiresGPU && rm.gpuManager != nil {
+		gpusNeeded := instancetypes.GPUCountForType(instanceTypeName)
+		if gpusNeeded > 0 {
+			availGPU = rm.gpuManager.Available() / gpusNeeded
+		}
 	}
 
 	n := canAllocateCount(
@@ -2141,7 +2559,7 @@ func (rm *ResourceManager) canAllocateLocked(instanceType *ec2.InstanceTypeInfo,
 		instanceTypeVCPUs(instanceType),
 		rm.instanceMemChargeMiB(instanceType),
 		count,
-		0, false,
+		availGPU, requiresGPU,
 	)
 	return rm.liveMemGate(n, instanceType)
 }
@@ -2185,7 +2603,7 @@ func (rm *ResourceManager) allocate(instanceType *ec2.InstanceTypeInfo) error {
 	return nil
 }
 
-// deallocate releases resources for an instance and updates NATS subscriptions
+// deallocate releases resources for an instance and updates NATS subscriptions.
 func (rm *ResourceManager) deallocate(instanceType *ec2.InstanceTypeInfo) {
 	rm.mu.Lock()
 	vCPUs := instanceTypeVCPUs(instanceType)
@@ -2276,6 +2694,7 @@ func (rm *ResourceManager) updateInstanceSubscriptions() {
 		}
 
 		queueTopic := fmt.Sprintf("%s.%s", subjectRoot, typeName)
+		handler = natsMetricsHandler(queueTopic, handler)
 		_, subscribed := rm.instanceSubs[queueTopic]
 		if canFit && !subscribed {
 			sub, err := rm.natsConn.QueueSubscribe(queueTopic, queueGroup, handler)
@@ -2436,6 +2855,11 @@ func buildGPUPool(devices []gpu.GPUDevice, cfg config.DaemonConfig) (*gpu.Manage
 		models = append(models, resolveGPUModel(dev, cfg.GPUModelOverrides))
 	}
 
+	// Apply MemoryMiB overrides to the raw devices too, not just the advertised
+	// model above, so a configured override reaches admission checks (e.g.
+	// Bedrock capacity) that read Device.MemoryMiB straight from the pool.
+	applyGPUModelOverrides(wholeGPU, cfg.GPUModelOverrides)
+
 	mgr := gpu.NewManager(wholeGPU)
 	for _, me := range migEntries {
 		if len(me.existing) > 0 {
@@ -2449,6 +2873,28 @@ func buildGPUPool(devices []gpu.GPUDevice, cfg config.DaemonConfig) (*gpu.Manage
 		"whole_gpu", len(wholeGPU), "mig_free", freeMIGGPUs,
 		"mig_slices_recovered", recoveredSlices, "mig_profiles", len(migProfiles))
 	return mgr, models, migProfiles
+}
+
+// applyGPUModelOverrides sets MemoryMiB on each device matched by a
+// GPUModelOverride, in place, so a corrected VRAM figure reaches admission
+// checks and not just the advertised model.
+func applyGPUModelOverrides(devices []gpu.GPUDevice, overrides []config.GPUModelOverride) {
+	for i := range devices {
+		dev := &devices[i]
+		for _, o := range overrides {
+			if o.VendorID != dev.VendorID || o.DeviceID != dev.DeviceID {
+				continue
+			}
+			// Only a positive value applies. An override set purely for
+			// xvga_off or mig_profile leaves memory_mib at 0, which the struct
+			// cannot distinguish from a deliberate 0 — so treat it as "not
+			// specified" rather than wiping discovered VRAM.
+			if o.MemoryMiB > 0 {
+				dev.MemoryMiB = o.MemoryMiB
+			}
+			break
+		}
+	}
 }
 
 // resolveGPUModel maps a GPU device to an instance type model. Overrides take

@@ -1,6 +1,7 @@
 package handlers_eks
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -19,7 +20,7 @@ import (
 func TestRLC1_EKSDeleteClusterIdempotentOnAbsent(t *testing.T) {
 	f := newEKSServiceFixture(t)
 
-	out, err := f.svc.DeleteCluster(deleteInput("absent"), testAccountID)
+	out, err := f.svc.DeleteCluster(context.Background(), deleteInput("absent"), testAccountID)
 	require.NoErrorf(t, err, "ADR-0006 §1: DeleteCluster on an absent cluster must return success, not ResourceNotFound (RLC rule #1)")
 	require.NotNil(t, out, "ADR-0006 §1: DeleteCluster must return a non-nil output on absent")
 	assert.Empty(t, f.inst.terminateCalls, "an absent cluster must trigger no billable teardown")
@@ -35,17 +36,17 @@ func TestRLC2_EKSBillableTeardownBeforeKVSweep(t *testing.T) {
 	f := newDeleteClusterFixture(t, "alpha")
 	f.inst.terminateErr = errors.New("hypervisor unreachable")
 
-	_, err := f.svc.DeleteCluster(deleteInput("alpha"), testAccountID)
+	_, err := f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
 	require.Error(t, err, "ADR-0006 §6: a failed billable teardown must surface, not be swallowed")
 
 	require.Len(t, f.inst.terminateCalls, 1, "the VM teardown must have been attempted")
-	meta, getErr := GetClusterMeta(f.kv, "alpha")
+	meta, getErr := GetClusterMeta(t.Context(), f.kv, "alpha")
 	require.NoErrorf(t, getErr, "ADR-0006 §6 billable-before-sweep: the KV sweep must NOT run while a billable teardown is failing — the meta must survive for retry")
 	assert.Equal(t, ClusterStatusDeleting, meta.Status, "a cluster with failed teardown must stay DELETING")
 }
 
 // TestRLC3_EKSNLBNoOrphanTargetGroupAfterDelete enforces ADR-0006 §6 NLB
-// no-orphan (riding ADR-0002 / mulga-siv-172 cascade composition): after a
+// no-orphan (riding ADR-0002 cascade composition): after a
 // successful DeleteCluster, the eks-{cluster}-cp target group must be gone — an
 // orphaned EKS NLB target group would pin itself as ResourceInUse exactly as a
 // user target group does.
@@ -63,10 +64,10 @@ func TestRLC3_EKSNLBNoOrphanTargetGroupAfterDelete(t *testing.T) {
 		TargetGroupName: aws.String(tgName),
 	}
 
-	_, err := f.svc.DeleteCluster(deleteInput("alpha"), testAccountID)
+	_, err := f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
 	require.NoError(t, err)
 
-	_, getErr := GetClusterMeta(f.kv, "alpha")
+	_, getErr := GetClusterMeta(t.Context(), f.kv, "alpha")
 	require.ErrorIs(t, getErr, ErrClusterNotFound, "a fully torn-down cluster must be swept")
 	assert.NotContainsf(t, f.nlb.tgByName, tgName,
 		"ADR-0006 §6 NLB no-orphan: the eks-{cluster}-cp target group must not survive DeleteCluster (rides ADR-0002/172)")

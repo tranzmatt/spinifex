@@ -31,6 +31,12 @@ type IAMService interface {
 	DetachUserPolicy(accountID string, input *iam.DetachUserPolicyInput) (*iam.DetachUserPolicyOutput, error)
 	ListAttachedUserPolicies(accountID string, input *iam.ListAttachedUserPoliciesInput) (*iam.ListAttachedUserPoliciesOutput, error)
 
+	// User inline policies — account-scoped
+	PutUserPolicy(accountID string, input *iam.PutUserPolicyInput) (*iam.PutUserPolicyOutput, error)
+	GetUserPolicy(accountID string, input *iam.GetUserPolicyInput) (*iam.GetUserPolicyOutput, error)
+	DeleteUserPolicy(accountID string, input *iam.DeleteUserPolicyInput) (*iam.DeleteUserPolicyOutput, error)
+	ListUserPolicies(accountID string, input *iam.ListUserPoliciesInput) (*iam.ListUserPoliciesOutput, error)
+
 	// Role CRUD — account-scoped
 	CreateRole(accountID string, input *iam.CreateRoleInput) (*iam.CreateRoleOutput, error)
 	GetRole(accountID string, input *iam.GetRoleInput) (*iam.GetRoleOutput, error)
@@ -47,6 +53,28 @@ type IAMService interface {
 	GetRolePolicy(accountID string, input *iam.GetRolePolicyInput) (*iam.GetRolePolicyOutput, error)
 	DeleteRolePolicy(accountID string, input *iam.DeleteRolePolicyInput) (*iam.DeleteRolePolicyOutput, error)
 	ListRolePolicies(accountID string, input *iam.ListRolePoliciesInput) (*iam.ListRolePoliciesOutput, error)
+
+	// Group CRUD — account-scoped
+	CreateGroup(accountID string, input *iam.CreateGroupInput) (*iam.CreateGroupOutput, error)
+	GetGroup(accountID string, input *iam.GetGroupInput) (*iam.GetGroupOutput, error)
+	ListGroups(accountID string, input *iam.ListGroupsInput) (*iam.ListGroupsOutput, error)
+	DeleteGroup(accountID string, input *iam.DeleteGroupInput) (*iam.DeleteGroupOutput, error)
+
+	// Group membership — account-scoped
+	AddUserToGroup(accountID string, input *iam.AddUserToGroupInput) (*iam.AddUserToGroupOutput, error)
+	RemoveUserFromGroup(accountID string, input *iam.RemoveUserFromGroupInput) (*iam.RemoveUserFromGroupOutput, error)
+	ListGroupsForUser(accountID string, input *iam.ListGroupsForUserInput) (*iam.ListGroupsForUserOutput, error)
+
+	// Group policy attachment — account-scoped
+	AttachGroupPolicy(accountID string, input *iam.AttachGroupPolicyInput) (*iam.AttachGroupPolicyOutput, error)
+	DetachGroupPolicy(accountID string, input *iam.DetachGroupPolicyInput) (*iam.DetachGroupPolicyOutput, error)
+	ListAttachedGroupPolicies(accountID string, input *iam.ListAttachedGroupPoliciesInput) (*iam.ListAttachedGroupPoliciesOutput, error)
+
+	// Group inline policies — account-scoped
+	PutGroupPolicy(accountID string, input *iam.PutGroupPolicyInput) (*iam.PutGroupPolicyOutput, error)
+	GetGroupPolicy(accountID string, input *iam.GetGroupPolicyInput) (*iam.GetGroupPolicyOutput, error)
+	DeleteGroupPolicy(accountID string, input *iam.DeleteGroupPolicyInput) (*iam.DeleteGroupPolicyOutput, error)
+	ListGroupPolicies(accountID string, input *iam.ListGroupPoliciesInput) (*iam.ListGroupPoliciesOutput, error)
 
 	// Instance profile CRUD — account-scoped
 	CreateInstanceProfile(accountID string, input *iam.CreateInstanceProfileInput) (*iam.CreateInstanceProfileOutput, error)
@@ -66,6 +94,23 @@ type IAMService interface {
 	GetOpenIDConnectProvider(accountID string, input *iam.GetOpenIDConnectProviderInput) (*iam.GetOpenIDConnectProviderOutput, error)
 	ListOpenIDConnectProviders(accountID string, input *iam.ListOpenIDConnectProvidersInput) (*iam.ListOpenIDConnectProvidersOutput, error)
 	DeleteOpenIDConnectProvider(accountID string, input *iam.DeleteOpenIDConnectProviderInput) (*iam.DeleteOpenIDConnectProviderOutput, error)
+
+	// Resource tagging — account-scoped
+	TagUser(accountID string, input *iam.TagUserInput) (*iam.TagUserOutput, error)
+	UntagUser(accountID string, input *iam.UntagUserInput) (*iam.UntagUserOutput, error)
+	ListUserTags(accountID string, input *iam.ListUserTagsInput) (*iam.ListUserTagsOutput, error)
+	TagRole(accountID string, input *iam.TagRoleInput) (*iam.TagRoleOutput, error)
+	UntagRole(accountID string, input *iam.UntagRoleInput) (*iam.UntagRoleOutput, error)
+	ListRoleTags(accountID string, input *iam.ListRoleTagsInput) (*iam.ListRoleTagsOutput, error)
+	TagPolicy(accountID string, input *iam.TagPolicyInput) (*iam.TagPolicyOutput, error)
+	UntagPolicy(accountID string, input *iam.UntagPolicyInput) (*iam.UntagPolicyOutput, error)
+	ListPolicyTags(accountID string, input *iam.ListPolicyTagsInput) (*iam.ListPolicyTagsOutput, error)
+	TagInstanceProfile(accountID string, input *iam.TagInstanceProfileInput) (*iam.TagInstanceProfileOutput, error)
+	UntagInstanceProfile(accountID string, input *iam.UntagInstanceProfileInput) (*iam.UntagInstanceProfileOutput, error)
+	ListInstanceProfileTags(accountID string, input *iam.ListInstanceProfileTagsInput) (*iam.ListInstanceProfileTagsOutput, error)
+	TagOpenIDConnectProvider(accountID string, input *iam.TagOpenIDConnectProviderInput) (*iam.TagOpenIDConnectProviderOutput, error)
+	UntagOpenIDConnectProvider(accountID string, input *iam.UntagOpenIDConnectProviderInput) (*iam.UntagOpenIDConnectProviderOutput, error)
+	ListOpenIDConnectProviderTags(accountID string, input *iam.ListOpenIDConnectProviderTagsInput) (*iam.ListOpenIDConnectProviderTagsOutput, error)
 
 	// ResolveInstanceProfile dereferences a RunInstancesInput.IamInstanceProfile
 	// reference (name or ARN) to the canonical InstanceProfile record. Used by
@@ -90,4 +135,8 @@ type IAMService interface {
 	CreateAccount(name string) (*Account, error)
 	GetAccount(accountID string) (*Account, error)
 	ListAccounts() ([]*Account, error)
+
+	// GetAccountSummary returns account-wide IAM usage counts plus AWS-parity
+	// quota values as a SummaryMap. Read-only and account-scoped.
+	GetAccountSummary(accountID string, input *iam.GetAccountSummaryInput) (*iam.GetAccountSummaryOutput, error)
 }

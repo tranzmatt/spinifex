@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,11 +15,14 @@ import (
 	handlers_ec2_eip "github.com/mulgadc/spinifex/spinifex/handlers/ec2/eip"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
 	"github.com/mulgadc/spinifex/spinifex/handlers/elbv2"
+	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
+	"github.com/mulgadc/spinifex/spinifex/network/external"
 	"github.com/mulgadc/spinifex/spinifex/tags"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/mulgadc/spinifex/spinifex/vm"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -81,6 +85,50 @@ func TestWaitForSystemInstance_Timeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// verifySystemInstanceLaunched
+// ---------------------------------------------------------------------------
+
+func TestVerifySystemInstanceLaunched_Running(t *testing.T) {
+	inst := &vm.VM{ID: "i-up", Status: vm.StateRunning}
+	d := newDaemonWithVMs(inst)
+
+	require.NoError(t, d.verifySystemInstanceLaunched(inst))
+}
+
+// LaunchRunInstances swallows launch errors and leaves the instance in a
+// cleanup state, so every non-running state must surface as a launch failure —
+// a GPU claim failure marks the VM shutting-down via MarkFailed.
+func TestVerifySystemInstanceLaunched_NonRunningStatesFail(t *testing.T) {
+	for _, status := range []vm.InstanceState{
+		vm.StateShuttingDown,
+		vm.StateError,
+		vm.StateTerminated,
+		vm.StatePending,
+		vm.StateProvisioning,
+	} {
+		t.Run(string(status), func(t *testing.T) {
+			inst := &vm.VM{ID: "i-down", Status: status}
+			d := newDaemonWithVMs(inst)
+
+			err := d.verifySystemInstanceLaunched(inst)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "i-down")
+			assert.Contains(t, err.Error(), string(status))
+		})
+	}
+}
+
+// MarkFailed transitions synchronously before running its cleanup goroutine, so
+// the check sees the failure without racing the teardown.
+func TestVerifySystemInstanceLaunched_AfterMarkFailedIsAnError(t *testing.T) {
+	inst := &vm.VM{ID: "i-gpu-claim-failed", Status: vm.StateProvisioning}
+	d := newDaemonWithVMs(inst)
+	d.vmMgr.MarkFailed(context.Background(), inst, "gpu_claim_failed")
+
+	require.Error(t, d.verifySystemInstanceLaunched(inst))
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +298,87 @@ func TestBuildNICNetdevs_EmptyNICs(t *testing.T) {
 	assert.Empty(t, res.devices)
 }
 
+func TestBuildNICNetdevs_UnprovisionedMgmtNIC_Skipped(t *testing.T) {
+	// Single-node host with no br-mgmt: NIC[1] (mgmt) never got a MAC/tap.
+	input := &handlers_elbv2.SystemInstanceInput{
+		ENIID: "eni-000000000000000c",
+		NICs: []handlers_elbv2.NICConfig{
+			{MAC: "02:aa:bb:cc:dd:01", IsDefault: true},
+			{MAC: ""},
+		},
+	}
+	res := buildNICNetdevs("i-test3", input, microvmMachineType())
+	require.Len(t, res.netdevs, 1)
+	require.Len(t, res.devices, 1)
+	assert.Contains(t, res.netdevs[0].Value, "id=net0,")
+	assert.Contains(t, res.devices[0].Value, "netdev=net0")
+}
+
+func TestBuildNICNetdevs_ProvisionedMgmtNIC_Included(t *testing.T) {
+	// Multi-node host with br-mgmt: NIC[1] (mgmt) has a real MAC/tap.
+	input := &handlers_elbv2.SystemInstanceInput{
+		ENIID: "eni-000000000000000d",
+		NICs: []handlers_elbv2.NICConfig{
+			{MAC: "02:aa:bb:cc:dd:01", IsDefault: true},
+			{MAC: "02:aa:bb:cc:dd:02"},
+		},
+	}
+	res := buildNICNetdevs("i-test4", input, microvmMachineType())
+	require.Len(t, res.netdevs, 2)
+	require.Len(t, res.devices, 2)
+	assert.Contains(t, res.netdevs[0].Value, "id=net0,")
+	assert.Contains(t, res.netdevs[1].Value, "id=net1,")
+	assert.Contains(t, res.devices[1].Value, "netdev=net1")
+}
+
+func TestBuildNICNetdevs_UnprovisionedMgmtNIC_ExtraENIUnaffected(t *testing.T) {
+	// NIC[1] mgmt unprovisioned + NIC[2] extra ENI provisioned: net1 must be
+	// skipped but the extra ENI's tap name resolution (index-based) must not
+	// be shifted/renumbered.
+	input := &handlers_elbv2.SystemInstanceInput{
+		ENIID: "eni-primary000000000",
+		ExtraENIs: []handlers_elbv2.ExtraENIInput{
+			{ENIID: "eni-extra000000000000"},
+		},
+		NICs: []handlers_elbv2.NICConfig{
+			{MAC: "02:aa:bb:cc:dd:01", IsDefault: true},
+			{MAC: ""},
+			{MAC: "02:aa:bb:cc:dd:03"},
+		},
+	}
+	res := buildNICNetdevs("i-test5", input, microvmMachineType())
+	require.Len(t, res.netdevs, 2)
+	require.Len(t, res.devices, 2)
+	assert.Contains(t, res.netdevs[0].Value, "id=net0,")
+	// net1 (mgmt) skipped entirely — net2 (extra ENI) keeps its own ID.
+	assert.Contains(t, res.netdevs[1].Value, "id=net2,")
+	assert.Contains(t, res.devices[1].Value, "netdev=net2")
+	assert.Contains(t, res.devices[1].Value, "02:aa:bb:cc:dd:03")
+	// Extra ENI's tap name must still resolve against ExtraENIs[0], not be
+	// mis-mapped by the gap at index 1.
+	assert.Equal(t, vm.TapDeviceName("eni-extra000000000000"), tapNameForNIC(2, input.NICs[2], "i-test5", input))
+}
+
+// ---------------------------------------------------------------------------
+// nicProvisioned
+// ---------------------------------------------------------------------------
+
+func TestNicProvisioned_MgmtSlotEmptyMAC(t *testing.T) {
+	assert.False(t, nicProvisioned(1, handlers_elbv2.NICConfig{MAC: ""}))
+}
+
+func TestNicProvisioned_MgmtSlotWithMAC(t *testing.T) {
+	assert.True(t, nicProvisioned(1, handlers_elbv2.NICConfig{MAC: "02:aa:bb:cc:dd:02"}))
+}
+
+func TestNicProvisioned_NonMgmtSlotsAlwaysTrue(t *testing.T) {
+	// Only the mgmt slot (index 1) is ever gated on MAC presence — an empty
+	// MAC anywhere else (e.g. primary, not expected in practice) is not
+	// treated as "unprovisioned" by this guard.
+	assert.True(t, nicProvisioned(0, handlers_elbv2.NICConfig{MAC: ""}))
+	assert.True(t, nicProvisioned(2, handlers_elbv2.NICConfig{MAC: ""}))
+}
+
 // ---------------------------------------------------------------------------
 // microvmMachineType
 // ---------------------------------------------------------------------------
@@ -307,6 +436,65 @@ func TestWriteFwCfgBlobs_HappyPath(t *testing.T) {
 	}
 }
 
+func TestWriteFwCfgBlobs_UnprovisionedMgmtNIC_ExcludedFromGuestConfig(t *testing.T) {
+	// Single-node host with no br-mgmt: the mgmt NIC (index 1) never got a
+	// MAC/CIDR. The guest netcfg blob must not carry a NIC1 entry at all.
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
+
+	d := &Daemon{}
+	instanceID := "i-fwcfg-nomgmt"
+	input := &handlers_elbv2.SystemInstanceInput{
+		NICs: []handlers_elbv2.NICConfig{
+			{MAC: "02:aa:bb:cc:dd:01", CIDR: "10.0.1.5/24", Gateway: "10.0.1.1", IsDefault: true},
+			{MAC: ""},
+		},
+	}
+
+	entries, err := d.writeFwCfgBlobs(instanceID, input)
+	require.NoError(t, err)
+	require.Len(t, entries, 3)
+
+	netcfgData, err := os.ReadFile(entries[0].File)
+	require.NoError(t, err)
+	assert.Contains(t, string(netcfgData), "NIC0_MAC=02:aa:bb:cc:dd:01")
+	// The unprovisioned mgmt NIC must not appear as NIC1 (nor anywhere else).
+	assert.NotContains(t, string(netcfgData), "NIC1_")
+	assert.NotContains(t, string(netcfgData), "MAC=\n")
+
+	for _, e := range entries {
+		assert.NoError(t, os.Remove(e.File))
+	}
+}
+
+func TestWriteFwCfgBlobs_ProvisionedMgmtNIC_IncludedInGuestConfig(t *testing.T) {
+	// Multi-node host with br-mgmt: mgmt NIC has a real MAC/CIDR and must
+	// still be wired into the guest config exactly as today.
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
+
+	d := &Daemon{}
+	instanceID := "i-fwcfg-mgmt"
+	input := &handlers_elbv2.SystemInstanceInput{
+		NICs: []handlers_elbv2.NICConfig{
+			{MAC: "02:aa:bb:cc:dd:01", CIDR: "10.0.1.5/24", Gateway: "10.0.1.1", IsDefault: true},
+			{MAC: "02:aa:bb:cc:dd:02", CIDR: "192.168.100.5/24"},
+		},
+	}
+
+	entries, err := d.writeFwCfgBlobs(instanceID, input)
+	require.NoError(t, err)
+
+	netcfgData, err := os.ReadFile(entries[0].File)
+	require.NoError(t, err)
+	assert.Contains(t, string(netcfgData), "NIC0_MAC=02:aa:bb:cc:dd:01")
+	assert.Contains(t, string(netcfgData), "NIC1_MAC=02:aa:bb:cc:dd:02")
+
+	for _, e := range entries {
+		assert.NoError(t, os.Remove(e.File))
+	}
+}
+
 func TestWriteFwCfgBlobs_InvalidNICs_NoDefault(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
@@ -331,6 +519,73 @@ func TestWriteFwCfgBlobs_InvalidNICs_NoDefault(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// buildDirectBootConfig — mmio slot packing
+// ---------------------------------------------------------------------------
+
+func TestBuildDirectBootConfig_MmioSlotsPacked_MgmtSkipped(t *testing.T) {
+	// NIC[1] (mgmt) unprovisioned (no br-mgmt) must not reserve an mmio slot;
+	// remaining NICs (primary, extra ENI) get packed, contiguous slots.
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
+
+	d := &Daemon{resourceMgr: &ResourceManager{instanceTypes: map[string]*ec2.InstanceTypeInfo{}}}
+	input := &handlers_elbv2.SystemInstanceInput{
+		ENIID: "eni-mmio000000000001",
+		ExtraENIs: []handlers_elbv2.ExtraENIInput{
+			{ENIID: "eni-mmio-extra00000001"},
+		},
+		NICs: []handlers_elbv2.NICConfig{
+			{MAC: "02:aa:bb:cc:dd:01", IsDefault: true},
+			{MAC: ""},
+			{MAC: "02:aa:bb:cc:dd:03"},
+		},
+	}
+
+	cfg, err := d.buildDirectBootConfig("i-mmio-test", input)
+	require.NoError(t, err)
+
+	// Only 2 real devices (mgmt skipped) → slots packed at 0 and 1, not 0 and 2.
+	assert.Contains(t, cfg.KernelCmdline, "virtio_mmio.device=0x200@0xfeb00000:5")
+	assert.Contains(t, cfg.KernelCmdline, "virtio_mmio.device=0x200@0xfeb00200:6")
+	assert.NotContains(t, cfg.KernelCmdline, "virtio_mmio.device=0x200@0xfeb00400:7")
+
+	require.Len(t, cfg.NetDevs, 2)
+	require.Len(t, cfg.Devices, 2)
+
+	for _, e := range cfg.FwCfg {
+		assert.NoError(t, os.Remove(e.File))
+	}
+}
+
+func TestBuildDirectBootConfig_MmioSlotsUnchanged_MgmtProvisioned(t *testing.T) {
+	// Multi-node host with br-mgmt: all NICs provisioned, slots stay 1:1
+	// with NIC index as before this fix.
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
+
+	d := &Daemon{resourceMgr: &ResourceManager{instanceTypes: map[string]*ec2.InstanceTypeInfo{}}}
+	input := &handlers_elbv2.SystemInstanceInput{
+		ENIID: "eni-mmio000000000002",
+		NICs: []handlers_elbv2.NICConfig{
+			{MAC: "02:aa:bb:cc:dd:01", IsDefault: true},
+			{MAC: "02:aa:bb:cc:dd:02"},
+		},
+	}
+
+	cfg, err := d.buildDirectBootConfig("i-mmio-test2", input)
+	require.NoError(t, err)
+
+	assert.Contains(t, cfg.KernelCmdline, "virtio_mmio.device=0x200@0xfeb00000:5")
+	assert.Contains(t, cfg.KernelCmdline, "virtio_mmio.device=0x200@0xfeb00200:6")
+	require.Len(t, cfg.NetDevs, 2)
+	require.Len(t, cfg.Devices, 2)
+
+	for _, e := range cfg.FwCfg {
+		assert.NoError(t, os.Remove(e.File))
+	}
+}
+
+// ---------------------------------------------------------------------------
 // refreshSystemInstanceState
 // ---------------------------------------------------------------------------
 
@@ -343,7 +598,9 @@ func newRefreshTestDaemon(t *testing.T) (*Daemon, *nats.Conn, string) {
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
 	_, nc, _ := testutil.StartTestJetStream(t)
-	svc, err := handlers_elbv2.NewELBv2ServiceImplWithNATS(nil, nc)
+	masterKey, err := handlers_iam.GenerateMasterKey()
+	require.NoError(t, err)
+	svc, err := handlers_elbv2.NewELBv2ServiceImplWithNATS(nil, nc, masterKey)
 	require.NoError(t, err)
 	t.Cleanup(svc.Close)
 	return &Daemon{vmMgr: vm.NewManager(), elbv2Service: svc}, nc, tmpDir
@@ -384,9 +641,9 @@ func TestRefreshSystemInstanceState_RewritesBlobs(t *testing.T) {
 	d.elbv2Service.GatewayURL = "https://10.0.0.1:9999"
 	d.elbv2Service.CACert = "-----BEGIN CERTIFICATE-----\nfake-ca\n-----END CERTIFICATE-----\n"
 
-	seedStore, err := handlers_elbv2.NewStore(nc)
+	seedStore, err := handlers_elbv2.NewStore(t.Context(), nc)
 	require.NoError(t, err)
-	require.NoError(t, seedStore.PutLoadBalancer(&handlers_elbv2.LoadBalancerRecord{
+	require.NoError(t, seedStore.PutLoadBalancer(t.Context(), &handlers_elbv2.LoadBalancerRecord{
 		LoadBalancerID: "lb-recover",
 		Name:           "recover-alb",
 		Scheme:         handlers_elbv2.SchemeInternal,
@@ -425,14 +682,14 @@ func TestRefreshSystemInstanceState_RewritesBlobs(t *testing.T) {
 }
 
 // TestRefreshSystemInstanceState_WriteErrorPropagates exercises the
-// writeFwCfgBlobs error path (plan §3): a write failure under the tmpfs
+// writeFwCfgBlobs error path: a write failure under the tmpfs
 // path must surface as a wrapped error so MarkRecoveryFailed gets called.
 func TestRefreshSystemInstanceState_WriteErrorPropagates(t *testing.T) {
 	d, nc, tmpDir := newRefreshTestDaemon(t)
 
-	seedStore, err := handlers_elbv2.NewStore(nc)
+	seedStore, err := handlers_elbv2.NewStore(t.Context(), nc)
 	require.NoError(t, err)
-	require.NoError(t, seedStore.PutLoadBalancer(&handlers_elbv2.LoadBalancerRecord{
+	require.NoError(t, seedStore.PutLoadBalancer(t.Context(), &handlers_elbv2.LoadBalancerRecord{
 		LoadBalancerID: "lb-werr",
 		Name:           "werr-alb",
 		Scheme:         handlers_elbv2.SchemeInternal,
@@ -494,9 +751,9 @@ func TestLaunchSystemInstance_NATFailureRollsBackPublicIP(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { jsNC.Close() })
 
-	js, err := jsNC.JetStream()
+	js, err := jetstream.New(jsNC)
 	require.NoError(t, err)
-	ipam, err := handlers_ec2_vpc.NewExternalIPAM(js, []handlers_ec2_vpc.ExternalPoolConfig{
+	ipam, err := handlers_ec2_vpc.NewExternalIPAM(t.Context(), js, []external.ExternalPoolConfig{
 		{Name: "wan-test", RangeStart: "203.0.113.10", RangeEnd: "203.0.113.20", Gateway: "203.0.113.1", PrefixLen: 24},
 	})
 	require.NoError(t, err)
@@ -504,16 +761,16 @@ func TestLaunchSystemInstance_NATFailureRollsBackPublicIP(t *testing.T) {
 
 	// Create a VPC + subnet + ENI so LaunchSystemInstance has a real ENI to
 	// attach to and to update with the public IP.
-	vpcOut, err := d.vpcService.CreateVpc(&ec2.CreateVpcInput{
+	vpcOut, err := d.vpcService.CreateVpc(t.Context(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.50.0.0/16"),
 	}, testAccountID)
 	require.NoError(t, err)
-	subnetOut, err := d.vpcService.CreateSubnet(&ec2.CreateSubnetInput{
+	subnetOut, err := d.vpcService.CreateSubnet(t.Context(), &ec2.CreateSubnetInput{
 		VpcId:     vpcOut.Vpc.VpcId,
 		CidrBlock: aws.String("10.50.1.0/24"),
 	}, testAccountID)
 	require.NoError(t, err)
-	eniOut, err := d.vpcService.CreateNetworkInterface(&ec2.CreateNetworkInterfaceInput{
+	eniOut, err := d.vpcService.CreateNetworkInterface(t.Context(), &ec2.CreateNetworkInterfaceInput{
 		SubnetId:    subnetOut.Subnet.SubnetId,
 		Description: aws.String("nat-fail-test"),
 	}, testAccountID)
@@ -561,7 +818,7 @@ func TestLaunchSystemInstance_NATFailureRollsBackPublicIP(t *testing.T) {
 
 	// ENI public IP record must be cleared so subsequent DescribeNetworkInterfaces
 	// does not surface the unreachable address.
-	descOut, err := d.vpcService.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{
+	descOut, err := d.vpcService.DescribeNetworkInterfaces(t.Context(), &ec2.DescribeNetworkInterfacesInput{
 		NetworkInterfaceIds: []*string{aws.String(eniID)},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -595,7 +852,7 @@ func TestLaunchSystemInstance_NATFailureRollsBackPublicIP(t *testing.T) {
 // its pool and clear the instance's EIP fields. The vm.Manager teardown
 // (Terminate/MarkFailed → ReleasePublicIP) only knows the externalIPAM path, so
 // without this an internet-facing system VM's allocated+associated EIP would
-// leak when its instance is torn down (mulga-siv-293).
+// leak when its instance is torn down.
 func TestReleaseSystemInstanceEIP_ReleasesEipServiceAllocation(t *testing.T) {
 	d := createVPCTestDaemon(t)
 
@@ -616,21 +873,21 @@ func TestReleaseSystemInstanceEIP_ReleasesEipServiceAllocation(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { jsNC.Close() })
 
-	js, err := jsNC.JetStream()
+	js, err := jetstream.New(jsNC)
 	require.NoError(t, err)
-	ipam, err := handlers_ec2_vpc.NewExternalIPAM(js, []handlers_ec2_vpc.ExternalPoolConfig{
+	ipam, err := handlers_ec2_vpc.NewExternalIPAM(t.Context(), js, []external.ExternalPoolConfig{
 		{Name: "wan-test", RangeStart: "203.0.113.10", RangeEnd: "203.0.113.20", Gateway: "203.0.113.1", PrefixLen: 24},
 	})
 	require.NoError(t, err)
 	d.externalIPAM = ipam
 
-	eipSvc, err := handlers_ec2_eip.NewEIPServiceImpl(jsNC, ipam, d.vpcService)
+	eipSvc, err := handlers_ec2_eip.NewEIPServiceImpl(t.Context(), jsNC, ipam, d.vpcService)
 	require.NoError(t, err)
 	d.eipService = eipSvc
 
 	// Allocate an EIP the way an internet-facing LB VM launch does, then attach
 	// it to a registered system instance.
-	alloc, err := eipSvc.AllocateAddress(&ec2.AllocateAddressInput{}, testAccountID)
+	alloc, err := eipSvc.AllocateAddress(t.Context(), &ec2.AllocateAddressInput{}, testAccountID)
 	require.NoError(t, err)
 	allocID := aws.StringValue(alloc.AllocationId)
 	publicIP := aws.StringValue(alloc.PublicIp)

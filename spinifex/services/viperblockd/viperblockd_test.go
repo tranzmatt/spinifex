@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -13,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestNew tests the service constructor
+// TestNew tests the service constructor.
 func TestNew(t *testing.T) {
 	cfg := &Config{
 		NatsHost:  "nats://localhost:4222",
@@ -37,7 +38,7 @@ func TestNew(t *testing.T) {
 	assert.Equal(t, "/tmp/viperblock", svc.Config.BaseDir)
 }
 
-// TestNewWithNilConfig tests that New handles nil config correctly
+// TestNewWithNilConfig tests that New handles nil config correctly.
 func TestNewWithNilConfig(t *testing.T) {
 	// This will panic if not handled, but based on the code it type asserts
 	// For now we test that it accepts a Config pointer
@@ -49,7 +50,7 @@ func TestNewWithNilConfig(t *testing.T) {
 	assert.NotNil(t, svc.Config)
 }
 
-// TestConfigDefaults tests Config struct default values
+// TestConfigDefaults tests Config struct default values.
 func TestConfigDefaults(t *testing.T) {
 	cfg := &Config{}
 
@@ -61,7 +62,7 @@ func TestConfigDefaults(t *testing.T) {
 	assert.Empty(t, cfg.MountedVolumes)
 }
 
-// TestConfigWithDebug tests Config with debug enabled
+// TestConfigWithDebug tests Config with debug enabled.
 func TestConfigWithDebug(t *testing.T) {
 	cfg := &Config{
 		Debug:    true,
@@ -74,7 +75,7 @@ func TestConfigWithDebug(t *testing.T) {
 	assert.Equal(t, "/tmp/test", cfg.BaseDir)
 }
 
-// TestMountedVolumeStruct tests the MountedVolume struct
+// TestMountedVolumeStruct tests the MountedVolume struct.
 func TestMountedVolumeStruct(t *testing.T) {
 	vol := MountedVolume{
 		Name:   "vol-123",
@@ -89,13 +90,13 @@ func TestMountedVolumeStruct(t *testing.T) {
 	assert.Equal(t, 12345, vol.PID)
 }
 
-// TestConfigMountedVolumesAppend tests adding volumes to the config
+// TestConfigMountedVolumesAppend tests adding volumes to the config.
 func TestConfigMountedVolumesAppend(t *testing.T) {
 	cfg := &Config{
 		MountedVolumes: []MountedVolume{},
 	}
 
-	assert.Len(t, cfg.MountedVolumes, 0)
+	assert.Empty(t, cfg.MountedVolumes)
 
 	// Add first volume
 	cfg.MountedVolumes = append(cfg.MountedVolumes, MountedVolume{
@@ -118,7 +119,7 @@ func TestConfigMountedVolumesAppend(t *testing.T) {
 	assert.Equal(t, "vol-2", cfg.MountedVolumes[1].Name)
 }
 
-// TestConfigMutexThreadSafety tests that the mutex protects MountedVolumes
+// TestConfigMutexThreadSafety tests that the mutex protects MountedVolumes.
 func TestConfigMutexThreadSafety(t *testing.T) {
 	cfg := &Config{
 		MountedVolumes: []MountedVolume{},
@@ -149,7 +150,7 @@ func TestConfigMutexThreadSafety(t *testing.T) {
 	cfg.mu.Unlock()
 }
 
-// TestServiceMethods tests the service interface methods
+// TestServiceMethods tests the service interface methods.
 func TestServiceMethods(t *testing.T) {
 	cfg := &Config{
 		NatsHost: "nats://localhost:4222",
@@ -169,7 +170,7 @@ func TestServiceMethods(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// TestServiceShutdown tests that Shutdown calls Stop
+// TestServiceShutdown tests that Shutdown calls Stop.
 func TestServiceShutdown(t *testing.T) {
 	cfg := &Config{
 		NatsHost: "nats://localhost:4222",
@@ -187,7 +188,7 @@ func TestServiceShutdown(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestServiceStop tests the Stop method
+// TestServiceStop tests the Stop method.
 func TestServiceStop(t *testing.T) {
 	cfg := &Config{
 		NatsHost: "nats://localhost:4222",
@@ -203,7 +204,7 @@ func TestServiceStop(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestConfigPluginPath tests PluginPath configuration
+// TestConfigPluginPath tests PluginPath configuration.
 func TestConfigPluginPath(t *testing.T) {
 	cfg := &Config{
 		PluginPath: "/usr/lib/nbdkit/plugins",
@@ -214,7 +215,7 @@ func TestConfigPluginPath(t *testing.T) {
 	assert.Equal(t, "/var/lib/viperblock", cfg.BaseDir)
 }
 
-// TestConfigFullyPopulated tests a fully populated config
+// TestConfigFullyPopulated tests a fully populated config.
 func TestConfigFullyPopulated(t *testing.T) {
 	cfg := &Config{
 		ConfigPath: "/etc/viperblock/config.yml",
@@ -251,7 +252,7 @@ func TestConfigFullyPopulated(t *testing.T) {
 	assert.Equal(t, "vol-001", cfg.MountedVolumes[0].Name)
 }
 
-// TestMountedVolumeFindByName tests finding a mounted volume by name
+// TestMountedVolumeFindByName tests finding a mounted volume by name.
 func TestMountedVolumeFindByName(t *testing.T) {
 	cfg := &Config{
 		MountedVolumes: []MountedVolume{
@@ -287,7 +288,7 @@ func TestMountedVolumeFindByName(t *testing.T) {
 	assert.Nil(t, found)
 }
 
-// TestMountedVolumeRemoval tests removing a mounted volume
+// TestMountedVolumeRemoval tests removing a mounted volume.
 func TestMountedVolumeRemoval(t *testing.T) {
 	cfg := &Config{
 		MountedVolumes: []MountedVolume{
@@ -314,12 +315,12 @@ func TestMountedVolumeRemoval(t *testing.T) {
 	assert.Equal(t, "vol-3", cfg.MountedVolumes[1].Name)
 }
 
-// TestServiceNameConstant tests the serviceName constant
+// TestServiceNameConstant tests the serviceName constant.
 func TestServiceNameConstant(t *testing.T) {
 	assert.Equal(t, "viperblock", serviceName)
 }
 
-// TestConfigS3Credentials tests S3 credential fields
+// TestConfigS3Credentials tests S3 credential fields.
 func TestConfigS3Credentials(t *testing.T) {
 	cfg := &Config{
 		AccessKey: "test-key",
@@ -332,7 +333,7 @@ func TestConfigS3Credentials(t *testing.T) {
 	assert.Equal(t, "test-secret", cfg.SecretKey)
 }
 
-// TestMountedVolumeWithSocket tests MountedVolume with socket path
+// TestMountedVolumeWithSocket tests MountedVolume with socket path.
 func TestMountedVolumeWithSocket(t *testing.T) {
 	vol := MountedVolume{
 		Name:   "vol-ebs-123",
@@ -342,10 +343,9 @@ func TestMountedVolumeWithSocket(t *testing.T) {
 	}
 
 	assert.Contains(t, vol.Socket, "vol-ebs-123")
-	assert.True(t, len(vol.Socket) > 0)
 }
 
-// TestConfigConcurrentRead tests concurrent reads are safe
+// TestConfigConcurrentRead tests concurrent reads are safe.
 func TestConfigConcurrentRead(t *testing.T) {
 	cfg := &Config{
 		MountedVolumes: []MountedVolume{
@@ -377,7 +377,7 @@ func TestConfigConcurrentRead(t *testing.T) {
 }
 
 // TestServiceStartWithoutNATS tests Start method behavior
-// Note: This will fail without a running NATS server, which is expected
+// Note: This will fail without a running NATS server, which is expected.
 func TestServiceStartWithoutNATS(t *testing.T) {
 	// Skip this test in CI environments or when NATS is not available
 	if os.Getenv("SKIP_INTEGRATION_TESTS") == "true" {
@@ -410,7 +410,7 @@ func TestServiceStartWithoutNATS(t *testing.T) {
 	}
 }
 
-// TestConfigValidation tests validation of required fields
+// TestConfigValidation tests validation of required fields.
 func TestConfigValidation(t *testing.T) {
 	// Test empty config - fields should be empty
 	cfg := &Config{}
@@ -429,7 +429,7 @@ func TestConfigValidation(t *testing.T) {
 	assert.NotEmpty(t, cfg2.Region)
 }
 
-// TestMountedVolumePortRange tests port assignment
+// TestMountedVolumePortRange tests port assignment.
 func TestMountedVolumePortRange(t *testing.T) {
 	volumes := []MountedVolume{
 		{Name: "vol-1", Port: 10809},
@@ -439,8 +439,8 @@ func TestMountedVolumePortRange(t *testing.T) {
 
 	for i, vol := range volumes {
 		assert.Equal(t, 10809+i, vol.Port)
-		assert.True(t, vol.Port >= 10809)
-		assert.True(t, vol.Port <= 65535)
+		assert.GreaterOrEqual(t, vol.Port, 10809)
+		assert.LessOrEqual(t, vol.Port, 65535)
 	}
 }
 
@@ -511,5 +511,64 @@ func TestRetryLoadState(t *testing.T) {
 		assert.Equal(t, 3, sleeps, "sleep happens between attempts, not after the final one")
 		// Backoff multiplier is 1.5: 100ms, 150ms, 225ms.
 		assert.Equal(t, 225*time.Millisecond, lastDelay)
+	})
+}
+
+// TestValidVolumeName covers the character-level gate every handler that
+// turns a wire volume name into a filesystem path must pass first.
+func TestValidVolumeName(t *testing.T) {
+	valid := []string{"vol-0123456789abcdef0", "vol-0123456789abcdef0-efi", "a"}
+	for _, name := range valid {
+		assert.True(t, validVolumeName(name), "expected %q to be valid", name)
+	}
+
+	invalid := []string{"", ".", "..", "../..", "a/b", "/etc/passwd", "vol/../.."}
+	for _, name := range invalid {
+		assert.False(t, validVolumeName(name), "expected %q to be rejected", name)
+	}
+}
+
+// TestLocalVolumeDir is the regression test for the ebs.delete data-destruction
+// hazard: an unvalidated volume name reaching os.RemoveAll could wipe BaseDir
+// itself (empty name) or escape it entirely ("../.."). Every case here must be
+// rejected before a caller ever gets a path back to remove.
+func TestLocalVolumeDir(t *testing.T) {
+	baseDir := t.TempDir()
+
+	t.Run("empty_volume_rejected", func(t *testing.T) {
+		_, err := localVolumeDir(baseDir, "")
+		require.Error(t, err, "an empty volume must never resolve to BaseDir itself")
+	})
+
+	t.Run("dot_rejected", func(t *testing.T) {
+		_, err := localVolumeDir(baseDir, ".")
+		require.Error(t, err)
+	})
+
+	t.Run("parent_traversal_rejected", func(t *testing.T) {
+		for _, name := range []string{"..", "../..", "../../etc"} {
+			_, err := localVolumeDir(baseDir, name)
+			require.Error(t, err, "volume %q must not escape BaseDir", name)
+		}
+	})
+
+	t.Run("embedded_separator_rejected", func(t *testing.T) {
+		for _, name := range []string{"a/b", "a/../../b", "/abs/path"} {
+			_, err := localVolumeDir(baseDir, name)
+			require.Error(t, err, "volume %q must not contain a path separator", name)
+		}
+	})
+
+	t.Run("empty_base_dir_rejected", func(t *testing.T) {
+		_, err := localVolumeDir("", "vol-abc123")
+		require.Error(t, err)
+	})
+
+	t.Run("valid_name_resolves_under_base_dir", func(t *testing.T) {
+		dir, err := localVolumeDir(baseDir, "vol-abc123")
+		require.NoError(t, err)
+		absBase, err := filepath.Abs(baseDir)
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(absBase, "vol-abc123"), dir)
 	})
 }

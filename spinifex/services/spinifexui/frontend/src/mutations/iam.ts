@@ -1,20 +1,32 @@
 import {
   AddRoleToInstanceProfileCommand,
+  AddUserToGroupCommand,
+  AttachGroupPolicyCommand,
   AttachRolePolicyCommand,
   AttachUserPolicyCommand,
   CreateAccessKeyCommand,
+  CreateGroupCommand,
   CreateInstanceProfileCommand,
   CreatePolicyCommand,
   CreateRoleCommand,
   CreateUserCommand,
   DeleteAccessKeyCommand,
+  DeleteGroupCommand,
+  DeleteGroupPolicyCommand,
   DeleteInstanceProfileCommand,
   DeletePolicyCommand,
   DeleteRoleCommand,
+  DeleteRolePolicyCommand,
   DeleteUserCommand,
+  DeleteUserPolicyCommand,
+  DetachGroupPolicyCommand,
   DetachRolePolicyCommand,
   DetachUserPolicyCommand,
+  PutGroupPolicyCommand,
+  PutRolePolicyCommand,
+  PutUserPolicyCommand,
   RemoveRoleFromInstanceProfileCommand,
+  RemoveUserFromGroupCommand,
   UpdateAccessKeyCommand,
 } from "@aws-sdk/client-iam"
 import { useMutation, useQueryClient } from "@tanstack/react-query"
@@ -22,11 +34,16 @@ import { useMutation, useQueryClient } from "@tanstack/react-query"
 import { getIamClient } from "@/lib/awsClient"
 import type {
   AddRoleToProfileParams,
+  CreateGroupFormData,
   CreateInstanceProfileFormData,
   CreatePolicyFormData,
   CreateRoleFormData,
   CreateUserFormData,
   DeleteAccessKeyParams,
+  DeleteInlinePolicyParams,
+  GroupMembershipParams,
+  GroupPolicyParams,
+  PutInlinePolicyParams,
   RolePolicyParams,
   UpdateAccessKeyParams,
   UserPolicyParams,
@@ -179,6 +196,47 @@ export function useDetachUserPolicy() {
   })
 }
 
+export function usePutUserPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({
+      name,
+      policyName,
+      policyDocument,
+    }: PutInlinePolicyParams) => {
+      const command = new PutUserPolicyCommand({
+        UserName: name,
+        PolicyName: policyName,
+        PolicyDocument: policyDocument,
+      })
+      return await getIamClient().send(command)
+    },
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({
+        queryKey: ["iam", "user-inline-policies", variables.name],
+      })
+    },
+  })
+}
+
+export function useDeleteUserPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ name, policyName }: DeleteInlinePolicyParams) => {
+      const command = new DeleteUserPolicyCommand({
+        UserName: name,
+        PolicyName: policyName,
+      })
+      return await getIamClient().send(command)
+    },
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({
+        queryKey: ["iam", "user-inline-policies", variables.name],
+      })
+    },
+  })
+}
+
 export function useCreateRole() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -243,6 +301,47 @@ export function useDetachRolePolicy() {
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: ["iam", "attached-role-policies"],
+      })
+    },
+  })
+}
+
+export function usePutRolePolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({
+      name,
+      policyName,
+      policyDocument,
+    }: PutInlinePolicyParams) => {
+      const command = new PutRolePolicyCommand({
+        RoleName: name,
+        PolicyName: policyName,
+        PolicyDocument: policyDocument,
+      })
+      return await getIamClient().send(command)
+    },
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({
+        queryKey: ["iam", "role-inline-policies", variables.name],
+      })
+    },
+  })
+}
+
+export function useDeleteRolePolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ name, policyName }: DeleteInlinePolicyParams) => {
+      const command = new DeleteRolePolicyCommand({
+        RoleName: name,
+        PolicyName: policyName,
+      })
+      return await getIamClient().send(command)
+    },
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({
+        queryKey: ["iam", "role-inline-policies", variables.name],
       })
     },
   })
@@ -321,6 +420,151 @@ export function useRemoveRoleFromInstanceProfile() {
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: ["iam", "instance-profiles"],
+      })
+    },
+  })
+}
+
+export function useCreateGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (params: CreateGroupFormData) => {
+      const command = new CreateGroupCommand({
+        GroupName: params.groupName,
+        // oxlint-disable-next-line typescript/prefer-nullish-coalescing
+        Path: params.path || undefined,
+      })
+      return await getIamClient().send(command)
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["iam", "groups"] })
+    },
+  })
+}
+
+export function useDeleteGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (groupName: string) => {
+      const command = new DeleteGroupCommand({ GroupName: groupName })
+      return await getIamClient().send(command)
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["iam", "groups"] })
+    },
+  })
+}
+
+export function useAttachGroupPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ groupName, policyArn }: GroupPolicyParams) => {
+      const command = new AttachGroupPolicyCommand({
+        GroupName: groupName,
+        PolicyArn: policyArn,
+      })
+      return await getIamClient().send(command)
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: ["iam", "attached-group-policies"],
+      })
+    },
+  })
+}
+
+export function useDetachGroupPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ groupName, policyArn }: GroupPolicyParams) => {
+      const command = new DetachGroupPolicyCommand({
+        GroupName: groupName,
+        PolicyArn: policyArn,
+      })
+      return await getIamClient().send(command)
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: ["iam", "attached-group-policies"],
+      })
+    },
+  })
+}
+
+export function usePutGroupPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({
+      name,
+      policyName,
+      policyDocument,
+    }: PutInlinePolicyParams) => {
+      const command = new PutGroupPolicyCommand({
+        GroupName: name,
+        PolicyName: policyName,
+        PolicyDocument: policyDocument,
+      })
+      return await getIamClient().send(command)
+    },
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({
+        queryKey: ["iam", "group-inline-policies", variables.name],
+      })
+    },
+  })
+}
+
+export function useDeleteGroupPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ name, policyName }: DeleteInlinePolicyParams) => {
+      const command = new DeleteGroupPolicyCommand({
+        GroupName: name,
+        PolicyName: policyName,
+      })
+      return await getIamClient().send(command)
+    },
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({
+        queryKey: ["iam", "group-inline-policies", variables.name],
+      })
+    },
+  })
+}
+
+export function useAddUserToGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ groupName, userName }: GroupMembershipParams) => {
+      const command = new AddUserToGroupCommand({
+        GroupName: groupName,
+        UserName: userName,
+      })
+      return await getIamClient().send(command)
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["iam", "groups"] })
+      void queryClient.invalidateQueries({
+        queryKey: ["iam", "groups-for-user"],
+      })
+    },
+  })
+}
+
+export function useRemoveUserFromGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ groupName, userName }: GroupMembershipParams) => {
+      const command = new RemoveUserFromGroupCommand({
+        GroupName: groupName,
+        UserName: userName,
+      })
+      return await getIamClient().send(command)
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["iam", "groups"] })
+      void queryClient.invalidateQueries({
+        queryKey: ["iam", "groups-for-user"],
       })
     },
   })

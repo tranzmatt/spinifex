@@ -1,6 +1,7 @@
 package gateway_ec2_vpc
 
 import (
+	"context"
 	"errors"
 
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -22,8 +23,8 @@ func ValidateCreateSubnetInput(input *ec2.CreateSubnetInput) error {
 	return nil
 }
 
-// CreateSubnet handles the EC2 CreateSubnet API call
-func CreateSubnet(input *ec2.CreateSubnetInput, natsConn *nats.Conn, accountID string) (ec2.CreateSubnetOutput, error) {
+// CreateSubnet handles the EC2 CreateSubnet API call.
+func CreateSubnet(ctx context.Context, input *ec2.CreateSubnetInput, natsConn *nats.Conn, accountID string) (ec2.CreateSubnetOutput, error) {
 	var output ec2.CreateSubnetOutput
 
 	if err := ValidateCreateSubnetInput(input); err != nil {
@@ -31,7 +32,7 @@ func CreateSubnet(input *ec2.CreateSubnetInput, natsConn *nats.Conn, accountID s
 	}
 
 	svc := handlers_ec2_vpc.NewNATSVPCService(natsConn)
-	result, err := svc.CreateSubnet(input, accountID)
+	result, err := svc.CreateSubnet(ctx, input, accountID)
 	if err != nil {
 		return output, err
 	}

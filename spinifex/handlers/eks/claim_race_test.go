@@ -1,6 +1,7 @@
 package handlers_eks
 
 import (
+	"context"
 	"sync"
 	"testing"
 
@@ -41,7 +42,7 @@ func TestCreateCluster_ConcurrentSameNameSingleOwner(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = f.svc.CreateCluster(createInput("race"), testAccountID, "")
+			_, errs[i] = f.svc.CreateCluster(context.Background(), createInput("race"), testAccountID, "")
 		}(i)
 	}
 	wg.Wait()
@@ -51,7 +52,7 @@ func TestCreateCluster_ConcurrentSameNameSingleOwner(t *testing.T) {
 	assert.Equal(t, 1, ok, "exactly one create owns the name")
 	assert.Equal(t, 1, inUse, "the duplicate is rejected ResourceInUse")
 
-	meta, err := GetClusterMeta(f.kv, "race")
+	meta, err := GetClusterMeta(t.Context(), f.kv, "race")
 	require.NoError(t, err)
 	assert.Equal(t, ClusterStatusCreating, meta.Status)
 }
@@ -64,7 +65,7 @@ func TestCreateCluster_ConcurrentReclaimSingleOwner(t *testing.T) {
 
 	meta := sampleClusterMeta("race")
 	meta.Status = ClusterStatusFailed
-	require.NoError(t, PutClusterMeta(f.kv, meta))
+	require.NoError(t, PutClusterMeta(t.Context(), f.kv, meta))
 
 	const n = 2
 	errs := make([]error, n)
@@ -73,7 +74,7 @@ func TestCreateCluster_ConcurrentReclaimSingleOwner(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = f.svc.CreateCluster(createInput("race"), testAccountID, "")
+			_, errs[i] = f.svc.CreateCluster(context.Background(), createInput("race"), testAccountID, "")
 		}(i)
 	}
 	wg.Wait()
@@ -83,7 +84,7 @@ func TestCreateCluster_ConcurrentReclaimSingleOwner(t *testing.T) {
 	assert.Equal(t, 1, ok, "exactly one retry reclaims the FAILED cluster")
 	assert.Equal(t, 1, inUse, "the concurrent retry is rejected")
 
-	got, err := GetClusterMeta(f.kv, "race")
+	got, err := GetClusterMeta(t.Context(), f.kv, "race")
 	require.NoError(t, err)
 	assert.Equal(t, ClusterStatusCreating, got.Status)
 }
@@ -103,12 +104,12 @@ func TestCreateNodegroup_ConcurrentSameNameSingleOwner(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = f.svc.CreateNodegroup(createNGInput("c1", "ng1", 1), testAccountID)
+			_, errs[i] = f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 1), testAccountID)
 		}(i)
 	}
 	wg.Wait()
 	// The single winning owner launches one worker; let its Ready-gate resolve.
-	markWorkersReady(t, f, "c1", 1)
+	markWorkersReady(t, f, "c1", "ng1", 1)
 	f.svc.WaitLaunches()
 
 	ok, inUse := classifyCreateErrs(t, errs)

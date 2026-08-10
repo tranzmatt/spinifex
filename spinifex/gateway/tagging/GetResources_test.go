@@ -1,6 +1,7 @@
 package gateway_tagging
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -21,12 +22,12 @@ type fakeLister struct {
 	gotFilter map[string]bool
 }
 
-func (f *fakeLister) listELBv2(typeFilters map[string]bool) ([]*rgt.ResourceTagMapping, error) {
+func (f *fakeLister) listELBv2(_ context.Context, typeFilters map[string]bool) ([]*rgt.ResourceTagMapping, error) {
 	f.gotFilter = typeFilters
 	return f.elbv2, f.elbv2Err
 }
 
-func (f *fakeLister) listEC2(typeFilters map[string]bool) ([]*rgt.ResourceTagMapping, error) {
+func (f *fakeLister) listEC2(_ context.Context, typeFilters map[string]bool) ([]*rgt.ResourceTagMapping, error) {
 	return f.ec2, f.ec2Err
 }
 
@@ -123,13 +124,13 @@ func TestPaginate(t *testing.T) {
 	page, next, err = paginate(all, aws.String("4"), aws.Int64(2))
 	require.NoError(t, err)
 	assert.Len(t, page, 1)
-	assert.Equal(t, "", next)
+	assert.Empty(t, next)
 
 	// Default page size returns everything in one page.
 	page, next, err = paginate(all, nil, nil)
 	require.NoError(t, err)
 	assert.Len(t, page, 5)
-	assert.Equal(t, "", next)
+	assert.Empty(t, next)
 
 	// Bad token is rejected.
 	_, _, err = paginate(all, aws.String("not-a-number"), nil)
@@ -153,7 +154,7 @@ func TestGetResources_MergesFiltersSortsPaginates(t *testing.T) {
 		TagFilters:       []*rgt.TagFilter{tagFilter("elbv2.k8s.aws/cluster", "prod")},
 		ResourcesPerPage: aws.Int64(1),
 	})
-	out, err := getResources(lister, body)
+	out, err := getResources(context.Background(), lister, body)
 	require.NoError(t, err)
 	res, ok := out.(*rgt.GetResourcesOutput)
 	require.True(t, ok)
@@ -167,13 +168,13 @@ func TestGetResources_MergesFiltersSortsPaginates(t *testing.T) {
 		ResourcesPerPage: aws.Int64(1),
 		PaginationToken:  aws.String("1"),
 	})
-	out, err = getResources(lister, body)
+	out, err = getResources(context.Background(), lister, body)
 	require.NoError(t, err)
 	res, ok = out.(*rgt.GetResourcesOutput)
 	require.True(t, ok)
 	require.Len(t, res.ResourceTagMappingList, 1)
 	assert.Equal(t, "arn:elb:c", aws.StringValue(res.ResourceTagMappingList[0].ResourceARN))
-	assert.Equal(t, "", aws.StringValue(res.PaginationToken))
+	assert.Empty(t, aws.StringValue(res.PaginationToken))
 }
 
 func TestGetResources_ResourceTypeFiltersLowercasedAndPassed(t *testing.T) {
@@ -181,19 +182,19 @@ func TestGetResources_ResourceTypeFiltersLowercasedAndPassed(t *testing.T) {
 	body := mustJSON(t, rgt.GetResourcesInput{
 		ResourceTypeFilters: aws.StringSlice([]string{"ElasticLoadBalancing:LoadBalancer"}),
 	})
-	_, err := getResources(lister, body)
+	_, err := getResources(context.Background(), lister, body)
 	require.NoError(t, err)
 	assert.True(t, lister.gotFilter["elasticloadbalancing:loadbalancer"])
 }
 
 func TestGetResources_ListerErrorPropagates(t *testing.T) {
 	lister := &fakeLister{elbv2Err: assert.AnError}
-	_, err := getResources(lister, []byte("{}"))
+	_, err := getResources(context.Background(), lister, []byte("{}"))
 	require.ErrorIs(t, err, assert.AnError)
 }
 
 func TestGetResources_InvalidBody(t *testing.T) {
-	_, err := getResources(&fakeLister{}, []byte("not-json"))
+	_, err := getResources(context.Background(), &fakeLister{}, []byte("not-json"))
 	require.Error(t, err)
 }
 

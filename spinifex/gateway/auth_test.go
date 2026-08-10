@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -14,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/service/iam"
-	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/go-chi/chi/v5"
-	"github.com/mulgadc/predastore/auth"
+	"github.com/mulgadc/predastore/pkg/sigv4"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	handlers_sts "github.com/mulgadc/spinifex/spinifex/handlers/sts"
@@ -35,8 +36,13 @@ const (
 	testService   = "ec2"
 )
 
-// mockIAMService implements handlers_iam.IAMService for auth tests.
+// mockIAMService implements handlers_iam.IAMService for auth tests. It embeds
+// the interface so it satisfies the full contract; the SigV4 middleware drives
+// only LookupAccessKey and DecryptSecret, so those are the only methods wired.
+// Any other method nil-panics, surfacing an unexpected call.
 type mockIAMService struct {
+	handlers_iam.IAMService
+
 	accessKeys map[string]*handlers_iam.AccessKey
 	masterKey  []byte
 }
@@ -49,136 +55,8 @@ func (m *mockIAMService) LookupAccessKey(accessKeyID string) (*handlers_iam.Acce
 	return ak, nil
 }
 
-func (m *mockIAMService) CreateUser(_ string, _ *iam.CreateUserInput) (*iam.CreateUserOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) GetUser(_ string, _ *iam.GetUserInput) (*iam.GetUserOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) ListUsers(_ string, _ *iam.ListUsersInput) (*iam.ListUsersOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) DeleteUser(_ string, _ *iam.DeleteUserInput) (*iam.DeleteUserOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) CreateAccessKey(_ string, _ *iam.CreateAccessKeyInput) (*iam.CreateAccessKeyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) ListAccessKeys(_ string, _ *iam.ListAccessKeysInput) (*iam.ListAccessKeysOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) DeleteAccessKey(_ string, _ *iam.DeleteAccessKeyInput) (*iam.DeleteAccessKeyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) UpdateAccessKey(_ string, _ *iam.UpdateAccessKeyInput) (*iam.UpdateAccessKeyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) CreatePolicy(_ string, _ *iam.CreatePolicyInput) (*iam.CreatePolicyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) GetPolicy(_ string, _ *iam.GetPolicyInput) (*iam.GetPolicyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) GetPolicyVersion(_ string, _ *iam.GetPolicyVersionInput) (*iam.GetPolicyVersionOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) ListPolicyVersions(_ string, _ *iam.ListPolicyVersionsInput) (*iam.ListPolicyVersionsOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) ListPolicies(_ string, _ *iam.ListPoliciesInput) (*iam.ListPoliciesOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) DeletePolicy(_ string, _ *iam.DeletePolicyInput) (*iam.DeletePolicyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) AttachUserPolicy(_ string, _ *iam.AttachUserPolicyInput) (*iam.AttachUserPolicyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) DetachUserPolicy(_ string, _ *iam.DetachUserPolicyInput) (*iam.DetachUserPolicyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) ListAttachedUserPolicies(_ string, _ *iam.ListAttachedUserPoliciesInput) (*iam.ListAttachedUserPoliciesOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) GetUserPolicies(_, _ string) ([]handlers_iam.PolicyDocument, error) {
-	return nil, nil
-}
-func (m *mockIAMService) GetRolePolicies(_, _ string) ([]handlers_iam.PolicyDocument, error) {
-	return nil, nil
-}
 func (m *mockIAMService) DecryptSecret(ciphertext string) (string, error) {
 	return handlers_iam.DecryptSecret(ciphertext, m.masterKey)
-}
-func (m *mockIAMService) SeedBootstrap(_ *handlers_iam.BootstrapData) error { return nil }
-func (m *mockIAMService) IsEmpty() (bool, error)                            { return true, nil }
-func (m *mockIAMService) CreateAccount(_ string) (*handlers_iam.Account, error) {
-	return nil, nil
-}
-func (m *mockIAMService) GetAccount(_ string) (*handlers_iam.Account, error) { return nil, nil }
-func (m *mockIAMService) ListAccounts() ([]*handlers_iam.Account, error)     { return nil, nil }
-
-func (m *mockIAMService) CreateRole(_ string, _ *iam.CreateRoleInput) (*iam.CreateRoleOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) GetRole(_ string, _ *iam.GetRoleInput) (*iam.GetRoleOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) ListRoles(_ string, _ *iam.ListRolesInput) (*iam.ListRolesOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) DeleteRole(_ string, _ *iam.DeleteRoleInput) (*iam.DeleteRoleOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) UpdateRole(_ string, _ *iam.UpdateRoleInput) (*iam.UpdateRoleOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) UpdateAssumeRolePolicy(_ string, _ *iam.UpdateAssumeRolePolicyInput) (*iam.UpdateAssumeRolePolicyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) AttachRolePolicy(_ string, _ *iam.AttachRolePolicyInput) (*iam.AttachRolePolicyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) DetachRolePolicy(_ string, _ *iam.DetachRolePolicyInput) (*iam.DetachRolePolicyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) ListAttachedRolePolicies(_ string, _ *iam.ListAttachedRolePoliciesInput) (*iam.ListAttachedRolePoliciesOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) PutRolePolicy(_ string, _ *iam.PutRolePolicyInput) (*iam.PutRolePolicyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) GetRolePolicy(_ string, _ *iam.GetRolePolicyInput) (*iam.GetRolePolicyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) DeleteRolePolicy(_ string, _ *iam.DeleteRolePolicyInput) (*iam.DeleteRolePolicyOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) ListRolePolicies(_ string, _ *iam.ListRolePoliciesInput) (*iam.ListRolePoliciesOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) CreateInstanceProfile(_ string, _ *iam.CreateInstanceProfileInput) (*iam.CreateInstanceProfileOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) GetInstanceProfile(_ string, _ *iam.GetInstanceProfileInput) (*iam.GetInstanceProfileOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) ListInstanceProfiles(_ string, _ *iam.ListInstanceProfilesInput) (*iam.ListInstanceProfilesOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) DeleteInstanceProfile(_ string, _ *iam.DeleteInstanceProfileInput) (*iam.DeleteInstanceProfileOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) ListInstanceProfilesForRole(_ string, _ *iam.ListInstanceProfilesForRoleInput) (*iam.ListInstanceProfilesForRoleOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) AddRoleToInstanceProfile(_ string, _ *iam.AddRoleToInstanceProfileInput) (*iam.AddRoleToInstanceProfileOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) RemoveRoleFromInstanceProfile(_ string, _ *iam.RemoveRoleFromInstanceProfileInput) (*iam.RemoveRoleFromInstanceProfileOutput, error) {
-	return nil, nil
-}
-func (m *mockIAMService) ResolveInstanceProfile(_, _ string) (*handlers_iam.InstanceProfile, error) {
-	return nil, nil
 }
 
 // testMasterKey is a fixed 32-byte key for deterministic tests.
@@ -192,13 +70,24 @@ func init() {
 	}
 }
 
-// signTestRequest signs req in place using SigV4. body must match what the
-// middleware will read from r.Body so the sha256 matches X-Amz-Content-Sha256.
-func signTestRequest(t *testing.T, req *http.Request, body []byte, accessKey, secret string, optFns ...func(*auth.Options)) {
+// signTestRequest signs req in place with the aws-sdk-go-v2 v4 signer — the same
+// path production callers use via gwsign — so the gateway verifies a real SDK
+// signature. body must match what the middleware reads from r.Body so the payload
+// hash agrees. An optional signingTime pins the clock for skew tests.
+func signTestRequest(t *testing.T, req *http.Request, body []byte, accessKey, secret string, signingTime ...time.Time) {
 	t.Helper()
 	sum := sha256.Sum256(body)
-	require.NoError(t, auth.SignReq(req, accessKey, secret,
-		hex.EncodeToString(sum[:]), testService, testRegion, optFns...))
+	payloadHash := hex.EncodeToString(sum[:])
+	when := time.Now().UTC()
+	if len(signingTime) > 0 {
+		when = signingTime[0]
+	}
+	// gwsign sets this header so the SDK signs it; sigv4 reproduces it when
+	// reconstructing the canonical request.
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	require.NoError(t, v4.NewSigner().SignHTTP(context.Background(),
+		aws.Credentials{AccessKeyID: accessKey, SecretAccessKey: secret},
+		req, payloadHash, testService, testRegion, when))
 }
 
 func setupTestApp(accessKey, secretKey string) http.Handler {
@@ -535,7 +424,7 @@ func TestSigV4Auth_DecryptFailure(t *testing.T) {
 func TestSigV4Auth_RequestBodyTooLarge(t *testing.T) {
 	handler := setupTestApp(testAccessKey, testSecretKey)
 
-	oversizedBody := []byte(strings.Repeat("x", maxBodySize+1))
+	oversizedBody := []byte(strings.Repeat("x", sigv4.MaxPayloadLen+1))
 	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(oversizedBody))
 	req.Host = "localhost:9999"
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -558,10 +447,10 @@ func TestSigV4Auth_RequestBodyTooLarge(t *testing.T) {
 func TestSigV4Auth_ExpiredTimestamp(t *testing.T) {
 	handler := setupTestApp(testAccessKey, testSecretKey)
 
-	past := time.Now().UTC().Add(-6 * time.Minute) // exceeds 5-minute maxClockSkew
+	past := time.Now().UTC().Add(-16 * time.Minute) // exceeds sigv4 15-minute MaxClockSkew
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Host = "localhost:9999"
-	signTestRequest(t, req, nil, testAccessKey, testSecretKey, auth.WithTime(past))
+	signTestRequest(t, req, nil, testAccessKey, testSecretKey, past)
 
 	resp := doRequest(handler, req)
 
@@ -578,10 +467,10 @@ func TestSigV4Auth_ExpiredTimestamp(t *testing.T) {
 func TestSigV4Auth_FutureTimestamp(t *testing.T) {
 	handler := setupTestApp(testAccessKey, testSecretKey)
 
-	future := time.Now().UTC().Add(6 * time.Minute) // exceeds 5-minute maxClockSkew
+	future := time.Now().UTC().Add(16 * time.Minute) // exceeds sigv4 15-minute MaxClockSkew
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Host = "localhost:9999"
-	signTestRequest(t, req, nil, testAccessKey, testSecretKey, auth.WithTime(future))
+	signTestRequest(t, req, nil, testAccessKey, testSecretKey, future)
 
 	resp := doRequest(handler, req)
 
@@ -598,10 +487,10 @@ func TestSigV4Auth_FutureTimestamp(t *testing.T) {
 func TestSigV4Auth_TimestampWithinSkew(t *testing.T) {
 	handler := setupTestApp(testAccessKey, testSecretKey)
 
-	recent := time.Now().UTC().Add(-4 * time.Minute) // within the 5-minute window
+	recent := time.Now().UTC().Add(-14 * time.Minute) // within the 15-minute window
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Host = "localhost:9999"
-	signTestRequest(t, req, nil, testAccessKey, testSecretKey, auth.WithTime(recent))
+	signTestRequest(t, req, nil, testAccessKey, testSecretKey, recent)
 
 	resp := doRequest(handler, req)
 
@@ -621,11 +510,11 @@ func TestSigV4Auth_ClockSkewBoundary(t *testing.T) {
 		offset     time.Duration
 		expectPass bool
 	}{
-		// 4m59s not 5m to absorb test execution time.
-		{"just within 5 min past", -(4*time.Minute + 59*time.Second), true},
-		{"just beyond 5 min past", -(5*time.Minute + 1*time.Second), false},
-		{"just within 5 min future", 4*time.Minute + 59*time.Second, true},
-		{"just beyond 5 min future", 5*time.Minute + 1*time.Second, false},
+		// 14m59s not 15m to absorb test execution time.
+		{"just within 15 min past", -(14*time.Minute + 59*time.Second), true},
+		{"just beyond 15 min past", -(15*time.Minute + 1*time.Second), false},
+		{"just within 15 min future", 14*time.Minute + 59*time.Second, true},
+		{"just beyond 15 min future", 15*time.Minute + 1*time.Second, false},
 	}
 
 	for _, tc := range testCases {
@@ -633,7 +522,7 @@ func TestSigV4Auth_ClockSkewBoundary(t *testing.T) {
 			at := time.Now().UTC().Add(tc.offset)
 			req := httptest.NewRequest(http.MethodGet, "/", nil)
 			req.Host = "localhost:9999"
-			signTestRequest(t, req, nil, testAccessKey, testSecretKey, auth.WithTime(at))
+			signTestRequest(t, req, nil, testAccessKey, testSecretKey, at)
 
 			resp := doRequest(handler, req)
 
@@ -1572,27 +1461,19 @@ func TestSigV4Auth_NATSDisconnectedShortCircuit(t *testing.T) {
 // --- Session credential (ASIA) auth tests ---
 
 // mockSTSService implements handlers_sts.STSService for auth-middleware tests.
-// Only LookupSessionCredential and VerifySessionToken are exercised; others
-// return nil so a misrouted call panics instead of silently allowing.
+// It embeds the interface so it satisfies the full contract; only
+// LookupSessionCredential and VerifySessionToken are exercised, and any other
+// method nil-panics so a misrouted call fails loudly instead of silently
+// allowing.
 type mockSTSService struct {
+	handlers_sts.STSService
+
 	sessions  map[string]*handlers_sts.SessionCredential
 	tokens    map[string]string // AKID → plaintext wire token for HMAC equivalence
 	lookupErr error
 	lookups   atomic.Int32 // counts LookupSessionCredential calls for negative-side-effect assertions
 }
 
-func (m *mockSTSService) AssumeRole(_, _, _ string, _ *sts.AssumeRoleInput) (*sts.AssumeRoleOutput, error) {
-	return nil, nil
-}
-func (m *mockSTSService) AssumeRoleForInstance(_, _, _ string, _ int64) (*sts.AssumeRoleOutput, error) {
-	return nil, nil
-}
-func (m *mockSTSService) GetCallerIdentity(_, _, _ string, _ *sts.GetCallerIdentityInput) (*sts.GetCallerIdentityOutput, error) {
-	return nil, nil
-}
-func (m *mockSTSService) GetSessionToken(_, _, _, _ string, _ *sts.GetSessionTokenInput) (*sts.GetSessionTokenOutput, error) {
-	return nil, nil
-}
 func (m *mockSTSService) LookupSessionCredential(accessKeyID string) (*handlers_sts.SessionCredential, error) {
 	m.lookups.Add(1)
 	if m.lookupErr != nil {
@@ -1619,14 +1500,6 @@ func (m *mockSTSService) VerifySessionToken(cred *handlers_sts.SessionCredential
 		return false
 	}
 	return want == wireToken
-}
-
-func (m *mockSTSService) AssumeRoleWithWebIdentity(_ *sts.AssumeRoleWithWebIdentityInput) (*sts.AssumeRoleWithWebIdentityOutput, error) {
-	return nil, errors.New(awserrors.ErrorNotImplemented)
-}
-
-func (m *mockSTSService) VerifyPresignedGetCallerIdentity(_, _ string) (*handlers_sts.PresignedCallerIdentity, error) {
-	return nil, errors.New(awserrors.ErrorNotImplemented)
 }
 
 const (
@@ -2295,4 +2168,44 @@ func TestCheckPolicy_AssumedRole_PassRole_WildcardResource_Allowed(t *testing.T)
 	resp := doSessionPolicyRequest(t, handler, cred.AccessKeyID)
 	body, _ := io.ReadAll(resp.Body)
 	require.Equalf(t, http.StatusOK, resp.StatusCode, "body: %s", string(body))
+}
+
+func TestMismatchAction_RecoversActionAndRewindsBody(t *testing.T) {
+	body := []byte("Action=ImportKeyPair&Version=2016-11-15&KeyName=demo&PublicKeyMaterial=c3NoLXJzYQ%3D%3D")
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	assert.Equal(t, "ImportKeyPair", mismatchAction(req, "ec2"))
+
+	// The error path still writes a response, so the body must survive the peek.
+	rest, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	assert.Equal(t, body, rest)
+}
+
+func TestMismatchAction_SkipsS3AndPrefersQueryString(t *testing.T) {
+	// An S3 body is object data, so it must never be parsed as query args.
+	s3req := httptest.NewRequest(http.MethodPut, "/bucket/key", bytes.NewReader([]byte("Action=NotReally")))
+	assert.Empty(t, mismatchAction(s3req, "s3"))
+
+	qreq := httptest.NewRequest(http.MethodGet, "/?Action=DescribeInstances", nil)
+	assert.Equal(t, "DescribeInstances", mismatchAction(qreq, "ec2"))
+}
+
+func TestRedactedCanonicalRequest_MasksSessionToken(t *testing.T) {
+	const token = "SUPERSECRETSESSIONTOKEN"
+	body := []byte("Action=DescribeInstances")
+	req := httptest.NewRequest(http.MethodPost, "http://gw.local/", bytes.NewReader(body))
+	req.Header.Set("X-Amz-Security-Token", token)
+	signTestRequest(t, req, body, testAccessKey, testSecretKey)
+
+	sig, err := sigv4.Parse(req)
+	require.NoError(t, err)
+
+	out := redactedCanonicalRequest(sig)
+	assert.NotContains(t, out, token, "session token must not reach the log")
+	assert.Contains(t, out, "x-amz-security-token:<redacted>")
+	// The rest must stay intact, or the log is useless for diffing.
+	assert.Contains(t, out, "POST")
+	assert.Contains(t, out, "x-amz-date:")
 }

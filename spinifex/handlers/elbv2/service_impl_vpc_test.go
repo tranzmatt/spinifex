@@ -1,6 +1,7 @@
 package handlers_elbv2
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/elbv2"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
+	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
@@ -24,23 +26,25 @@ func setupTestServiceWithVPC(t *testing.T) (*ELBv2ServiceImpl, *handlers_ec2_vpc
 	testutil.StubVpcdSGResponder(t, nc)
 
 	// Create VPC service
-	vpcSvc, err := handlers_ec2_vpc.NewVPCServiceImplWithNATS(nil, nc)
+	vpcSvc, err := handlers_ec2_vpc.NewVPCServiceImplWithNATS(t.Context(), nil, nc)
 	require.NoError(t, err)
 
 	// Create ELBv2 service with VPC wired in.
 	// Use DevNetworking=true so single-subnet tests aren't blocked by multi-AZ validation.
 	cfg := &config.Config{Daemon: config.DaemonConfig{DevNetworking: true}}
-	elbv2Svc, err := NewELBv2ServiceImplWithNATS(cfg, nc)
+	masterKey, err := handlers_iam.GenerateMasterKey()
+	require.NoError(t, err)
+	elbv2Svc, err := NewELBv2ServiceImplWithNATS(cfg, nc, masterKey)
 	require.NoError(t, err)
 	elbv2Svc.VPCService = vpcSvc
 
 	// Create a VPC and subnet for tests
-	vpcOut, err := vpcSvc.CreateVpc(&ec2.CreateVpcInput{
+	vpcOut, err := vpcSvc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.0/16"),
 	}, testAccountID)
 	require.NoError(t, err)
 
-	_, err = vpcSvc.CreateSubnet(&ec2.CreateSubnetInput{
+	_, err = vpcSvc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:            vpcOut.Vpc.VpcId,
 		CidrBlock:        aws.String("10.0.1.0/24"),
 		AvailabilityZone: aws.String("us-east-1a"),
@@ -53,7 +57,7 @@ func setupTestServiceWithVPC(t *testing.T) (*ELBv2ServiceImpl, *handlers_ec2_vpc
 // getTestSubnetID creates a fresh subnet and returns its ID.
 func getTestSubnetID(t *testing.T, vpcSvc *handlers_ec2_vpc.VPCServiceImpl, vpcID, cidr, az string) string {
 	t.Helper()
-	out, err := vpcSvc.CreateSubnet(&ec2.CreateSubnetInput{
+	out, err := vpcSvc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:            aws.String(vpcID),
 		CidrBlock:        aws.String(cidr),
 		AvailabilityZone: aws.String(az),
@@ -66,13 +70,13 @@ func TestCreateLoadBalancer_CreatesENIs(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
 	// Find the subnet we created
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	require.NotEmpty(t, subnets.Subnets)
 	subnetID := *subnets.Subnets[0].SubnetId
 
 	// Create ALB with subnet
-	out, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	out, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("eni-test-alb"),
 		Subnets: []*string{aws.String(subnetID)},
 	}, testAccountID)
@@ -89,7 +93,7 @@ func TestCreateLoadBalancer_CreatesENIs(t *testing.T) {
 	assert.Equal(t, subnetID, *lb.AvailabilityZones[0].SubnetId)
 
 	// Verify ENI was created
-	eniDesc, err := vpcSvc.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{}, testAccountID)
+	eniDesc, err := vpcSvc.DescribeNetworkInterfaces(context.Background(), &ec2.DescribeNetworkInterfacesInput{}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, eniDesc.NetworkInterfaces, 1)
 
@@ -116,12 +120,12 @@ func TestCreateLoadBalancer_CreatesENIs(t *testing.T) {
 func TestCreateLoadBalancer_SubnetMappings_CreatesENIs(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	require.NotEmpty(t, subnets.Subnets)
 	subnetID := *subnets.Subnets[0].SubnetId
 
-	out, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	out, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name: aws.String("subnetmapping-alb"),
 		SubnetMappings: []*elbv2.SubnetMapping{
 			{SubnetId: aws.String(subnetID)},
@@ -135,7 +139,7 @@ func TestCreateLoadBalancer_SubnetMappings_CreatesENIs(t *testing.T) {
 	require.Len(t, lb.AvailabilityZones, 1)
 	assert.Equal(t, subnetID, *lb.AvailabilityZones[0].SubnetId)
 
-	eniDesc, err := vpcSvc.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{}, testAccountID)
+	eniDesc, err := vpcSvc.DescribeNetworkInterfaces(context.Background(), &ec2.DescribeNetworkInterfacesInput{}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, eniDesc.NetworkInterfaces, 1, "an ENI must be created for the SubnetMappings subnet")
 	assert.Equal(t, subnetID, *eniDesc.NetworkInterfaces[0].SubnetId)
@@ -145,14 +149,14 @@ func TestCreateLoadBalancer_MultipleSubnets(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
 	// Get VPC ID
-	vpcs, _ := vpcSvc.DescribeVpcs(&ec2.DescribeVpcsInput{}, testAccountID)
+	vpcs, _ := vpcSvc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{}, testAccountID)
 	vpcID := *vpcs.Vpcs[0].VpcId
 
 	// Create two subnets in different AZs
 	sub1 := getTestSubnetID(t, vpcSvc, vpcID, "10.0.2.0/24", "us-east-1a")
 	sub2 := getTestSubnetID(t, vpcSvc, vpcID, "10.0.3.0/24", "us-east-1b")
 
-	out, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	out, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("multi-subnet-alb"),
 		Subnets: []*string{aws.String(sub1), aws.String(sub2)},
 	}, testAccountID)
@@ -162,7 +166,7 @@ func TestCreateLoadBalancer_MultipleSubnets(t *testing.T) {
 	assert.Len(t, lb.AvailabilityZones, 2)
 
 	// Verify 2 ENIs created (+ 1 from setupTestServiceWithVPC's initial subnet)
-	eniDesc, _ := vpcSvc.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{}, testAccountID)
+	eniDesc, _ := vpcSvc.DescribeNetworkInterfaces(context.Background(), &ec2.DescribeNetworkInterfacesInput{}, testAccountID)
 	managedCount := 0
 	for _, eni := range eniDesc.NetworkInterfaces {
 		if eni.RequesterManaged != nil && *eni.RequesterManaged {
@@ -178,7 +182,7 @@ func TestCreateLoadBalancer_MultipleSubnets(t *testing.T) {
 func TestCreateLoadBalancer_MultiSubnet_AllENIsPassedToLauncher(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	vpcs, _ := vpcSvc.DescribeVpcs(&ec2.DescribeVpcsInput{}, testAccountID)
+	vpcs, _ := vpcSvc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{}, testAccountID)
 	vpcID := *vpcs.Vpcs[0].VpcId
 
 	sub1 := getTestSubnetID(t, vpcSvc, vpcID, "10.0.10.0/24", "us-east-1a")
@@ -197,7 +201,7 @@ func TestCreateLoadBalancer_MultiSubnet_AllENIsPassedToLauncher(t *testing.T) {
 	svc.SystemAccessKey = "AKID"
 	svc.SystemSecretKey = "SECRET"
 
-	_, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	_, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("multi-eni-alb"),
 		Subnets: []*string{aws.String(sub1), aws.String(sub2), aws.String(sub3)},
 	}, testAccountID)
@@ -230,35 +234,95 @@ func TestCreateLoadBalancer_MultiSubnet_AllENIsPassedToLauncher(t *testing.T) {
 func TestDeleteLoadBalancer_CleansUpENIs(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, _ := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, _ := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	subnetID := *subnets.Subnets[0].SubnetId
 
 	// Create and then delete ALB
-	lbOut, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	lbOut, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("cleanup-alb"),
 		Subnets: []*string{aws.String(subnetID)},
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Verify ENI exists
-	eniDesc, _ := vpcSvc.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{}, testAccountID)
+	eniDesc, _ := vpcSvc.DescribeNetworkInterfaces(context.Background(), &ec2.DescribeNetworkInterfacesInput{}, testAccountID)
 	assert.Len(t, eniDesc.NetworkInterfaces, 1)
 
 	// Delete ALB
-	_, err = svc.DeleteLoadBalancer(&elbv2.DeleteLoadBalancerInput{
+	_, err = svc.DeleteLoadBalancer(context.Background(), &elbv2.DeleteLoadBalancerInput{
 		LoadBalancerArn: lbOut.LoadBalancers[0].LoadBalancerArn,
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Verify ENI was cleaned up
-	eniDesc, _ = vpcSvc.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{}, testAccountID)
+	eniDesc, _ = vpcSvc.DescribeNetworkInterfaces(context.Background(), &ec2.DescribeNetworkInterfacesInput{}, testAccountID)
 	assert.Empty(t, eniDesc.NetworkInterfaces)
+}
+
+// TestDeleteLoadBalancer_PersistsSurvivingENIsOnPersistentDeleteFailure
+// asserts DeleteLoadBalancer does not delete the LB record while an ENI
+// delete fails persistently — the ownership edge (lb.ENIs) is the only thing
+// that would ever let a retry (or the orphan reaper) find and finish it.
+func TestDeleteLoadBalancer_PersistsSurvivingENIsOnPersistentDeleteFailure(t *testing.T) {
+	_, nc, js := testutil.StartTestJetStream(t)
+	testutil.StubVpcdSGResponder(t, nc)
+
+	vpcSvc, err := handlers_ec2_vpc.NewVPCServiceImplWithNATS(t.Context(), nil, nc)
+	require.NoError(t, err)
+
+	cfg := &config.Config{Daemon: config.DaemonConfig{DevNetworking: true}}
+	masterKey, err := handlers_iam.GenerateMasterKey()
+	require.NoError(t, err)
+	svc, err := NewELBv2ServiceImplWithNATS(cfg, nc, masterKey)
+	require.NoError(t, err)
+	svc.VPCService = vpcSvc
+
+	vpcOut, err := vpcSvc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
+		CidrBlock: aws.String("10.0.0.0/16"),
+	}, testAccountID)
+	require.NoError(t, err)
+	subOut, err := vpcSvc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
+		VpcId:            vpcOut.Vpc.VpcId,
+		CidrBlock:        aws.String("10.0.1.0/24"),
+		AvailabilityZone: aws.String("us-east-1a"),
+	}, testAccountID)
+	require.NoError(t, err)
+
+	lbOut, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
+		Name:    aws.String("persist-alb"),
+		Subnets: []*string{subOut.Subnet.SubnetId},
+	}, testAccountID)
+	require.NoError(t, err)
+	lbArn := *lbOut.LoadBalancers[0].LoadBalancerArn
+
+	lb, err := svc.store.GetLoadBalancerByArn(context.Background(), lbArn)
+	require.NoError(t, err)
+	require.NotEmpty(t, lb.ENIs, "CreateLoadBalancer must have allocated a system-managed ENI")
+	eniID := lb.ENIs[0]
+
+	// Corrupt the ENI record so every DetachAndDeleteENI read fails closed —
+	// a persistent failure, not a one-shot race.
+	eniKV, err := js.KeyValue(context.Background(), handlers_ec2_vpc.KVBucketENIs)
+	require.NoError(t, err)
+	_, err = eniKV.Put(context.Background(), testAccountID+"."+eniID, []byte("{not json"))
+	require.NoError(t, err)
+
+	_, err = svc.DeleteLoadBalancer(context.Background(), &elbv2.DeleteLoadBalancerInput{
+		LoadBalancerArn: aws.String(lbArn),
+	}, testAccountID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "DependencyViolation")
+
+	persisted, err := svc.store.GetLoadBalancerByArn(context.Background(), lbArn)
+	require.NoError(t, err)
+	require.NotNil(t, persisted, "the LB record must survive while its ENI could not be deleted")
+	assert.Contains(t, persisted.ENIs, eniID, "the surviving ENI id must stay recorded for retry")
 }
 
 func TestCreateLoadBalancer_InvalidSubnet(t *testing.T) {
 	svc, _ := setupTestServiceWithVPC(t)
 
-	_, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	_, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("bad-subnet-alb"),
 		Subnets: []*string{aws.String("subnet-nonexistent")},
 	}, testAccountID)
@@ -269,18 +333,18 @@ func TestCreateLoadBalancer_InvalidSubnet(t *testing.T) {
 func TestCreateLoadBalancer_RollbackOnPartialFailure(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, _ := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, _ := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	validSubnet := *subnets.Subnets[0].SubnetId
 
 	// First subnet valid, second invalid — should rollback the first ENI
-	_, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	_, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("rollback-alb"),
 		Subnets: []*string{aws.String(validSubnet), aws.String("subnet-bogus")},
 	}, testAccountID)
 	assert.Error(t, err)
 
 	// Verify no orphaned ENIs remain
-	eniDesc, _ := vpcSvc.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{}, testAccountID)
+	eniDesc, _ := vpcSvc.DescribeNetworkInterfaces(context.Background(), &ec2.DescribeNetworkInterfacesInput{}, testAccountID)
 	assert.Empty(t, eniDesc.NetworkInterfaces)
 }
 
@@ -288,7 +352,7 @@ func TestCreateLoadBalancer_WithoutVPCService(t *testing.T) {
 	// When vpcService is nil (e.g. in pure unit tests), ENI creation is skipped
 	svc := setupTestService(t)
 
-	out, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	out, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("no-vpc-alb"),
 		Subnets: []*string{aws.String("subnet-xxx")},
 	}, testAccountID)
@@ -302,7 +366,7 @@ func TestCreateLoadBalancer_WithoutVPCService(t *testing.T) {
 func TestCreateLoadBalancer_InternetFacing_AllocatesPublicIP(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	subnetID := *subnets.Subnets[0].SubnetId
 
@@ -318,7 +382,7 @@ func TestCreateLoadBalancer_InternetFacing_AllocatesPublicIP(t *testing.T) {
 	svc.SystemAccessKey = "AKID"
 	svc.SystemSecretKey = "SECRET"
 
-	out, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	out, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("inet-alb"),
 		Subnets: []*string{aws.String(subnetID)},
 	}, testAccountID)
@@ -334,7 +398,7 @@ func TestCreateLoadBalancer_InternetFacing_AllocatesPublicIP(t *testing.T) {
 	// The public IP is attached by the asynchronous launch, so it surfaces on a
 	// describe after the boot completes rather than on the create response (which
 	// returns while the LB is still provisioning — AWS parity).
-	desc, err := svc.DescribeLoadBalancers(&elbv2.DescribeLoadBalancersInput{
+	desc, err := svc.DescribeLoadBalancers(context.Background(), &elbv2.DescribeLoadBalancersInput{
 		LoadBalancerArns: []*string{out.LoadBalancers[0].LoadBalancerArn},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -360,7 +424,7 @@ func TestCreateLoadBalancer_InternetFacing_AllocatesPublicIP(t *testing.T) {
 func TestCreateLoadBalancer_Internal_NoPublicIP(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	subnetID := *subnets.Subnets[0].SubnetId
 
@@ -376,7 +440,7 @@ func TestCreateLoadBalancer_Internal_NoPublicIP(t *testing.T) {
 	svc.SystemAccessKey = "AKID"
 	svc.SystemSecretKey = "SECRET"
 
-	out, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	out, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("internal-only"),
 		Scheme:  aws.String("internal"),
 		Subnets: []*string{aws.String(subnetID)},
@@ -401,7 +465,7 @@ func TestCreateLoadBalancer_Internal_NoPublicIP(t *testing.T) {
 func TestCreateLoadBalancer_NLB_Internal_NoPublicIP(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	subnetID := *subnets.Subnets[0].SubnetId
 
@@ -417,7 +481,7 @@ func TestCreateLoadBalancer_NLB_Internal_NoPublicIP(t *testing.T) {
 	svc.SystemAccessKey = "AKID"
 	svc.SystemSecretKey = "SECRET"
 
-	out, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	out, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("nlb-internal"),
 		Type:    aws.String("network"),
 		Scheme:  aws.String("internal"),
@@ -449,7 +513,7 @@ func TestCreateLoadBalancer_NLB_Internal_NoPublicIP(t *testing.T) {
 func TestDeleteLoadBalancer_TerminatesVM_WithPublicIP(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	subnetID := *subnets.Subnets[0].SubnetId
 
@@ -466,7 +530,7 @@ func TestDeleteLoadBalancer_TerminatesVM_WithPublicIP(t *testing.T) {
 	svc.SystemAccessKey = "AKID"
 	svc.SystemSecretKey = "SECRET"
 
-	lbOut, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	lbOut, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("del-pub-alb"),
 		Subnets: []*string{aws.String(subnetID)},
 	}, testAccountID)
@@ -474,11 +538,11 @@ func TestDeleteLoadBalancer_TerminatesVM_WithPublicIP(t *testing.T) {
 	svc.WaitLaunches()
 
 	// Verify ENI exists before delete
-	eniDesc, _ := vpcSvc.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{}, testAccountID)
+	eniDesc, _ := vpcSvc.DescribeNetworkInterfaces(context.Background(), &ec2.DescribeNetworkInterfacesInput{}, testAccountID)
 	assert.Len(t, eniDesc.NetworkInterfaces, 1)
 
 	// Delete ALB
-	_, err = svc.DeleteLoadBalancer(&elbv2.DeleteLoadBalancerInput{
+	_, err = svc.DeleteLoadBalancer(context.Background(), &elbv2.DeleteLoadBalancerInput{
 		LoadBalancerArn: lbOut.LoadBalancers[0].LoadBalancerArn,
 	}, testAccountID)
 	require.NoError(t, err)
@@ -491,14 +555,14 @@ func TestDeleteLoadBalancer_TerminatesVM_WithPublicIP(t *testing.T) {
 	mock.mu.Unlock()
 
 	// Verify ENIs were cleaned up (detach + delete happens in DeleteLoadBalancer)
-	eniDesc, _ = vpcSvc.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{}, testAccountID)
+	eniDesc, _ = vpcSvc.DescribeNetworkInterfaces(context.Background(), &ec2.DescribeNetworkInterfacesInput{}, testAccountID)
 	assert.Empty(t, eniDesc.NetworkInterfaces)
 }
 
 func TestDeleteLoadBalancer_ReapsFloatingIPNAT(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	subnetID := *subnets.Subnets[0].SubnetId
 
@@ -531,14 +595,14 @@ func TestDeleteLoadBalancer_ReapsFloatingIPNAT(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = sub.Unsubscribe() }()
 
-	lbOut, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	lbOut, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("nat-reap-alb"),
 		Subnets: []*string{aws.String(subnetID)},
 	}, testAccountID)
 	require.NoError(t, err)
 	svc.WaitLaunches()
 
-	_, err = svc.DeleteLoadBalancer(&elbv2.DeleteLoadBalancerInput{
+	_, err = svc.DeleteLoadBalancer(context.Background(), &elbv2.DeleteLoadBalancerInput{
 		LoadBalancerArn: lbOut.LoadBalancers[0].LoadBalancerArn,
 	}, testAccountID)
 	require.NoError(t, err)
@@ -556,7 +620,7 @@ func TestDeleteLoadBalancer_ReapsFloatingIPNAT(t *testing.T) {
 func TestDescribeLoadBalancers_InternetFacing_IncludesPublicIP(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	subnetID := *subnets.Subnets[0].SubnetId
 
@@ -572,7 +636,7 @@ func TestDescribeLoadBalancers_InternetFacing_IncludesPublicIP(t *testing.T) {
 	svc.SystemAccessKey = "AKID"
 	svc.SystemSecretKey = "SECRET"
 
-	_, err = svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	_, err = svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("desc-pub-alb"),
 		Subnets: []*string{aws.String(subnetID)},
 	}, testAccountID)
@@ -580,7 +644,7 @@ func TestDescribeLoadBalancers_InternetFacing_IncludesPublicIP(t *testing.T) {
 	svc.WaitLaunches()
 
 	// Describe and verify public IP is in the response
-	desc, err := svc.DescribeLoadBalancers(&elbv2.DescribeLoadBalancersInput{
+	desc, err := svc.DescribeLoadBalancers(context.Background(), &elbv2.DescribeLoadBalancersInput{
 		Names: []*string{aws.String("desc-pub-alb")},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -607,7 +671,7 @@ func TestDescribeLoadBalancers_InternetFacing_IncludesPublicIP(t *testing.T) {
 func TestDescribeLoadBalancers_Internal_NoPublicIP(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	subnetID := *subnets.Subnets[0].SubnetId
 
@@ -622,7 +686,7 @@ func TestDescribeLoadBalancers_Internal_NoPublicIP(t *testing.T) {
 	svc.SystemAccessKey = "AKID"
 	svc.SystemSecretKey = "SECRET"
 
-	_, err = svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	_, err = svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("desc-int-alb"),
 		Scheme:  aws.String("internal"),
 		Subnets: []*string{aws.String(subnetID)},
@@ -630,7 +694,7 @@ func TestDescribeLoadBalancers_Internal_NoPublicIP(t *testing.T) {
 	require.NoError(t, err)
 	svc.WaitLaunches()
 
-	desc, err := svc.DescribeLoadBalancers(&elbv2.DescribeLoadBalancersInput{
+	desc, err := svc.DescribeLoadBalancers(context.Background(), &elbv2.DescribeLoadBalancersInput{
 		Names: []*string{aws.String("desc-int-alb")},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -649,7 +713,7 @@ func TestDescribeLoadBalancers_Internal_NoPublicIP(t *testing.T) {
 func TestCreateLoadBalancer_LaunchFailure_SetsStateFailed(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	subnetID := *subnets.Subnets[0].SubnetId
 
@@ -661,7 +725,7 @@ func TestCreateLoadBalancer_LaunchFailure_SetsStateFailed(t *testing.T) {
 	svc.SystemAccessKey = "AKID"
 	svc.SystemSecretKey = "SECRET"
 
-	out, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	out, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("fail-launch-alb"),
 		Subnets: []*string{aws.String(subnetID)},
 	}, testAccountID)
@@ -671,7 +735,7 @@ func TestCreateLoadBalancer_LaunchFailure_SetsStateFailed(t *testing.T) {
 	assert.Equal(t, StateProvisioning, *out.LoadBalancers[0].State.Code)
 
 	svc.WaitLaunches()
-	desc, err := svc.DescribeLoadBalancers(&elbv2.DescribeLoadBalancersInput{
+	desc, err := svc.DescribeLoadBalancers(context.Background(), &elbv2.DescribeLoadBalancersInput{
 		LoadBalancerArns: []*string{out.LoadBalancers[0].LoadBalancerArn},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -682,7 +746,7 @@ func TestCreateLoadBalancer_LaunchFailure_SetsStateFailed(t *testing.T) {
 func TestCreateLoadBalancer_MissingCredentials_SetsStateFailed(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	subnetID := *subnets.Subnets[0].SubnetId
 
@@ -695,7 +759,7 @@ func TestCreateLoadBalancer_MissingCredentials_SetsStateFailed(t *testing.T) {
 	svc.InstanceLauncher = mock
 	// Deliberately NOT setting credentials
 
-	out, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	out, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("no-creds-alb"),
 		Subnets: []*string{aws.String(subnetID)},
 	}, testAccountID)
@@ -703,7 +767,7 @@ func TestCreateLoadBalancer_MissingCredentials_SetsStateFailed(t *testing.T) {
 	assert.Equal(t, StateProvisioning, *out.LoadBalancers[0].State.Code)
 
 	svc.WaitLaunches()
-	desc, err := svc.DescribeLoadBalancers(&elbv2.DescribeLoadBalancersInput{
+	desc, err := svc.DescribeLoadBalancers(context.Background(), &elbv2.DescribeLoadBalancersInput{
 		LoadBalancerArns: []*string{out.LoadBalancers[0].LoadBalancerArn},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -716,18 +780,18 @@ func TestCreateLoadBalancer_MissingCredentials_SetsStateFailed(t *testing.T) {
 func TestENI_RequesterManagedFlag(t *testing.T) {
 	_, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, _ := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, _ := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	subnetID := *subnets.Subnets[0].SubnetId
 
 	// Create a normal ENI (not managed)
-	normalENI, err := vpcSvc.CreateNetworkInterface(&ec2.CreateNetworkInterfaceInput{
+	normalENI, err := vpcSvc.CreateNetworkInterface(context.Background(), &ec2.CreateNetworkInterfaceInput{
 		SubnetId:    aws.String(subnetID),
 		Description: aws.String("user ENI"),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Create a managed ENI (like ALB would)
-	managedENI, err := vpcSvc.CreateNetworkInterface(&ec2.CreateNetworkInterfaceInput{
+	managedENI, err := vpcSvc.CreateNetworkInterface(context.Background(), &ec2.CreateNetworkInterfaceInput{
 		SubnetId:    aws.String(subnetID),
 		Description: aws.String("ELB app/test/lb123"),
 		TagSpecifications: []*ec2.TagSpecification{
@@ -742,7 +806,7 @@ func TestENI_RequesterManagedFlag(t *testing.T) {
 	require.NoError(t, err)
 
 	// Describe all ENIs
-	desc, _ := vpcSvc.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{}, testAccountID)
+	desc, _ := vpcSvc.DescribeNetworkInterfaces(context.Background(), &ec2.DescribeNetworkInterfacesInput{}, testAccountID)
 	require.Len(t, desc.NetworkInterfaces, 2)
 
 	for _, eni := range desc.NetworkInterfaces {
@@ -761,13 +825,13 @@ func TestENI_RequesterManagedFlag(t *testing.T) {
 func TestCreateLoadBalancer_AttachesSpecifiedSecurityGroupsToENI(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	require.NotEmpty(t, subnets.Subnets)
 	subnetID := *subnets.Subnets[0].SubnetId
 	vpcID := *subnets.Subnets[0].VpcId
 
-	sgOut, err := vpcSvc.CreateSecurityGroup(&ec2.CreateSecurityGroupInput{
+	sgOut, err := vpcSvc.CreateSecurityGroup(context.Background(), &ec2.CreateSecurityGroupInput{
 		GroupName:   aws.String("alb-sg"),
 		Description: aws.String("ALB ingress"),
 		VpcId:       aws.String(vpcID),
@@ -775,14 +839,14 @@ func TestCreateLoadBalancer_AttachesSpecifiedSecurityGroupsToENI(t *testing.T) {
 	require.NoError(t, err)
 	sgID := *sgOut.GroupId
 
-	_, err = svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	_, err = svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:           aws.String("sg-attach-alb"),
 		Subnets:        []*string{aws.String(subnetID)},
 		SecurityGroups: []*string{aws.String(sgID)},
 	}, testAccountID)
 	require.NoError(t, err)
 
-	eniDesc, err := vpcSvc.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{}, testAccountID)
+	eniDesc, err := vpcSvc.DescribeNetworkInterfaces(context.Background(), &ec2.DescribeNetworkInterfacesInput{}, testAccountID)
 	require.NoError(t, err)
 
 	var albENI *ec2.NetworkInterface
@@ -804,7 +868,7 @@ func TestCreateLoadBalancer_AttachesSpecifiedSecurityGroupsToENI(t *testing.T) {
 func TestCreateLoadBalancer_NoSecurityGroupsFallsBackToDefault(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	subnetID := *subnets.Subnets[0].SubnetId
 	vpcID := *subnets.Subnets[0].VpcId
@@ -813,13 +877,13 @@ func TestCreateLoadBalancer_NoSecurityGroupsFallsBackToDefault(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, defaultSGID, "VPC must have a default SG provisioned")
 
-	_, err = svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	_, err = svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("no-sg-alb"),
 		Subnets: []*string{aws.String(subnetID)},
 	}, testAccountID)
 	require.NoError(t, err)
 
-	eniDesc, err := vpcSvc.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{}, testAccountID)
+	eniDesc, err := vpcSvc.DescribeNetworkInterfaces(context.Background(), &ec2.DescribeNetworkInterfacesInput{}, testAccountID)
 	require.NoError(t, err)
 
 	var albENI *ec2.NetworkInterface
@@ -840,7 +904,7 @@ func TestCreateLoadBalancer_NoSecurityGroupsFallsBackToDefault(t *testing.T) {
 func TestRebuildSystemInstanceInput_HappyPath(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	subnetID := *subnets.Subnets[0].SubnetId
 
@@ -856,7 +920,7 @@ func TestRebuildSystemInstanceInput_HappyPath(t *testing.T) {
 	svc.SystemSecretKey = "SECRET"
 	svc.CACert = "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n"
 
-	_, err = svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	_, err = svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("recover-alb"),
 		Subnets: []*string{aws.String(subnetID)},
 		Scheme:  aws.String("internal"),
@@ -916,7 +980,7 @@ func TestRebuildSystemInstanceInput_NoLBRecord(t *testing.T) {
 func TestRebuildSystemInstanceInput_MultiENI(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	vpcs, _ := vpcSvc.DescribeVpcs(&ec2.DescribeVpcsInput{}, testAccountID)
+	vpcs, _ := vpcSvc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{}, testAccountID)
 	vpcID := *vpcs.Vpcs[0].VpcId
 	sub1 := getTestSubnetID(t, vpcSvc, vpcID, "10.0.20.0/24", "us-east-1a")
 	sub2 := getTestSubnetID(t, vpcSvc, vpcID, "10.0.21.0/24", "us-east-1b")
@@ -929,7 +993,7 @@ func TestRebuildSystemInstanceInput_MultiENI(t *testing.T) {
 	svc.SystemAccessKey = "AKID"
 	svc.SystemSecretKey = "SECRET"
 
-	_, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	_, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("recover-multi-alb"),
 		Subnets: []*string{aws.String(sub1), aws.String(sub2)},
 	}, testAccountID)
@@ -962,7 +1026,7 @@ func TestRebuildSystemInstanceInput_MultiENI(t *testing.T) {
 func TestCreateClusterNLBSync_CarriesCrossAccountENI(t *testing.T) {
 	svc, vpcSvc := setupTestServiceWithVPC(t)
 
-	subnets, err := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, err := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	subnetID := *subnets.Subnets[0].SubnetId
 
@@ -1005,7 +1069,7 @@ func TestCreateClusterNLBSync_CarriesCrossAccountENI(t *testing.T) {
 	assert.Equal(t, "02:0a:01:23:45:67", launch.NICs[2].MAC)
 
 	// And it is persisted for host-reboot recovery.
-	record, err := svc.store.GetLoadBalancerByName("eks-alpha", testAccountID)
+	record, err := svc.store.GetLoadBalancerByName(t.Context(), "eks-alpha", testAccountID)
 	require.NoError(t, err)
 	require.NotNil(t, record)
 	require.Len(t, record.CrossAccountENIs, 1)

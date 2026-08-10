@@ -1,7 +1,9 @@
 package nbd
 
 import (
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -37,12 +39,11 @@ func TestBuildArgs_TCPTransport(t *testing.T) {
 		"volume=vol-abc123",
 		"bucket=my-bucket",
 		"region=us-east-1",
-		"access_key=AKIA123",
-		"secret_key=secret",
 		"base_dir=/data",
 		"host=localhost:9000",
 		"cache_size=256",
 		"shardwal=true",
+		"gc_enabled=false",
 	}
 
 	assertArgs(t, expected, args)
@@ -64,6 +65,7 @@ func TestBuildArgs_UnixSocketTransport(t *testing.T) {
 		Host:       "10.0.0.1:9000",
 		CacheSize:  128,
 		ShardWAL:   false,
+		GCEnabled:  true,
 	}
 
 	args, err := cfg.buildArgs()
@@ -80,12 +82,11 @@ func TestBuildArgs_UnixSocketTransport(t *testing.T) {
 		"volume=vol-def456",
 		"bucket=bucket-2",
 		"region=eu-west-1",
-		"access_key=AKIA456",
-		"secret_key=topsecret",
 		"base_dir=/mnt/data",
 		"host=10.0.0.1:9000",
 		"cache_size=128",
 		"shardwal=false",
+		"gc_enabled=true",
 	}
 
 	assertArgs(t, expected, args)
@@ -124,7 +125,7 @@ func TestBuildArgs_Verbose(t *testing.T) {
 	}
 
 	// -v should appear right after plugin path
-	pluginIdx := indexOf(args, cfg.PluginPath)
+	pluginIdx := slices.Index(args, cfg.PluginPath)
 	if pluginIdx < 0 {
 		t.Fatal("plugin path not found in args")
 	}
@@ -177,7 +178,7 @@ func TestBuildArgs_TCPPortValue(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			pIdx := indexOf(args, "-p")
+			pIdx := slices.Index(args, "-p")
 			if pIdx < 0 || pIdx+1 >= len(args) {
 				t.Fatal("-p flag not found in args")
 			}
@@ -208,11 +209,11 @@ func TestBuildArgs_ArgOrdering(t *testing.T) {
 	}
 
 	// --pidfile before transport args
-	pidIdx := indexOf(args, "--pidfile")
-	unixIdx := indexOf(args, "--unix")
-	pluginIdx := indexOf(args, cfg.PluginPath)
-	verboseIdx := indexOf(args, "-v")
-	volumeIdx := indexOf(args, "volume=vol-test")
+	pidIdx := slices.Index(args, "--pidfile")
+	unixIdx := slices.Index(args, "--unix")
+	pluginIdx := slices.Index(args, cfg.PluginPath)
+	verboseIdx := slices.Index(args, "-v")
+	volumeIdx := slices.Index(args, "volume=vol-test")
 
 	if pidIdx < 0 || unixIdx < 0 || pluginIdx < 0 || verboseIdx < 0 || volumeIdx < 0 {
 		t.Fatalf("missing expected args in: %v", args)
@@ -233,6 +234,66 @@ func TestBuildArgs_ArgOrdering(t *testing.T) {
 	}
 }
 
+// TestBuildArgs_NoCredentialsInArgv pins the credential-exposure fix: argv
+// must carry neither an access_key=/secret_key= flag nor the raw credential
+// values anywhere, since argv is world-readable via /proc/<pid>/cmdline.
+func TestBuildArgs_NoCredentialsInArgv(t *testing.T) {
+	cfg := &NBDKitConfig{
+		Socket:     "/tmp/nbd.sock",
+		PidFile:    "/tmp/nbd.pid",
+		PluginPath: "/plugin.so",
+		AccessKey:  "AKIASECRETVALUE",
+		SecretKey:  "topsecretvalue",
+	}
+
+	args, err := cfg.buildArgs()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "access_key=") || strings.HasPrefix(arg, "secret_key=") {
+			t.Errorf("argv must not contain a credential flag, got: %q in %v", arg, args)
+		}
+		if strings.Contains(arg, cfg.AccessKey) || strings.Contains(arg, cfg.SecretKey) {
+			t.Errorf("argv must not contain a credential value, got: %q in %v", arg, args)
+		}
+	}
+}
+
+// TestBuildCmd_CredentialsInEnv pins that credentials reach the nbdkit child
+// via cmd.Env instead of argv, and that cmd.Args stays free of them.
+func TestBuildCmd_CredentialsInEnv(t *testing.T) {
+	cfg := &NBDKitConfig{
+		Socket:     "/tmp/nbd.sock",
+		PidFile:    "/tmp/nbd.pid",
+		PluginPath: "/plugin.so",
+		AccessKey:  "AKIAENVTEST",
+		SecretKey:  "supersecretenv",
+	}
+
+	cmd, err := cfg.buildCmd()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wantAccess := accessKeyEnv + "=" + cfg.AccessKey
+	wantSecret := secretKeyEnv + "=" + cfg.SecretKey
+
+	if !slices.Contains(cmd.Env, wantAccess) {
+		t.Errorf("cmd.Env missing %q, got: %v", wantAccess, cmd.Env)
+	}
+	if !slices.Contains(cmd.Env, wantSecret) {
+		t.Errorf("cmd.Env missing %q, got: %v", wantSecret, cmd.Env)
+	}
+
+	for _, arg := range cmd.Args {
+		if strings.Contains(arg, cfg.AccessKey) || strings.Contains(arg, cfg.SecretKey) {
+			t.Errorf("cmd.Args must not contain a credential value, got: %q", arg)
+		}
+	}
+}
+
 func TestBuildArgs_EncryptionKeyFileForwarded(t *testing.T) {
 	cfg := &NBDKitConfig{
 		Socket:            "/tmp/nbd.sock",
@@ -247,7 +308,7 @@ func TestBuildArgs_EncryptionKeyFileForwarded(t *testing.T) {
 	}
 
 	want := "encryption_key_file=/etc/spinifex/viperblock/encryption.key"
-	if indexOf(args, want) < 0 {
+	if slices.Index(args, want) < 0 {
 		t.Errorf("expected %q in args, got: %v", want, args)
 	}
 }
@@ -271,6 +332,41 @@ func TestBuildArgs_EncryptionKeyFileOmittedWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestBuildArgs_GCEnabledForwarded(t *testing.T) {
+	cfg := &NBDKitConfig{
+		Socket:     "/tmp/nbd.sock",
+		PidFile:    "/tmp/nbd.pid",
+		PluginPath: "/plugin.so",
+		GCEnabled:  true,
+	}
+
+	args, err := cfg.buildArgs()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if slices.Index(args, "gc_enabled=true") < 0 {
+		t.Errorf("expected gc_enabled=true in args, got: %v", args)
+	}
+}
+
+func TestBuildArgs_GCEnabledDefaultFalse(t *testing.T) {
+	cfg := &NBDKitConfig{
+		Socket:     "/tmp/nbd.sock",
+		PidFile:    "/tmp/nbd.pid",
+		PluginPath: "/plugin.so",
+	}
+
+	args, err := cfg.buildArgs()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if slices.Index(args, "gc_enabled=false") < 0 {
+		t.Errorf("expected gc_enabled=false (default off) in args, got: %v", args)
+	}
+}
+
 func assertArgs(t *testing.T, expected, got []string) {
 	t.Helper()
 	if len(expected) != len(got) {
@@ -281,13 +377,4 @@ func assertArgs(t *testing.T, expected, got []string) {
 			t.Errorf("args[%d] = %q, want %q", i, got[i], expected[i])
 		}
 	}
-}
-
-func indexOf(args []string, val string) int {
-	for i, a := range args {
-		if a == val {
-			return i
-		}
-	}
-	return -1
 }

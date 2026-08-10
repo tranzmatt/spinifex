@@ -1,7 +1,7 @@
 package handlers_elbv2
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -31,19 +31,8 @@ func newHealthChecker(store *Store) *healthChecker {
 	}
 }
 
-// handleHealthReport unmarshals a JSON-encoded health report and processes it.
-func (hc *healthChecker) handleHealthReport(data []byte) {
-	var report lbagent.HealthReport
-	if err := json.Unmarshal(data, &report); err != nil {
-		slog.Warn("healthChecker: invalid health report", "err", err)
-		return
-	}
-
-	hc.handleHealthReportDirect(report)
-}
-
 // handleHealthReportDirect processes a health report without a JSON round-trip.
-func (hc *healthChecker) handleHealthReportDirect(report lbagent.HealthReport) {
+func (hc *healthChecker) handleHealthReportDirect(ctx context.Context, report lbagent.HealthReport) {
 	if len(report.Servers) == 0 {
 		return
 	}
@@ -58,12 +47,12 @@ func (hc *healthChecker) handleHealthReportDirect(report lbagent.HealthReport) {
 	var tgs []*TargetGroupRecord
 	var err error
 	if report.LBID != "" {
-		tgs, err = hc.store.TargetGroupsForLB(report.LBID)
+		tgs, err = hc.store.TargetGroupsForLB(ctx, report.LBID)
 	} else {
-		tgs, err = hc.store.ListTargetGroups()
+		tgs, err = hc.store.ListTargetGroups(ctx)
 	}
 	if err != nil {
-		slog.Warn("healthChecker: failed to list target groups", "lbId", report.LBID, "err", err)
+		slog.WarnContext(ctx, "healthChecker: failed to list target groups", "lbId", report.LBID, "err", err)
 		return
 	}
 
@@ -108,7 +97,7 @@ func (hc *healthChecker) handleHealthReportDirect(report lbagent.HealthReport) {
 
 			newState, newDesc := evaluateHealth(target.HealthState, ctr, tg.HealthCheck)
 			if newState != target.HealthState {
-				slog.Info("Target health changed",
+				slog.InfoContext(ctx, "Target health changed",
 					"targetId", target.Id,
 					"from", target.HealthState,
 					"to", newState,
@@ -126,8 +115,8 @@ func (hc *healthChecker) handleHealthReportDirect(report lbagent.HealthReport) {
 	hc.mu.Unlock()
 
 	for _, tg := range changedTGs {
-		if err := hc.store.PutTargetGroup(tg); err != nil {
-			slog.Error("healthChecker: failed to persist target group", "tgId", tg.TargetGroupID, "err", err)
+		if err := hc.store.PutTargetGroup(ctx, tg); err != nil {
+			slog.ErrorContext(ctx, "healthChecker: failed to persist target group", "tgId", tg.TargetGroupID, "err", err)
 		}
 	}
 }

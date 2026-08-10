@@ -18,7 +18,7 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	handlers_eks "github.com/mulgadc/spinifex/spinifex/handlers/eks"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
-	"github.com/mulgadc/spinifex/spinifex/utils"
+	"github.com/mulgadc/spinifex/spinifex/kvutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -43,6 +43,20 @@ type webIdentityFixture struct {
 	federatedARN string
 }
 
+// signingJWK encodes a public key as an RFC 7518 EC JWK, with x and y left-padded to
+// the fixed coordinate width. Encoding priv.X.Bytes() directly would drop a leading
+// zero byte on ~1 in 256 keys, producing a JWK the decoder rightly rejects.
+func signingJWK(t *testing.T, pub *ecdsa.PublicKey) *JWK {
+	t.Helper()
+	point, err := pub.Bytes()
+	require.NoError(t, err)
+	return &JWK{
+		Kty: "EC", Crv: "P-256",
+		X: base64.RawURLEncoding.EncodeToString(point[1 : 1+p256CoordLen]),
+		Y: base64.RawURLEncoding.EncodeToString(point[1+p256CoordLen:]),
+	}
+}
+
 func newWebIdentityFixture(t *testing.T, svc *STSServiceImpl, accountID string) *webIdentityFixture {
 	t.Helper()
 
@@ -50,11 +64,9 @@ func newWebIdentityFixture(t *testing.T, svc *STSServiceImpl, accountID string) 
 	require.NoError(t, err)
 
 	const kid = "test-kid-1"
-	jwks := &JWKS{Keys: []JWK{{
-		Kty: "EC", Crv: "P-256", Alg: "ES256", Use: "sig", Kid: kid,
-		X: base64.RawURLEncoding.EncodeToString(priv.X.Bytes()),
-		Y: base64.RawURLEncoding.EncodeToString(priv.Y.Bytes()),
-	}}}
+	jwk := signingJWK(t, &priv.PublicKey)
+	jwk.Alg, jwk.Use, jwk.Kid = "ES256", "sig", kid
+	jwks := &JWKS{Keys: []JWK{*jwk}}
 
 	issuer := fmt.Sprintf("https://gw.%s/oidc/eks/%s/%s/%s",
 		testWebSuffix, testWebRegion, accountID, testWebClusterName)
@@ -62,20 +74,20 @@ func newWebIdentityFixture(t *testing.T, svc *STSServiceImpl, accountID string) 
 	federatedARN := handlers_iam.OIDCProviderARN(accountID, issuerHostPath)
 
 	// Publish JWKS to the per-cluster EKS bucket.
-	kv, err := handlers_eks.GetOrCreateAccountBucket(svc.js, accountID)
+	kv, err := handlers_eks.GetOrCreateAccountBucket(t.Context(), svc.js, accountID, 1)
 	require.NoError(t, err)
 	raw, err := json.Marshal(jwks)
 	require.NoError(t, err)
-	_, err = kv.Put(handlers_eks.OIDCJWKSKey(testWebClusterName), raw)
+	_, err = kv.Put(t.Context(), handlers_eks.OIDCJWKSKey(testWebClusterName), raw)
 	require.NoError(t, err)
 
 	// Register the OIDC provider on the role-account's IAM bucket. Bucket is
 	// created on-the-fly here — the IAM CreateOpenIDConnectProvider API lands
 	// in Sprint 6e.
-	iamKV, err := utils.GetOrCreateKVBucket(svc.js,
+	iamKV, err := kvutil.GetOrCreateBucket(t.Context(), svc.js,
 		handlers_iam.IAMAccountBucketName(accountID), handlers_iam.KVBucketIAMAccountVersion)
 	require.NoError(t, err)
-	_, err = iamKV.Put(handlers_iam.OIDCProviderKey(issuer), []byte(`{"registered":true}`))
+	_, err = iamKV.Put(t.Context(), handlers_iam.OIDCProviderKey(issuer), []byte(`{"registered":true}`))
 	require.NoError(t, err)
 
 	return &webIdentityFixture{
@@ -352,16 +364,14 @@ func TestAssumeRoleWithWebIdentity_ProviderNotRegistered(t *testing.T) {
 	federatedARN := handlers_iam.OIDCProviderARN(testCallerAccountID, issuerHostPath)
 
 	// Publish JWKS — but skip the IAM provider registration.
-	kv, err := handlers_eks.GetOrCreateAccountBucket(svc.js, testCallerAccountID)
+	kv, err := handlers_eks.GetOrCreateAccountBucket(t.Context(), svc.js, testCallerAccountID, 1)
 	require.NoError(t, err)
-	jwks := &JWKS{Keys: []JWK{{
-		Kty: "EC", Crv: "P-256", Alg: "ES256", Use: "sig", Kid: kid,
-		X: base64.RawURLEncoding.EncodeToString(priv.X.Bytes()),
-		Y: base64.RawURLEncoding.EncodeToString(priv.Y.Bytes()),
-	}}}
+	jwk := signingJWK(t, &priv.PublicKey)
+	jwk.Alg, jwk.Use, jwk.Kid = "ES256", "sig", kid
+	jwks := &JWKS{Keys: []JWK{*jwk}}
 	raw, err := json.Marshal(jwks)
 	require.NoError(t, err)
-	_, err = kv.Put(handlers_eks.OIDCJWKSKey("unregistered-cluster"), raw)
+	_, err = kv.Put(t.Context(), handlers_eks.OIDCJWKSKey("unregistered-cluster"), raw)
 	require.NoError(t, err)
 
 	role := createRoleForFixture(t, svc, testCallerAccountID, "irsa-unreg",
@@ -570,11 +580,8 @@ func TestAssumeRoleWithWebIdentity_DurationBounds(t *testing.T) {
 func TestJWKToECDSAPublicKey_RoundTrip(t *testing.T) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
-	jwk := &JWK{
-		Kty: "EC", Crv: "P-256",
-		X: base64.RawURLEncoding.EncodeToString(priv.X.Bytes()),
-		Y: base64.RawURLEncoding.EncodeToString(priv.Y.Bytes()),
-	}
+	jwk := signingJWK(t, &priv.PublicKey)
+
 	pub, err := jwkToECDSAPublicKey(jwk)
 	require.NoError(t, err)
 	assert.True(t, priv.PublicKey.Equal(pub))
@@ -589,7 +596,18 @@ func TestJWKToECDSAPublicKey_RejectsUnsupportedShapes(t *testing.T) {
 		{"rsa_kty", &JWK{Kty: "RSA", Crv: "P-256", X: "AA", Y: "AA"}},
 		{"wrong_curve", &JWK{Kty: "EC", Crv: "P-384", X: "AA", Y: "AA"}},
 		{"bad_x_base64", &JWK{Kty: "EC", Crv: "P-256", X: "!!!", Y: "AA"}},
-		{"off_curve", &JWK{Kty: "EC", Crv: "P-256", X: base64.RawURLEncoding.EncodeToString([]byte{1, 2, 3}), Y: base64.RawURLEncoding.EncodeToString([]byte{4, 5, 6})}},
+		// (0,0) is a well-formed pair of fixed-width coordinates that is not on P-256.
+		{"off_curve", &JWK{Kty: "EC", Crv: "P-256",
+			X: base64.RawURLEncoding.EncodeToString(make([]byte, p256CoordLen)),
+			Y: base64.RawURLEncoding.EncodeToString(make([]byte, p256CoordLen))}},
+		// RFC 7518 6.2.1.2 fixes the coordinate width; odd-width members are rejected
+		// before the point is assembled, whatever curve they might land on.
+		{"short_x", &JWK{Kty: "EC", Crv: "P-256",
+			X: base64.RawURLEncoding.EncodeToString(make([]byte, p256CoordLen-1)),
+			Y: base64.RawURLEncoding.EncodeToString(make([]byte, p256CoordLen))}},
+		{"long_y", &JWK{Kty: "EC", Crv: "P-256",
+			X: base64.RawURLEncoding.EncodeToString(make([]byte, p256CoordLen)),
+			Y: base64.RawURLEncoding.EncodeToString(make([]byte, p256CoordLen+1))}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

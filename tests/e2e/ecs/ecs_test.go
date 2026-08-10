@@ -44,11 +44,26 @@ const (
 	ecsHostNetnsCmd = "sleep 600"
 )
 
+// ecsCredCheckCmd runs inside a task container and proves a task role is
+// actually usable, not just declared: it fetches the container's own
+// credentials from AWS_CONTAINER_CREDENTIALS_RELATIVE_URI (the endpoint
+// credendpoint.go DNATs onto 169.254.170.2:80) and grep-asserts the AWS SDK's
+// expected JSON fields are present. wget (nginx:alpine has no curl) exits
+// non-zero on any connection or HTTP failure, and `set -e` propagates that to
+// the container exit — so a dead endpoint stops the task instead of leaving an
+// unused env var that every other subtest's container ignores.
+var ecsCredCheckCmd = []string{"sh", "-c",
+	`set -e; body=$(wget -qO- "http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"); ` +
+		`echo "$body"; echo "$body" | grep -q '"AccessKeyId"'; echo "$body" | grep -q '"SecretAccessKey"'; ` +
+		`echo "$body" | grep -q '"Token"'; sleep 600`,
+}
+
 // TestECS drives the ECS data plane end-to-end against the local awsgw: a
 // customer VPC + a real container instance launched from the spinifex-ecs-node
 // AMI (which boots, registers over the gateway, and runs tasks through
 // containerd), then standalone tasks in all three network modes (awsvpc,
-// bridge, host) and an awsvpc service fronted by an ALB target group.
+// bridge, host), a task-role credential fetch from inside the container, and
+// an awsvpc service fronted by an ALB target group.
 //
 // One fixture (VPC + cluster + one node) is shared across subtests — node boot
 // + registration is the slow step, so re-provisioning per subtest would blow
@@ -89,6 +104,19 @@ func TestECS(t *testing.T) {
 		assert.NotEmpty(t, attachmentDetail(att, "networkInterfaceId"), "ENI must carry an interface id")
 	})
 
+	t.Run("TaskRoleCredentials", func(t *testing.T) {
+		tdArn := registerTaskDef(t, c, fx, "awsvpc", ecsCredCheckCmd)
+		task := runStandaloneTask(t, c, fx, tdArn, &ecs.NetworkConfiguration{
+			AwsvpcConfiguration: &ecs.AwsVpcConfiguration{
+				Subnets:        aws.StringSlice([]string{fx.SubnetAID}),
+				SecurityGroups: aws.StringSlice([]string{fx.SGID}),
+			},
+		})
+		assert.Equal(t, "RUNNING", aws.StringValue(task.LastStatus),
+			"task must reach and stay RUNNING: ecsCredCheckCmd exits non-zero and stops "+
+				"the task on any credential-fetch failure, including a dead credential endpoint")
+	})
+
 	t.Run("TaskBridge", func(t *testing.T) {
 		tdArn := registerTaskDef(t, c, fx, "bridge", nil)
 		task := runStandaloneTask(t, c, fx, tdArn, nil)
@@ -104,6 +132,52 @@ func TestECS(t *testing.T) {
 	t.Run("ServiceWithELB", func(t *testing.T) {
 		runServiceWithELB(t, c, env, fx)
 	})
+
+	// Runs last: terminates the container instance ahead of the fixture's own
+	// teardown so the assertion below observes a clean sweep. By this point the
+	// instance carries its own primary ENI plus a post-launch-attached one per
+	// awsvpc task/service subtest above (TaskAwsvpc, TaskRoleCredentials,
+	// ServiceWithELB) — none of those ever touch vm.VM.ENIId. Relying on the
+	// launch-time scalar alone would leave every one attached, blocking
+	// SG/subnet/VPC teardown
+	// behind DependencyViolation.
+	t.Run("TerminateReleasesAttachedENIs", func(t *testing.T) {
+		terminateContainerInstanceAndAssertENIsReleased(t, c, fx)
+	})
+}
+
+// terminateContainerInstanceAndAssertENIsReleased terminates the fixture's
+// container instance and polls describe-network-interfaces on its subnet
+// until the count returns to zero, following the WaitForENICleanup pattern
+// (tests/e2e/harness/lb.go) but scoped by subnet-id rather than description
+// since every ENI the instance and its tasks accumulated shares this subnet.
+func terminateContainerInstanceAndAssertENIsReleased(t *testing.T, c *harness.AWSClient, fx *ecsFixture) {
+	t.Helper()
+
+	_, err := c.EC2.TerminateInstances(&ec2.TerminateInstancesInput{
+		InstanceIds: aws.StringSlice([]string{fx.InstanceID}),
+	})
+	require.NoError(t, err, "terminate-instances")
+	harness.WaitForInstanceTerminated(t, c, []string{fx.InstanceID}, 3*time.Minute)
+
+	label := fmt.Sprintf("container instance %s", fx.InstanceID)
+	harness.Step(t, "%s: waiting for ENIs in %s to drain", label, fx.SubnetAID)
+	harness.EventuallyErr(t, func() error {
+		out, derr := c.EC2.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{
+			Filters: []*ec2.Filter{{
+				Name:   aws.String("subnet-id"),
+				Values: []*string{aws.String(fx.SubnetAID)},
+			}},
+		})
+		if derr != nil {
+			return fmt.Errorf("describe ENIs in %s: %w", fx.SubnetAID, derr)
+		}
+		if len(out.NetworkInterfaces) == 0 {
+			return nil
+		}
+		return fmt.Errorf("%s: %d ENIs still present in %s", label, len(out.NetworkInterfaces), fx.SubnetAID)
+	}, 90*time.Second, 3*time.Second)
+	harness.Step(t, "%s ENIs cleaned up", label)
 }
 
 // --- Fixture --------------------------------------------------------------
@@ -340,7 +414,11 @@ func ensureInstanceProfile(t *testing.T, c *harness.AWSClient) {
 func createTaskRole(t *testing.T, c *harness.AWSClient, fx *ecsFixture) {
 	t.Helper()
 	name := fx.ClusterName + "-task-role"
-	const trust = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}`
+	// The trust policy AWS documents for a task role, and nothing else: STS
+	// attributes ecs-tasks.amazonaws.com to the agent's container-instance session,
+	// so no AWS-principal clause naming the instance role is needed.
+	const trust = `{"Version":"2012-10-17","Statement":[` +
+		`{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}`
 	out, err := c.IAM.CreateRole(&iam.CreateRoleInput{
 		RoleName:                 aws.String(name),
 		AssumeRolePolicyDocument: aws.String(trust),

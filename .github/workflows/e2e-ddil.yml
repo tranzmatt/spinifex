@@ -1,8 +1,7 @@
 name: E2E DDIL
 
-# Phase 1 trigger: workflow_dispatch only. Nightly cron + on-main-merge
-# land in mulga-siv-5.8 once ≥4 scenarios are asserting. See
-# docs/development/improvements/ddil-e2e-test-harness.md §4 / §Dependencies.
+# This workflow is manually triggered while the DDIL scenarios are being
+# validated.
 on:
   workflow_dispatch:
     inputs:
@@ -13,9 +12,16 @@ on:
 
 permissions:
   contents: read
+  # actions: read lets the otel-job-id action look up this job's numeric id via
+  # the Actions API — github.job is only the YAML key, no context exposes it.
+  actions: read
 
 env:
   GIT_BRANCH: ${{ github.ref_name }}
+  # OTLP export to the central Elastic sink (wattle). Repo variable overrides;
+  # empty string disables telemetry entirely.
+  SPINIFEX_OTLP_ENDPOINT: ${{ vars.SPINIFEX_OTLP_ENDPOINT || 'http://192.168.1.13:8200' }}
+  SPINIFEX_OTEL_ATTRS: ci.run_id=${{ github.run_id }},ci.workflow=${{ github.workflow }}
 
 jobs:
   ddil:
@@ -24,6 +30,10 @@ jobs:
     timeout-minutes: 60
     env:
       TOFU_LOG: /tmp/e2e-tofu-ddil-${{ github.run_id }}.log
+      # Job-level env wins over the workflow-level default. ci.cell=ddil marks
+      # this workflow's telemetry so a DDIL run's partition-induced errors are
+      # never mistaken for a healthy multi-node run's in the sink.
+      SPINIFEX_OTEL_ATTRS: ci.run_id=${{ github.run_id }},ci.workflow=${{ github.workflow }},ci.cell=ddil
     steps:
       - name: Clean Workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE"/*
@@ -67,6 +77,13 @@ jobs:
           fi
           echo "${BIN_DIR}" >> "${GITHUB_PATH}"
           "${BIN_DIR}/gotestsum" --version
+
+      # Adds ci.job_id alongside ci.cell, before Bootstrap bakes the attrs into
+      # the VMs, so a telemetry doc points back at this job's log directly.
+      - name: Resolve CI job id
+        uses: ./spinifex/.github/actions/otel-job-id
+        with:
+          job-name: DDIL Real Multi-Node
 
       - name: Build Install Artifacts
         working-directory: mulga/scripts/tofu-cluster
@@ -200,6 +217,16 @@ jobs:
           set -euo pipefail
           source "${GITHUB_WORKSPACE}/spinifex/.github/scripts/ci-fmt.sh"
           quiet_run "tofu workspace select" "$TOFU_LOG" tofu workspace select -or-create "${SPINIFEX_CI_ENV}"
+          quiet_run "telemetry flush"       "$TOFU_LOG" timeout 120 ./flush-telemetry.sh "${SPINIFEX_CI_ENV}" || true
           quiet_run "tofu destroy"          "$TOFU_LOG" tofu destroy -var-file=envs/${SPINIFEX_CI_ENV}.tfvars -auto-approve -input=false
           quiet_run "scrub-env"             "$TOFU_LOG" ./scrub-env.sh "${SPINIFEX_CI_ENV}" || true
           ok "teardown complete"
+
+      - name: Upload tofu log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tofu-log-ddil-${{ github.run_id }}
+          path: ${{ env.TOFU_LOG }}
+          if-no-files-found: ignore
+          retention-days: 30

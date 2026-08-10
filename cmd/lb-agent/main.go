@@ -19,11 +19,17 @@ import (
 	"syscall"
 
 	"github.com/mulgadc/spinifex/spinifex/lbagent"
+	"github.com/mulgadc/spinifex/spinifex/otelsetup"
 
 	_ "github.com/mulgadc/spinifex/internal/fipsboot"
 )
 
 func main() {
+	// Without this the agent falls back to slog's default text handler, which folds
+	// attributes into the message so the console scraper recovers a level and nothing
+	// else. No OTLP export: the agent's only egress is the gateway it is watching.
+	otelsetup.SetDefaultJSONLogger(slog.LevelInfo)
+
 	var (
 		lbID       string
 		gatewayURL string
@@ -49,12 +55,13 @@ func main() {
 		slog.Error("--gateway is required (or set LB_GATEWAY_URL)")
 		os.Exit(1)
 	}
-	if accessKey == "" || secretKey == "" {
-		slog.Error("--access-key and --secret-key are required (or set LB_ACCESS_KEY / LB_SECRET_KEY)")
-		os.Exit(1)
+	// Empty keys select IMDS instance-role credentials (the SDK default chain
+	// falls back to the in-VM IMDS endpoint); static keys sign as-is.
+	credSource := "imds"
+	if accessKey != "" && secretKey != "" {
+		credSource = "static"
 	}
-
-	slog.Info("Starting LB agent", "lbId", lbID, "gateway", gatewayURL)
+	slog.Info("Starting LB agent", "lbId", lbID, "gateway", gatewayURL, "credSource", credSource)
 
 	agent, err := lbagent.New(lbID, gatewayURL, accessKey, secretKey, region)
 	if err != nil {

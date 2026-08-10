@@ -21,8 +21,8 @@ set -eu
 #   EKS_NLB_ENDPOINT           https://{cluster}.{accountID}.eks.{region}.{suffix}
 #
 # Idempotent: a sentinel file at /var/lib/spinifex-eks/first-boot.pending gates
-# execution. On success the sentinel is removed and the OpenRC service is
-# pulled from the default runlevel so it does not retry on subsequent boots.
+# execution. On success the sentinel is removed and the service is disabled
+# under whichever init the image ships so it does not retry on subsequent boots.
 
 SENTINEL=/var/lib/spinifex-eks/first-boot.pending
 ENVFILE=/etc/spinifex-eks/first-boot.env
@@ -30,6 +30,33 @@ LOGTAG="k3s-first-boot"
 
 log() { echo "[${LOGTAG}] $*"; }
 die() { log "ERROR: $*"; exit 1; }
+
+# This script is delivered unmodified to both the legacy Alpine/OpenRC image
+# and the mkosi Ubuntu/systemd image, so the self-disable below must dispatch
+# on whichever init actually owns the box. EKS_NODE_INIT lets the env knob
+# win outright (unit-testable without root or a real init); detection then
+# prefers rc-update so an Alpine host with a stray systemctl shim still
+# resolves to openrc. Duplicated from eks-node-role.sh rather than shared:
+# both are single-file deliverables installed straight to /usr/local/sbin
+# with no shared library-path convention, and scripts/images/ is deleted at
+# image-build cutover, so a shared file would outlive its usefulness.
+INIT_SYSTEM="${EKS_NODE_INIT:-}"
+if [ -z "${INIT_SYSTEM}" ]; then
+    if command -v rc-update >/dev/null 2>&1; then
+        INIT_SYSTEM=openrc
+    elif command -v systemctl >/dev/null 2>&1; then
+        INIT_SYSTEM=systemd
+    else
+        die "no supported init system found (need rc-update or systemctl)"
+    fi
+fi
+
+svc_disable() {
+    case "${INIT_SYSTEM}" in
+        openrc) rc-update del "$1" default 2>/dev/null || true ;;
+        systemd) systemctl disable "$1.service" 2>/dev/null || true ;;
+    esac
+}
 
 if [ ! -f "${SENTINEL}" ]; then
     log "sentinel missing — first boot already complete"
@@ -48,7 +75,9 @@ set -a
 . "${ENVFILE}"
 set +a
 
-for v in EKS_GATEWAY_URL EKS_ACCESS_KEY EKS_SECRET_KEY EKS_ACCOUNT_ID EKS_CLUSTER_NAME EKS_NLB_ENDPOINT; do
+# EKS_ACCESS_KEY/EKS_SECRET_KEY are intentionally not required: when absent,
+# eks-gateway-publish signs with IMDS instance-role creds via the SDK chain.
+for v in EKS_GATEWAY_URL EKS_ACCOUNT_ID EKS_CLUSTER_NAME EKS_NLB_ENDPOINT; do
     eval "val=\${$v:-}"
     [ -n "${val}" ] || die "env ${v} not set"
 done
@@ -133,7 +162,30 @@ jq -n --arg k "${KUBECONFIG_REWRITTEN}" '{adminKubeconfig: $k}'      | publish_e
 jq -n --arg j "${JWKS}"                 '{jwks: $j}'                  | publish_envelope k3s-oidc-jwks
 jq -n --arg c "${CA_B64}"               '{certificateAuthority: $c}' | publish_envelope k3s-ca
 
-# 4. Self-disable. Remove sentinel, pull from runlevel.
+# 3.5 Prune a terminated control-plane peer this VM replaces. The spinifex
+# reconciler sets EKS_ETCD_PRUNE_PEER_IP to the dead member's node IP when this
+# VM is provisioned as its replacement (member-count reconcile). Deleting the
+# dead Node makes k3s embedded-etcd remove the stale member, so quorum width
+# returns to N rather than N+1-with-a-dead-peer. Best-effort: a failure leaves
+# the member for an operator and never blocks first boot.
+if [ -n "${EKS_ETCD_PRUNE_PEER_IP:-}" ]; then
+    log "pruning terminated CP peer at ${EKS_ETCD_PRUNE_PEER_IP} from etcd"
+    dead_node=$(kubectl --kubeconfig "${KUBECONFIG_FILE}" get nodes \
+        -o "custom-columns=NAME:.metadata.name,IP:.status.addresses[?(@.type=='InternalIP')].address" \
+        --no-headers 2>/dev/null \
+        | awk -v ip="${EKS_ETCD_PRUNE_PEER_IP}" '$2==ip {print $1; exit}')
+    if [ -n "${dead_node}" ]; then
+        if kubectl --kubeconfig "${KUBECONFIG_FILE}" delete node "${dead_node}" --ignore-not-found=true; then
+            log "deleted dead node ${dead_node}; k3s will remove its etcd member"
+        else
+            log "WARN: delete of dead node ${dead_node} failed; etcd member left for operator"
+        fi
+    else
+        log "no node has internal IP ${EKS_ETCD_PRUNE_PEER_IP}; nothing to prune"
+    fi
+fi
+
+# 4. Self-disable. Remove sentinel, disable the unit so it does not re-run.
 rm -f "${SENTINEL}"
-rc-update del k3s-first-boot default 2>/dev/null || true
+svc_disable k3s-first-boot
 log "first boot complete"

@@ -1,0 +1,62 @@
+#!/sbin/openrc-run
+# Konnectivity server (apiserver-network-proxy) — the apiserver egress proxy for
+# the Mulga EKS control plane. The kube-apiserver's `cluster` egress selector
+# (egress-selector-config.yaml) routes pod/kubelet/webhook traffic to this
+# server's UDS; konnectivity-agents on the workers dial in over :8132 and the
+# egress rides back down the agent-initiated reverse tunnel. Server-role only;
+# enabled by eks-node-role. Runs as root to bind the UDS the apiserver reads.
+
+description="Konnectivity server (Mulga EKS apiserver egress proxy)"
+
+KONN_DIR=/var/lib/spinifex-eks/konnectivity
+KONN_UDS=/run/konnectivity/konnectivity-server.socket
+KUBECONFIG_FILE=/etc/rancher/k3s/k3s.yaml
+
+command="/usr/local/bin/konnectivity-server"
+# Built in start_pre once konnectivity-server-prestart has resolved the
+# apiserver replica count (see below); every other flag is static.
+command_args=""
+pidfile="/run/konnectivity-server.pid"
+
+# Supervise: a transient exit must self-heal, or apiserver egress (webhooks,
+# exec, logs) stays broken until the next boot and the cluster wedges.
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+output_log="/var/log/konnectivity-server.log"
+error_log="/var/log/konnectivity-server.log"
+
+depend() {
+    need net
+    after k3s
+}
+
+start_pre() {
+    # konnectivity-server-prestart reproduces the wait-for-CA/kubeconfig +
+    # cert-mint steps this start_pre used to run inline, plus the top-level
+    # server-count derivation (both apiserver replica count and cert minting
+    # need first-boot.env), shared with the systemd unit that will eventually
+    # replace this runscript. It writes the resolved count to a /run env file
+    # for command_args below.
+    /usr/local/sbin/konnectivity-server-prestart || return 1
+
+    # shellcheck disable=SC1091
+    . /run/konnectivity-server-args.env
+
+    command_args="--logtostderr=true
+ --uds-name=${KONN_UDS}
+ --delete-existing-uds-file
+ --cluster-cert=${KONN_DIR}/tls.crt
+ --cluster-key=${KONN_DIR}/tls.key
+ --server-count=${KONN_SERVER_COUNT}
+ --mode=grpc
+ --server-port=0
+ --agent-port=8132
+ --admin-port=8093
+ --health-port=8092
+ --kubeconfig=${KUBECONFIG_FILE}
+ --authentication-audience=system:konnectivity-server
+ --agent-namespace=kube-system
+ --agent-service-account=konnectivity-agent
+ --proxy-strategies=destHost,default"
+}

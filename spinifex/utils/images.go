@@ -99,7 +99,7 @@ func newHasher(checksumType string) (hash.Hash, error) {
 func fetchExpectedDigest(checksumURL, filename string) (string, error) {
 	parsed, err := url.Parse(checksumURL)
 	if err != nil {
-		return "", fmt.Errorf("%w: parse url: %v", ErrChecksumFetchFailed, err)
+		return "", fmt.Errorf("%w: parse url: %w", ErrChecksumFetchFailed, err)
 	}
 	if parsed.Scheme != "https" {
 		return "", fmt.Errorf("%w: non-https checksum url scheme %q", ErrChecksumFetchFailed, parsed.Scheme)
@@ -138,12 +138,12 @@ func fetchExpectedDigest(checksumURL, filename string) (string, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checksumURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("%w: build request: %v", ErrChecksumFetchFailed, err)
+		return "", fmt.Errorf("%w: build request: %w", ErrChecksumFetchFailed, err)
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrChecksumFetchFailed, err)
+		return "", fmt.Errorf("%w: %w", ErrChecksumFetchFailed, err)
 	}
 	defer resp.Body.Close()
 
@@ -153,7 +153,7 @@ func fetchExpectedDigest(checksumURL, filename string) (string, error) {
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, sumsFileMaxSize+1))
 	if err != nil {
-		return "", fmt.Errorf("%w: read body: %v", ErrChecksumFetchFailed, err)
+		return "", fmt.Errorf("%w: read body: %w", ErrChecksumFetchFailed, err)
 	}
 	if len(body) > sumsFileMaxSize {
 		return "", fmt.Errorf("%w: sums file exceeds %d byte limit", ErrChecksumFetchFailed, sumsFileMaxSize)
@@ -203,7 +203,7 @@ func parseSumsFile(body []byte, filename string) (string, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("%w: scan sums file: %v", ErrChecksumFetchFailed, err)
+		return "", fmt.Errorf("%w: scan sums file: %w", ErrChecksumFetchFailed, err)
 	}
 
 	// Alpine single-file fallback: accept only if exactly one bare-digest line in the file.
@@ -285,9 +285,9 @@ var AvailableImages = map[string]Images{
 		Version:      "13",
 		Arch:         "x86_64",
 		Platform:     "Linux/UNIX",
-		CreatedAt:    time.Date(2026, 5, 18, 0, 0, 0, 0, time.UTC),
-		URL:          "https://cloud.debian.org/images/cloud/trixie/20260518-2482/debian-13-genericcloud-amd64-20260518-2482.tar.xz",
-		Checksum:     "https://cloud.debian.org/images/cloud/trixie/20260518-2482/SHA512SUMS",
+		CreatedAt:    time.Date(2026, 7, 22, 0, 0, 0, 0, time.UTC),
+		URL:          "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.tar.xz",
+		Checksum:     "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS",
 		ChecksumType: "sha512",
 		BootMode:     "uefi",
 	},
@@ -299,9 +299,9 @@ var AvailableImages = map[string]Images{
 		Version:      "13",
 		Arch:         "arm64",
 		Platform:     "Linux/UNIX",
-		CreatedAt:    time.Date(2026, 5, 18, 0, 0, 0, 0, time.UTC),
-		URL:          "https://cloud.debian.org/images/cloud/trixie/20260518-2482/debian-13-genericcloud-arm64-20260518-2482.tar.xz",
-		Checksum:     "https://cloud.debian.org/images/cloud/trixie/20260518-2482/SHA512SUMS",
+		CreatedAt:    time.Date(2026, 7, 22, 0, 0, 0, 0, time.UTC),
+		URL:          "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.tar.xz",
+		Checksum:     "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS",
 		ChecksumType: "sha512",
 		BootMode:     "uefi",
 	},
@@ -313,9 +313,9 @@ var AvailableImages = map[string]Images{
 		Version:      "26.04",
 		Arch:         "x86_64",
 		Platform:     "Linux/UNIX",
-		CreatedAt:    time.Date(2026, 4, 21, 0, 0, 0, 0, time.UTC),
-		URL:          "https://cloud-images.ubuntu.com/resolute/20260421/resolute-server-cloudimg-amd64.img",
-		Checksum:     "https://cloud-images.ubuntu.com/resolute/20260421/SHA256SUMS",
+		CreatedAt:    time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC),
+		URL:          "https://cloud-images.ubuntu.com/releases/resolute/release/ubuntu-26.04-server-cloudimg-amd64.img",
+		Checksum:     "https://cloud-images.ubuntu.com/releases/resolute/release/SHA256SUMS",
 		ChecksumType: "sha256",
 		BootMode:     "uefi",
 	},
@@ -327,37 +327,37 @@ var AvailableImages = map[string]Images{
 		Version:      "26.04",
 		Arch:         "arm64",
 		Platform:     "Linux/UNIX",
-		CreatedAt:    time.Date(2026, 4, 21, 0, 0, 0, 0, time.UTC),
-		URL:          "https://cloud-images.ubuntu.com/resolute/20260421/resolute-server-cloudimg-arm64.img",
-		Checksum:     "https://cloud-images.ubuntu.com/resolute/20260421/SHA256SUMS",
+		CreatedAt:    time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC),
+		URL:          "https://cloud-images.ubuntu.com/releases/resolute/release/ubuntu-26.04-server-cloudimg-arm64.img",
+		Checksum:     "https://cloud-images.ubuntu.com/releases/resolute/release/SHA256SUMS",
 		ChecksumType: "sha256",
 		BootMode:     "uefi",
 	},
 
-	"alpine-3.22.4-x86_64": {
-		Name:         "alpine-3.22.4-x86_64",
-		Description:  "Alpine Linux 3.22.4 x86_64 cloud image",
+	"alpine-3.24.1-x86_64": {
+		Name:         "alpine-3.24.1-x86_64",
+		Description:  "Alpine Linux 3.24.1 x86_64 cloud image",
 		Distro:       "alpine",
-		Version:      "3.22.4",
+		Version:      "3.24.1",
 		Arch:         "x86_64",
 		Platform:     "Linux/UNIX",
-		CreatedAt:    time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC),
-		URL:          "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.4-x86_64-uefi-cloudinit-r0.qcow2",
-		Checksum:     "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.4-x86_64-uefi-cloudinit-r0.qcow2.sha512",
+		CreatedAt:    time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC),
+		URL:          "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/generic_alpine-3.24.1-x86_64-uefi-cloudinit-r0.qcow2",
+		Checksum:     "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/generic_alpine-3.24.1-x86_64-uefi-cloudinit-r0.qcow2.sha512",
 		ChecksumType: "sha512",
 		BootMode:     "uefi",
 	},
 
-	"alpine-3.22.4-arm64": {
-		Name:         "alpine-3.22.4-arm64",
-		Description:  "Alpine Linux 3.22.4 arm64 cloud image",
+	"alpine-3.24.1-arm64": {
+		Name:         "alpine-3.24.1-arm64",
+		Description:  "Alpine Linux 3.24.1 arm64 cloud image",
 		Distro:       "alpine",
-		Version:      "3.22.4",
+		Version:      "3.24.1",
 		Arch:         "arm64",
 		Platform:     "Linux/UNIX",
-		CreatedAt:    time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC),
-		URL:          "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.4-aarch64-uefi-cloudinit-r0.qcow2",
-		Checksum:     "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.4-aarch64-uefi-cloudinit-r0.qcow2.sha512",
+		CreatedAt:    time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC),
+		URL:          "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/generic_alpine-3.24.1-aarch64-uefi-cloudinit-r0.qcow2",
+		Checksum:     "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/generic_alpine-3.24.1-aarch64-uefi-cloudinit-r0.qcow2.sha512",
 		ChecksumType: "sha512",
 		BootMode:     "uefi",
 	},
@@ -370,8 +370,8 @@ var AvailableImages = map[string]Images{
 		Arch:         "x86_64",
 		Platform:     "Linux/UNIX",
 		CreatedAt:    time.Date(2026, 5, 25, 0, 0, 0, 0, time.UTC),
-		URL:          "https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base-10.2-20260525.0.x86_64.qcow2",
-		Checksum:     "https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base-10.2-20260525.0.x86_64.qcow2.CHECKSUM",
+		URL:          "https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2",
+		Checksum:     "https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2.CHECKSUM",
 		ChecksumType: "sha256",
 		BootMode:     "uefi",
 	},
@@ -384,8 +384,8 @@ var AvailableImages = map[string]Images{
 		Arch:         "arm64",
 		Platform:     "Linux/UNIX",
 		CreatedAt:    time.Date(2026, 5, 25, 0, 0, 0, 0, time.UTC),
-		URL:          "https://dl.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-GenericCloud-Base-10.2-20260525.0.aarch64.qcow2",
-		Checksum:     "https://dl.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-GenericCloud-Base-10.2-20260525.0.aarch64.qcow2.CHECKSUM",
+		URL:          "https://dl.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-GenericCloud-Base.latest.aarch64.qcow2",
+		Checksum:     "https://dl.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-GenericCloud-Base.latest.aarch64.qcow2.CHECKSUM",
 		ChecksumType: "sha256",
 		BootMode:     "uefi",
 	},
@@ -436,6 +436,26 @@ var AvailableImages = map[string]Images{
 		Tags:         map[string]string{"spinifex:managed-by": "eks"},
 	},
 
+	// GPU EKS node system AMI. Resolved by spinifex:managed-by=eks + gpu-vendor=nvidia
+	// tags — CreateNodegroup selects it for GPU instance types instead of the Alpine AMI.
+	"spinifex-eks-node-gpu": {
+		Name:         "spinifex-eks-node-gpu",
+		Description:  "Mulga EKS GPU node image — Ubuntu 26.04 + NVIDIA driver + K3s v1.32.5, agent-only (GPU nodes never run the EKS control plane, so no role selector or eks-token-webhook)",
+		Distro:       "ubuntu",
+		Version:      "26.04",
+		Arch:         "x86_64",
+		Platform:     "Linux/UNIX",
+		CreatedAt:    time.Date(2026, 6, 8, 0, 0, 0, 0, time.UTC),
+		URL:          "https://iso.mulgadc.com/system-ami/spinifex-eks-node-gpu-x86_64.qcow2",
+		Checksum:     "https://iso.mulgadc.com/system-ami/spinifex-eks-node-gpu-x86_64.qcow2.sha256",
+		ChecksumType: "sha256",
+		// Ubuntu 26.04 is built GPT/EFI-only; legacy BIOS finds no bootable MBR
+		// bootloader and hangs at firmware with zero serial output (no OVMF/pflash
+		// is attached unless BootMode is uefi/uefi-preferred, see vm/lifecycle.go).
+		BootMode: "uefi",
+		Tags:     map[string]string{"spinifex:managed-by": "eks", "gpu-vendor": "nvidia"},
+	},
+
 	// ECS container-instance system AMI. Resolved by spinifex:managed-by=ecs tag —
 	// importing this entry lets ECS launch container instances that register and run tasks.
 	"spinifex-ecs-node": {
@@ -451,6 +471,43 @@ var AvailableImages = map[string]Images{
 		ChecksumType: "sha256",
 		BootMode:     "bios",
 		Tags:         map[string]string{"spinifex:managed-by": "ecs"},
+	},
+
+	// GPU ECS node system AMI. Resolved by spinifex:managed-by=ecs + gpu-vendor=nvidia
+	// tags — ProvisionCapacity selects it for GPU instance types instead of the Alpine AMI.
+	"spinifex-ecs-node-gpu": {
+		Name:         "spinifex-ecs-node-gpu",
+		Description:  "Mulga ECS GPU node image — Ubuntu 26.04 + NVIDIA driver + containerd + ecs-agent (registers as a container instance at first boot)",
+		Distro:       "ubuntu",
+		Version:      "26.04",
+		Arch:         "x86_64",
+		Platform:     "Linux/UNIX",
+		CreatedAt:    time.Date(2026, 6, 26, 0, 0, 0, 0, time.UTC),
+		URL:          "https://iso.mulgadc.com/system-ami/spinifex-ecs-node-gpu-x86_64.qcow2",
+		Checksum:     "https://iso.mulgadc.com/system-ami/spinifex-ecs-node-gpu-x86_64.qcow2.sha256",
+		ChecksumType: "sha256",
+		// Ubuntu 26.04 is built GPT/EFI-only; legacy BIOS finds no bootable MBR
+		// bootloader and hangs at firmware with zero serial output (no OVMF/pflash
+		// is attached unless BootMode is uefi/uefi-preferred, see vm/lifecycle.go).
+		BootMode: "uefi",
+		Tags:     map[string]string{"spinifex:managed-by": "ecs", "gpu-vendor": "nvidia"},
+	},
+
+	// Resolved by spinifex:managed-by=rds plus the engine tags an
+	// Engine/EngineVersion request maps onto, not by parsing the image name.
+	"spinifex-rds-postgres": {
+		Name:         "spinifex-rds-postgres",
+		Description:  "Mulga RDS PostgreSQL image — Alpine 3.24.1 + PostgreSQL 18 + rds-init (initdb, master password, parameters and TLS applied at first boot)",
+		Distro:       "alpine",
+		Version:      "3.24.1",
+		Arch:         "x86_64",
+		Platform:     "Linux/UNIX",
+		CreatedAt:    time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC),
+		URL:          "https://iso.mulgadc.com/system-ami/spinifex-rds-postgres-x86_64.qcow2",
+		Checksum:     "https://iso.mulgadc.com/system-ami/spinifex-rds-postgres-x86_64.qcow2.sha256",
+		ChecksumType: "sha256",
+		BootMode:     "bios",
+		Tags:         map[string]string{"spinifex:managed-by": "rds", "engine": "postgres", "engine-version": "18"},
 	},
 }
 

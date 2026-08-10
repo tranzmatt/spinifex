@@ -1,6 +1,8 @@
 package handlers_eks
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -20,9 +23,15 @@ type fakeSubnetResolver struct{}
 
 var _ SubnetVPCResolver = (*fakeSubnetResolver)(nil)
 
-func (fakeSubnetResolver) GetSubnetVPC(_, _ string) (string, error) { return "vpc-aaa", nil }
-func (fakeSubnetResolver) GetVPCCIDR(_, _ string) (string, error)   { return "10.0.0.0/16", nil }
-func (fakeSubnetResolver) GetSubnetAZ(_, _ string) (string, error)  { return "spinifexz1", nil }
+func (fakeSubnetResolver) GetSubnetVPC(_ context.Context, _, _ string) (string, error) {
+	return "vpc-aaa", nil
+}
+func (fakeSubnetResolver) GetVPCCIDR(_ context.Context, _, _ string) (string, error) {
+	return "10.0.0.0/16", nil
+}
+func (fakeSubnetResolver) GetSubnetAZ(_ context.Context, _, _ string) (string, error) {
+	return "spinifexz1", nil
+}
 
 func deleteInput(name string) *eks.DeleteClusterInput {
 	return &eks.DeleteClusterInput{Name: aws.String(name)}
@@ -33,7 +42,7 @@ func deleteInput(name string) *eks.DeleteClusterInput {
 // failures at specific lifecycle steps.
 type eksServiceFixture struct {
 	svc    *EKSServiceImpl
-	kv     nats.KeyValue
+	kv     jetstream.KeyValue
 	nlb    *fakeNLBProvisioner
 	inst   *fakeK3sInst
 	vpc    *fakeK3sVPC
@@ -49,8 +58,9 @@ type eksServiceFixture struct {
 
 func newEKSServiceFixture(t *testing.T) *eksServiceFixture {
 	t.Helper()
-	_, nc, js := testutil.StartTestJetStream(t)
-	kv, err := GetOrCreateAccountBucket(js, testAccountID)
+	_, nc, _ := testutil.StartTestJetStream(t)
+	js := testutil.NewJetStream(t, nc)
+	kv, err := GetOrCreateAccountBucket(t.Context(), js, testAccountID, 1)
 	require.NoError(t, err)
 
 	nlb := newFakeNLBProvisioner()
@@ -66,35 +76,44 @@ func newEKSServiceFixture(t *testing.T) *eksServiceFixture {
 	rt := newFakeRouteTableProvisioner()
 
 	svc, err := NewEKSServiceImpl(EKSServiceDeps{
-		NATSConn:         nc,
-		MasterKey:        bootstrapTestMasterKey,
-		GatewayBaseURL:   "https://gw.local:9999",
-		Region:           "us-east-1",
-		HolderID:         "node-1",
-		SystemGatewayURL: "https://gw.local:9999",
-		SystemAccessKey:  "AKIAEXAMPLE",
-		SystemSecretKey:  "s3cr3t-key",
-		GatewayCACert:    "-----BEGIN CERTIFICATE-----\nFAKECA\n-----END CERTIFICATE-----\n",
-		VPCSG:            sg,
-		VPCK3s:           vpc,
-		VPCSubnet:        fakeSubnetResolver{},
-		NLB:              nlb,
-		Instance:         inst,
-		Image:            ami,
-		EIP:              eip,
-		Worker:           worker,
-		VPCMgr:           vpcMgr,
-		IGW:              igw,
-		NATGW:            ngw,
-		RouteTable:       rt,
-		PlacementGroup:   &fakePlacer{},
-		Scheduler:        &fakeHostScheduler{},
+		NATSConn:            nc,
+		MasterKey:           bootstrapTestMasterKey,
+		GatewayBaseURL:      "https://gw.local:9999",
+		Region:              "us-east-1",
+		HolderID:            "node-1",
+		SystemGatewayURL:    "https://gw.local:9999",
+		SystemAccessKey:     "AKIAEXAMPLE",
+		SystemSecretKey:     "s3cr3t-key",
+		SystemPredastoreURL: "https://10.15.8.1:8443",
+		GatewayCACert:       "-----BEGIN CERTIFICATE-----\nFAKECA\n-----END CERTIFICATE-----\n",
+		VPCSG:               sg,
+		VPCK3s:              vpc,
+		VPCSubnet:           fakeSubnetResolver{},
+		IAM:                 newFakeEnsurer(),
+		NLB:                 nlb,
+		Instance:            inst,
+		Image:               ami,
+		EIP:                 eip,
+		Worker:              worker,
+		VPCMgr:              vpcMgr,
+		IGW:                 igw,
+		NATGW:               ngw,
+		RouteTable:          rt,
+		PlacementGroup:      &fakePlacer{},
+		Scheduler:           &fakeHostScheduler{},
 	})
 	require.NoError(t, err)
 	// Tight Ready-gating knobs so nodegroup launches resolve in tests without the
 	// production 10m timeout; tests drive meta.NodeCount to simulate the reconciler.
 	svc.nodegroupReadyTimeout = 1 * time.Second
 	svc.nodegroupReadyPoll = 2 * time.Millisecond
+	// Tight worker-launch-retry knobs so a launch-failure retry test resolves
+	// quickly instead of against the production 5m/10s budget.
+	svc.workerLaunchRetryTimeout = 100 * time.Millisecond
+	svc.workerLaunchRetryBackoff = 20 * time.Millisecond
+	// Tight boot-scan re-scan backoff so the eventually-consistent JetStream
+	// enumeration settles fast in tests instead of the production 100ms.
+	svc.spawnScanRetryBackoff = 2 * time.Millisecond
 	t.Cleanup(svc.Shutdown)
 
 	return &eksServiceFixture{svc: svc, kv: kv, nlb: nlb, inst: inst, vpc: vpc, ami: ami, eip: eip, sg: sg, worker: worker, vpcMgr: vpcMgr, igw: igw, ngw: ngw, rt: rt}
@@ -105,7 +124,7 @@ func newEKSServiceFixture(t *testing.T) *eksServiceFixture {
 // DeleteCluster exercises every teardown branch.
 type deleteClusterFixture struct {
 	svc  *EKSServiceImpl
-	kv   nats.KeyValue
+	kv   jetstream.KeyValue
 	nlb  *fakeNLBProvisioner
 	inst *fakeK3sInst
 	vpc  *fakeK3sVPC
@@ -127,17 +146,17 @@ func newDeleteClusterFixture(t *testing.T, clusterName string) *deleteClusterFix
 	meta.ResourcesVpcConfig.VpcId = "vpc-aaa"
 	meta.EgressEIPPublicIP = "203.0.113.50"
 	meta.EgressEIPAllocationID = "eipalloc-fake01"
-	require.NoError(t, PutClusterMeta(kv, meta))
+	require.NoError(t, PutClusterMeta(t.Context(), kv, meta))
 
 	// Real OIDC key so ZeroizeClusterOIDCKey has material to wipe.
-	_, _, err := GenerateClusterOIDCKeypair(kv, clusterName, bootstrapTestMasterKey)
+	_, _, err := GenerateClusterOIDCKeypair(t.Context(), kv, clusterName, bootstrapTestMasterKey)
 	require.NoError(t, err)
 
 	return &deleteClusterFixture{svc: f.svc, kv: kv, nlb: f.nlb, inst: f.inst, vpc: f.vpc, eip: f.eip, sg: f.sg}
 }
 
 // TestDeleteCluster_LeakedSGKeepsClusterDeleting guards the customer-VPC SG
-// no-orphan contract (mulga-siv-340): the cluster SGs live in the customer VPC,
+// no-orphan contract: the cluster SGs live in the customer VPC,
 // so a DeleteClusterSGs failure must surface and leave the cluster DELETING — its
 // meta intact for a retry — never complete deletion with an SG stranded that pins
 // the VPC on DependencyViolation. All other teardown steps succeed, isolating the
@@ -153,15 +172,15 @@ func TestDeleteCluster_LeakedSGKeepsClusterDeleting(t *testing.T) {
 	// A worker ENI never detaches — the SG delete keeps returning DependencyViolation.
 	f.sg.deleteErr = errors.New("DependencyViolation: resource has a dependent object")
 
-	_, err := f.svc.DeleteCluster(deleteInput("alpha"), testAccountID)
+	_, err := f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
 	require.Error(t, err, "a leaked customer-VPC SG must surface, not be swallowed")
 
-	meta, getErr := GetClusterMeta(f.kv, "alpha")
+	meta, getErr := GetClusterMeta(t.Context(), f.kv, "alpha")
 	require.NoError(t, getErr, "the KV sweep must NOT run while an SG is still leaked — meta must survive for retry")
 	assert.Equal(t, ClusterStatusDeleting, meta.Status, "a cluster with a leaked SG must stay DELETING")
 }
 
-// TestRLC5_DeleteClusterCPVPCReleasesNATGWEIPAfterRoutes locks the mulga-siv-303
+// TestRLC5_DeleteClusterCPVPCReleasesNATGWEIPAfterRoutes locks the
 // teardown order: route tables must be torn down before the NAT gateway, because
 // the NAT GW delete is guarded against live route forwards (rule #3). Deleting it
 // while the private route table still routes to it fails with DependencyViolation
@@ -171,21 +190,21 @@ func TestRLC5_DeleteClusterCPVPCReleasesNATGWEIPAfterRoutes(t *testing.T) {
 	f.ngw.routeGuard = f.rt
 	f.ngw.gws = []*fakeCPNatGateway{{
 		id:    "nat-cp",
-		tags:  map[string]string{clusterEKSClusterTagKey: "alpha", clusterEKSRoleTagKey: clusterEKSRoleCPNatGW},
+		tags:  map[string]string{clusterEKSClusterTagKey: "alpha", clusterEKSRoleTagKey: cpVPCRoles.NatGW},
 		state: "available",
 		addrs: []*ec2.NatGatewayAddress{{AllocationId: aws.String("eipalloc-cp")}},
 	}}
 	f.rt.tables = []*fakeCPRouteTable{{
 		id:   "rtb-cp",
 		vpc:  "vpc-cp",
-		tags: map[string]string{clusterEKSClusterTagKey: "alpha", clusterEKSRoleTagKey: clusterEKSRolePrivateRT},
+		tags: map[string]string{clusterEKSClusterTagKey: "alpha", clusterEKSRoleTagKey: cpVPCRoles.PrivateRT},
 	}}
 
-	require.NoError(t, DeleteClusterCPVPC(f.svc.cpVPCDeps(), testAccountID, "alpha"))
+	require.NoError(t, DeleteClusterCPVPC(context.Background(), f.svc.cpVPCDeps(), testAccountID, "alpha", nil))
 
 	require.Len(t, f.ngw.gws, 1)
 	assert.Equal(t, "deleted", f.ngw.gws[0].state, "NAT GW must delete after routes are cleared (rule #3 guard not tripped)")
-	require.Len(t, f.eip.releaseCalls, 1, "the NAT-GW EIP must be released, not stranded (mulga-siv-303)")
+	require.Len(t, f.eip.releaseCalls, 1, "the NAT-GW EIP must be released, not stranded")
 	assert.Equal(t, "eipalloc-cp", aws.StringValue(f.eip.releaseCalls[0].AllocationId))
 }
 
@@ -199,7 +218,7 @@ func TestRLC1_DeleteClusterCPVPCToleratesAbsentVPC(t *testing.T) {
 	cpVPC := []*fakeCPVPC{{
 		id:   "vpc-cp",
 		cidr: "10.0.0.0/16",
-		tags: map[string]string{clusterEKSClusterTagKey: "alpha", clusterEKSRoleTagKey: clusterEKSRoleCPVPC},
+		tags: map[string]string{clusterEKSClusterTagKey: "alpha", clusterEKSRoleTagKey: cpVPCRoles.VPC},
 	}}
 
 	t.Run("absent VPC (NotFound) converges to success", func(t *testing.T) {
@@ -207,7 +226,7 @@ func TestRLC1_DeleteClusterCPVPCToleratesAbsentVPC(t *testing.T) {
 		f.vpcMgr.vpcs = cpVPC
 		f.vpcMgr.deleteVpcErr = errors.New(awserrors.ErrorInvalidVpcIDNotFound)
 
-		require.NoErrorf(t, DeleteClusterCPVPC(f.svc.cpVPCDeps(), testAccountID, "alpha"),
+		require.NoErrorf(t, DeleteClusterCPVPC(context.Background(), f.svc.cpVPCDeps(), testAccountID, "alpha", nil),
 			"RLC rule #1: teardown must tolerate DeleteVpc NotFound (resource already gone), not abort")
 	})
 
@@ -216,7 +235,7 @@ func TestRLC1_DeleteClusterCPVPCToleratesAbsentVPC(t *testing.T) {
 		f.vpcMgr.vpcs = cpVPC
 		f.vpcMgr.deleteVpcErr = errors.New(awserrors.ErrorDependencyViolation)
 
-		err := DeleteClusterCPVPC(f.svc.cpVPCDeps(), testAccountID, "alpha")
+		err := DeleteClusterCPVPC(context.Background(), f.svc.cpVPCDeps(), testAccountID, "alpha", nil)
 		require.Error(t, err, "a non-NotFound DeleteVpc failure must surface so the teardown backstop retries")
 		assert.Contains(t, err.Error(), awserrors.ErrorDependencyViolation)
 	})
@@ -225,17 +244,17 @@ func TestRLC1_DeleteClusterCPVPCToleratesAbsentVPC(t *testing.T) {
 func TestDeleteCluster_AllTeardownSucceedsSweepsKV(t *testing.T) {
 	f := newDeleteClusterFixture(t, "alpha")
 
-	out, err := f.svc.DeleteCluster(deleteInput("alpha"), testAccountID)
+	out, err := f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
 	require.NoError(t, err)
 	require.NotNil(t, out)
 
-	_, err = GetClusterMeta(f.kv, "alpha")
+	_, err = GetClusterMeta(t.Context(), f.kv, "alpha")
 	assert.ErrorIs(t, err, ErrClusterNotFound, "meta must be swept after successful teardown")
 	assert.Len(t, f.inst.terminateCalls, 1)
 	assert.Len(t, f.vpc.deleteCalls, 1)
 }
 
-// TestDeleteCluster_DetachesPrivateEndpointENIBeforeDelete locks the mulga-siv-301
+// TestDeleteCluster_DetachesPrivateEndpointENIBeforeDelete locks the
 // teardown fix: the Set A private-endpoint ENI is an extra NIC on the cluster NLB's
 // LB VM, not that VM's primary ENI, so the instance-terminate cascade never reclaims
 // it. purgeClusterInfra must detach (store-clear) the stale attachment before
@@ -245,18 +264,18 @@ func TestDeleteCluster_AllTeardownSucceedsSweepsKV(t *testing.T) {
 func TestDeleteCluster_DetachesPrivateEndpointENIBeforeDelete(t *testing.T) {
 	f := newDeleteClusterFixture(t, "alpha")
 
-	meta, err := GetClusterMeta(f.kv, "alpha")
+	meta, err := GetClusterMeta(t.Context(), f.kv, "alpha")
 	require.NoError(t, err)
 	meta.PrivateEndpointENIID = "eni-pe-001"
-	require.NoError(t, PutClusterMeta(f.kv, meta))
+	require.NoError(t, PutClusterMeta(t.Context(), f.kv, meta))
 	f.vpc.inUseUntilDetached = map[string]bool{"eni-pe-001": true}
 
-	out, err := f.svc.DeleteCluster(deleteInput("alpha"), testAccountID)
+	out, err := f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
 	require.NoError(t, err, "teardown must complete: the private-endpoint ENI is detached before delete")
 	require.NotNil(t, out)
 
 	assert.Contains(t, f.vpc.detachCalls, "eni-pe-001", "private-endpoint ENI must be detached before delete")
-	_, getErr := GetClusterMeta(f.kv, "alpha")
+	_, getErr := GetClusterMeta(t.Context(), f.kv, "alpha")
 	assert.ErrorIs(t, getErr, ErrClusterNotFound, "successful teardown must sweep the meta")
 }
 
@@ -271,10 +290,10 @@ func TestDeleteCluster_NLBFailureLeavesMetaAndDELETING(t *testing.T) {
 	}
 	f.nlb.deleteLBErr = errors.New("elbv2 unavailable")
 
-	_, err := f.svc.DeleteCluster(deleteInput("alpha"), testAccountID)
+	_, err := f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
 	require.Error(t, err, "teardown failure must surface, not be swallowed")
 
-	meta, getErr := GetClusterMeta(f.kv, "alpha")
+	meta, getErr := GetClusterMeta(t.Context(), f.kv, "alpha")
 	require.NoError(t, getErr, "meta must survive so a retry can find the resource ARNs")
 	assert.Equal(t, ClusterStatusDeleting, meta.Status)
 	assert.NotEmpty(t, meta.NLBArn, "NLB ARN must remain recorded for retry")
@@ -284,10 +303,10 @@ func TestDeleteCluster_VMTerminateFailureLeavesMeta(t *testing.T) {
 	f := newDeleteClusterFixture(t, "alpha")
 	f.inst.terminateErr = errors.New("hypervisor unreachable")
 
-	_, err := f.svc.DeleteCluster(deleteInput("alpha"), testAccountID)
+	_, err := f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
 	require.Error(t, err)
 
-	meta, getErr := GetClusterMeta(f.kv, "alpha")
+	meta, getErr := GetClusterMeta(t.Context(), f.kv, "alpha")
 	require.NoError(t, getErr)
 	assert.Equal(t, ClusterStatusDeleting, meta.Status)
 }
@@ -299,12 +318,12 @@ func TestDeleteCluster_EgressEIPAlreadyReleasedSweepsKV(t *testing.T) {
 	f := newDeleteClusterFixture(t, "alpha")
 	f.eip.releaseErr = errors.New(awserrors.ErrorInvalidAllocationIDNotFound)
 
-	out, err := f.svc.DeleteCluster(deleteInput("alpha"), testAccountID)
+	out, err := f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
 	require.NoError(t, err)
 	require.NotNil(t, out)
 
 	require.Len(t, f.eip.releaseCalls, 1, "release must still be attempted")
-	_, getErr := GetClusterMeta(f.kv, "alpha")
+	_, getErr := GetClusterMeta(t.Context(), f.kv, "alpha")
 	assert.ErrorIs(t, getErr, ErrClusterNotFound, "NotFound release must not block the KV sweep")
 }
 
@@ -314,16 +333,16 @@ func TestDeleteCluster_EgressEIPReleaseRealErrorLeavesMeta(t *testing.T) {
 	f := newDeleteClusterFixture(t, "alpha")
 	f.eip.releaseErr = errors.New("AddressLimitExceeded")
 
-	_, err := f.svc.DeleteCluster(deleteInput("alpha"), testAccountID)
+	_, err := f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
 	require.Error(t, err)
 
-	meta, getErr := GetClusterMeta(f.kv, "alpha")
+	meta, getErr := GetClusterMeta(t.Context(), f.kv, "alpha")
 	require.NoError(t, getErr)
 	assert.Equal(t, ClusterStatusDeleting, meta.Status)
 	assert.NotEmpty(t, meta.EgressEIPAllocationID, "alloc ID must remain for retry")
 }
 
-// TestDeleteClusterSingleFlightLoserSkipsTeardown locks mulga-siv-295.12: when a
+// TestDeleteClusterSingleFlightLoserSkipsTeardown locks the contract: when a
 // concurrent handler already holds the per-cluster teardown lease (an SDK retry
 // fanned to another worker), DeleteCluster must return the cluster as DELETING
 // without running purgeClusterInfra — no duplicate ENI/NLB/EIP teardown — and
@@ -332,10 +351,10 @@ func TestDeleteClusterSingleFlightLoserSkipsTeardown(t *testing.T) {
 	f := newDeleteClusterFixture(t, "alpha")
 
 	// Stand in for the winning handler: hold the teardown lease.
-	_, err := f.svc.leaderKV.Create(teardownLeaderKey(testAccountID, "alpha"), []byte("node-2"))
+	_, err := f.svc.leaderKV.Create(t.Context(), teardownLeaderKey(testAccountID, "alpha"), []byte("node-2"))
 	require.NoError(t, err)
 
-	out, err := f.svc.DeleteCluster(deleteInput("alpha"), testAccountID)
+	out, err := f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
 	require.NoError(t, err)
 	require.NotNil(t, out.Cluster)
 	assert.Equal(t, string(ClusterStatusDeleting), aws.StringValue(out.Cluster.Status),
@@ -344,7 +363,7 @@ func TestDeleteClusterSingleFlightLoserSkipsTeardown(t *testing.T) {
 	assert.Empty(t, f.inst.terminateCalls, "the loser must not terminate the CP VM — the lease holder owns the teardown")
 	assert.Empty(t, f.eip.releaseCalls, "the loser must not release the billable EIP")
 
-	meta, getErr := GetClusterMeta(f.kv, "alpha")
+	meta, getErr := GetClusterMeta(t.Context(), f.kv, "alpha")
 	require.NoError(t, getErr, "the loser must leave the meta for the lease holder to sweep")
 	assert.Equal(t, ClusterStatusCreating, meta.Status, "the loser must not mutate KV state; the winner owns the DELETING transition")
 }
@@ -355,14 +374,27 @@ func TestDeleteClusterSingleFlightLoserSkipsTeardown(t *testing.T) {
 func TestDeleteClusterWinnerReleasesTeardownLease(t *testing.T) {
 	f := newDeleteClusterFixture(t, "alpha")
 
-	_, err := f.svc.DeleteCluster(deleteInput("alpha"), testAccountID)
+	_, err := f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
 	require.NoError(t, err)
 
-	_, getErr := f.svc.leaderKV.Get(teardownLeaderKey(testAccountID, "alpha"))
-	assert.ErrorIs(t, getErr, nats.ErrKeyNotFound, "the teardown lease must be released after a successful delete")
+	_, getErr := f.svc.leaderKV.Get(t.Context(), teardownLeaderKey(testAccountID, "alpha"))
+	assert.ErrorIs(t, getErr, jetstream.ErrKeyNotFound, "the teardown lease must be released after a successful delete")
 }
 
-// TestDeleteCluster_ManagedCPVPCReclaimsCustomerVPCSGs guards mulga-siv-419: in
+func TestTeardownLeaseReleaseSurvivesCallerCancellation(t *testing.T) {
+	f := newDeleteClusterFixture(t, "alpha")
+	ctx, cancel := context.WithCancel(t.Context())
+
+	release, acquired := f.svc.acquireTeardownLease(ctx, testAccountID, "alpha")
+	require.True(t, acquired)
+	cancel()
+	release()
+
+	_, err := f.svc.leaderKV.Get(t.Context(), teardownLeaderKey(testAccountID, "alpha"))
+	require.ErrorIs(t, err, jetstream.ErrKeyNotFound)
+}
+
+// TestDeleteCluster_ManagedCPVPCReclaimsCustomerVPCSGs guards the contract: in
 // the managed control-plane VPC topology the nodegroup's worker-side security
 // groups are created by launchNodegroupInfra in the CUSTOMER VPC
 // (ResourcesVpcConfig.VpcId), not the managed CP VPC. Teardown must reclaim them
@@ -371,16 +403,16 @@ func TestDeleteClusterWinnerReleasesTeardownLease(t *testing.T) {
 func TestDeleteCluster_ManagedCPVPCReclaimsCustomerVPCSGs(t *testing.T) {
 	f := newDeleteClusterFixture(t, "alpha")
 
-	meta, err := GetClusterMeta(f.kv, "alpha")
+	meta, err := GetClusterMeta(t.Context(), f.kv, "alpha")
 	require.NoError(t, err)
 	meta.ManagedCPVPC = &ManagedCPVPC{VpcId: "vpc-cp"}
-	require.NoError(t, PutClusterMeta(f.kv, meta))
+	require.NoError(t, PutClusterMeta(t.Context(), f.kv, meta))
 
 	// Worker-side SGs created in the customer VPC (vpc-aaa) by launchNodegroupInfra.
 	f.sg.existing["eks-cluster-alpha-control-plane-sg|vpc-aaa"] = "sg-cust-cp"
 	f.sg.existing["eks-cluster-alpha-nodegroup-sg|vpc-aaa"] = "sg-cust-ng"
 
-	_, err = f.svc.DeleteCluster(deleteInput("alpha"), testAccountID)
+	_, err = f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
 	require.NoError(t, err)
 
 	var deleted []string
@@ -389,4 +421,115 @@ func TestDeleteCluster_ManagedCPVPCReclaimsCustomerVPCSGs(t *testing.T) {
 	}
 	assert.Contains(t, deleted, "sg-cust-cp", "customer-VPC control-plane SG must be reclaimed on teardown")
 	assert.Contains(t, deleted, "sg-cust-ng", "customer-VPC nodegroup SG must be reclaimed on teardown")
+}
+
+// TestDeleteCluster_ManagedCPVPCAlreadyGoneClearsStateRecord locks the
+// Teardown is idempotent when the managed CP VPC is already
+// gone (its tag-indexed EC2 record is absent — the "InvalidVpcID.NotFound"
+// case confirmed live), DeleteClusterCPVPC converges to success, and the
+// internal cp-vpc state record (meta.ManagedCPVPC) must be cleared right away —
+// even while an unrelated step (here, the NLB delete) keeps failing and the
+// overall teardown still surfaces an error. Without this, every re-drive keeps
+// retrying SG/VPC API calls against the stale VpcId, which is what turns a
+// single failure into the reaper's permanent "DependencyViolation" loop. A
+// later re-drive, once the unrelated failure clears, must then fully converge.
+func TestDeleteCluster_ManagedCPVPCAlreadyGoneClearsStateRecord(t *testing.T) {
+	f := newDeleteClusterFixture(t, "alpha")
+
+	meta, err := GetClusterMeta(t.Context(), f.kv, "alpha")
+	require.NoError(t, err)
+	meta.ManagedCPVPC = &ManagedCPVPC{VpcId: "vpc-cp-gone", PublicSubnetId: "subnet-cp-pub"}
+	require.NoError(t, PutClusterMeta(t.Context(), f.kv, meta))
+
+	// The CP VPC's own EC2 record is already gone: f.vpcMgr has nothing tagged
+	// for "alpha", so DeleteClusterCPVPC's describe-by-tag finds zero VPCs and
+	// converges to success. An unrelated NLB failure must still surface.
+	lbName := ClusterNLBName("alpha")
+	f.nlb.lbByName[lbName] = &elbv2.LoadBalancer{
+		LoadBalancerArn:  aws.String("arn:lb"),
+		LoadBalancerName: aws.String(lbName),
+	}
+	f.nlb.deleteLBErr = errors.New("elbv2 unavailable")
+
+	_, err = f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
+	require.Error(t, err, "the unrelated NLB failure must still surface")
+
+	stuck, getErr := GetClusterMeta(t.Context(), f.kv, "alpha")
+	require.NoError(t, getErr, "meta must survive for retry")
+	assert.Equal(t, ClusterStatusDeleting, stuck.Status)
+	assert.Nil(t, stuck.ManagedCPVPC,
+		"the internal cp-vpc state record must be cleared once its VPC converges to deleted, independent of the NLB failure")
+
+	// Re-drive: the NLB failure clears, teardown must now fully converge —
+	// and must NOT re-attempt any CP-VPC/SG calls against the stale VpcId,
+	// since the state record is already cleared.
+	f.nlb.deleteLBErr = nil
+	_, err = f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
+	require.NoError(t, err, "the re-drive must converge to fully deleted")
+
+	_, getErr = GetClusterMeta(t.Context(), f.kv, "alpha")
+	assert.ErrorIs(t, getErr, ErrClusterNotFound, "meta must be swept once teardown converges")
+}
+
+// subscribeVPCDelete subscribes to the vpc.delete OVN-GC signal and returns a
+// getter that blocks for (and unmarshals) the next message's vpc_id.
+func subscribeVPCDelete(t *testing.T, nc *nats.Conn) func() string {
+	t.Helper()
+	sub, err := nc.SubscribeSync("vpc.delete")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+	return func() string {
+		t.Helper()
+		msg, err := sub.NextMsg(2 * time.Second)
+		require.NoError(t, err, "expected a vpc.delete OVN-GC event")
+		var evt struct {
+			VpcId string `json:"vpc_id"`
+		}
+		require.NoError(t, json.Unmarshal(msg.Data, &evt))
+		return evt.VpcId
+	}
+}
+
+// TestDeleteClusterCPVPC_OVNGCSelection locks the OVN-GC half of the
+// DeleteClusterCPVPC must republish vpc.delete for the CP
+// VPC so vpcd's topology manager gets another chance to remove the orphaned
+// logical router/subnets/egress-drop policies — both when the EC2 VPC is
+// actually deleted this call, and when it was already gone, where the only
+// surviving reference to its identity is the caller's persisted ManagedCPVPC
+// record (knownRefs). With no known record at all, there is nothing to GC.
+func TestDeleteClusterCPVPC_OVNGCSelection(t *testing.T) {
+	t.Run("VPC deleted this call: GC targets the live vpc id", func(t *testing.T) {
+		f := newEKSServiceFixture(t)
+		f.vpcMgr.vpcs = []*fakeCPVPC{{
+			id:   "vpc-cp-live",
+			cidr: "10.0.0.0/16",
+			tags: map[string]string{clusterEKSClusterTagKey: "alpha", clusterEKSRoleTagKey: cpVPCRoles.VPC},
+		}}
+		nextVPCID := subscribeVPCDelete(t, f.svc.deps.NATSConn)
+
+		require.NoError(t, DeleteClusterCPVPC(context.Background(), f.svc.cpVPCDeps(), testAccountID, "alpha", nil))
+		assert.Equal(t, "vpc-cp-live", nextVPCID())
+	})
+
+	t.Run("VPC already gone: GC falls back to the persisted state record", func(t *testing.T) {
+		f := newEKSServiceFixture(t) // vpcMgr has nothing tagged — already gone
+		nextVPCID := subscribeVPCDelete(t, f.svc.deps.NATSConn)
+
+		knownRefs := &ManagedCPVPC{VpcId: "vpc-cp-orphaned"}
+		require.NoError(t, DeleteClusterCPVPC(context.Background(), f.svc.cpVPCDeps(), testAccountID, "alpha", knownRefs))
+		assert.Equal(t, "vpc-cp-orphaned", nextVPCID())
+	})
+
+	t.Run("VPC already gone, no known record: nothing to GC, no event published", func(t *testing.T) {
+		f := newEKSServiceFixture(t)
+		sub, err := f.svc.deps.NATSConn.SubscribeSync("vpc.delete")
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+		require.NoError(t, DeleteClusterCPVPC(context.Background(), f.svc.cpVPCDeps(), testAccountID, "alpha", nil))
+		require.NoError(t, f.svc.deps.NATSConn.Flush())
+
+		_, err = sub.NextMsg(50 * time.Millisecond)
+		assert.ErrorIs(t, err, nats.ErrTimeout, "no known vpc id: nothing to GC, must not publish")
+	})
 }

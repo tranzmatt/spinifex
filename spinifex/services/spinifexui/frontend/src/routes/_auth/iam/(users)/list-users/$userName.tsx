@@ -1,6 +1,6 @@
-import type { AccessKeyMetadata, AttachedPolicy } from "@aws-sdk/client-iam"
+import type { AccessKeyMetadata, Group } from "@aws-sdk/client-iam"
 import { useSuspenseQuery } from "@tanstack/react-query"
-import { createFileRoute, useNavigate } from "@tanstack/react-router"
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router"
 import { Trash2 } from "lucide-react"
 import { useState } from "react"
 
@@ -14,21 +14,24 @@ import { StateBadge } from "@/components/state-badge"
 import { Button } from "@/components/ui/button"
 import { formatDateTime } from "@/lib/utils"
 import {
-  useAttachUserPolicy,
   useCreateAccessKey,
   useDeleteAccessKey,
   useDeleteUser,
-  useDetachUserPolicy,
+  useRemoveUserFromGroup,
   useUpdateAccessKey,
 } from "@/mutations/iam"
 import {
   iamAccessKeysQueryOptions,
   iamAttachedUserPoliciesQueryOptions,
+  iamGroupsForUserQueryOptions,
   iamPoliciesQueryOptions,
+  iamUserPoliciesQueryOptions,
   iamUserQueryOptions,
 } from "@/queries/iam"
 
 import { AccessKeyModal } from "../../-components/access-key-modal"
+import { AttachedPoliciesPanel } from "../../-components/attached-policies-panel"
+import { InlinePoliciesPanel } from "../../-components/inline-policies-panel"
 
 export const Route = createFileRoute("/_auth/iam/(users)/list-users/$userName")(
   {
@@ -44,6 +47,12 @@ export const Route = createFileRoute("/_auth/iam/(users)/list-users/$userName")(
           iamAttachedUserPoliciesQueryOptions(params.userName),
         ),
         context.queryClient.ensureQueryData(iamPoliciesQueryOptions),
+        context.queryClient.ensureQueryData(
+          iamGroupsForUserQueryOptions(params.userName),
+        ),
+        context.queryClient.ensureQueryData(
+          iamUserPoliciesQueryOptions(params.userName),
+        ),
       ])
     },
     head: ({ params }) => ({
@@ -60,38 +69,29 @@ function UserDetail() {
   const { data: accessKeysData } = useSuspenseQuery(
     iamAccessKeysQueryOptions(userName),
   )
-  const { data: attachedPoliciesData } = useSuspenseQuery(
-    iamAttachedUserPoliciesQueryOptions(userName),
+  const { data: groupsData } = useSuspenseQuery(
+    iamGroupsForUserQueryOptions(userName),
   )
-  const { data: allPoliciesData } = useSuspenseQuery(iamPoliciesQueryOptions)
 
   const deleteMutation = useDeleteUser()
   const createAccessKeyMutation = useCreateAccessKey()
   const deleteAccessKeyMutation = useDeleteAccessKey()
   const updateAccessKeyMutation = useUpdateAccessKey()
-  const attachPolicyMutation = useAttachUserPolicy()
-  const detachPolicyMutation = useDetachUserPolicy()
+  const removeFromGroupMutation = useRemoveUserFromGroup()
 
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [newAccessKey, setNewAccessKey] = useState<{
     accessKeyId: string
     secretAccessKey: string
   } | null>(null)
-  const [showAttachSelect, setShowAttachSelect] = useState(false)
   const [pendingKeyAction, setPendingKeyAction] = useState<string | null>(null)
-  const [pendingPolicyAction, setPendingPolicyAction] = useState<string | null>(
+  const [pendingGroupAction, setPendingGroupAction] = useState<string | null>(
     null,
   )
 
   const user = userData.User
   const accessKeys = accessKeysData.AccessKeyMetadata ?? []
-  const attachedPolicies = attachedPoliciesData.AttachedPolicies ?? []
-  const allPolicies = allPoliciesData.Policies ?? []
-
-  const attachedArns = new Set(attachedPolicies.map((p) => p.PolicyArn))
-  const availablePolicies = allPolicies.filter(
-    (p) => p.Arn && !attachedArns.has(p.Arn),
-  )
+  const groups = groupsData.Groups ?? []
 
   const handleDelete = async () => {
     try {
@@ -137,17 +137,12 @@ function UserDetail() {
     }
   }
 
-  const handleAttachPolicy = async (policyArn: string) => {
-    await attachPolicyMutation.mutateAsync({ userName, policyArn })
-    setShowAttachSelect(false)
-  }
-
-  const handleDetachPolicy = async (policyArn: string) => {
-    setPendingPolicyAction(policyArn)
+  const handleRemoveFromGroup = async (groupName: string) => {
+    setPendingGroupAction(groupName)
     try {
-      await detachPolicyMutation.mutateAsync({ userName, policyArn })
+      await removeFromGroupMutation.mutateAsync({ groupName, userName })
     } finally {
-      setPendingPolicyAction(null)
+      setPendingGroupAction(null)
     }
   }
 
@@ -179,16 +174,10 @@ function UserDetail() {
           msg="Failed to delete access key"
         />
       )}
-      {attachPolicyMutation.error && (
+      {removeFromGroupMutation.error && (
         <ErrorBanner
-          error={attachPolicyMutation.error}
-          msg="Failed to attach policy"
-        />
-      )}
-      {detachPolicyMutation.error && (
-        <ErrorBanner
-          error={detachPolicyMutation.error}
-          msg="Failed to detach policy"
+          error={removeFromGroupMutation.error}
+          msg="Failed to remove from group"
         />
       )}
 
@@ -286,83 +275,46 @@ function UserDetail() {
           </DetailCard.Content>
         </DetailCard>
 
-        {/* Attached Policies */}
+        <AttachedPoliciesPanel kind="user" name={userName} />
+
+        <InlinePoliciesPanel kind="user" name={userName} />
+
+        {/* Groups */}
         <DetailCard>
-          <DetailCard.Header>
-            <div className="flex items-center justify-between">
-              <span>Attached Policies</span>
-              <Button
-                onClick={() => setShowAttachSelect(!showAttachSelect)}
-                size="sm"
-              >
-                Attach Policy
-              </Button>
-            </div>
-          </DetailCard.Header>
+          <DetailCard.Header>Groups</DetailCard.Header>
           <DetailCard.Content>
-            {showAttachSelect && availablePolicies.length > 0 && (
-              <div className="col-span-2 space-y-2 rounded-md border p-3">
-                <p className="text-sm font-medium">
-                  Select a policy to attach:
-                </p>
-                <div className="space-y-1">
-                  {availablePolicies.map((policy) => (
-                    <button
-                      className="flex w-full items-center justify-between rounded-md p-2 text-left text-sm hover:bg-accent"
-                      disabled={attachPolicyMutation.isPending}
-                      key={policy.Arn}
-                      onClick={() => {
-                        if (policy.Arn) {
-                          void handleAttachPolicy(policy.Arn)
-                        }
-                      }}
-                      type="button"
-                    >
-                      <span>{policy.PolicyName}</span>
-                      <span className="text-xs text-muted-foreground">
-                        {policy.Arn}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-            {showAttachSelect && availablePolicies.length === 0 && (
-              <p className="col-span-2 text-sm text-muted-foreground">
-                No policies available to attach.
-              </p>
-            )}
-            {attachedPolicies.length > 0 ? (
+            {groups.length > 0 ? (
               <div className="col-span-2 space-y-3">
-                {attachedPolicies.map((policy: AttachedPolicy) => (
+                {groups.map((group: Group) => (
                   <div
                     className="flex items-center justify-between rounded-md border p-3"
-                    key={policy.PolicyArn}
+                    key={group.GroupName}
                   >
-                    <div className="space-y-1">
-                      <p className="text-sm font-medium">{policy.PolicyName}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {policy.PolicyArn}
-                      </p>
-                    </div>
+                    <Link
+                      className="text-sm font-medium hover:underline"
+                      params={{ groupName: group.GroupName ?? "" }}
+                      to="/iam/list-groups/$groupName"
+                    >
+                      {group.GroupName}
+                    </Link>
                     <Button
-                      disabled={pendingPolicyAction === policy.PolicyArn}
+                      disabled={pendingGroupAction === group.GroupName}
                       onClick={() => {
-                        if (policy.PolicyArn) {
-                          void handleDetachPolicy(policy.PolicyArn)
+                        if (group.GroupName) {
+                          void handleRemoveFromGroup(group.GroupName)
                         }
                       }}
                       size="sm"
                       variant="outline"
                     >
-                      Detach
+                      Remove
                     </Button>
                   </div>
                 ))}
               </div>
             ) : (
               <p className="col-span-2 text-sm text-muted-foreground">
-                No attached policies.
+                Not a member of any group.
               </p>
             )}
           </DetailCard.Content>

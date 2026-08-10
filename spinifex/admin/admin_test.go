@@ -11,9 +11,27 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// certHasIP reports whether a PEM-encoded cert carries ip as an IP SAN.
+func certHasIP(t *testing.T, certPath, ip string) bool {
+	t.Helper()
+	certPEM, err := os.ReadFile(certPath)
+	require.NoError(t, err)
+	block, _ := pem.Decode(certPEM)
+	require.NotNil(t, block)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	require.NoError(t, err)
+	for _, got := range cert.IPAddresses {
+		if got.Equal(net.ParseIP(ip)) {
+			return true
+		}
+	}
+	return false
+}
 
 // --- Key / Token generation ---
 
@@ -222,7 +240,7 @@ func TestSetupAWSCredentials_CreatesFiles(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 
-	err := SetupAWSCredentials("AKIATEST123", "secret123", "us-east-1", "/path/to/ca.pem", "", "")
+	err := SetupAWSCredentials("AKIATEST123", "secret123", "us-east-1", "/path/to/ca.pem", "")
 	require.NoError(t, err)
 
 	credData, _ := os.ReadFile(filepath.Join(dir, ".aws", "credentials"))
@@ -245,7 +263,7 @@ func TestSetupAWSCredentials_PreservesExistingProfiles(t *testing.T) {
 		"aws_access_key_id": "EXISTING_KEY",
 	}))
 
-	err := SetupAWSCredentials("NEWAKEY", "NEWSECRET", "us-west-2", "/ca.pem", "", "")
+	err := SetupAWSCredentials("NEWAKEY", "NEWSECRET", "us-west-2", "/ca.pem", "")
 	require.NoError(t, err)
 
 	data, _ := os.ReadFile(filepath.Join(awsDir, "credentials"))
@@ -258,7 +276,7 @@ func TestSetupAWSCredentials_UsesBindIP(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 
-	err := SetupAWSCredentials("AKIATEST123", "secret123", "us-east-1", "/ca.pem", "10.11.12.1", "")
+	err := SetupAWSCredentials("AKIATEST123", "secret123", "us-east-1", "/ca.pem", "10.11.12.1")
 	require.NoError(t, err)
 
 	configData, _ := os.ReadFile(filepath.Join(dir, ".aws", "config"))
@@ -270,11 +288,37 @@ func TestSetupAWSCredentials_FallsBackToLocalhostForWildcard(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 
-	err := SetupAWSCredentials("AKIATEST123", "secret123", "us-east-1", "/ca.pem", "0.0.0.0", "")
+	err := SetupAWSCredentials("AKIATEST123", "secret123", "us-east-1", "/ca.pem", "0.0.0.0")
 	require.NoError(t, err)
 
 	configData, _ := os.ReadFile(filepath.Join(dir, ".aws", "config"))
 	assert.Contains(t, string(configData), "https://localhost:9999")
+}
+
+// On a --force re-init the preserve path passes empty admin credentials: the
+// existing ~/.aws/credentials must be left intact while ~/.aws/config is still
+// refreshed (endpoint/CA for a changed bind IP).
+func TestSetupAWSCredentials_EmptyCredsRefreshesConfigOnly(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	awsDir := filepath.Join(dir, ".aws")
+	require.NoError(t, os.MkdirAll(awsDir, 0700))
+	require.NoError(t, UpdateAWSINIFile(filepath.Join(awsDir, "credentials"), "spinifex", map[string]string{
+		"aws_access_key_id":     "PRESERVED_KEY",
+		"aws_secret_access_key": "PRESERVED_SECRET",
+	}))
+
+	err := SetupAWSCredentials("", "", "ap-southeast-2", "/new/ca.pem", "10.11.12.5")
+	require.NoError(t, err)
+
+	credData, _ := os.ReadFile(filepath.Join(awsDir, "credentials"))
+	assert.Contains(t, string(credData), "PRESERVED_KEY", "existing admin credentials must be preserved on re-init")
+	assert.Contains(t, string(credData), "PRESERVED_SECRET")
+
+	configData, _ := os.ReadFile(filepath.Join(awsDir, "config"))
+	assert.Contains(t, string(configData), "https://10.11.12.5:9999", "config endpoint must be refreshed")
+	assert.Contains(t, string(configData), "/new/ca.pem")
 }
 
 // --- Certificate generation ---
@@ -326,7 +370,7 @@ func TestGenerateSignedCert(t *testing.T) {
 		certPath := filepath.Join(dir, "server.pem")
 		keyPath := filepath.Join(dir, "server.key")
 
-		require.NoError(t, GenerateSignedCert(certPath, keyPath, caCertPath, caKeyPath))
+		require.NoError(t, GenerateSignedCert(certPath, keyPath, caCertPath, caKeyPath, nil, nil))
 
 		certPEM, _ := os.ReadFile(certPath)
 		block, _ := pem.Decode(certPEM)
@@ -368,7 +412,7 @@ func TestGenerateSignedCert(t *testing.T) {
 		certPath := filepath.Join(dir, "server.pem")
 		keyPath := filepath.Join(dir, "server.key")
 
-		require.NoError(t, GenerateSignedCert(certPath, keyPath, caCertPath, caKeyPath, "192.168.1.100"))
+		require.NoError(t, GenerateSignedCert(certPath, keyPath, caCertPath, caKeyPath, []string{"192.168.1.100"}, nil))
 
 		certPEM, _ := os.ReadFile(certPath)
 		block, _ := pem.Decode(certPEM)
@@ -389,7 +433,7 @@ func TestGenerateSignedCert(t *testing.T) {
 		certPath := filepath.Join(dir, "server.pem")
 		keyPath := filepath.Join(dir, "server.key")
 
-		require.NoError(t, GenerateSignedCert(certPath, keyPath, caCertPath, caKeyPath, "127.0.0.1", "::1", "0.0.0.0", ""))
+		require.NoError(t, GenerateSignedCert(certPath, keyPath, caCertPath, caKeyPath, []string{"127.0.0.1", "::1", "0.0.0.0", ""}, nil))
 
 		certPEM, _ := os.ReadFile(certPath)
 		block, _ := pem.Decode(certPEM)
@@ -401,12 +445,12 @@ func TestGenerateSignedCert(t *testing.T) {
 		baseDir := t.TempDir()
 		baseCert := filepath.Join(baseDir, "server.pem")
 		baseKey := filepath.Join(baseDir, "server.key")
-		require.NoError(t, GenerateSignedCert(baseCert, baseKey, caCertPath, caKeyPath))
+		require.NoError(t, GenerateSignedCert(baseCert, baseKey, caCertPath, caKeyPath, nil, nil))
 		basePEM, _ := os.ReadFile(baseCert)
 		baseBlock, _ := pem.Decode(basePEM)
 		baseParsed, _ := x509.ParseCertificate(baseBlock.Bytes)
 
-		assert.Equal(t, len(baseParsed.IPAddresses), len(cert.IPAddresses),
+		assert.Len(t, cert.IPAddresses, len(baseParsed.IPAddresses),
 			"passing duplicate/special IPs should not add extra entries")
 	})
 
@@ -416,7 +460,7 @@ func TestGenerateSignedCert(t *testing.T) {
 		badCACert := filepath.Join(dir, "bad-ca.pem")
 		require.NoError(t, os.WriteFile(badCACert, []byte("not-a-cert"), 0600))
 
-		err := GenerateSignedCert(filepath.Join(dir, "s.pem"), filepath.Join(dir, "s.key"), badCACert, caKeyPath)
+		err := GenerateSignedCert(filepath.Join(dir, "s.pem"), filepath.Join(dir, "s.key"), badCACert, caKeyPath, nil, nil)
 		assert.Error(t, err)
 	})
 }
@@ -452,7 +496,7 @@ func TestDiscoverHostname(t *testing.T) {
 	}
 }
 
-func TestGenerateSignedCertWithDNS_DedupDNS(t *testing.T) {
+func TestGenerateSignedCert_DedupDNS(t *testing.T) {
 	t.Parallel()
 	caDir := t.TempDir()
 	caCertPath := filepath.Join(caDir, "ca.pem")
@@ -466,7 +510,7 @@ func TestGenerateSignedCertWithDNS_DedupDNS(t *testing.T) {
 	// Pass "localhost" as extra DNS — should not duplicate the built-in entry.
 	// Also pass empty strings and duplicates — should be ignored.
 	extraDNS := []string{"localhost", "", "example.local", "example.local", ""}
-	require.NoError(t, GenerateSignedCertWithDNS(certPath, keyPath, caCertPath, caKeyPath, nil, extraDNS))
+	require.NoError(t, GenerateSignedCert(certPath, keyPath, caCertPath, caKeyPath, nil, extraDNS))
 
 	certPEM, _ := os.ReadFile(certPath)
 	block, _ := pem.Decode(certPEM)
@@ -488,7 +532,7 @@ func TestGenerateSignedCertWithDNS_DedupDNS(t *testing.T) {
 	assert.Contains(t, cert.DNSNames, "example.local")
 }
 
-func TestGenerateSignedCertWithDNS_NilSlices(t *testing.T) {
+func TestGenerateSignedCert_NilSlices(t *testing.T) {
 	t.Parallel()
 	caDir := t.TempDir()
 	caCertPath := filepath.Join(caDir, "ca.pem")
@@ -500,7 +544,7 @@ func TestGenerateSignedCertWithDNS_NilSlices(t *testing.T) {
 	keyPath := filepath.Join(dir, "server.key")
 
 	// Both slices nil — should still produce a valid cert with defaults.
-	require.NoError(t, GenerateSignedCertWithDNS(certPath, keyPath, caCertPath, caKeyPath, nil, nil))
+	require.NoError(t, GenerateSignedCert(certPath, keyPath, caCertPath, caKeyPath, nil, nil))
 
 	certPEM, _ := os.ReadFile(certPath)
 	block, _ := pem.Decode(certPEM)
@@ -510,12 +554,12 @@ func TestGenerateSignedCertWithDNS_NilSlices(t *testing.T) {
 	assert.GreaterOrEqual(t, len(cert.IPAddresses), 2, "should have at least loopback IPs")
 }
 
-func TestGenerateSignedCertWithDNS_InvalidCA(t *testing.T) {
+func TestGenerateSignedCert_InvalidCA(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 
 	// Missing CA cert file.
-	err := GenerateSignedCertWithDNS(
+	err := GenerateSignedCert(
 		filepath.Join(dir, "s.pem"), filepath.Join(dir, "s.key"),
 		filepath.Join(dir, "missing-ca.pem"), filepath.Join(dir, "missing-ca.key"),
 		nil, nil,
@@ -526,7 +570,7 @@ func TestGenerateSignedCertWithDNS_InvalidCA(t *testing.T) {
 	// Corrupt CA cert.
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "bad-ca.pem"), []byte("not-pem"), 0600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "bad-ca.key"), []byte("not-pem"), 0600))
-	err = GenerateSignedCertWithDNS(
+	err = GenerateSignedCert(
 		filepath.Join(dir, "s.pem"), filepath.Join(dir, "s.key"),
 		filepath.Join(dir, "bad-ca.pem"), filepath.Join(dir, "bad-ca.key"),
 		nil, nil,
@@ -534,7 +578,7 @@ func TestGenerateSignedCertWithDNS_InvalidCA(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestGenerateSignedCertWithDNS_ExtraDNS(t *testing.T) {
+func TestGenerateSignedCert_ExtraDNS(t *testing.T) {
 	t.Parallel()
 	caDir := t.TempDir()
 	caCertPath := filepath.Join(caDir, "ca.pem")
@@ -547,7 +591,7 @@ func TestGenerateSignedCertWithDNS_ExtraDNS(t *testing.T) {
 
 	extraIPs := []string{"10.0.0.42"}
 	extraDNS := []string{"spinifex.local", "node1.spinifex.local"}
-	require.NoError(t, GenerateSignedCertWithDNS(certPath, keyPath, caCertPath, caKeyPath, extraIPs, extraDNS))
+	require.NoError(t, GenerateSignedCert(certPath, keyPath, caCertPath, caKeyPath, extraIPs, extraDNS))
 
 	certPEM, _ := os.ReadFile(certPath)
 	block, _ := pem.Decode(certPEM)
@@ -579,7 +623,7 @@ func TestGenerateSignedCert_IncludesHostname(t *testing.T) {
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "server.pem")
 	keyPath := filepath.Join(dir, "server.key")
-	require.NoError(t, GenerateSignedCert(certPath, keyPath, caCertPath, caKeyPath))
+	require.NoError(t, GenerateSignedCert(certPath, keyPath, caCertPath, caKeyPath, nil, nil))
 
 	certPEM, _ := os.ReadFile(certPath)
 	block, _ := pem.Decode(certPEM)
@@ -593,29 +637,11 @@ func TestGenerateSignedCert_IncludesHostname(t *testing.T) {
 	}
 }
 
-func TestGenerateSelfSignedCert_CreatesValidCert(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	certPath := filepath.Join(dir, "self.pem")
-	keyPath := filepath.Join(dir, "self.key")
-
-	require.NoError(t, GenerateSelfSignedCert(certPath, keyPath))
-
-	certPEM, _ := os.ReadFile(certPath)
-	block, _ := pem.Decode(certPEM)
-	require.NotNil(t, block)
-
-	cert, err := x509.ParseCertificate(block.Bytes)
-	require.NoError(t, err)
-	assert.Contains(t, cert.DNSNames, "localhost")
-
-	info, _ := os.Stat(keyPath)
-	assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
-}
-
 // --- Certificate orchestrator ---
 
 // TestGenerateCertificatesIfNeeded uses subtests to share the initial generation.
+//
+//nolint:tparallel // subtests mutate the shared dir in order: SkipsWhenAllExist pins the CA modtime that ForcePreservesCARegeneratesServerCert then regenerates against
 func TestGenerateCertificatesIfNeeded(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -637,12 +663,45 @@ func TestGenerateCertificatesIfNeeded(t *testing.T) {
 		assert.Equal(t, origModTime, caInfo2.ModTime())
 	})
 
-	t.Run("ForceRegenerates", func(t *testing.T) {
+	// --force must preserve the CA (trust anchor for joined nodes / baked AMIs)
+	// and only re-sign the server cert, which stays verifiable against that CA.
+	t.Run("ForcePreservesCARegeneratesServerCert", func(t *testing.T) {
 		origCA, _ := os.ReadFile(filepath.Join(dir, "ca.pem"))
+		origCAKey, _ := os.ReadFile(filepath.Join(dir, "ca.key"))
+		origServer, _ := os.ReadFile(filepath.Join(dir, "server.pem"))
 
-		GenerateCertificatesIfNeeded(dir, true, "", "us-east-1", "spinifex.internal")
+		GenerateCertificatesIfNeeded(dir, true, "10.9.8.7", "us-east-1", "spinifex.internal")
+
 		newCA, _ := os.ReadFile(filepath.Join(dir, "ca.pem"))
-		assert.NotEqual(t, origCA, newCA)
+		newCAKey, _ := os.ReadFile(filepath.Join(dir, "ca.key"))
+		newServer, _ := os.ReadFile(filepath.Join(dir, "server.pem"))
+		assert.Equal(t, origCA, newCA, "CA cert must be preserved on --force")
+		assert.Equal(t, origCAKey, newCAKey, "CA key must be preserved on --force")
+		assert.NotEqual(t, origServer, newServer, "server cert must be re-signed on --force")
+
+		// The re-signed server cert must verify against the preserved CA.
+		caBlock, _ := pem.Decode(newCA)
+		caCert, err := x509.ParseCertificate(caBlock.Bytes)
+		require.NoError(t, err)
+		pool := x509.NewCertPool()
+		pool.AddCert(caCert)
+
+		srvBlock, _ := pem.Decode(newServer)
+		srvCert, err := x509.ParseCertificate(srvBlock.Bytes)
+		require.NoError(t, err)
+		_, err = srvCert.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}})
+		assert.NoError(t, err, "re-signed server cert must verify against preserved CA")
+	})
+
+	// The mgmt-bridge IP must be a SAN even though br-mgmt is not a live
+	// interface here (interface enumeration cannot discover it), mirroring a
+	// host where br-mgmt is down when the cert is minted. Without the explicit
+	// pin the control-plane publish to https://<mgmt-ip> would fail cert verify.
+	t.Run("MgmtBridgeIPAlwaysInSAN", func(t *testing.T) {
+		certDir := t.TempDir()
+		GenerateCertificatesIfNeeded(certDir, false, "10.0.0.5", "us-east-1", "spinifex.internal")
+		assert.True(t, certHasIP(t, filepath.Join(certDir, "server.pem"), config.DefaultMgmtBridgeIP),
+			"server cert must carry the canonical mgmt-bridge IP SAN regardless of br-mgmt state")
 	})
 }
 
@@ -653,6 +712,7 @@ func TestGenerateServerCertOnly(t *testing.T) {
 	require.NoError(t, GenerateCACert(filepath.Join(caDir, "ca.pem"), filepath.Join(caDir, "ca.key")))
 
 	t.Run("Success", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		// Copy CA files into test dir
 		caCert, _ := os.ReadFile(filepath.Join(caDir, "ca.pem"))
@@ -680,9 +740,14 @@ func TestGenerateServerCertOnly(t *testing.T) {
 		// AWS-parity ECR SANs must be present.
 		assert.Contains(t, cert.DNSNames, "ecr.us-east-1.spinifex.internal")
 		assert.Contains(t, cert.DNSNames, "*.dkr.ecr.us-east-1.spinifex.internal")
+
+		// Joining nodes must also pin the mgmt-bridge IP regardless of br-mgmt state.
+		assert.True(t, certHasIP(t, filepath.Join(dir, "server.pem"), config.DefaultMgmtBridgeIP),
+			"server cert must carry the canonical mgmt-bridge IP SAN")
 	})
 
 	t.Run("MissingCA", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		err := GenerateServerCertOnly(dir, "10.0.0.5", "us-east-1", "spinifex.internal")
 		assert.Error(t, err)
@@ -735,9 +800,10 @@ func TestCreateServiceDirectories_Idempotent(t *testing.T) {
 // --- Predastore multi-node config ---
 
 func TestGenerateMultiNodePredastoreConfig_Success(t *testing.T) {
-	tmpl := `{{range .Nodes}}[[db]]
+	tmpl := `{{range .Nodes}}[[host]]
 id = {{.ID}}
-host = "{{.Host}}"
+public_addr = "{{.Host}}:6660"
+data_dir = "{{$.PredastoreDataDir}}"
 {{end}}`
 	nodes := []PredastoreNodeConfig{
 		{ID: 1, Host: "10.0.0.1"},
@@ -745,10 +811,82 @@ host = "{{.Host}}"
 		{ID: 3, Host: "10.0.0.3"},
 	}
 
-	result, err := GenerateMultiNodePredastoreConfig(tmpl, nodes, "AK", "SK", "us-east-1", "nats-token", "/config", "10.0.0.1", 0)
+	result, err := GenerateMultiNodePredastoreConfig(tmpl, nodes, "AK", "SK", "us-east-1", "nats-token", "/config", "/var/lib/spinifex", "10.0.0.1", 0, NorthstarCredentials{})
 	require.NoError(t, err)
-	assert.Contains(t, result, `host = "10.0.0.1"`)
-	assert.Contains(t, result, `host = "10.0.0.3"`)
+	assert.Contains(t, result, `public_addr = "10.0.0.1:6660"`)
+	assert.Contains(t, result, `public_addr = "10.0.0.3:6660"`)
+	assert.Contains(t, result, `data_dir = "/var/lib/spinifex/predastore/cluster"`)
+}
+
+// Each machine hosts one shard-storage node and one state replica, with node
+// IDs unique across both roles so the topology validates.
+func TestGenerateMultiNodePredastoreConfig_Topology(t *testing.T) {
+	tmpl := `{{range .ClusterNodes}}[[node]]
+id = {{.ID}}
+host_id = {{.HostID}}
+role = "{{.Role}}"
+{{end}}`
+	nodes := []PredastoreNodeConfig{
+		{ID: 1, Host: "10.0.0.1"},
+		{ID: 2, Host: "10.0.0.2"},
+		{ID: 3, Host: "10.0.0.3"},
+	}
+
+	result, err := GenerateMultiNodePredastoreConfig(tmpl, nodes, "AK", "SK", "us-east-1", "nats-token", "/config", "/var/lib/spinifex", "10.0.0.1", 0, NorthstarCredentials{})
+	require.NoError(t, err)
+
+	assert.Contains(t, result, "id = 1\nhost_id = 1\nrole = \"shard-storage\"")
+	assert.Contains(t, result, "id = 3\nhost_id = 3\nrole = \"shard-storage\"")
+	assert.Contains(t, result, "id = 4\nhost_id = 1\nrole = \"state-replica\"")
+	assert.Contains(t, result, "id = 6\nhost_id = 3\nrole = \"state-replica\"")
+}
+
+func TestPredastoreTopology_UniqueIDsAcrossRoles(t *testing.T) {
+	topology := PredastoreTopology([]PredastoreNodeConfig{
+		{ID: 1, Host: "10.0.0.1"},
+		{ID: 2, Host: "10.0.0.2"},
+	})
+
+	require.Len(t, topology, 4)
+	seen := map[int]bool{}
+	for _, n := range topology {
+		assert.False(t, seen[n.ID], "duplicate node id %d", n.ID)
+		seen[n.ID] = true
+		assert.Contains(t, []int{1, 2}, n.HostID)
+	}
+	assert.Equal(t, "shard-storage", topology[0].Role)
+	assert.Equal(t, "state-replica", topology[2].Role)
+}
+
+// The northstar template fields were declared but never assigned, so every
+// multi-node predastore config silently rendered the empty-key path: no zone
+// bucket and no credential the resolver could authenticate with.
+func TestGenerateMultiNodePredastoreConfig_NorthstarCredentialsReachTemplate(t *testing.T) {
+	tmpl := `access = "{{.NorthstarAccessKey}}" secret = "{{.NorthstarSecretKey}}" bucket = "{{.NorthstarBucket}}"`
+	nodes := []PredastoreNodeConfig{
+		{ID: 1, Host: "10.0.0.1"},
+		{ID: 2, Host: "10.0.0.2"},
+	}
+
+	result, err := GenerateMultiNodePredastoreConfig(tmpl, nodes, "AK", "SK", "us-east-1", "nats-token", "/config", "/var/lib/spinifex", "10.0.0.1", 0,
+		NorthstarCredentials{AccessKey: "NSAK", SecretKey: "NSSK", Bucket: "northstar"})
+	require.NoError(t, err)
+	assert.Equal(t, `access = "NSAK" secret = "NSSK" bucket = "northstar"`, result)
+}
+
+// A zero credential must leave every northstar field empty, which is what the
+// production template's guards key off to omit the stanzas entirely.
+func TestGenerateMultiNodePredastoreConfig_NoNorthstarCredentials(t *testing.T) {
+	tmpl := `access = "{{.NorthstarAccessKey}}" secret = "{{.NorthstarSecretKey}}" bucket = "{{.NorthstarBucket}}"`
+	nodes := []PredastoreNodeConfig{
+		{ID: 1, Host: "10.0.0.1"},
+		{ID: 2, Host: "10.0.0.2"},
+	}
+
+	result, err := GenerateMultiNodePredastoreConfig(tmpl, nodes, "AK", "SK", "us-east-1", "nats-token", "/config", "/var/lib/spinifex", "10.0.0.1", 0,
+		NorthstarCredentials{})
+	require.NoError(t, err)
+	assert.Equal(t, `access = "" secret = "" bucket = ""`, result)
 }
 
 func TestGenerateMultiNodePredastoreConfig_MinimumNodes(t *testing.T) {
@@ -756,7 +894,7 @@ func TestGenerateMultiNodePredastoreConfig_MinimumNodes(t *testing.T) {
 
 	_, err := GenerateMultiNodePredastoreConfig(tmpl, []PredastoreNodeConfig{
 		{ID: 1, Host: "10.0.0.1"},
-	}, "AK", "SK", "us-east-1", "nats-token", "/config", "10.0.0.1", 0)
+	}, "AK", "SK", "us-east-1", "nats-token", "/config", "/var/lib/spinifex", "10.0.0.1", 0, NorthstarCredentials{})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "at least 2 nodes")
 }
@@ -764,7 +902,7 @@ func TestGenerateMultiNodePredastoreConfig_MinimumNodes(t *testing.T) {
 func TestGenerateMultiNodePredastoreConfig_InvalidTemplate(t *testing.T) {
 	_, err := GenerateMultiNodePredastoreConfig("{{.Unclosed", []PredastoreNodeConfig{
 		{ID: 1, Host: "a"}, {ID: 2, Host: "b"}, {ID: 3, Host: "c"},
-	}, "AK", "SK", "us-east-1", "nats-token", "/config", "10.0.0.1", 0)
+	}, "AK", "SK", "us-east-1", "nats-token", "/config", "/var/lib/spinifex", "10.0.0.1", 0, NorthstarCredentials{})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to parse")
 }
@@ -783,26 +921,40 @@ func TestFindNodeIDByIP(t *testing.T) {
 	assert.Equal(t, 0, FindNodeIDByIP(nil, "10.0.0.1"))
 }
 
-// --- ParsePredastoreNodeIDFromConfig ---
+// --- ParsePredastoreHostIDFromConfig ---
 
-func TestParsePredastoreNodeIDFromConfig(t *testing.T) {
+func TestParsePredastoreHostIDFromConfig(t *testing.T) {
 	tomlContent := `
-[[db]]
+[[host]]
 id = 1
-host = "10.0.0.1"
+bind_addr = "0.0.0.0:6660"
+public_addr = "10.0.0.1:6660"
 
-[[db]]
+[[host]]
 id = 2
-host = "10.0.0.2"
+bind_addr = "0.0.0.0:6660"
+public_addr = "10.0.0.2:6660"
 
-[[db]]
+[[host]]
 id = 3
-host = "10.0.0.3"
+bind_addr = "0.0.0.0:6660"
+public_addr = "10.0.0.3:6660"
 `
-	assert.Equal(t, 2, ParsePredastoreNodeIDFromConfig(tomlContent, "10.0.0.2"))
-	assert.Equal(t, 0, ParsePredastoreNodeIDFromConfig(tomlContent, "10.0.0.99"))
-	assert.Equal(t, 0, ParsePredastoreNodeIDFromConfig("invalid toml {{{", "10.0.0.1"))
-	assert.Equal(t, 0, ParsePredastoreNodeIDFromConfig("", "10.0.0.1"))
+	assert.Equal(t, 2, ParsePredastoreHostIDFromConfig(tomlContent, "10.0.0.2"))
+	assert.Equal(t, 0, ParsePredastoreHostIDFromConfig(tomlContent, "10.0.0.99"))
+	assert.Equal(t, 0, ParsePredastoreHostIDFromConfig("invalid toml {{{", "10.0.0.1"))
+	assert.Equal(t, 0, ParsePredastoreHostIDFromConfig("", "10.0.0.1"))
+}
+
+// A public_addr without a port must still match, so a hand-edited config that
+// omits it resolves to a host rather than silently to zero.
+func TestParsePredastoreHostIDFromConfig_AddressWithoutPort(t *testing.T) {
+	tomlContent := `
+[[host]]
+id = 7
+public_addr = "10.0.0.7"
+`
+	assert.Equal(t, 7, ParsePredastoreHostIDFromConfig(tomlContent, "10.0.0.7"))
 }
 
 // --- Integration: Full config generation flow ---
@@ -838,17 +990,20 @@ secretkey = "{{.SecretKey}}"
 }
 
 func TestChownRecursive_InvalidUser(t *testing.T) {
-	// ChownRecursive should silently return on invalid username
+	// ChownRecursive must report a non-nil error naming the user when the
+	// user cannot be resolved, rather than silently doing nothing.
 	tmpDir := t.TempDir()
 	testFile := filepath.Join(tmpDir, "test.txt")
 	os.WriteFile(testFile, []byte("test"), 0644)
 
-	// Should not panic or error with a non-existent user
-	ChownRecursive(tmpDir, "nonexistent-user-that-does-not-exist-12345")
+	const badUser = "nonexistent-user-that-does-not-exist-12345"
+	err := ChownRecursive(tmpDir, badUser)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), badUser)
 
 	// File should still exist and be readable
-	_, err := os.ReadFile(testFile)
-	assert.NoError(t, err)
+	_, readErr := os.ReadFile(testFile)
+	assert.NoError(t, readErr)
 }
 
 func TestChownRecursive_CurrentUser(t *testing.T) {
@@ -864,7 +1019,7 @@ func TestChownRecursive_CurrentUser(t *testing.T) {
 		t.Skip("USER env not set")
 	}
 
-	ChownRecursive(tmpDir, currentUser)
+	assert.NoError(t, ChownRecursive(tmpDir, currentUser))
 
 	// Verify files are still accessible
 	_, err := os.ReadFile(testFile)
@@ -872,12 +1027,48 @@ func TestChownRecursive_CurrentUser(t *testing.T) {
 }
 
 func TestChownRecursive_NonExistentPath(t *testing.T) {
-	// Should not panic on a path that doesn't exist
+	// Should not panic on a path that doesn't exist; OpenRoot fails and the
+	// fallback Lchown fails too, but both are logged, not returned — the
+	// user itself resolved fine, so this is not one of the abort cases.
 	currentUser := os.Getenv("USER")
 	if currentUser == "" {
 		t.Skip("USER env not set")
 	}
-	ChownRecursive("/tmp/nonexistent-path-12345", currentUser)
+	assert.NoError(t, ChownRecursive("/tmp/nonexistent-path-12345", currentUser))
+}
+
+func TestChownServicePaths_MissingUser(t *testing.T) {
+	// chownServicePaths is the map-walking core extracted from
+	// SetServiceOwnership so it can be exercised against a small map
+	// instead of the hardcoded /etc/spinifex and /var/lib/spinifex paths,
+	// which are not writable/creatable without root in CI.
+	tmpDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(tmpDir, 0755))
+
+	const badUser = "nonexistent-user-that-does-not-exist-12345"
+	err := chownServicePaths(map[string]string{tmpDir: badUser})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), badUser)
+	assert.Contains(t, err.Error(), tmpDir)
+}
+
+func TestChownServicePaths_SkipsMissingPath(t *testing.T) {
+	// A path that doesn't exist on disk is never attempted, so it can't
+	// produce a "user not found" failure even for a bogus user.
+	err := chownServicePaths(map[string]string{
+		"/nonexistent-path-12345": "nonexistent-user-that-does-not-exist-12345",
+	})
+	assert.NoError(t, err)
+}
+
+func TestSetServiceOwnership_RequiresRoot(t *testing.T) {
+	// SetServiceOwnership operates on hardcoded /etc/spinifex and
+	// /var/lib/spinifex paths and chowns to the spinifex group, both of
+	// which require root. The per-service failure-aggregation logic itself
+	// is covered without root via TestChownServicePaths_MissingUser above.
+	if os.Geteuid() != 0 {
+		t.Skip("SetServiceOwnership requires root")
+	}
 }
 
 // --- SetGPUPassthrough ---

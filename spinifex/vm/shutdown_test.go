@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"context"
 	"errors"
 	"os"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/mulgadc/spinifex/spinifex/gpu"
 	"github.com/mulgadc/spinifex/spinifex/qmp"
+	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -68,7 +70,7 @@ func TestMarkFailed_TransitionsToTerminated(t *testing.T) {
 	m.Insert(instance)
 
 	terminated := rt.waitFor(instance.ID, StateTerminated)
-	m.MarkFailed(instance, "volume_preparation_failed")
+	m.MarkFailed(context.Background(), instance, "volume_preparation_failed")
 
 	require.NotNil(t, instance.Instance.StateReason,
 		"MarkFailed must populate StateReason synchronously")
@@ -107,7 +109,7 @@ func TestMarkFailed_NilInstance(t *testing.T) {
 
 	terminated := rt.waitFor(instance.ID, StateTerminated)
 	require.NotPanics(t, func() {
-		m.MarkFailed(instance, "test_failure")
+		m.MarkFailed(context.Background(), instance, "test_failure")
 	})
 
 	select {
@@ -131,7 +133,7 @@ func TestMarkFailed_AlreadyShuttingDown_NoOp(t *testing.T) {
 	}
 	m.Insert(instance)
 
-	m.MarkFailed(instance, "duplicate_call")
+	m.MarkFailed(context.Background(), instance, "duplicate_call")
 
 	assert.Empty(t, rt.snapshot(),
 		"MarkFailed must not transition an already-shutting-down instance")
@@ -151,7 +153,7 @@ func TestMarkFailed_AlreadyTerminated_NoOp(t *testing.T) {
 	}
 	m.Insert(instance)
 
-	m.MarkFailed(instance, "duplicate_call")
+	m.MarkFailed(context.Background(), instance, "duplicate_call")
 
 	assert.Empty(t, rt.snapshot(),
 		"MarkFailed must not transition an already-terminated instance")
@@ -241,14 +243,12 @@ func TestStopAll_EmptyMap_FastPath(t *testing.T) {
 	assert.Empty(t, cleaner.cleanupMgmt, "empty StopAll must not invoke cleaner")
 }
 
-// TestStopAll_FiresOnInstanceDownAndMigratesPerVM verifies the DRAIN
-// hook contract: every Running VM transitions through Stopping → Stopped,
-// is migrated to the cluster-shared "stopped" bucket, fires
-// OnInstanceDown once, and is removed from the local running map. The
-// pre-fix StopAll only ran stopCleanup and left every VM stuck in
-// Running, so a daemon restart promoted user-stopped VMs through the
-// failed-recovery path and surfaced them as terminated — data-equivalent
-// loss for the customer.
+// TestStopAll_FiresOnInstanceDownAndMigratesPerVM verifies the
+// operator-stop hook contract: a Running VM stamped with the operator
+// StopInstance intent transitions through Stopping → Stopped, is migrated
+// to the cluster-shared "stopped" bucket, fires OnInstanceDown once, and
+// is removed from the local running map. Without honouring the operator
+// intent a restart would relaunch a deliberately stopped VM.
 func TestStopAll_FiresOnInstanceDownAndMigratesPerVM(t *testing.T) {
 	m, store, _, _, rt := shutdownTestManager(t)
 	var (
@@ -278,6 +278,7 @@ func TestStopAll_FiresOnInstanceDownAndMigratesPerVM(t *testing.T) {
 			Status:       StateRunning,
 			InstanceType: "t3.micro",
 			Instance:     &ec2.Instance{},
+			Attributes:   types.EC2CommandAttributes{StopInstance: true},
 		})
 	}
 
@@ -295,6 +296,56 @@ func TestStopAll_FiresOnInstanceDownAndMigratesPerVM(t *testing.T) {
 		require.NotNil(t, stored, "VM %s must be migrated to the stopped KV bucket", id)
 		assert.Equal(t, StateStopped, stored.Status,
 			"VM %s must be persisted in StateStopped", id)
+	}
+}
+
+// TestStopAll_DrainStopKeepsLocalNoMigrate verifies the host-DRAIN
+// contract: a Running VM with no operator StopInstance intent is stopped
+// gracefully (Stopping → Stopped) but stays in the local running map so
+// Restore relaunches it on the next boot. It must NOT be migrated to the
+// operator-stopped shared bucket and must NOT fire OnInstanceDown. This is
+// the reboot-resilience fix — DRAIN previously migrated every VM to the
+// shared bucket, hiding it from the node-local restore path.
+func TestStopAll_DrainStopKeepsLocalNoMigrate(t *testing.T) {
+	m, store, _, _, rt := shutdownTestManager(t)
+	var down atomic.Int64
+	m.SetDeps(Deps{
+		NodeID:          "test-node",
+		StateStore:      store,
+		VolumeMounter:   &fakeVolumeMounter{},
+		InstanceCleaner: &recordingInstanceCleaner{},
+		TransitionState: rt.apply,
+		ShutdownSignal:  func() bool { return false },
+		Hooks: ManagerHooks{
+			OnInstanceDown: func(string) { down.Add(1) },
+		},
+	})
+
+	ids := []string{"i-1", "i-2", "i-3"}
+	for _, id := range ids {
+		m.Insert(&VM{
+			ID:           id,
+			Status:       StateRunning,
+			InstanceType: "t3.micro",
+			Instance:     &ec2.Instance{},
+			Attributes:   types.EC2CommandAttributes{},
+		})
+	}
+
+	require.NoError(t, m.StopAll())
+
+	assert.Zero(t, down.Load(),
+		"drain stop must not fire OnInstanceDown — the VM is being relaunched, not released")
+	assert.Equal(t, len(ids), m.Count(),
+		"drain-stopped VMs must stay in the local running map so Restore relaunches them")
+	for _, id := range ids {
+		v, ok := m.Get(id)
+		require.True(t, ok, "drain-stopped VM %s must remain in the local map", id)
+		assert.Equal(t, StateStopped, v.Status, "drain-stopped VM %s must be at StateStopped", id)
+		stored, err := store.LoadStoppedInstance(id)
+		require.NoError(t, err)
+		assert.Nil(t, stored,
+			"drain-stopped VM %s must NOT migrate to the operator-stopped shared bucket", id)
 	}
 }
 
@@ -381,6 +432,7 @@ func TestStopAll_WriteRunningStateFailure(t *testing.T) {
 			Status:       StateRunning,
 			InstanceType: "t3.micro",
 			Instance:     &ec2.Instance{},
+			Attributes:   types.EC2CommandAttributes{StopInstance: true},
 		})
 	}
 
@@ -505,6 +557,7 @@ func TestStop_FiresOnInstanceDownExactlyOnce(t *testing.T) {
 		Status:       StateRunning,
 		InstanceType: "t3.micro",
 		Instance:     &ec2.Instance{},
+		Attributes:   types.EC2CommandAttributes{StopInstance: true},
 	}
 	m.Insert(v)
 
@@ -544,6 +597,7 @@ func TestStop_DoesNotFireOnInstanceDown_OnSlotReclaim(t *testing.T) {
 		Status:       StateRunning,
 		InstanceType: "t3.micro",
 		Instance:     &ec2.Instance{},
+		Attributes:   types.EC2CommandAttributes{StopInstance: true},
 	}
 	m.Insert(v)
 
@@ -709,6 +763,59 @@ func TestTransitionWithPrecheck_PersistenceFailure_PassesThroughError(t *testing
 		"persistence failure on a valid transition is not a transition error")
 	assert.Equal(t, StateRunning, m.Status(instance),
 		"persistence-failure branch implies status reached target before error returned")
+}
+
+// TestTransitionWithPrecheck_PersistenceFailure_StampsShuttingDownAt covers
+// the specific target that matters for the stuck-terminate backstop: when
+// TransitionState fails but the in-memory status still reached
+// StateShuttingDown, ShuttingDownAt must be stamped anyway so
+// StuckTerminateReaper.Sweep can eventually see and bound this instance.
+// Before the fix this never ran because the function returned before
+// reaching the stamp call.
+func TestTransitionWithPrecheck_PersistenceFailure_StampsShuttingDownAt(t *testing.T) {
+	persistErr := errors.New("no space left on device")
+	var m *Manager
+	m = NewManagerWithDeps(Deps{
+		TransitionState: func(v *VM, target InstanceState) error {
+			// Memory mutation succeeded; only persistence (e.g. a full disk
+			// writing local state) failed.
+			m.Inspect(v, func(vv *VM) { vv.Status = target })
+			return persistErr
+		},
+	})
+
+	instance := &VM{ID: "i-persist-fail-shutdown", Status: StateRunning}
+	m.Insert(instance)
+
+	err := m.transitionWithPrecheck(instance, StateShuttingDown)
+
+	require.ErrorIs(t, err, persistErr, "the persistence error must still reach the caller")
+	assert.False(t, instance.ShuttingDownAt.IsZero(),
+		"ShuttingDownAt must be stamped even though the state write failed, so the reaper can see this instance")
+}
+
+// TestTransitionWithPrecheck_Raced_DoesNotStampShuttingDownAt is the
+// contrast: when TransitionState fails AND the in-memory status did not
+// reach StateShuttingDown (a concurrent transition beat this call), the
+// target state was never actually entered, so stamping would be a lie.
+func TestTransitionWithPrecheck_Raced_DoesNotStampShuttingDownAt(t *testing.T) {
+	persistErr := errors.New("kv put failed")
+	m := NewManagerWithDeps(Deps{
+		TransitionState: func(_ *VM, _ InstanceState) error {
+			// Return error without mutating status, matching a concurrent
+			// transition that beat this call.
+			return persistErr
+		},
+	})
+
+	instance := &VM{ID: "i-raced-shutdown", Status: StateRunning}
+	m.Insert(instance)
+
+	err := m.transitionWithPrecheck(instance, StateShuttingDown)
+
+	require.ErrorIs(t, err, ErrInvalidTransition)
+	assert.True(t, instance.ShuttingDownAt.IsZero(),
+		"the raced branch never actually entered StateShuttingDown, so it must not stamp")
 }
 
 // TestTransitionWithPrecheck_InvalidInitialTransition_WrapsErrInvalidTransition
@@ -911,6 +1018,55 @@ func TestTerminate_WriteTerminatedFailure_PropagatesAndKeepsLocal(t *testing.T) 
 	assert.True(t, stillInMap, "instance must remain in local map for retry on the next daemon restart")
 }
 
+// TestTerminate_LocalPersistenceFailure_StillDurablyRecordsTerminated covers
+// the ENOSPC scenario: TransitionState fails to persist locally (e.g. the
+// local state file write hits a full disk) but the in-memory status still
+// reaches StateTerminated. Before the fix, finalizeTerminated bailed out on
+// that error before ever calling WriteTerminatedInstance, so the durable
+// terminated record TerminatedTeardownReaper scans was never written and
+// nothing retried teardown without an operator restart. The durable KV write
+// (a JetStream call independent of local disk space) must still happen.
+func TestTerminate_LocalPersistenceFailure_StillDurablyRecordsTerminated(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	persistErr := errors.New("no space left on device")
+	store := newFakeStateStore()
+	cleaner := &recordingInstanceCleaner{}
+	down := &atomic.Int64{}
+	m := NewManager()
+	m.SetDeps(Deps{
+		NodeID:          "test-node",
+		StateStore:      store,
+		VolumeMounter:   &fakeVolumeMounter{},
+		InstanceCleaner: cleaner,
+		TransitionState: func(v *VM, target InstanceState) error {
+			// Mirrors daemon.TransitionState: memory mutation always
+			// succeeds; only the local file persistence fails, matching a
+			// full disk on the terminated transition specifically.
+			m.Inspect(v, func(vv *VM) { vv.Status = target })
+			if target == StateTerminated {
+				return persistErr
+			}
+			return nil
+		},
+		ShutdownSignal: func() bool { return false },
+		Hooks: ManagerHooks{
+			OnInstanceDown: func(id string) { down.Add(1) },
+		},
+	})
+
+	v := &VM{ID: "i-local-persist-fail", Status: StateRunning, InstanceType: "t3.micro", Instance: &ec2.Instance{}}
+	m.Insert(v)
+
+	err := m.Terminate(v.ID)
+
+	require.ErrorIs(t, err, persistErr, "the local persistence failure must still surface to the caller")
+	require.NotNil(t, store.terminated[v.ID],
+		"WriteTerminatedInstance must still run so TerminatedTeardownReaper can find and finish this instance")
+	assert.Equal(t, int64(1), down.Load(), "OnInstanceDown must still fire once the durable record lands")
+	_, stillInMap := m.Get(v.ID)
+	assert.False(t, stillInMap, "instance must leave the local running map once terminated is durable")
+}
+
 // TestTerminate_DeleteIfReclaimed_NoHook covers the slot-reclaim branch
 // in finalizeTerminated (shutdown.go:197-201): a concurrent handler
 // inserts a fresh VM under the same id between WriteTerminatedInstance
@@ -956,7 +1112,7 @@ func TestTerminate_WriteRunningStateFailure_RollbackInsert(t *testing.T) {
 }
 
 // TestMarkRecoveryFailed_PreservesVolumesAndAWSResources locks down the
-// siv-25 architectural invariant: when daemon recovery cannot bring a
+// Architectural invariant: when daemon recovery cannot bring a
 // previously-running instance back online, the cleanup path must NOT
 // invoke DeleteVolumes, ReleasePublicIP, DetachAndDeleteENI, or
 // RemoveFromPlacementGroup. A regression here re-introduces the P0 data
@@ -1172,13 +1328,19 @@ func (s *signalingStore) SaveRunningState(string, map[string]*VM) error {
 func (s *signalingStore) LoadRunningState(string) (map[string]*VM, error) {
 	return map[string]*VM{}, nil
 }
-func (s *signalingStore) WriteStoppedInstance(string, *VM) error    { return nil }
-func (s *signalingStore) LoadStoppedInstance(string) (*VM, error)   { return nil, nil }
-func (s *signalingStore) DeleteStoppedInstance(string) error        { return nil }
-func (s *signalingStore) ListStoppedInstances() ([]*VM, error)      { return nil, nil }
+func (s *signalingStore) WriteStoppedInstance(string, *VM) error  { return nil }
+func (s *signalingStore) LoadStoppedInstance(string) (*VM, error) { return nil, nil }
+func (s *signalingStore) DeleteStoppedInstance(string) error      { return nil }
+func (s *signalingStore) ListStoppedInstances() ([]*VM, error)    { return nil, nil }
+func (s *signalingStore) ClaimStoppedInstance(string) (*VM, error) {
+	return nil, ErrStoppedInstanceClaimed
+}
 func (s *signalingStore) WriteTerminatedInstance(string, *VM) error { return nil }
 func (s *signalingStore) ListTerminatedInstances() ([]*VM, error)   { return nil, nil }
 func (s *signalingStore) DeleteTerminatedInstance(string) error     { return nil }
+func (s *signalingStore) UpdateTerminatedInstance(string, func(*VM)) (*VM, error) {
+	return nil, nil
+}
 
 var _ StateStore = (*signalingStore)(nil)
 

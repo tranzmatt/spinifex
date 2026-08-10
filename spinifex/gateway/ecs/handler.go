@@ -9,6 +9,7 @@
 package gateway_ecs
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -25,15 +26,19 @@ const TargetPrefix = "AmazonEC2ContainerServiceV20141113"
 // JSONContentType is the AWS JSON 1.1 content type ECS clients expect.
 const JSONContentType = "application/x-amz-json-1.1"
 
-// Handler is the signature every ECS control-plane action implements. nc is the
-// gateway NATS connection (handlers relay onto ecs.* subjects); accountID is the
-// resolved caller account; body is the raw JSON 1.1 request payload.
-type Handler func(nc *nats.Conn, accountID string, body []byte) (any, error)
+// PassRoleChecker enforces iam:PassRole on a role ARN a task definition names,
+// built from the caller's identity and threaded down from the gateway.
+type PassRoleChecker func(roleARN string) error
+
+// Handler is the signature every ECS control-plane action implements. nc, accountID
+// and body carry the request; passRoleCheck enforces iam:PassRole for actions that
+// can name an IAM role.
+type Handler func(ctx context.Context, nc *nats.Conn, accountID string, body []byte, passRoleCheck PassRoleChecker) (any, error)
 
 // NotImplemented is the placeholder for every unimplemented ECS control-plane
 // action. It returns the AWS NotImplemented error, which the shared gateway
 // ErrorHandler renders as a 501 JSON 1.1 envelope.
-func NotImplemented(_ *nats.Conn, _ string, _ []byte) (any, error) {
+func NotImplemented(_ context.Context, _ *nats.Conn, _ string, _ []byte, _ PassRoleChecker) (any, error) {
 	return nil, errors.New(awserrors.ErrorNotImplemented)
 }
 
@@ -41,13 +46,19 @@ func NotImplemented(_ *nats.Conn, _ string, _ []byte) (any, error) {
 // Wired actions point at their handler; unimplemented actions keep the
 // NotImplemented value. The key set is the v1 API contract.
 var Actions = map[string]Handler{
-	// Cluster. PutClusterCapacityProviders is a no-op stub in v1 (Q15).
+	// Cluster.
 	"CreateCluster":               CreateCluster,
 	"DescribeClusters":            DescribeClusters,
 	"ListClusters":                ListClusters,
 	"DeleteCluster":               DeleteCluster,
 	"UpdateCluster":               NotImplemented,
-	"PutClusterCapacityProviders": NotImplemented,
+	"PutClusterCapacityProviders": PutClusterCapacityProviders,
+
+	// Capacity providers. Strategy is accepted + persisted but inert in v1
+	// (no scheduler coupling, no scale loop).
+	"CreateCapacityProvider":    CreateCapacityProvider,
+	"DescribeCapacityProviders": DescribeCapacityProviders,
+	"DeleteCapacityProvider":    DeleteCapacityProvider,
 
 	// Task definition.
 	"RegisterTaskDefinition":     RegisterTaskDefinition,
@@ -68,6 +79,9 @@ var Actions = map[string]Handler{
 
 	// Agent assignment polling (agent drains its inbox over the gateway).
 	"PollAssignments": PollAssignments,
+
+	// Agent per-task GPU device-assignment report (agent → gateway → task record).
+	"ReportTaskGPU": ReportTaskGPU,
 
 	// Service. ListServicesByNamespace is a no-op stub in v1.
 	"CreateService":           CreateService,
@@ -90,9 +104,9 @@ var Actions = map[string]Handler{
 	"ListAccountSettings": NotImplemented,
 
 	// Tags.
-	"TagResource":         NotImplemented,
-	"UntagResource":       NotImplemented,
-	"ListTagsForResource": NotImplemented,
+	"TagResource":         TagResource,
+	"UntagResource":       UntagResource,
+	"ListTagsForResource": ListTagsForResource,
 }
 
 // RawJSONActions encode their response with encoding/json instead of jsonutil.

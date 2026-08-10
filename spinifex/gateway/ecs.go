@@ -23,7 +23,7 @@ func ecsActionFromTarget(target string) string {
 // ECS_Request dispatches AWS JSON 1.1 ECS control-plane requests. The action
 // comes from X-Amz-Target; errors are returned as awserrors codes and rendered
 // by the shared ErrorHandler. Every action is a NotImplemented (501) stub until
-// its real handler lands in a later Phase 4 sprint.
+// its real handler is added when the service supports the operation.
 func (gw *GatewayConfig) ECS_Request(w http.ResponseWriter, r *http.Request) error {
 	action := ecsActionFromTarget(r.Header.Get("X-Amz-Target"))
 	if action == "" {
@@ -32,7 +32,7 @@ func (gw *GatewayConfig) ECS_Request(w http.ResponseWriter, r *http.Request) err
 
 	handler, ok := gateway_ecs.Actions[action]
 	if !ok {
-		slog.Debug("ECS: unknown action", "action", action)
+		slog.DebugContext(r.Context(), "ECS: unknown action", "action", action)
 		return errors.New(awserrors.ErrorInvalidAction)
 	}
 
@@ -42,17 +42,24 @@ func (gw *GatewayConfig) ECS_Request(w http.ResponseWriter, r *http.Request) err
 
 	accountID, _ := r.Context().Value(ctxAccountID).(string)
 	if accountID == "" {
-		slog.Error("ECS_Request: no account ID in auth context")
+		slog.ErrorContext(r.Context(), "ECS_Request: no account ID in auth context")
 		return errors.New(awserrors.ErrorServerInternal)
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		slog.Error("ECS_Request: failed to read body", "err", err)
+		slog.ErrorContext(r.Context(), "ECS_Request: failed to read body", "err", err)
 		return errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 
-	output, err := handler(gw.NATSConn, accountID, body)
+	// Mirrors gateway/ec2.go's RunInstances/AssociateIamInstanceProfile closures:
+	// enforce iam:PassRole against the caller's identity on this request, for
+	// whichever role ARN the action later resolves.
+	passRoleCheck := func(roleARN string) error {
+		return gw.checkPolicyResource(r, "iam", "PassRole", roleARN)
+	}
+
+	output, err := handler(r.Context(), gw.NATSConn, accountID, body, passRoleCheck)
 	if err != nil {
 		return err
 	}

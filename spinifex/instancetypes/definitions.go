@@ -1,6 +1,9 @@
 package instancetypes
 
-import "slices"
+import (
+	"slices"
+	"strings"
+)
 
 // GPUModel describes a GPU device model that maps to a specific GPU instance family.
 type GPUModel struct {
@@ -13,21 +16,22 @@ type GPUModel struct {
 }
 
 var (
-	// NVIDIA GPU models
-	NVIDIAa10g      = GPUModel{"10de", "2236", "g5", "NVIDIA", "A10G", 24576}
-	NVIDIAt4        = GPUModel{"10de", "1eb8", "g4dn", "NVIDIA", "T4", 16384}
-	NVIDIAl4        = GPUModel{"10de", "27b8", "g6", "NVIDIA", "L4", 24576} // gr6 uses identical hardware; requires operator config
-	NVIDIAl40s      = GPUModel{"10de", "26b9", "g6e", "NVIDIA", "L40S", 49152}
-	NVIDIAv100sxm16 = GPUModel{"10de", "1db1", "p3", "NVIDIA", "V100", 16384}   // SXM2 16 GiB
-	NVIDIAv100sxm32 = GPUModel{"10de", "1db3", "p3dn", "NVIDIA", "V100", 32768} // SXM2 32 GiB
-	NVIDIAv100pcie  = GPUModel{"10de", "1dba", "p3", "NVIDIA", "V100", 16384}   // PCIe 16 GiB
-	NVIDIAa100sxm40 = GPUModel{"10de", "20b0", "p4d", "NVIDIA", "A100", 40960}  // SXM4 40 GiB
-	NVIDIAa100sxm80 = GPUModel{"10de", "20b5", "p4de", "NVIDIA", "A100", 81920} // SXM4 80 GiB
-	NVIDIAh100sxm   = GPUModel{"10de", "2330", "p5", "NVIDIA", "H100", 81920}   // SXM5 80 GiB
-	NVIDIAh100pcie  = GPUModel{"10de", "2331", "p5", "NVIDIA", "H100", 81920}   // PCIe 80 GiB
-	NVIDIAh200sxm   = GPUModel{"10de", "2335", "p5e", "NVIDIA", "H200", 144384} // SXM5 141 GiB
+	// NVIDIA GPU models.
+	NVIDIAa10g                  = GPUModel{"10de", "2236", "g5", "NVIDIA", "A10G", 24576}
+	NVIDIAt4                    = GPUModel{"10de", "1eb8", "g4dn", "NVIDIA", "T4", 16384}
+	NVIDIAl4                    = GPUModel{"10de", "27b8", "g6", "NVIDIA", "L4", 24576} // gr6 uses identical hardware; requires operator config
+	NVIDIAl40s                  = GPUModel{"10de", "26b9", "g6e", "NVIDIA", "L40S", 49152}
+	NVIDIAv100sxm16             = GPUModel{"10de", "1db1", "p3", "NVIDIA", "V100", 16384}                                   // SXM2 16 GiB
+	NVIDIAv100sxm32             = GPUModel{"10de", "1db3", "p3dn", "NVIDIA", "V100", 32768}                                 // SXM2 32 GiB
+	NVIDIAv100pcie              = GPUModel{"10de", "1dba", "p3", "NVIDIA", "V100", 16384}                                   // PCIe 16 GiB
+	NVIDIAa100sxm40             = GPUModel{"10de", "20b0", "p4d", "NVIDIA", "A100", 40960}                                  // SXM4 40 GiB
+	NVIDIAa100sxm80             = GPUModel{"10de", "20b5", "p4de", "NVIDIA", "A100", 81920}                                 // SXM4 80 GiB
+	NVIDIAh100sxm               = GPUModel{"10de", "2330", "p5", "NVIDIA", "H100", 81920}                                   // SXM5 80 GiB
+	NVIDIAh100pcie              = GPUModel{"10de", "2331", "p5", "NVIDIA", "H100", 81920}                                   // PCIe 80 GiB
+	NVIDIAh200sxm               = GPUModel{"10de", "2335", "p5e", "NVIDIA", "H200", 144384}                                 // SXM5 141 GiB
+	NVIDIArtxPro6000BlackwellSE = GPUModel{"10de", "2bb5", "g7e", "NVIDIA", "RTX Pro 6000 Blackwell Server Edition", 98304} // 96 GiB GDDR7
 
-	// AMD GPU models
+	// AMD GPU models.
 	AMDradeonV520 = GPUModel{"1002", "7362", "g4ad", "AMD", "Radeon Pro V520", 8192}
 	AMDmi350x     = GPUModel{"1002", "75a0", "g7e", "AMD", "Instinct MI350X", 294896}
 )
@@ -45,6 +49,7 @@ var knownGPUModels = []GPUModel{
 	NVIDIAh100sxm,
 	NVIDIAh100pcie,
 	NVIDIAh200sxm,
+	NVIDIArtxPro6000BlackwellSE,
 	AMDradeonV520,
 	AMDmi350x,
 }
@@ -58,6 +63,24 @@ func GPUModelForVendorDevice(vendorID, deviceID string) *GPUModel {
 		}
 	}
 	return nil
+}
+
+// GPUVendorForType returns the lowercase GPU manufacturer (e.g. "nvidia") for
+// a GPU instance type's family prefix (e.g. "g5.xlarge" -> "g5"), or "" if
+// instanceType is not a known GPU family.
+func GPUVendorForType(instanceType string) string {
+	family, _, _ := strings.Cut(instanceType, ".")
+	for i := range knownGPUModels {
+		if knownGPUModels[i].Family == family {
+			return strings.ToLower(knownGPUModels[i].Manufacturer)
+		}
+	}
+	return ""
+}
+
+// IsGPUTypeName reports whether instanceType belongs to a known GPU family.
+func IsGPUTypeName(instanceType string) bool {
+	return GPUVendorForType(instanceType) != ""
 }
 
 // cpuGeneration represents a specific CPU microarchitecture generation
@@ -87,25 +110,25 @@ var vendorSiblingFamily = map[string]string{
 }
 
 var (
-	// Intel generations
+	// Intel generations.
 	genIntelBroadwell      = cpuGeneration{"Intel Broadwell", []string{"t2", "c4", "m4", "r4"}}
 	genIntelSkylake        = cpuGeneration{"Intel Skylake/Cascade Lake", []string{"t3", "c5", "m5", "r5"}}
 	genIntelIceLake        = cpuGeneration{"Intel Ice Lake", []string{"t3", "c6i", "m6i", "r6i"}}
 	genIntelSapphireRapids = cpuGeneration{"Intel Sapphire Rapids", []string{"t3", "c7i", "m7i", "r7i"}}
 	genIntelGraniteRapids  = cpuGeneration{"Intel Granite Rapids", []string{"t3", "c8i", "m8i", "r8i"}}
 
-	// AMD generations
+	// AMD generations.
 	genAMDZen  = cpuGeneration{"AMD Zen/Zen2 (Naples/Rome)", []string{"t3a", "c5a", "m5a", "r5a"}}
 	genAMDZen3 = cpuGeneration{"AMD Zen 3 (Milan)", []string{"t3a", "c6a", "m6a", "r6a"}}
 	genAMDZen4 = cpuGeneration{"AMD Zen 4 (Genoa)", []string{"t3a", "c7a", "m7a", "r7a"}}
 	genAMDZen5 = cpuGeneration{"AMD Zen 5 (Turin)", []string{"t3a", "c8a", "m8a", "r8a"}}
 
-	// ARM generations
+	// ARM generations.
 	genARMNeoverseN1 = cpuGeneration{"ARM Neoverse N1 (Graviton2)", []string{"t4g", "c6g", "m6g", "r6g"}}
 	genARMNeoverseV1 = cpuGeneration{"ARM Neoverse V1 (Graviton3)", []string{"t4g", "c7g", "m7g", "r7g"}}
 	genARMNeoverseV2 = cpuGeneration{"ARM Neoverse V2 (Graviton4)", []string{"t4g", "c8g", "m8g", "r8g"}}
 
-	// Unknown/fallback — expose only burstable family
+	// Unknown/fallback — expose only burstable family.
 	genUnknownIntel = cpuGeneration{"Unknown Intel", []string{"t3"}}
 	genUnknownAMD   = cpuGeneration{"Unknown AMD", []string{"t3a"}}
 	genUnknownARM   = cpuGeneration{"Unknown ARM", []string{"t4g"}}
@@ -216,7 +239,7 @@ var gr6Sizes = []instanceSize{
 	{"8xlarge", 32, 256},
 }
 
-// g7eSizes are the G7e instance sizes (AMD Instinct MI350X).
+// g7eSizes are the G7e instance sizes (NVIDIA RTX Pro 6000 Blackwell Server Edition / AMD Instinct MI350X).
 // 12xlarge carries 2 GPUs; sizes above that are excluded (require 4+ GPUs).
 var g7eSizes = []instanceSize{
 	{"2xlarge", 8, 64},
@@ -360,4 +383,74 @@ var instanceFamilyDefs = []instanceFamilyDef{
 	{name: "r8i", sizes: memorySizes, currentGen: true},
 	{name: "r8a", sizes: memorySizes, currentGen: true},
 	{name: "r8g", sizes: memorySizesSmall, currentGen: true},
+}
+
+// migHostResources maps a MIG profile name to the host vCPU count and memory
+// that EC2 instances of that type receive. MIG only partitions GPU resources;
+// host CPU/RAM allocation is a policy decision with no NVIDIA-defined mapping.
+//
+// Sizing rule: 4 vCPUs and 32 GiB host RAM per compute slice (the leading digit
+// in the profile name, e.g. "3g.40gb" = 3 slices → 12 vCPUs / 96 GiB).
+// This table covers all profiles defined by NVIDIA for A100, H100, H100 NVL,
+// H200, A30, and RTX Pro 6000 Blackwell Server Edition.
+var migHostResources = map[string]struct {
+	vcpus    int
+	memoryGB float64
+}{
+	// A100 40 GiB (7-way MIG)
+	"1g.5gb":  {4, 32},
+	"2g.10gb": {8, 64},
+	"3g.20gb": {12, 96},
+	"4g.20gb": {16, 128},
+	"7g.40gb": {28, 224},
+	// A100 80 GiB / H100 SXM 80 GiB (7-way MIG)
+	"1g.10gb": {4, 32},
+	"2g.20gb": {8, 64},
+	"3g.40gb": {12, 96},
+	"4g.40gb": {16, 128},
+	"7g.80gb": {28, 224},
+	// H100 NVL 94 GiB (7-way MIG)
+	"1g.12gb": {4, 32},
+	"2g.24gb": {8, 64},
+	"3g.47gb": {12, 96},
+	"4g.47gb": {16, 128},
+	"7g.94gb": {28, 224},
+	// H200 SXM 141 GiB (7-way MIG)
+	"1g.18gb":  {4, 32},
+	"2g.35gb":  {8, 64},
+	"4g.71gb":  {16, 128},
+	"7g.141gb": {28, 224},
+	// A30 24 GiB (4-way MIG)
+	"1g.6gb":  {4, 32},
+	"2g.12gb": {8, 64},
+	"4g.24gb": {16, 128},
+	// RTX Pro 6000 Blackwell Server Edition 96 GiB (4-way MIG)
+	"1g.24gb": {4, 32},
+	"2g.48gb": {8, 64},
+	"4g.96gb": {16, 128},
+}
+
+// migHostDefault is used for unrecognised profile names. Mirrors a single
+// 1-slice allocation: conservative enough for the smallest known profiles.
+var migHostDefault = struct {
+	vcpus    int
+	memoryGB float64
+}{4, 32}
+
+// MIGHostResources returns the host vCPU count and memory in MiB to assign to
+// an EC2 instance of the given MIG profile name (e.g. "1g.10gb"). The profile
+// name is matched after stripping any hardware-specific suffixes (+gfx, -me,
+// +me) that nvidia-smi appends on some architectures. Returns a 4-vCPU /
+// 32-GiB default for profiles not present in the table.
+func MIGHostResources(profileName string) (vcpus, memMiB int64) {
+	// Strip Blackwell/Hopper suffixes that nvidia-smi appends.
+	clean := profileName
+	for _, suffix := range []string{"+gfx", "+me", "-me"} {
+		clean = strings.TrimSuffix(clean, suffix)
+	}
+	s, ok := migHostResources[clean]
+	if !ok {
+		s = migHostDefault
+	}
+	return int64(s.vcpus), int64(s.memoryGB * 1024)
 }

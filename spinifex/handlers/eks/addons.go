@@ -1,30 +1,32 @@
 package handlers_eks
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/eks"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // ListAddons returns the names of every managed add-on installed on a cluster.
-func (s *EKSServiceImpl) ListAddons(input *eks.ListAddonsInput, accountID string) (*eks.ListAddonsOutput, error) {
+func (s *EKSServiceImpl) ListAddons(ctx context.Context, input *eks.ListAddonsInput, accountID string) (*eks.ListAddonsOutput, error) {
 	if input == nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 	cluster := aws.StringValue(input.ClusterName)
-	acctKV, err := s.acctKVForCluster(accountID, cluster)
+	acctKV, err := s.acctKVForCluster(ctx, accountID, cluster)
 	if err != nil {
 		return nil, err
 	}
-	recs, err := ListAddonRecords(acctKV, cluster)
+	recs, err := ListAddonRecords(ctx, acctKV, cluster)
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +38,7 @@ func (s *EKSServiceImpl) ListAddons(input *eks.ListAddonsInput, accountID string
 }
 
 // DescribeAddonVersions returns the static add-on catalog, optionally filtered by name.
-func (s *EKSServiceImpl) DescribeAddonVersions(input *eks.DescribeAddonVersionsInput, _ string) (*eks.DescribeAddonVersionsOutput, error) {
+func (s *EKSServiceImpl) DescribeAddonVersions(ctx context.Context, input *eks.DescribeAddonVersionsInput, _ string) (*eks.DescribeAddonVersionsOutput, error) {
 	filter := ""
 	if input != nil {
 		filter = aws.StringValue(input.AddonName)
@@ -59,7 +61,7 @@ func (s *EKSServiceImpl) DescribeAddonVersions(input *eks.DescribeAddonVersionsI
 
 // CreateAddon validates, persists a CREATING record, and stages it for delivery.
 // Transitions to ACTIVE once the cluster state report confirms delivery.
-func (s *EKSServiceImpl) CreateAddon(input *eks.CreateAddonInput, accountID string) (*eks.CreateAddonOutput, error) {
+func (s *EKSServiceImpl) CreateAddon(ctx context.Context, input *eks.CreateAddonInput, accountID string) (*eks.CreateAddonOutput, error) {
 	if input == nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
@@ -78,11 +80,11 @@ func (s *EKSServiceImpl) CreateAddon(input *eks.CreateAddonInput, accountID stri
 	} else if !spec.supportsVersion(version) {
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
-	acctKV, err := s.acctKVForCluster(accountID, cluster)
+	acctKV, err := s.acctKVForCluster(ctx, accountID, cluster)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := GetAddonRecord(acctKV, cluster, addonName); err == nil {
+	if _, err := GetAddonRecord(ctx, acctKV, cluster, addonName); err == nil {
 		return nil, errors.New(awserrors.ErrorEKSResourceInUse)
 	} else if !errors.Is(err, ErrAddonNotFound) {
 		return nil, err
@@ -99,11 +101,11 @@ func (s *EKSServiceImpl) CreateAddon(input *eks.CreateAddonInput, accountID stri
 		CreatedAt:             now,
 		ModifiedAt:            now,
 	}
-	if err := PutAddonRecord(acctKV, cluster, rec); err != nil {
+	if err := PutAddonRecord(ctx, acctKV, cluster, rec); err != nil {
 		return nil, err
 	}
-	if err := s.addonInstaller().Install(accountID, cluster, rec); err != nil {
-		s.markAddonFailed(acctKV, cluster, addonName, err)
+	if err := s.addonInstaller().Install(ctx, accountID, cluster, rec); err != nil {
+		s.markAddonFailed(ctx, acctKV, cluster, addonName, err)
 		return nil, err
 	}
 	return &eks.CreateAddonOutput{Addon: addonRecordToAWS(cluster, rec)}, nil
@@ -129,17 +131,17 @@ type ListStagedAddonManifestsOutput struct {
 // route) to render the baked bundles into the K3s auto-deploy dir; an add-on
 // whose record was deleted has its staged manifest removed, so the agent treats
 // absence here as "remove the locally-rendered manifest".
-func (s *EKSServiceImpl) ListStagedAddonManifests(input *ListStagedAddonManifestsInput, accountID string) (*ListStagedAddonManifestsOutput, error) {
+func (s *EKSServiceImpl) ListStagedAddonManifests(ctx context.Context, input *ListStagedAddonManifestsInput, accountID string) (*ListStagedAddonManifestsOutput, error) {
 	if input == nil || input.ClusterName == "" {
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
-	acctKV, err := s.acctKVForCluster(accountID, input.ClusterName)
+	acctKV, err := s.acctKVForCluster(ctx, accountID, input.ClusterName)
 	if err != nil {
 		return nil, err
 	}
-	keys, err := acctKV.Keys()
+	keys, err := acctKV.Keys(ctx)
 	if err != nil {
-		if errors.Is(err, nats.ErrNoKeysFound) {
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
 			return &ListStagedAddonManifestsOutput{Manifests: []StagedAddonManifest{}}, nil
 		}
 		return nil, err
@@ -150,9 +152,9 @@ func (s *EKSServiceImpl) ListStagedAddonManifests(input *ListStagedAddonManifest
 		if !strings.HasPrefix(k, prefix) || !strings.HasSuffix(k, "/manifest") {
 			continue
 		}
-		entry, err := acctKV.Get(k)
+		entry, err := acctKV.Get(ctx, k)
 		if err != nil {
-			if errors.Is(err, nats.ErrKeyNotFound) {
+			if errors.Is(err, jetstream.ErrKeyNotFound) {
 				continue
 			}
 			return nil, err
@@ -167,26 +169,26 @@ func (s *EKSServiceImpl) ListStagedAddonManifests(input *ListStagedAddonManifest
 	return &ListStagedAddonManifestsOutput{Manifests: out}, nil
 }
 
+// sortStagedManifests orders manifests by add-on name. One manifest is staged
+// per add-on name, so the ordering is total and an unstable sort suffices.
 func sortStagedManifests(m []StagedAddonManifest) {
-	for i := 1; i < len(m); i++ {
-		for j := i; j > 0 && m[j-1].AddonName > m[j].AddonName; j-- {
-			m[j-1], m[j] = m[j], m[j-1]
-		}
-	}
+	slices.SortFunc(m, func(a, b StagedAddonManifest) int {
+		return strings.Compare(a.AddonName, b.AddonName)
+	})
 }
 
 // DescribeAddon returns one installed add-on's record.
-func (s *EKSServiceImpl) DescribeAddon(input *eks.DescribeAddonInput, accountID string) (*eks.DescribeAddonOutput, error) {
+func (s *EKSServiceImpl) DescribeAddon(ctx context.Context, input *eks.DescribeAddonInput, accountID string) (*eks.DescribeAddonOutput, error) {
 	if input == nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 	cluster := aws.StringValue(input.ClusterName)
 	addonName := aws.StringValue(input.AddonName)
-	acctKV, err := s.acctKVForCluster(accountID, cluster)
+	acctKV, err := s.acctKVForCluster(ctx, accountID, cluster)
 	if err != nil {
 		return nil, err
 	}
-	rec, err := GetAddonRecord(acctKV, cluster, addonName)
+	rec, err := GetAddonRecord(ctx, acctKV, cluster, addonName)
 	if err != nil {
 		if errors.Is(err, ErrAddonNotFound) {
 			return nil, errors.New(awserrors.ErrorEKSResourceNotFound)
@@ -197,13 +199,13 @@ func (s *EKSServiceImpl) DescribeAddon(input *eks.DescribeAddonInput, accountID 
 }
 
 // UpdateAddon CASes new version/config/role onto the record, marks it UPDATING, and re-stages it.
-func (s *EKSServiceImpl) UpdateAddon(input *eks.UpdateAddonInput, accountID string) (*eks.UpdateAddonOutput, error) {
+func (s *EKSServiceImpl) UpdateAddon(ctx context.Context, input *eks.UpdateAddonInput, accountID string) (*eks.UpdateAddonOutput, error) {
 	if input == nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 	cluster := aws.StringValue(input.ClusterName)
 	addonName := aws.StringValue(input.AddonName)
-	acctKV, err := s.acctKVForCluster(accountID, cluster)
+	acctKV, err := s.acctKVForCluster(ctx, accountID, cluster)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +217,7 @@ func (s *EKSServiceImpl) UpdateAddon(input *eks.UpdateAddonInput, accountID stri
 		}
 	}
 	now := time.Now().UTC()
-	rec, err := casUpdateAddon(acctKV, cluster, addonName, func(r *AddonRecord) bool {
+	rec, err := casUpdateAddon(ctx, acctKV, cluster, addonName, func(r *AddonRecord) bool {
 		if v := aws.StringValue(input.AddonVersion); v != "" {
 			r.AddonVersion = v
 		}
@@ -235,8 +237,8 @@ func (s *EKSServiceImpl) UpdateAddon(input *eks.UpdateAddonInput, accountID stri
 		}
 		return nil, err
 	}
-	if err := s.addonInstaller().Install(accountID, cluster, rec); err != nil {
-		s.markAddonFailed(acctKV, cluster, addonName, err)
+	if err := s.addonInstaller().Install(ctx, accountID, cluster, rec); err != nil {
+		s.markAddonFailed(ctx, acctKV, cluster, addonName, err)
 		return nil, err
 	}
 	return &eks.UpdateAddonOutput{Update: &eks.Update{
@@ -248,17 +250,17 @@ func (s *EKSServiceImpl) UpdateAddon(input *eks.UpdateAddonInput, accountID stri
 }
 
 // DeleteAddon marks the record DELETING, removes the staged manifest, then deletes the record.
-func (s *EKSServiceImpl) DeleteAddon(input *eks.DeleteAddonInput, accountID string) (*eks.DeleteAddonOutput, error) {
+func (s *EKSServiceImpl) DeleteAddon(ctx context.Context, input *eks.DeleteAddonInput, accountID string) (*eks.DeleteAddonOutput, error) {
 	if input == nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 	cluster := aws.StringValue(input.ClusterName)
 	addonName := aws.StringValue(input.AddonName)
-	acctKV, err := s.acctKVForCluster(accountID, cluster)
+	acctKV, err := s.acctKVForCluster(ctx, accountID, cluster)
 	if err != nil {
 		return nil, err
 	}
-	rec, err := GetAddonRecord(acctKV, cluster, addonName)
+	rec, err := GetAddonRecord(ctx, acctKV, cluster, addonName)
 	if err != nil {
 		if errors.Is(err, ErrAddonNotFound) {
 			return nil, errors.New(awserrors.ErrorEKSResourceNotFound)
@@ -268,10 +270,10 @@ func (s *EKSServiceImpl) DeleteAddon(input *eks.DeleteAddonInput, accountID stri
 	rec.Status = AddonStatusDeleting
 	rec.ModifiedAt = time.Now().UTC()
 	out := &eks.DeleteAddonOutput{Addon: addonRecordToAWS(cluster, rec)}
-	if err := s.addonInstaller().Uninstall(accountID, cluster, addonName); err != nil {
+	if err := s.addonInstaller().Uninstall(ctx, accountID, cluster, addonName); err != nil {
 		return nil, err
 	}
-	if err := DeleteAddonRecord(acctKV, cluster, addonName); err != nil {
+	if err := DeleteAddonRecord(ctx, acctKV, cluster, addonName); err != nil {
 		if errors.Is(err, ErrAddonNotFound) {
 			return nil, errors.New(awserrors.ErrorEKSResourceNotFound)
 		}
@@ -328,13 +330,13 @@ func (s *EKSServiceImpl) addonInstaller() AddonInstaller {
 	if s.deps.AddonInstaller != nil {
 		return s.deps.AddonInstaller
 	}
-	return newStagingInstaller(s.deps.NATSConn)
+	return newStagingInstaller(s.deps.NATSConn, s.deps.ClusterSize)
 }
 
 // markAddonFailed best-effort flips a record to CREATE_FAILED with the error reason.
-func (s *EKSServiceImpl) markAddonFailed(acctKV nats.KeyValue, cluster, addon string, cause error) {
+func (s *EKSServiceImpl) markAddonFailed(ctx context.Context, acctKV jetstream.KeyValue, cluster, addon string, cause error) {
 	now := time.Now().UTC()
-	if _, err := casUpdateAddon(acctKV, cluster, addon, func(r *AddonRecord) bool {
+	if _, err := casUpdateAddon(ctx, acctKV, cluster, addon, func(r *AddonRecord) bool {
 		r.Status = AddonStatusCreateFailed
 		r.Health = cause.Error()
 		r.ModifiedAt = now

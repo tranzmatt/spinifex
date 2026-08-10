@@ -1,6 +1,7 @@
 package handlers_ec2_vpc
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ func setupTestVPCServiceWithNC(t *testing.T) (*VPCServiceImpl, *nats.Conn) {
 	t.Helper()
 	_, nc, _ := testutil.StartTestJetStream(t)
 
-	svc, err := NewVPCServiceImplWithNATS(nil, nc)
+	svc, err := NewVPCServiceImplWithNATS(t.Context(), nil, nc)
 	require.NoError(t, err)
 	testutil.StubVpcdSGResponder(t, nc)
 	return svc, nc
@@ -38,7 +39,7 @@ func setupTestVPCService(t *testing.T) *VPCServiceImpl {
 func setupTestVPCServiceWithFailingVpcd(t *testing.T, errMsg string) (*VPCServiceImpl, *nats.Conn) {
 	t.Helper()
 	_, nc, _ := testutil.StartTestJetStream(t)
-	svc, err := NewVPCServiceImplWithNATS(nil, nc)
+	svc, err := NewVPCServiceImplWithNATS(t.Context(), nil, nc)
 	require.NoError(t, err)
 	testutil.StubVpcdSGFailingResponder(t, nc, errMsg)
 	return svc, nc
@@ -46,7 +47,7 @@ func setupTestVPCServiceWithFailingVpcd(t *testing.T, errMsg string) (*VPCServic
 
 func createTestVPC(t *testing.T, svc *VPCServiceImpl, cidr string) string {
 	t.Helper()
-	out, err := svc.CreateVpc(&ec2.CreateVpcInput{
+	out, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String(cidr),
 	}, testAccountID)
 	require.NoError(t, err)
@@ -55,7 +56,7 @@ func createTestVPC(t *testing.T, svc *VPCServiceImpl, cidr string) string {
 
 func createTestSubnet(t *testing.T, svc *VPCServiceImpl, vpcID, cidr string) string {
 	t.Helper()
-	out, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	out, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:     aws.String(vpcID),
 		CidrBlock: aws.String(cidr),
 	}, testAccountID)
@@ -67,7 +68,7 @@ func createTestSubnet(t *testing.T, svc *VPCServiceImpl, vpcID, cidr string) str
 
 func TestCreateVpc(t *testing.T) {
 	svc := setupTestVPCService(t)
-	out, err := svc.CreateVpc(&ec2.CreateVpcInput{
+	out, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.0/16"),
 	}, testAccountID)
 	require.NoError(t, err)
@@ -80,13 +81,13 @@ func TestCreateVpc(t *testing.T) {
 
 func TestCreateVpc_MissingCidr(t *testing.T) {
 	svc := setupTestVPCService(t)
-	_, err := svc.CreateVpc(&ec2.CreateVpcInput{}, testAccountID)
+	_, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{}, testAccountID)
 	assert.ErrorContains(t, err, "MissingParameter")
 }
 
 func TestCreateVpc_EmptyCidr(t *testing.T) {
 	svc := setupTestVPCService(t)
-	_, err := svc.CreateVpc(&ec2.CreateVpcInput{
+	_, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String(""),
 	}, testAccountID)
 	assert.ErrorContains(t, err, "MissingParameter")
@@ -94,7 +95,7 @@ func TestCreateVpc_EmptyCidr(t *testing.T) {
 
 func TestCreateVpc_InvalidCidr(t *testing.T) {
 	svc := setupTestVPCService(t)
-	_, err := svc.CreateVpc(&ec2.CreateVpcInput{
+	_, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("not-a-cidr"),
 	}, testAccountID)
 	assert.ErrorContains(t, err, "InvalidVpcRange")
@@ -102,7 +103,7 @@ func TestCreateVpc_InvalidCidr(t *testing.T) {
 
 func TestCreateVpc_CidrTooLarge(t *testing.T) {
 	svc := setupTestVPCService(t)
-	_, err := svc.CreateVpc(&ec2.CreateVpcInput{
+	_, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.0/8"),
 	}, testAccountID)
 	assert.ErrorContains(t, err, "InvalidVpcRange")
@@ -110,7 +111,7 @@ func TestCreateVpc_CidrTooLarge(t *testing.T) {
 
 func TestCreateVpc_CidrTooSmall(t *testing.T) {
 	svc := setupTestVPCService(t)
-	_, err := svc.CreateVpc(&ec2.CreateVpcInput{
+	_, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.0/29"),
 	}, testAccountID)
 	assert.ErrorContains(t, err, "InvalidVpcRange")
@@ -118,7 +119,7 @@ func TestCreateVpc_CidrTooSmall(t *testing.T) {
 
 func TestCreateVpc_WithTags(t *testing.T) {
 	svc := setupTestVPCService(t)
-	out, err := svc.CreateVpc(&ec2.CreateVpcInput{
+	out, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.0/16"),
 		TagSpecifications: []*ec2.TagSpecification{
 			{
@@ -134,7 +135,7 @@ func TestCreateVpc_WithTags(t *testing.T) {
 	assert.Len(t, out.Vpc.Tags, 2)
 
 	// Verify tags persist through describe
-	desc, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	desc, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		VpcIds: []*string{out.Vpc.VpcId},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -144,7 +145,7 @@ func TestCreateVpc_WithTags(t *testing.T) {
 
 func TestCreateVpc_TagsWrongResourceType(t *testing.T) {
 	svc := setupTestVPCService(t)
-	out, err := svc.CreateVpc(&ec2.CreateVpcInput{
+	out, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.0/16"),
 		TagSpecifications: []*ec2.TagSpecification{
 			{
@@ -163,9 +164,9 @@ func TestCreateVpc_VNIIncrement(t *testing.T) {
 	svc := setupTestVPCService(t)
 
 	// Create two VPCs and verify they get different VNIs
-	out1, err := svc.CreateVpc(&ec2.CreateVpcInput{CidrBlock: aws.String("10.0.0.0/16")}, testAccountID)
+	out1, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{CidrBlock: aws.String("10.0.0.0/16")}, testAccountID)
 	require.NoError(t, err)
-	out2, err := svc.CreateVpc(&ec2.CreateVpcInput{CidrBlock: aws.String("10.1.0.0/16")}, testAccountID)
+	out2, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{CidrBlock: aws.String("10.1.0.0/16")}, testAccountID)
 	require.NoError(t, err)
 
 	// Verify VPCs are different
@@ -176,13 +177,13 @@ func TestDeleteVpc(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
-	_, err := svc.DeleteVpc(&ec2.DeleteVpcInput{
+	_, err := svc.DeleteVpc(context.Background(), &ec2.DeleteVpcInput{
 		VpcId: aws.String(vpcID),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Verify deleted
-	desc, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	desc, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		VpcIds: []*string{aws.String(vpcID)},
 	}, testAccountID)
 	assert.ErrorContains(t, err, "InvalidVpcID.NotFound")
@@ -191,20 +192,23 @@ func TestDeleteVpc(t *testing.T) {
 
 func TestDeleteVpc_MissingID(t *testing.T) {
 	svc := setupTestVPCService(t)
-	_, err := svc.DeleteVpc(&ec2.DeleteVpcInput{}, testAccountID)
+	_, err := svc.DeleteVpc(context.Background(), &ec2.DeleteVpcInput{}, testAccountID)
 	assert.ErrorContains(t, err, "MissingParameter")
 }
 
 func TestDeleteVpc_WithSubnets(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
-	createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
+	subnetID := createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 
 	// Should fail because VPC has subnets
-	_, err := svc.DeleteVpc(&ec2.DeleteVpcInput{
+	_, err := svc.DeleteVpc(context.Background(), &ec2.DeleteVpcInput{
 		VpcId: aws.String(vpcID),
 	}, testAccountID)
 	assert.ErrorContains(t, err, "DependencyViolation")
+	// The message must name the blocking subnet so the caller knows what to
+	// delete first, not just that something is blocking.
+	assert.ErrorContains(t, err, subnetID)
 }
 
 func TestDescribeVpcs_All(t *testing.T) {
@@ -212,7 +216,7 @@ func TestDescribeVpcs_All(t *testing.T) {
 	createTestVPC(t, svc, "10.0.0.0/16")
 	createTestVPC(t, svc, "10.1.0.0/16")
 
-	desc, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{}, testAccountID)
+	desc, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{}, testAccountID)
 	require.NoError(t, err)
 	assert.Len(t, desc.Vpcs, 2)
 }
@@ -222,7 +226,7 @@ func TestDescribeVpcs_ByID(t *testing.T) {
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	createTestVPC(t, svc, "10.1.0.0/16")
 
-	desc, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	desc, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		VpcIds: []*string{aws.String(vpcID)},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -232,14 +236,14 @@ func TestDescribeVpcs_ByID(t *testing.T) {
 
 func TestDescribeVpcs_Empty(t *testing.T) {
 	svc := setupTestVPCService(t)
-	desc, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{}, testAccountID)
+	desc, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{}, testAccountID)
 	require.NoError(t, err)
 	assert.Empty(t, desc.Vpcs)
 }
 
 func TestDescribeVpcs_NotFound(t *testing.T) {
 	svc := setupTestVPCService(t)
-	_, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	_, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		VpcIds: []*string{aws.String("vpc-nonexistent")},
 	}, testAccountID)
 	assert.ErrorContains(t, err, "InvalidVpcID.NotFound")
@@ -251,7 +255,7 @@ func TestCreateSubnet(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
-	out, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	out, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:     aws.String(vpcID),
 		CidrBlock: aws.String("10.0.1.0/24"),
 	}, testAccountID)
@@ -267,7 +271,7 @@ func TestCreateSubnet(t *testing.T) {
 
 func TestCreateSubnet_MissingVpcId(t *testing.T) {
 	svc := setupTestVPCService(t)
-	_, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	_, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		CidrBlock: aws.String("10.0.1.0/24"),
 	}, testAccountID)
 	assert.ErrorContains(t, err, "MissingParameter")
@@ -276,7 +280,7 @@ func TestCreateSubnet_MissingVpcId(t *testing.T) {
 func TestCreateSubnet_MissingCidr(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
-	_, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	_, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId: aws.String(vpcID),
 	}, testAccountID)
 	assert.ErrorContains(t, err, "MissingParameter")
@@ -284,7 +288,7 @@ func TestCreateSubnet_MissingCidr(t *testing.T) {
 
 func TestCreateSubnet_InvalidVpcId(t *testing.T) {
 	svc := setupTestVPCService(t)
-	_, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	_, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:     aws.String("vpc-nonexistent"),
 		CidrBlock: aws.String("10.0.1.0/24"),
 	}, testAccountID)
@@ -294,7 +298,7 @@ func TestCreateSubnet_InvalidVpcId(t *testing.T) {
 func TestCreateSubnet_InvalidCidr(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
-	_, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	_, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:     aws.String(vpcID),
 		CidrBlock: aws.String("not-a-cidr"),
 	}, testAccountID)
@@ -304,7 +308,7 @@ func TestCreateSubnet_InvalidCidr(t *testing.T) {
 func TestCreateSubnet_OutsideVpcCidr(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
-	_, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	_, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:     aws.String(vpcID),
 		CidrBlock: aws.String("192.168.1.0/24"),
 	}, testAccountID)
@@ -317,7 +321,7 @@ func TestCreateSubnet_ConflictingCidr(t *testing.T) {
 	createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 
 	// Try to create overlapping subnet
-	_, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	_, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:     aws.String(vpcID),
 		CidrBlock: aws.String("10.0.1.0/25"),
 	}, testAccountID)
@@ -328,7 +332,7 @@ func TestCreateSubnet_WithTags(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
-	out, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	out, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:     aws.String(vpcID),
 		CidrBlock: aws.String("10.0.1.0/24"),
 		TagSpecifications: []*ec2.TagSpecification{
@@ -348,7 +352,7 @@ func TestCreateSubnet_WithAZ(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
-	out, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	out, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:            aws.String(vpcID),
 		CidrBlock:        aws.String("10.0.1.0/24"),
 		AvailabilityZone: aws.String("us-east-1a"),
@@ -362,13 +366,13 @@ func TestDeleteSubnet(t *testing.T) {
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	subnetID := createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 
-	_, err := svc.DeleteSubnet(&ec2.DeleteSubnetInput{
+	_, err := svc.DeleteSubnet(context.Background(), &ec2.DeleteSubnetInput{
 		SubnetId: aws.String(subnetID),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Verify deleted
-	desc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	desc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		SubnetIds: []*string{aws.String(subnetID)},
 	}, testAccountID)
 	assert.ErrorContains(t, err, "InvalidSubnetID.NotFound")
@@ -377,7 +381,7 @@ func TestDeleteSubnet(t *testing.T) {
 
 func TestDeleteSubnet_MissingID(t *testing.T) {
 	svc := setupTestVPCService(t)
-	_, err := svc.DeleteSubnet(&ec2.DeleteSubnetInput{}, testAccountID)
+	_, err := svc.DeleteSubnet(context.Background(), &ec2.DeleteSubnetInput{}, testAccountID)
 	assert.ErrorContains(t, err, "MissingParameter")
 }
 
@@ -387,7 +391,7 @@ func TestDescribeSubnets_All(t *testing.T) {
 	createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 	createTestSubnet(t, svc, vpcID, "10.0.2.0/24")
 
-	desc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	desc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	assert.Len(t, desc.Subnets, 2)
 }
@@ -398,7 +402,7 @@ func TestDescribeSubnets_ByID(t *testing.T) {
 	subnetID := createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 	createTestSubnet(t, svc, vpcID, "10.0.2.0/24")
 
-	desc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	desc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		SubnetIds: []*string{aws.String(subnetID)},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -413,7 +417,7 @@ func TestDescribeSubnets_ByVpcId(t *testing.T) {
 	createTestSubnet(t, svc, vpc1, "10.0.1.0/24")
 	createTestSubnet(t, svc, vpc2, "10.1.1.0/24")
 
-	desc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	desc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{
 				Name:   aws.String("vpc-id"),
@@ -428,14 +432,14 @@ func TestDescribeSubnets_ByVpcId(t *testing.T) {
 
 func TestDescribeSubnets_Empty(t *testing.T) {
 	svc := setupTestVPCService(t)
-	desc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	desc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	assert.Empty(t, desc.Subnets)
 }
 
 func TestDescribeSubnets_NotFound(t *testing.T) {
 	svc := setupTestVPCService(t)
-	_, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	_, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		SubnetIds: []*string{aws.String("subnet-nonexistent")},
 	}, testAccountID)
 	assert.ErrorContains(t, err, "InvalidSubnetID.NotFound")
@@ -453,7 +457,7 @@ func TestCreateMultipleSubnetsInVpc(t *testing.T) {
 	assert.NotEqual(t, sub1, sub2)
 	assert.NotEqual(t, sub2, sub3)
 
-	desc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	desc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("vpc-id"), Values: []*string{aws.String(vpcID)}},
 		},
@@ -468,15 +472,15 @@ func TestDeleteVpcAfterSubnetsDeleted(t *testing.T) {
 	subnetID := createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 
 	// Can't delete VPC with subnets
-	_, err := svc.DeleteVpc(&ec2.DeleteVpcInput{VpcId: aws.String(vpcID)}, testAccountID)
+	_, err := svc.DeleteVpc(context.Background(), &ec2.DeleteVpcInput{VpcId: aws.String(vpcID)}, testAccountID)
 	assert.ErrorContains(t, err, "DependencyViolation")
 
 	// Delete subnet first
-	_, err = svc.DeleteSubnet(&ec2.DeleteSubnetInput{SubnetId: aws.String(subnetID)}, testAccountID)
+	_, err = svc.DeleteSubnet(context.Background(), &ec2.DeleteSubnetInput{SubnetId: aws.String(subnetID)}, testAccountID)
 	require.NoError(t, err)
 
 	// Now VPC can be deleted
-	_, err = svc.DeleteVpc(&ec2.DeleteVpcInput{VpcId: aws.String(vpcID)}, testAccountID)
+	_, err = svc.DeleteVpc(context.Background(), &ec2.DeleteVpcInput{VpcId: aws.String(vpcID)}, testAccountID)
 	require.NoError(t, err)
 }
 
@@ -485,7 +489,7 @@ func TestCreateSubnet_CidrRanges(t *testing.T) {
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
 	// /28 (smallest allowed) = 16 IPs - 5 reserved = 11
-	out, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	out, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:     aws.String(vpcID),
 		CidrBlock: aws.String("10.0.0.0/28"),
 	}, testAccountID)
@@ -494,7 +498,7 @@ func TestCreateSubnet_CidrRanges(t *testing.T) {
 
 	// /16 (largest allowed) = 65536 IPs - 5 reserved = 65531
 	vpcID2 := createTestVPC(t, svc, "172.16.0.0/16")
-	out2, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	out2, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:     aws.String(vpcID2),
 		CidrBlock: aws.String("172.16.0.0/16"),
 	}, testAccountID)
@@ -516,14 +520,14 @@ func TestEnsureDefaultVPC(t *testing.T) {
 	assert.Equal(t, "172.31.0.0/20", info.SubnetCidr)
 
 	// Verify default VPC was created
-	desc, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{}, testAccountID)
+	desc, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, desc.Vpcs, 1)
 	assert.True(t, *desc.Vpcs[0].IsDefault)
 	assert.Equal(t, "172.31.0.0/16", *desc.Vpcs[0].CidrBlock)
 
 	// Verify default subnet was created
-	subDesc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subDesc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, subDesc.Subnets, 1)
 	assert.True(t, *subDesc.Subnets[0].DefaultForAz)
@@ -541,11 +545,11 @@ func TestEnsureDefaultVPC_Idempotent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Should still have exactly 1 VPC and 1 subnet
-	desc, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{}, testAccountID)
+	desc, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{}, testAccountID)
 	require.NoError(t, err)
 	assert.Len(t, desc.Vpcs, 1)
 
-	subDesc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subDesc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	assert.Len(t, subDesc.Subnets, 1)
 }
@@ -564,7 +568,7 @@ func TestEnsureDefaultVPC_SkipsWhenDefaultExists(t *testing.T) {
 	_, err = svc.EnsureDefaultVPC(testAccountID)
 	require.NoError(t, err)
 
-	desc, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{}, testAccountID)
+	desc, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{}, testAccountID)
 	require.NoError(t, err)
 	assert.Len(t, desc.Vpcs, 2) // 1 default + 1 manual
 
@@ -585,13 +589,13 @@ func TestCreateMainRouteTable_Idempotent(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.99.0.0/16") // CreateVpc auto-calls createMainRouteTable
 
-	firstID, err := svc.findMainRouteTableID(testAccountID, vpcID)
+	firstID, err := svc.findMainRouteTableID(t.Context(), testAccountID, vpcID)
 	require.NoError(t, err)
 	require.NotEmpty(t, firstID, "CreateVpc should have created a main route table")
 
-	require.NoError(t, svc.createMainRouteTable(testAccountID, vpcID, "10.99.0.0/16"))
+	require.NoError(t, svc.createMainRouteTable(context.Background(), testAccountID, vpcID, "10.99.0.0/16"))
 
-	secondID, err := svc.findMainRouteTableID(testAccountID, vpcID)
+	secondID, err := svc.findMainRouteTableID(t.Context(), testAccountID, vpcID)
 	require.NoError(t, err)
 	assert.Equal(t, firstID, secondID, "second call must be a no-op")
 
@@ -607,15 +611,15 @@ func TestDeleteVpc_ReapsMainRouteTable(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.77.0.0/16") // auto-creates the main RT
 
-	rtbID, err := svc.findMainRouteTableID(testAccountID, vpcID)
+	rtbID, err := svc.findMainRouteTableID(t.Context(), testAccountID, vpcID)
 	require.NoError(t, err)
 	require.NotEmpty(t, rtbID, "CreateVpc should have created a main route table")
 	require.Equal(t, 1, countMainRouteTablesForVPC(t, svc, vpcID))
 
-	_, err = svc.DeleteVpc(&ec2.DeleteVpcInput{VpcId: aws.String(vpcID)}, testAccountID)
+	_, err = svc.DeleteVpc(context.Background(), &ec2.DeleteVpcInput{VpcId: aws.String(vpcID)}, testAccountID)
 	require.NoError(t, err)
 
-	gone, err := svc.findMainRouteTableID(testAccountID, vpcID)
+	gone, err := svc.findMainRouteTableID(t.Context(), testAccountID, vpcID)
 	require.NoError(t, err)
 	assert.Empty(t, gone, "DeleteVpc must reap the main route table, not leak it")
 	assert.Equal(t, 0, countMainRouteTablesForVPC(t, svc, vpcID))
@@ -625,13 +629,13 @@ func TestDeleteVpc_ReapsMainRouteTable(t *testing.T) {
 // state in tests. Returns the number of IsMain=true records for vpcID.
 func countMainRouteTablesForVPC(t *testing.T, svc *VPCServiceImpl, vpcID string) int {
 	t.Helper()
-	keys, err := svc.rtbKV.Keys()
+	keys, err := svc.rtbKV.Keys(t.Context())
 	if err != nil {
 		return 0
 	}
 	n := 0
 	for _, key := range keys {
-		entry, err := svc.rtbKV.Get(key)
+		entry, err := svc.rtbKV.Get(t.Context(), key)
 		if err != nil {
 			continue
 		}
@@ -649,12 +653,208 @@ func countMainRouteTablesForVPC(t *testing.T, svc *VPCServiceImpl, vpcID string)
 	return n
 }
 
+// nonMainRTBRecord mirrors routetable.RouteTableRecord (see
+// clearRouteTableAssociationsForSubnet) so tests can seed a non-main route
+// table with an association directly in rtbKV, bypassing the routetable
+// package to avoid a circular import.
+type nonMainRTBRecord struct {
+	RouteTableId string `json:"route_table_id"`
+	VpcId        string `json:"vpc_id"`
+	AccountID    string `json:"account_id"`
+	IsMain       bool   `json:"is_main"`
+	Associations []struct {
+		AssociationId string `json:"association_id"`
+		SubnetId      string `json:"subnet_id,omitempty"`
+		Main          bool   `json:"main"`
+	} `json:"associations"`
+	Tags      map[string]string `json:"tags"`
+	CreatedAt time.Time         `json:"created_at"`
+}
+
+// putTestNonMainRouteTable writes a non-main route table associated with
+// subnetID directly to rtbKV and returns its ID and association ID.
+func putTestNonMainRouteTable(t *testing.T, svc *VPCServiceImpl, accountID, vpcID, subnetID string) (rtbID, assocID string) {
+	t.Helper()
+	rtbID = "rtb-" + t.Name() + "-" + subnetID
+	assocID = "rtbassoc-" + t.Name() + "-" + subnetID
+	rec := nonMainRTBRecord{
+		RouteTableId: rtbID,
+		VpcId:        vpcID,
+		AccountID:    accountID,
+		IsMain:       false,
+		Associations: []struct {
+			AssociationId string `json:"association_id"`
+			SubnetId      string `json:"subnet_id,omitempty"`
+			Main          bool   `json:"main"`
+		}{
+			{AssociationId: assocID, SubnetId: subnetID, Main: false},
+		},
+		Tags:      make(map[string]string),
+		CreatedAt: time.Now(),
+	}
+	data, err := json.Marshal(rec)
+	require.NoError(t, err)
+	_, err = svc.rtbKV.Put(t.Context(), accountID+"."+rtbID, data)
+	require.NoError(t, err)
+	return rtbID, assocID
+}
+
+// getTestRouteTableAssociations reads back the associations of rtbID for
+// assertions.
+func getTestRouteTableAssociations(t *testing.T, svc *VPCServiceImpl, accountID, rtbID string) []string {
+	t.Helper()
+	entry, err := svc.rtbKV.Get(t.Context(), accountID+"."+rtbID)
+	require.NoError(t, err)
+	var rec nonMainRTBRecord
+	require.NoError(t, json.Unmarshal(entry.Value(), &rec))
+	subnetIDs := make([]string, 0, len(rec.Associations))
+	for _, a := range rec.Associations {
+		subnetIDs = append(subnetIDs, a.SubnetId)
+	}
+	return subnetIDs
+}
+
+// TestDeleteVpc_RejectsNonMainRouteTable asserts DeleteVpc rejects with
+// DependencyViolation while a non-main route table exists, matching AWS:
+// non-main route tables must be deleted first. Without this check the VPC
+// is removed out from under the route table, orphaning it permanently since
+// DeleteRouteTable can never resolve a VpcId that no longer exists.
+func TestDeleteVpc_RejectsNonMainRouteTable(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.60.0.0/16")
+	subnetID := createTestSubnet(t, svc, vpcID, "10.60.1.0/24")
+	rtbID, _ := putTestNonMainRouteTable(t, svc, testAccountID, vpcID, subnetID)
+
+	_, err := svc.DeleteVpc(context.Background(), &ec2.DeleteVpcInput{VpcId: aws.String(vpcID)}, testAccountID)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "DependencyViolation")
+
+	// Rejected call must mutate nothing: VPC and route table both persist.
+	desc, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{VpcIds: []*string{aws.String(vpcID)}}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, desc.Vpcs, 1, "VPC must persist so the caller can delete the route table and retry")
+
+	_, err = svc.rtbKV.Get(t.Context(), testAccountID+"."+rtbID)
+	require.NoError(t, err, "non-main route table must not be reaped by a rejected DeleteVpc")
+}
+
+// TestDeleteVpc_RouteTableCheckFailsClosedOnCorruptRTB asserts a corrupt
+// route table record blocks DeleteVpc rather than being silently skipped —
+// a transient/corrupt read must never let DeleteVpc orphan a route table it
+// could not evaluate.
+func TestDeleteVpc_RouteTableCheckFailsClosedOnCorruptRTB(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.61.0.0/16")
+
+	_, err := svc.rtbKV.Put(t.Context(), testAccountID+".rtb-corrupt", []byte("{not json"))
+	require.NoError(t, err)
+
+	_, err = svc.DeleteVpc(context.Background(), &ec2.DeleteVpcInput{VpcId: aws.String(vpcID)}, testAccountID)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "ServerInternal")
+}
+
+// TestDeleteSubnet_ClearsRouteTableAssociations asserts DeleteSubnet removes
+// every association naming the deleted subnet, so the route table it leaves
+// behind never carries a reference to a subnet that no longer exists.
+func TestDeleteSubnet_ClearsRouteTableAssociations(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.62.0.0/16")
+	subnetID := createTestSubnet(t, svc, vpcID, "10.62.1.0/24")
+	rtbID, _ := putTestNonMainRouteTable(t, svc, testAccountID, vpcID, subnetID)
+
+	_, err := svc.DeleteSubnet(context.Background(), &ec2.DeleteSubnetInput{SubnetId: aws.String(subnetID)}, testAccountID)
+	require.NoError(t, err)
+
+	assert.NotContains(t, getTestRouteTableAssociations(t, svc, testAccountID, rtbID), subnetID,
+		"DeleteSubnet must clear associations naming the deleted subnet")
+}
+
+// TestDeleteSubnet_PreservesUnknownRouteTableFields pins the write-back to
+// editing only "associations". routetable owns this record and imports vpc, so
+// it cannot be typed here; a mirror struct would silently erase every field
+// added to RouteTableRecord that the mirror had not caught up with.
+func TestDeleteSubnet_PreservesUnknownRouteTableFields(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.63.0.0/16")
+	subnetID := createTestSubnet(t, svc, vpcID, "10.63.1.0/24")
+	rtbID, _ := putTestNonMainRouteTable(t, svc, testAccountID, vpcID, subnetID)
+
+	// Re-write the stored record with a field no struct in this package knows.
+	key := testAccountID + "." + rtbID
+	entry, err := svc.rtbKV.Get(t.Context(), key)
+	require.NoError(t, err)
+	var stored map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(entry.Value(), &stored))
+	stored["propagating_vgws"] = json.RawMessage(`["vgw-deadbeef"]`)
+	data, err := json.Marshal(stored)
+	require.NoError(t, err)
+	_, err = svc.rtbKV.Put(t.Context(), key, data)
+	require.NoError(t, err)
+
+	_, err = svc.DeleteSubnet(context.Background(), &ec2.DeleteSubnetInput{SubnetId: aws.String(subnetID)}, testAccountID)
+	require.NoError(t, err)
+
+	after, err := svc.rtbKV.Get(t.Context(), key)
+	require.NoError(t, err)
+	var reread map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(after.Value(), &reread))
+
+	assert.NotContains(t, getTestRouteTableAssociations(t, svc, testAccountID, rtbID), subnetID,
+		"the association naming the subnet must still be cleared")
+	assert.JSONEq(t, `["vgw-deadbeef"]`, string(reread["propagating_vgws"]),
+		"a field this package does not model must survive the association clear")
+}
+
+// TestDeleteSubnet_LeavesOtherVPCsAssociationsAlone asserts clearing
+// associations for one subnet does not touch a route table association
+// belonging to a different subnet/VPC.
+func TestDeleteSubnet_LeavesOtherVPCsAssociationsAlone(t *testing.T) {
+	svc := setupTestVPCService(t)
+
+	vpcA := createTestVPC(t, svc, "10.63.0.0/16")
+	subnetA := createTestSubnet(t, svc, vpcA, "10.63.1.0/24")
+	rtbA, _ := putTestNonMainRouteTable(t, svc, testAccountID, vpcA, subnetA)
+
+	vpcB := createTestVPC(t, svc, "10.64.0.0/16")
+	subnetB := createTestSubnet(t, svc, vpcB, "10.64.1.0/24")
+	rtbB, _ := putTestNonMainRouteTable(t, svc, testAccountID, vpcB, subnetB)
+
+	_, err := svc.DeleteSubnet(context.Background(), &ec2.DeleteSubnetInput{SubnetId: aws.String(subnetA)}, testAccountID)
+	require.NoError(t, err)
+
+	assert.NotContains(t, getTestRouteTableAssociations(t, svc, testAccountID, rtbA), subnetA)
+	assert.Contains(t, getTestRouteTableAssociations(t, svc, testAccountID, rtbB), subnetB,
+		"deleting a subnet in one VPC must not touch another VPC's route table associations")
+}
+
+// TestDeleteSubnet_RouteTableCheckFailsClosedOnCorruptRTB asserts a corrupt
+// route table record blocks DeleteSubnet, leaving the subnet present and the
+// operation retryable, rather than deleting the subnet with a stale
+// association strand behind it unseen.
+func TestDeleteSubnet_RouteTableCheckFailsClosedOnCorruptRTB(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.65.0.0/16")
+	subnetID := createTestSubnet(t, svc, vpcID, "10.65.1.0/24")
+
+	_, err := svc.rtbKV.Put(t.Context(), testAccountID+".rtb-corrupt", []byte("{not json"))
+	require.NoError(t, err)
+
+	_, err = svc.DeleteSubnet(context.Background(), &ec2.DeleteSubnetInput{SubnetId: aws.String(subnetID)}, testAccountID)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "ServerInternal")
+
+	desc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{SubnetIds: []*string{aws.String(subnetID)}}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, desc.Subnets, 1, "subnet must persist so a KV read failure never strands an association unseen")
+}
+
 // TestEnsureDefaultVPC_NoVpcdResponder simulates the daemon-startup race where
 // EnsureDefaultVPC runs before vpcd has subscribed. The SG step is best-effort,
 // so subnet and RTB must still land in KV when vpcd is absent.
 func TestEnsureDefaultVPC_NoVpcdResponder(t *testing.T) {
 	_, nc, _ := testutil.StartTestJetStream(t)
-	svc, err := NewVPCServiceImplWithNATS(nil, nc)
+	svc, err := NewVPCServiceImplWithNATS(t.Context(), nil, nc)
 	require.NoError(t, err)
 	// Intentionally NOT calling StubVpcdSGResponder — vpc.create-sg has no
 	// responder, mirroring the bootstrap race.
@@ -664,22 +864,22 @@ func TestEnsureDefaultVPC_NoVpcdResponder(t *testing.T) {
 	require.NotNil(t, info)
 
 	// Default VPC, subnet, and main RTB must all be present in KV.
-	desc, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{}, testAccountID)
+	desc, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, desc.Vpcs, 1)
 	assert.True(t, *desc.Vpcs[0].IsDefault)
 
-	subDesc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subDesc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, subDesc.Subnets, 1)
 	assert.Equal(t, info.VpcId, *subDesc.Subnets[0].VpcId)
 
 	require.NotNil(t, svc.rtbKV)
-	rtbKeys, err := svc.rtbKV.Keys()
+	rtbKeys, err := svc.rtbKV.Keys(t.Context())
 	require.NoError(t, err)
 	foundMainRTB := false
 	for _, k := range rtbKeys {
-		entry, err := svc.rtbKV.Get(k)
+		entry, err := svc.rtbKV.Get(t.Context(), k)
 		if err != nil {
 			continue
 		}
@@ -699,7 +899,7 @@ func TestEnsureDefaultVPC_NoVpcdResponder(t *testing.T) {
 
 	// Default SG record is best-effort; KV write happens before the synchronous
 	// vpcd round-trip, so the record should still be present.
-	sgKeys, err := svc.sgKV.Keys()
+	sgKeys, err := svc.sgKV.Keys(t.Context())
 	require.NoError(t, err)
 	assert.NotEmpty(t, sgKeys, "default SG record must persist in KV for vpcd reconciler to converge")
 }
@@ -743,7 +943,7 @@ func TestGetDefaultSubnet_NotConfusedByNonDefault(t *testing.T) {
 func TestCreateSubnet_CidrTooSmall(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
-	_, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	_, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:     aws.String(vpcID),
 		CidrBlock: aws.String("10.0.0.0/29"),
 	}, testAccountID)
@@ -752,7 +952,7 @@ func TestCreateSubnet_CidrTooSmall(t *testing.T) {
 
 func TestVpcCidrBlockAssociation(t *testing.T) {
 	svc := setupTestVPCService(t)
-	out, err := svc.CreateVpc(&ec2.CreateVpcInput{
+	out, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.0/16"),
 	}, testAccountID)
 	require.NoError(t, err)
@@ -768,7 +968,7 @@ func TestDescribeVpcs_NilFields(t *testing.T) {
 	createTestVPC(t, svc, "10.0.0.0/16")
 
 	// DescribeVpcs with nil VpcIds and nil Filters should return all
-	desc, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	desc, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		VpcIds:  nil,
 		Filters: nil,
 	}, testAccountID)
@@ -782,7 +982,7 @@ func TestDescribeSubnets_FilterByVpcId_NoMatch(t *testing.T) {
 	createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 
 	// Filter by a VPC ID that doesn't match any subnet
-	desc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	desc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{
 				Name:   aws.String("vpc-id"),
@@ -806,7 +1006,7 @@ func TestCreateVpc_PublishesEvent(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = sub.Unsubscribe() }()
 
-	out, err := svc.CreateVpc(&ec2.CreateVpcInput{
+	out, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.0/16"),
 	}, testAccountID)
 	require.NoError(t, err)
@@ -832,7 +1032,7 @@ func TestDeleteVpc_PublishesEvent(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = sub.Unsubscribe() }()
 
-	_, err = svc.DeleteVpc(&ec2.DeleteVpcInput{
+	_, err = svc.DeleteVpc(context.Background(), &ec2.DeleteVpcInput{
 		VpcId: aws.String(vpcID),
 	}, testAccountID)
 	require.NoError(t, err)
@@ -856,7 +1056,7 @@ func TestCreateSubnet_PublishesEvent(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = sub.Unsubscribe() }()
 
-	out, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	out, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:     aws.String(vpcID),
 		CidrBlock: aws.String("10.0.1.0/24"),
 	}, testAccountID)
@@ -884,7 +1084,7 @@ func TestDeleteSubnet_PublishesEvent(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = sub.Unsubscribe() }()
 
-	_, err = svc.DeleteSubnet(&ec2.DeleteSubnetInput{
+	_, err = svc.DeleteSubnet(context.Background(), &ec2.DeleteSubnetInput{
 		SubnetId: aws.String(subnetID),
 	}, testAccountID)
 	require.NoError(t, err)
@@ -906,14 +1106,14 @@ func TestEnsureDefaultVPC_WithConfigAZ(t *testing.T) {
 	testutil.StubVpcdSGResponder(t, nc)
 
 	cfg := &config.Config{AZ: "us-west-2b"}
-	svc, err := NewVPCServiceImplWithNATS(cfg, nc)
+	svc, err := NewVPCServiceImplWithNATS(t.Context(), cfg, nc)
 	require.NoError(t, err)
 
 	_, err = svc.EnsureDefaultVPC(testAccountID)
 	require.NoError(t, err)
 
 	// Verify the subnet uses the configured AZ
-	subDesc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subDesc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, subDesc.Subnets, 1)
 	assert.Equal(t, "us-west-2b", *subDesc.Subnets[0].AvailabilityZone)
@@ -922,7 +1122,7 @@ func TestEnsureDefaultVPC_WithConfigAZ(t *testing.T) {
 func TestCreateVpc_NormalizesNetworkCidr(t *testing.T) {
 	svc := setupTestVPCService(t)
 	// Pass a CIDR with host bits set — should be normalized to network address
-	out, err := svc.CreateVpc(&ec2.CreateVpcInput{
+	out, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.5/16"),
 	}, testAccountID)
 	require.NoError(t, err)
@@ -936,19 +1136,19 @@ func TestDeleteVpc_WithENIs(t *testing.T) {
 	subnetID := createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 
 	// Create an ENI in the subnet
-	_, err := svc.CreateNetworkInterface(&ec2.CreateNetworkInterfaceInput{
+	_, err := svc.CreateNetworkInterface(context.Background(), &ec2.CreateNetworkInterfaceInput{
 		SubnetId: aws.String(subnetID),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Delete subnet should succeed (ENI is in subnet but delete checks subnet dependencies in vpc delete)
 	// First delete subnet
-	_, err = svc.DeleteSubnet(&ec2.DeleteSubnetInput{SubnetId: aws.String(subnetID)}, testAccountID)
+	_, err = svc.DeleteSubnet(context.Background(), &ec2.DeleteSubnetInput{SubnetId: aws.String(subnetID)}, testAccountID)
 	// DeleteSubnet doesn't check for ENIs currently - just deletes
 	require.NoError(t, err)
 
 	// Now delete VPC should succeed since subnet is gone
-	_, err = svc.DeleteVpc(&ec2.DeleteVpcInput{VpcId: aws.String(vpcID)}, testAccountID)
+	_, err = svc.DeleteVpc(context.Background(), &ec2.DeleteVpcInput{VpcId: aws.String(vpcID)}, testAccountID)
 	require.NoError(t, err)
 }
 
@@ -957,7 +1157,7 @@ func TestCreateNetworkInterface_WithExplicitIP(t *testing.T) {
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	subnetID := createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 
-	out, err := svc.CreateNetworkInterface(&ec2.CreateNetworkInterfaceInput{
+	out, err := svc.CreateNetworkInterface(context.Background(), &ec2.CreateNetworkInterfaceInput{
 		SubnetId:         aws.String(subnetID),
 		PrivateIpAddress: aws.String("10.0.1.100"),
 	}, testAccountID)
@@ -973,7 +1173,7 @@ func TestAttachENI_NotFound(t *testing.T) {
 
 func TestDetachENI_NotFound(t *testing.T) {
 	svc := setupTestVPCService(t)
-	err := svc.DetachENI(testAccountID, "eni-nonexistent")
+	err := svc.DetachENI(context.Background(), testAccountID, "eni-nonexistent")
 	assert.ErrorContains(t, err, "InvalidNetworkInterfaceID.NotFound")
 }
 
@@ -990,12 +1190,12 @@ func TestEnsureDefaultVPC_PerAccountIsolation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Each account should see only their own default VPC
-	descA, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{}, accountA)
+	descA, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{}, accountA)
 	require.NoError(t, err)
 	require.Len(t, descA.Vpcs, 1)
 	assert.Equal(t, accountA, *descA.Vpcs[0].OwnerId)
 
-	descB, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{}, accountB)
+	descB, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{}, accountB)
 	require.NoError(t, err)
 	require.Len(t, descB.Vpcs, 1)
 	assert.Equal(t, accountB, *descB.Vpcs[0].OwnerId)
@@ -1049,7 +1249,7 @@ func TestDescribeVpcs_NoGlobalSharing(t *testing.T) {
 	require.NoError(t, err)
 
 	// Other account should NOT see the global default VPC
-	desc, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{}, otherAccount)
+	desc, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{}, otherAccount)
 	require.NoError(t, err)
 	assert.Empty(t, desc.Vpcs)
 }
@@ -1116,7 +1316,7 @@ func TestSubnet_MapPublicIpOnLaunch(t *testing.T) {
 	subnetID := createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 
 	// Verify MapPublicIpOnLaunch defaults to false
-	desc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	desc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		SubnetIds: []*string{aws.String(subnetID)},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -1130,7 +1330,7 @@ func TestSubnet_ModifyAttribute(t *testing.T) {
 	subnetID := createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 
 	// Set MapPublicIpOnLaunch to true
-	_, err := svc.ModifySubnetAttribute(&ec2.ModifySubnetAttributeInput{
+	_, err := svc.ModifySubnetAttribute(context.Background(), &ec2.ModifySubnetAttributeInput{
 		SubnetId: aws.String(subnetID),
 		MapPublicIpOnLaunch: &ec2.AttributeBooleanValue{
 			Value: aws.Bool(true),
@@ -1139,7 +1339,7 @@ func TestSubnet_ModifyAttribute(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify via DescribeSubnets
-	desc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	desc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		SubnetIds: []*string{aws.String(subnetID)},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -1154,7 +1354,7 @@ func TestVpc_DescribeVpcAttribute_Defaults(t *testing.T) {
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
 	// EnableDnsSupport defaults to true
-	desc, err := svc.DescribeVpcAttribute(&ec2.DescribeVpcAttributeInput{
+	desc, err := svc.DescribeVpcAttribute(context.Background(), &ec2.DescribeVpcAttributeInput{
 		VpcId:     aws.String(vpcID),
 		Attribute: aws.String(ec2.VpcAttributeNameEnableDnsSupport),
 	}, testAccountID)
@@ -1163,7 +1363,7 @@ func TestVpc_DescribeVpcAttribute_Defaults(t *testing.T) {
 	assert.True(t, *desc.EnableDnsSupport.Value)
 
 	// EnableDnsHostnames defaults to false
-	desc, err = svc.DescribeVpcAttribute(&ec2.DescribeVpcAttributeInput{
+	desc, err = svc.DescribeVpcAttribute(context.Background(), &ec2.DescribeVpcAttributeInput{
 		VpcId:     aws.String(vpcID),
 		Attribute: aws.String(ec2.VpcAttributeNameEnableDnsHostnames),
 	}, testAccountID)
@@ -1171,7 +1371,7 @@ func TestVpc_DescribeVpcAttribute_Defaults(t *testing.T) {
 	assert.False(t, *desc.EnableDnsHostnames.Value)
 
 	// EnableNetworkAddressUsageMetrics defaults to false
-	desc, err = svc.DescribeVpcAttribute(&ec2.DescribeVpcAttributeInput{
+	desc, err = svc.DescribeVpcAttribute(context.Background(), &ec2.DescribeVpcAttributeInput{
 		VpcId:     aws.String(vpcID),
 		Attribute: aws.String(ec2.VpcAttributeNameEnableNetworkAddressUsageMetrics),
 	}, testAccountID)
@@ -1184,14 +1384,14 @@ func TestVpc_ModifyVpcAttribute_EnableDnsHostnames(t *testing.T) {
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
 	// Set EnableDnsHostnames to true
-	_, err := svc.ModifyVpcAttribute(&ec2.ModifyVpcAttributeInput{
+	_, err := svc.ModifyVpcAttribute(context.Background(), &ec2.ModifyVpcAttributeInput{
 		VpcId:              aws.String(vpcID),
 		EnableDnsHostnames: &ec2.AttributeBooleanValue{Value: aws.Bool(true)},
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Verify via DescribeVpcAttribute
-	desc, err := svc.DescribeVpcAttribute(&ec2.DescribeVpcAttributeInput{
+	desc, err := svc.DescribeVpcAttribute(context.Background(), &ec2.DescribeVpcAttributeInput{
 		VpcId:     aws.String(vpcID),
 		Attribute: aws.String(ec2.VpcAttributeNameEnableDnsHostnames),
 	}, testAccountID)
@@ -1204,14 +1404,14 @@ func TestVpc_ModifyVpcAttribute_EnableDnsSupport(t *testing.T) {
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
 	// Set EnableDnsSupport to false
-	_, err := svc.ModifyVpcAttribute(&ec2.ModifyVpcAttributeInput{
+	_, err := svc.ModifyVpcAttribute(context.Background(), &ec2.ModifyVpcAttributeInput{
 		VpcId:            aws.String(vpcID),
 		EnableDnsSupport: &ec2.AttributeBooleanValue{Value: aws.Bool(false)},
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Verify via DescribeVpcAttribute
-	desc, err := svc.DescribeVpcAttribute(&ec2.DescribeVpcAttributeInput{
+	desc, err := svc.DescribeVpcAttribute(context.Background(), &ec2.DescribeVpcAttributeInput{
 		VpcId:     aws.String(vpcID),
 		Attribute: aws.String(ec2.VpcAttributeNameEnableDnsSupport),
 	}, testAccountID)
@@ -1224,13 +1424,13 @@ func TestVpc_ModifyVpcAttribute_IndependentFields(t *testing.T) {
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
 	// Modify only EnableDnsHostnames — EnableDnsSupport should remain true
-	_, err := svc.ModifyVpcAttribute(&ec2.ModifyVpcAttributeInput{
+	_, err := svc.ModifyVpcAttribute(context.Background(), &ec2.ModifyVpcAttributeInput{
 		VpcId:              aws.String(vpcID),
 		EnableDnsHostnames: &ec2.AttributeBooleanValue{Value: aws.Bool(true)},
 	}, testAccountID)
 	require.NoError(t, err)
 
-	desc, err := svc.DescribeVpcAttribute(&ec2.DescribeVpcAttributeInput{
+	desc, err := svc.DescribeVpcAttribute(context.Background(), &ec2.DescribeVpcAttributeInput{
 		VpcId:     aws.String(vpcID),
 		Attribute: aws.String(ec2.VpcAttributeNameEnableDnsSupport),
 	}, testAccountID)
@@ -1241,7 +1441,7 @@ func TestVpc_ModifyVpcAttribute_IndependentFields(t *testing.T) {
 func TestVpc_DescribeVpcAttribute_InvalidVpcID(t *testing.T) {
 	svc := setupTestVPCService(t)
 
-	_, err := svc.DescribeVpcAttribute(&ec2.DescribeVpcAttributeInput{
+	_, err := svc.DescribeVpcAttribute(context.Background(), &ec2.DescribeVpcAttributeInput{
 		VpcId:     aws.String("vpc-nonexistent"),
 		Attribute: aws.String(ec2.VpcAttributeNameEnableDnsSupport),
 	}, testAccountID)
@@ -1252,7 +1452,7 @@ func TestVpc_DescribeVpcAttribute_InvalidAttribute(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
-	_, err := svc.DescribeVpcAttribute(&ec2.DescribeVpcAttributeInput{
+	_, err := svc.DescribeVpcAttribute(context.Background(), &ec2.DescribeVpcAttributeInput{
 		VpcId:     aws.String(vpcID),
 		Attribute: aws.String("invalidAttribute"),
 	}, testAccountID)
@@ -1263,7 +1463,7 @@ func TestVpc_DescribeVpcAttribute_MissingAttribute(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
-	_, err := svc.DescribeVpcAttribute(&ec2.DescribeVpcAttributeInput{
+	_, err := svc.DescribeVpcAttribute(context.Background(), &ec2.DescribeVpcAttributeInput{
 		VpcId: aws.String(vpcID),
 	}, testAccountID)
 	assert.Error(t, err)
@@ -1273,13 +1473,13 @@ func TestVpc_ModifyVpcAttribute_EnableNetworkAddressUsageMetrics(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
-	_, err := svc.ModifyVpcAttribute(&ec2.ModifyVpcAttributeInput{
+	_, err := svc.ModifyVpcAttribute(context.Background(), &ec2.ModifyVpcAttributeInput{
 		VpcId:                            aws.String(vpcID),
 		EnableNetworkAddressUsageMetrics: &ec2.AttributeBooleanValue{Value: aws.Bool(true)},
 	}, testAccountID)
 	require.NoError(t, err)
 
-	desc, err := svc.DescribeVpcAttribute(&ec2.DescribeVpcAttributeInput{
+	desc, err := svc.DescribeVpcAttribute(context.Background(), &ec2.DescribeVpcAttributeInput{
 		VpcId:     aws.String(vpcID),
 		Attribute: aws.String(ec2.VpcAttributeNameEnableNetworkAddressUsageMetrics),
 	}, testAccountID)
@@ -1291,7 +1491,7 @@ func TestVpc_ModifyVpcAttribute_NoAttributes(t *testing.T) {
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
-	_, err := svc.ModifyVpcAttribute(&ec2.ModifyVpcAttributeInput{
+	_, err := svc.ModifyVpcAttribute(context.Background(), &ec2.ModifyVpcAttributeInput{
 		VpcId: aws.String(vpcID),
 	}, testAccountID)
 	assert.EqualError(t, err, "InvalidParameterValue")
@@ -1300,7 +1500,7 @@ func TestVpc_ModifyVpcAttribute_NoAttributes(t *testing.T) {
 func TestVpc_ModifyVpcAttribute_InvalidVpcID(t *testing.T) {
 	svc := setupTestVPCService(t)
 
-	_, err := svc.ModifyVpcAttribute(&ec2.ModifyVpcAttributeInput{
+	_, err := svc.ModifyVpcAttribute(context.Background(), &ec2.ModifyVpcAttributeInput{
 		VpcId:              aws.String("vpc-nonexistent"),
 		EnableDnsHostnames: &ec2.AttributeBooleanValue{Value: aws.Bool(true)},
 	}, testAccountID)
@@ -1314,7 +1514,7 @@ func TestDescribeVpcs_FilterByCidr(t *testing.T) {
 	createTestVPC(t, svc, "10.0.0.0/16")
 	createTestVPC(t, svc, "172.16.0.0/16")
 
-	out, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("cidr-block"), Values: []*string{aws.String("10.0.0.0/16")}},
 		},
@@ -1329,7 +1529,7 @@ func TestDescribeVpcs_FilterByState(t *testing.T) {
 	createTestVPC(t, svc, "10.0.0.0/16")
 
 	// VPCs are always "available"
-	out, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("state"), Values: []*string{aws.String("available")}},
 		},
@@ -1337,7 +1537,7 @@ func TestDescribeVpcs_FilterByState(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, out.Vpcs, 1)
 
-	out, err = svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err = svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("state"), Values: []*string{aws.String("pending")}},
 		},
@@ -1350,7 +1550,7 @@ func TestDescribeVpcs_FilterByIsDefault(t *testing.T) {
 	svc := setupTestVPCService(t)
 	createTestVPC(t, svc, "10.0.0.0/16")
 
-	out, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("is-default"), Values: []*string{aws.String("false")}},
 		},
@@ -1358,7 +1558,7 @@ func TestDescribeVpcs_FilterByIsDefault(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, out.Vpcs, 1)
 
-	out, err = svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err = svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("is-default"), Values: []*string{aws.String("true")}},
 		},
@@ -1373,7 +1573,7 @@ func TestDescribeVpcs_FilterMultipleValues_OR(t *testing.T) {
 	createTestVPC(t, svc, "172.16.0.0/16")
 	createTestVPC(t, svc, "192.168.0.0/16")
 
-	out, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("cidr-block"), Values: []*string{aws.String("10.0.0.0/16"), aws.String("192.168.0.0/16")}},
 		},
@@ -1387,7 +1587,7 @@ func TestDescribeVpcs_FilterMultipleFilters_AND(t *testing.T) {
 	createTestVPC(t, svc, "10.0.0.0/16")
 
 	// Both match
-	out, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("cidr-block"), Values: []*string{aws.String("10.0.0.0/16")}},
 			{Name: aws.String("state"), Values: []*string{aws.String("available")}},
@@ -1397,7 +1597,7 @@ func TestDescribeVpcs_FilterMultipleFilters_AND(t *testing.T) {
 	assert.Len(t, out.Vpcs, 1)
 
 	// One doesn't match
-	out, err = svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err = svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("cidr-block"), Values: []*string{aws.String("10.0.0.0/16")}},
 			{Name: aws.String("state"), Values: []*string{aws.String("pending")}},
@@ -1409,7 +1609,7 @@ func TestDescribeVpcs_FilterMultipleFilters_AND(t *testing.T) {
 
 func TestDescribeVpcs_FilterUnknownName_Error(t *testing.T) {
 	svc := setupTestVPCService(t)
-	_, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	_, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("bogus-filter"), Values: []*string{aws.String("val")}},
 		},
@@ -1423,7 +1623,7 @@ func TestDescribeVpcs_FilterWildcard(t *testing.T) {
 	createTestVPC(t, svc, "10.1.0.0/16")
 	createTestVPC(t, svc, "172.16.0.0/16")
 
-	out, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("cidr-block"), Values: []*string{aws.String("10.*")}},
 		},
@@ -1436,7 +1636,7 @@ func TestDescribeVpcs_FilterNoResults(t *testing.T) {
 	svc := setupTestVPCService(t)
 	createTestVPC(t, svc, "10.0.0.0/16")
 
-	out, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("cidr-block"), Values: []*string{aws.String("99.99.99.99/32")}},
 		},
@@ -1450,7 +1650,7 @@ func TestDescribeVpcs_FilterNoFilters(t *testing.T) {
 	createTestVPC(t, svc, "10.0.0.0/16")
 	createTestVPC(t, svc, "172.16.0.0/16")
 
-	out, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{}, testAccountID)
+	out, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{}, testAccountID)
 	require.NoError(t, err)
 	assert.Len(t, out.Vpcs, 2)
 }
@@ -1458,7 +1658,7 @@ func TestDescribeVpcs_FilterNoFilters(t *testing.T) {
 func TestDescribeVpcs_FilterByTag(t *testing.T) {
 	svc := setupTestVPCService(t)
 
-	out, err := svc.CreateVpc(&ec2.CreateVpcInput{
+	out, err := svc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.0/16"),
 		TagSpecifications: []*ec2.TagSpecification{
 			{
@@ -1474,7 +1674,7 @@ func TestDescribeVpcs_FilterByTag(t *testing.T) {
 
 	createTestVPC(t, svc, "172.16.0.0/16")
 
-	desc, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	desc, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("tag:Environment"), Values: []*string{aws.String("prod")}},
 		},
@@ -1489,7 +1689,7 @@ func TestDescribeVpcs_FilterByVpcId(t *testing.T) {
 	id1 := createTestVPC(t, svc, "10.0.0.0/16")
 	createTestVPC(t, svc, "172.16.0.0/16")
 
-	out, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("vpc-id"), Values: []*string{aws.String(id1)}},
 		},
@@ -1503,7 +1703,7 @@ func TestDescribeVpcs_FilterByOwnerId(t *testing.T) {
 	svc := setupTestVPCService(t)
 	createTestVPC(t, svc, "10.0.0.0/16")
 
-	out, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("owner-id"), Values: []*string{aws.String(testAccountID)}},
 		},
@@ -1511,7 +1711,7 @@ func TestDescribeVpcs_FilterByOwnerId(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, out.Vpcs, 1)
 
-	out, err = svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err = svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("owner-id"), Values: []*string{aws.String("999999999999")}},
 		},
@@ -1529,7 +1729,7 @@ func TestDescribeSubnets_FilterByVpcId(t *testing.T) {
 	createTestSubnet(t, svc, vpc1, "10.0.1.0/24")
 	createTestSubnet(t, svc, vpc2, "172.16.1.0/24")
 
-	out, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	out, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("vpc-id"), Values: []*string{aws.String(vpc1)}},
 		},
@@ -1545,7 +1745,7 @@ func TestDescribeSubnets_FilterByCidr(t *testing.T) {
 	createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 	createTestSubnet(t, svc, vpcID, "10.0.2.0/24")
 
-	out, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	out, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("cidr-block"), Values: []*string{aws.String("10.0.1.0/24")}},
 		},
@@ -1560,7 +1760,7 @@ func TestDescribeSubnets_FilterByState(t *testing.T) {
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 
-	out, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	out, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("state"), Values: []*string{aws.String("available")}},
 		},
@@ -1568,7 +1768,7 @@ func TestDescribeSubnets_FilterByState(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, out.Subnets, 1)
 
-	out, err = svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	out, err = svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("state"), Values: []*string{aws.String("pending")}},
 		},
@@ -1583,7 +1783,7 @@ func TestDescribeSubnets_FilterBySubnetId(t *testing.T) {
 	subnetID := createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 	createTestSubnet(t, svc, vpcID, "10.0.2.0/24")
 
-	out, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	out, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("subnet-id"), Values: []*string{aws.String(subnetID)}},
 		},
@@ -1598,7 +1798,7 @@ func TestDescribeSubnets_FilterByDefaultForAz(t *testing.T) {
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 
-	out, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	out, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("default-for-az"), Values: []*string{aws.String("false")}},
 		},
@@ -1614,7 +1814,7 @@ func TestDescribeSubnets_FilterMultipleValues_OR(t *testing.T) {
 	createTestSubnet(t, svc, vpcID, "10.0.2.0/24")
 	createTestSubnet(t, svc, vpcID, "10.0.3.0/24")
 
-	out, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	out, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("cidr-block"), Values: []*string{aws.String("10.0.1.0/24"), aws.String("10.0.3.0/24")}},
 		},
@@ -1631,7 +1831,7 @@ func TestDescribeSubnets_FilterMultipleFilters_AND(t *testing.T) {
 	createTestSubnet(t, svc, vpc2, "172.16.1.0/24")
 
 	// Both filters match subnet in vpc1
-	out, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	out, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("vpc-id"), Values: []*string{aws.String(vpc1)}},
 			{Name: aws.String("cidr-block"), Values: []*string{aws.String("10.0.1.0/24")}},
@@ -1641,7 +1841,7 @@ func TestDescribeSubnets_FilterMultipleFilters_AND(t *testing.T) {
 	assert.Len(t, out.Subnets, 1)
 
 	// Mismatched: vpc1 + wrong cidr
-	out, err = svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	out, err = svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("vpc-id"), Values: []*string{aws.String(vpc1)}},
 			{Name: aws.String("cidr-block"), Values: []*string{aws.String("172.16.1.0/24")}},
@@ -1654,7 +1854,7 @@ func TestDescribeSubnets_FilterMultipleFilters_AND(t *testing.T) {
 func TestDescribeSubnets_FilterUnknownName_Error(t *testing.T) {
 	svc := setupTestVPCService(t)
 
-	_, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	_, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("bogus-filter"), Values: []*string{aws.String("x")}},
 		},
@@ -1668,7 +1868,7 @@ func TestDescribeSubnets_FilterWildcard(t *testing.T) {
 	createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 	createTestSubnet(t, svc, vpcID, "10.0.2.0/24")
 
-	out, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	out, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("cidr-block"), Values: []*string{aws.String("10.0.*")}},
 		},
@@ -1682,7 +1882,7 @@ func TestDescribeSubnets_FilterNoResults(t *testing.T) {
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
 
-	out, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	out, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("cidr-block"), Values: []*string{aws.String("192.168.0.0/16")}},
 		},
@@ -1696,7 +1896,7 @@ func TestDescribeSubnets_FilterByTag(t *testing.T) {
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
 	// Create subnet with tags
-	out, err := svc.CreateSubnet(&ec2.CreateSubnetInput{
+	out, err := svc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:     aws.String(vpcID),
 		CidrBlock: aws.String("10.0.1.0/24"),
 		TagSpecifications: []*ec2.TagSpecification{
@@ -1711,7 +1911,7 @@ func TestDescribeSubnets_FilterByTag(t *testing.T) {
 	// Create another without tag
 	createTestSubnet(t, svc, vpcID, "10.0.2.0/24")
 
-	desc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	desc, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("tag:Env"), Values: []*string{aws.String("prod")}},
 		},
@@ -1743,7 +1943,7 @@ func TestGetSubnet_NotFound(t *testing.T) {
 	assert.Contains(t, err.Error(), "subnet-missing")
 }
 
-// --- CreateTags write-through (mulga-siv-347) ---
+// --- CreateTags write-through ---
 
 func TestApplyRecordTags_SubnetTagFilteredDescribe(t *testing.T) {
 	svc := setupTestVPCService(t)
@@ -1759,7 +1959,7 @@ func TestApplyRecordTags_SubnetTagFilteredDescribe(t *testing.T) {
 	require.NoError(t, err)
 
 	// DescribeSubnets must surface the tag...
-	out, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	out, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		SubnetIds: []*string{aws.String(subnetID)},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -1767,7 +1967,7 @@ func TestApplyRecordTags_SubnetTagFilteredDescribe(t *testing.T) {
 	assert.Equal(t, "1", findTag(out.Subnets[0].Tags, "kubernetes.io/role/elb"))
 
 	// ...and a tag: filter must match it (the LBC auto-discovery path).
-	filtered, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	filtered, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("tag:kubernetes.io/role/elb"), Values: []*string{aws.String("1")}},
 		},
@@ -1787,7 +1987,7 @@ func TestApplyRecordTags_VpcMergePreservesRecord(t *testing.T) {
 	}, testAccountID)
 	require.NoError(t, err)
 
-	out, err := svc.DescribeVpcs(&ec2.DescribeVpcsInput{
+	out, err := svc.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
 		VpcIds: []*string{aws.String(vpcID)},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -1819,13 +2019,88 @@ func TestRemoveRecordTags_Subnet(t *testing.T) {
 		},
 	}, testAccountID))
 
-	out, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+	out, err := svc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
 		SubnetIds: []*string{aws.String(subnetID)},
 	}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, out.Subnets, 1)
 	assert.Equal(t, "yes", findTag(out.Subnets[0].Tags, "keep"))
-	assert.Equal(t, "", findTag(out.Subnets[0].Tags, "drop"))
+	assert.Empty(t, findTag(out.Subnets[0].Tags, "drop"))
+}
+
+func TestApplyRecordTags_SecurityGroupTagFilteredDescribe(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.3.0.0/16")
+	sgID := createTestSG(t, svc, vpcID, "mirror-sg")
+
+	err := svc.ApplyRecordTags(&ec2.CreateTagsInput{
+		Resources: []*string{aws.String(sgID)},
+		Tags:      []*ec2.Tag{{Key: aws.String("env"), Value: aws.String("prod")}},
+	}, testAccountID)
+	require.NoError(t, err)
+
+	out, err := svc.DescribeSecurityGroups(context.Background(), &ec2.DescribeSecurityGroupsInput{
+		Filters: []*ec2.Filter{
+			{Name: aws.String("tag:env"), Values: []*string{aws.String("prod")}},
+		},
+	}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, out.SecurityGroups, 1)
+	assert.Equal(t, sgID, *out.SecurityGroups[0].GroupId)
+	assert.Equal(t, "prod", findTag(out.SecurityGroups[0].Tags, "env"))
+}
+
+func TestRemoveRecordTags_SecurityGroup(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.4.0.0/16")
+	sgID := createTestSG(t, svc, vpcID, "mirror-sg-del")
+
+	require.NoError(t, svc.ApplyRecordTags(&ec2.CreateTagsInput{
+		Resources: []*string{aws.String(sgID)},
+		Tags: []*ec2.Tag{
+			{Key: aws.String("keep"), Value: aws.String("yes")},
+			{Key: aws.String("drop"), Value: aws.String("v")},
+		},
+	}, testAccountID))
+
+	require.NoError(t, svc.RemoveRecordTags(&ec2.DeleteTagsInput{
+		Resources: []*string{aws.String(sgID)},
+		Tags: []*ec2.Tag{
+			{Key: aws.String("keep"), Value: aws.String("wrong")},
+			{Key: aws.String("drop"), Value: aws.String("v")},
+		},
+	}, testAccountID))
+
+	out, err := svc.DescribeSecurityGroups(context.Background(), &ec2.DescribeSecurityGroupsInput{
+		GroupIds: []*string{aws.String(sgID)},
+	}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, out.SecurityGroups, 1)
+	assert.Equal(t, "yes", findTag(out.SecurityGroups[0].Tags, "keep"))
+	assert.Empty(t, findTag(out.SecurityGroups[0].Tags, "drop"))
+}
+
+func TestApplyRecordTags_ENITagFilteredDescribe(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.5.0.0/16")
+	subnetID := createTestSubnet(t, svc, vpcID, "10.5.1.0/24")
+	eniID := createTestENI(t, svc, subnetID)
+
+	err := svc.ApplyRecordTags(&ec2.CreateTagsInput{
+		Resources: []*string{aws.String(eniID)},
+		Tags:      []*ec2.Tag{{Key: aws.String("Name"), Value: aws.String("primary")}},
+	}, testAccountID)
+	require.NoError(t, err)
+
+	out, err := svc.DescribeNetworkInterfaces(context.Background(), &ec2.DescribeNetworkInterfacesInput{
+		Filters: []*ec2.Filter{
+			{Name: aws.String("tag:Name"), Values: []*string{aws.String("primary")}},
+		},
+	}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, out.NetworkInterfaces, 1)
+	assert.Equal(t, eniID, *out.NetworkInterfaces[0].NetworkInterfaceId)
+	assert.Equal(t, "primary", findTag(out.NetworkInterfaces[0].TagSet, "Name"))
 }
 
 func TestApplyRecordTags_UnknownResourceNoError(t *testing.T) {

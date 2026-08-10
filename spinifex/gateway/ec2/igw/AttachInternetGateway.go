@@ -1,6 +1,7 @@
 package gateway_ec2_igw
 
 import (
+	"context"
 	"errors"
 
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -22,8 +23,8 @@ func ValidateAttachInternetGatewayInput(input *ec2.AttachInternetGatewayInput) e
 	return nil
 }
 
-// AttachInternetGateway handles the EC2 AttachInternetGateway API call
-func AttachInternetGateway(input *ec2.AttachInternetGatewayInput, natsConn *nats.Conn, accountID string) (ec2.AttachInternetGatewayOutput, error) {
+// AttachInternetGateway handles the EC2 AttachInternetGateway API call.
+func AttachInternetGateway(ctx context.Context, input *ec2.AttachInternetGatewayInput, natsConn *nats.Conn, accountID string) (ec2.AttachInternetGatewayOutput, error) {
 	var output ec2.AttachInternetGatewayOutput
 
 	if err := ValidateAttachInternetGatewayInput(input); err != nil {
@@ -31,7 +32,7 @@ func AttachInternetGateway(input *ec2.AttachInternetGatewayInput, natsConn *nats
 	}
 
 	svc := handlers_ec2_igw.NewNATSIGWService(natsConn)
-	result, err := svc.AttachInternetGateway(input, accountID)
+	result, err := svc.AttachInternetGateway(ctx, input, accountID)
 	if err != nil {
 		return output, err
 	}

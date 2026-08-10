@@ -1,6 +1,10 @@
 package awserrors
 
-import "strings"
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
 
 type ErrorMessage struct {
 	HTTPCode int
@@ -197,6 +201,7 @@ var (
 	ErrorInvalidKeyPairDuplicate                               = "InvalidKeyPair.Duplicate"
 	ErrorInvalidKeyPairFormat                                  = "InvalidKeyPair.Format"
 	ErrorInvalidKeyPairNotFound                                = "InvalidKeyPair.NotFound"
+	ErrorInvalidKeyPairType                                    = "InvalidKeyPair.Type"
 	ErrorInvalidLaunchTargets                                  = "InvalidLaunchTargets"
 	ErrorInvalidLaunchTemplateIdMalformed                      = "InvalidLaunchTemplateId.Malformed"
 	ErrorInvalidLaunchTemplateIdNotFound                       = "InvalidLaunchTemplateId.NotFound"
@@ -374,6 +379,19 @@ var (
 	ErrorResourceNotFound    = "ResourceNotFound"
 	ErrorEKSResourceInUse    = "ResourceInUseException"
 	ErrorEKSResourceNotFound = "ResourceNotFoundException"
+	// ErrorACMResourceInUse aliases ErrorEKSResourceInUse: real ACM's
+	// DeleteCertificate and real EKS's CreateCluster both legitimately use the
+	// wire code "ResourceInUseException", so this is a distinct, self-documenting
+	// name for ACM call sites rather than a second ErrorLookup entry — ErrorLookup
+	// is keyed by wire code across every service, so it can only hold one message
+	// per code. LookupErrorMessage resolves the ACM-flavored wording from
+	// errorLookupByService instead, so an ACM call site is not stuck with EKS's
+	// "cluster already exists" text.
+	ErrorACMResourceInUse = ErrorEKSResourceInUse
+	// ErrorACMRequestInProgress is what GetCertificate returns for a certificate
+	// that exists but has not been issued yet (still PENDING_VALIDATION), so a
+	// client polling for the body can tell "not ready" apart from "not mine".
+	ErrorACMRequestInProgress = "RequestInProgressException"
 	// ECS JSON-1.1 exception codes. ECS clients key on the "Exception"-suffixed
 	// __type; do not cross-wire with the EC2/ACM not-found codes above.
 	ErrorECSClusterNotFound                             = "ClusterNotFoundException"
@@ -449,7 +467,7 @@ var (
 	ErrorVpnGatewayLimitExceeded                        = "VpnGatewayLimitExceeded"
 	ErrorZonesMismatched                                = "ZonesMismatched"
 
-	// IAM-specific error codes
+	// IAM-specific error codes.
 	ErrorIAMNoSuchEntity            = "NoSuchEntity"
 	ErrorIAMEntityAlreadyExists     = "EntityAlreadyExists"
 	ErrorIAMDeleteConflict          = "DeleteConflict"
@@ -458,7 +476,26 @@ var (
 	ErrorIAMMalformedPolicyDocument = "MalformedPolicyDocument"
 	ErrorAccessDenied               = "AccessDenied"
 
-	// ECR-specific error codes
+	// RDS-specific error codes. The "Fault" suffix is AWS's own for the group
+	// lookups, so the SDK's typed error matching round-trips.
+	ErrorDBInstanceNotFound       = "DBInstanceNotFound"
+	ErrorDBInstanceAlreadyExists  = "DBInstanceAlreadyExists"
+	ErrorDBInstanceInvalidState   = "InvalidDBInstanceState"
+	ErrorDBSnapshotAlreadyExists  = "DBSnapshotAlreadyExists"
+	ErrorDBSnapshotNotFound       = "DBSnapshotNotFound"
+	ErrorDBSnapshotInvalidState   = "InvalidDBSnapshotState"
+	ErrorDBSubnetGroupNotFound    = "DBSubnetGroupNotFoundFault"
+	ErrorDBParameterGroupNotFound = "DBParameterGroupNotFound"
+	ErrorDBInvalidVPCNetworkState = "InvalidVPCNetworkStateFault"
+
+	ErrorDBSubnetGroupAlreadyExists    = "DBSubnetGroupAlreadyExists"
+	ErrorDBSubnetGroupInvalidState     = "InvalidDBSubnetGroupStateFault"
+	ErrorDBSubnetGroupDoesNotCoverAZs  = "DBSubnetGroupDoesNotCoverEnoughAZs"
+	ErrorDBSubnetInvalid               = "InvalidSubnet"
+	ErrorDBParameterGroupAlreadyExists = "DBParameterGroupAlreadyExists"
+	ErrorDBParameterGroupInvalidState  = "InvalidDBParameterGroupState"
+
+	// ECR-specific error codes.
 	ErrorRepositoryNotFound       = "RepositoryNotFoundException"
 	ErrorRepositoryPolicyNotFound = "RepositoryPolicyNotFoundException"
 	ErrorLifecyclePolicyNotFound  = "LifecyclePolicyNotFoundException"
@@ -473,7 +510,7 @@ var (
 	ErrorTooManyTags              = "TooManyTagsException"
 	ErrorOperationNotSupported    = "OperationNotSupportedException"
 
-	// ELBv2-specific error codes
+	// ELBv2-specific error codes.
 	ErrorELBv2LoadBalancerNotFound         = "LoadBalancerNotFound"
 	ErrorELBv2TargetGroupNotFound          = "TargetGroupNotFound"
 	ErrorELBv2ListenerNotFound             = "ListenerNotFound"
@@ -499,6 +536,21 @@ var (
 	ErrorELBv2IncompatibleProtocols        = "IncompatibleProtocols"
 	ErrorELBv2CertificateNotFound          = "CertificateNotFound"
 	ErrorELBv2SSLPolicyNotFound            = "SSLPolicyNotFound"
+
+	// Bedrock/bedrock-runtime error codes.
+	ErrorValidationException = "ValidationException"
+	// ErrorResourceNotFoundException aliases ErrorEKSResourceNotFound: both
+	// services use the same wire code, so it is not a second ErrorLookup entry.
+	ErrorResourceNotFoundException   = ErrorEKSResourceNotFound
+	ErrorAccessDeniedException       = "AccessDeniedException"
+	ErrorThrottlingException         = "ThrottlingException"
+	ErrorModelNotReadyException      = "ModelNotReadyException"
+	ErrorServiceUnavailableException = "ServiceUnavailableException"
+	ErrorModelErrorException         = "ModelErrorException"
+	// ErrorServiceQuotaExceededException is for genuine per-account limits
+	// (e.g. Ochre's tokens-per-month cap) — unlike ErrorModelNotReadyException,
+	// which is reserved for transient capacity conditions that breach no quota.
+	ErrorServiceQuotaExceededException = "ServiceQuotaExceededException"
 )
 
 // ValidErrorCode returns the error code if it exists in ErrorLookup,
@@ -506,6 +558,117 @@ var (
 // before sending them to clients.
 func ValidErrorCode(code string) string {
 	if _, ok := ErrorLookup[code]; ok {
+		return code
+	}
+	return ErrorServerInternal
+}
+
+// ResolveErrorCode returns the first registered AWS error code in err's unwrap tree.
+func ResolveErrorCode(err error) (string, bool) {
+	code, _, ok := resolveErrorDetail(err)
+	return code, ok
+}
+
+// ResolveErrorDetail resolves the same registered code as ResolveErrorCode,
+// plus the message the producing call site attached via Errorf, if any. A
+// generic %w wrapper added purely for internal context carries no message.
+func ResolveErrorDetail(err error) (code, message string, ok bool) {
+	return resolveErrorDetail(err)
+}
+
+// resolveErrorDetail is the shared unwrap-tree walk behind ResolveErrorCode
+// and ResolveErrorDetail.
+func resolveErrorDetail(err error) (code, message string, ok bool) {
+	if err == nil {
+		return "", "", false
+	}
+	text := err.Error()
+	if _, exists := ErrorLookup[text]; exists {
+		var cause *codedError
+		if errors.As(err, &cause) {
+			return text, cause.message, true
+		}
+		return text, "", true
+	}
+
+	if joined, isJoined := err.(interface{ Unwrap() []error }); isJoined {
+		for _, inner := range joined.Unwrap() {
+			if c, m, found := resolveErrorDetail(inner); found {
+				return c, m, true
+			}
+		}
+		return "", "", false
+	}
+	if wrapped, isWrapped := err.(interface{ Unwrap() error }); isWrapped {
+		return resolveErrorDetail(wrapped.Unwrap())
+	}
+	return "", "", false
+}
+
+// codedError is the leaf Errorf wraps around a registered code, letting the
+// resolved layer distinguish a client-facing message from an unrelated %w
+// wrapper. Error() returns only the code, so code resolution is unaffected.
+type codedError struct {
+	code    string
+	message string
+}
+
+func (c *codedError) Error() string { return c.code }
+
+// Errorf returns an error carrying an AWS error code where ResolveErrorCode can
+// find it, alongside a message for the logs and the traces. Formatting the code
+// into the message with %s instead leaves it unresolvable, so a handler's 400
+// reaches the client as a 500 with its own code stripped.
+func Errorf(code, format string, args ...any) error {
+	cause := &codedError{code: code}
+	outer := fmt.Errorf(format+": %w", append(args, cause)...)
+	// Derived from the already-formatted outer text, not a second
+	// fmt.Sprintf(format, args...) call, so a caller's own %w renders via
+	// fmt.Errorf's %w support instead of failing under Sprintf, which has none.
+	cause.message = strings.TrimSuffix(outer.Error(), ": "+code)
+	return outer
+}
+
+// errorLookupByService overrides ErrorLookup's message and HTTP status for a
+// (service, code) pair whose wire code is shared by services with different
+// canonical wording — e.g. ACM and EKS both use "ResourceInUseException".
+var errorLookupByService = map[string]map[string]ErrorMessage{
+	"acm": {
+		ErrorACMResourceInUse: {HTTPCode: 400, Message: "The certificate is in use by another AWS resource in this account. Remove the reference to the certificate before deleting it."},
+	},
+	// Both keys are needed: the gateway splits bedrock from bedrock-runtime on
+	// the /model/ path prefix, so an override under one does not cover the other.
+	"bedrock": {
+		ErrorResourceNotFoundException: {HTTPCode: 404, Message: bedrockResourceNotFoundMessage},
+	},
+	"bedrock-runtime": {
+		ErrorResourceNotFoundException: {HTTPCode: 404, Message: bedrockResourceNotFoundMessage},
+	},
+	"rds": {
+		ErrorOperationNotSupported: {HTTPCode: 400, Message: "The specified RDS action is not supported in the RDS v1 API."},
+	},
+}
+
+// bedrockResourceNotFoundMessage overrides the EKS wording ErrorLookup carries
+// for the shared ResourceNotFoundException wire code, which otherwise tells a
+// Bedrock caller to go and list EKS clusters.
+const bedrockResourceNotFoundMessage = "Could not resolve the foundation model from the provided model identifier."
+
+// LookupErrorMessage returns the ErrorMessage for code, scoped to service
+// where errorLookupByService has an override, otherwise ErrorLookup's global
+// default.
+func LookupErrorMessage(service, code string) ErrorMessage {
+	if svcMsgs, ok := errorLookupByService[service]; ok {
+		if msg, ok := svcMsgs[code]; ok {
+			return msg
+		}
+	}
+	return ErrorLookup[code]
+}
+
+// ValidErrorCodeFromError resolves err or returns ErrorServerInternal.
+func ValidErrorCodeFromError(err error) string {
+	if code, ok := ResolveErrorCode(err); ok {
 		return code
 	}
 	return ErrorServerInternal
@@ -724,6 +887,7 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorInvalidKeyPairDuplicate:                               {HTTPCode: 409, Message: "The key pair name already exists in that AWS Region. If you are creating or importing a key pair, ensure that you use a unique name."},
 	ErrorInvalidKeyPairFormat:                                  {HTTPCode: 400, Message: "The format of the public key you are attempting to import is not valid."},
 	ErrorInvalidKeyPairNotFound:                                {HTTPCode: 404, Message: "The specified key pair name does not exist. Ensure that you specify the AWS Region in which the key pair is located, if it's not in the default Region."},
+	ErrorInvalidKeyPairType:                                    {HTTPCode: 400, Message: "The instance was launched with an ED25519 key pair, which cannot decrypt a Windows administrator password. Only RSA can perform the PKCS#1 v1.5 encryption the guest uses. Relaunch the instance with a key pair created using --key-type rsa."},
 	ErrorInvalidLaunchTargets:                                  {HTTPCode: 400, Message: "One or more specified targets are invalid. Verify the capacity for the Capacity Reservation selected or verify the ID."},
 	ErrorInvalidLaunchTemplateIdMalformed:                      {HTTPCode: 400, Message: "The ID for the launch template is malformed. Ensure that you specify the launch template ID in the form lt-xxxxxxxxxxxxxxxxx."},
 	ErrorInvalidLaunchTemplateIdNotFound:                       {HTTPCode: 404, Message: "The specified launch template ID does not exist. Ensure that you specify the AWS Region in which the launch template is located."},
@@ -736,6 +900,7 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorInvalidNatGatewayIDNotFound:                           {HTTPCode: 404, Message: "The specified NAT gateway ID does not exist. Ensure that you specify the AWS Region in which the NAT gateway is located, if it's not in the default Region."},
 	ErrorInvalidNetworkAclEntryNotFound:                        {HTTPCode: 404, Message: "The specified network ACL entry does not exist."},
 	ErrorACMInvalidArn:                                         {HTTPCode: 400, Message: "The requested Amazon Resource Name (ARN) does not refer to an existing resource."},
+	ErrorACMRequestInProgress:                                  {HTTPCode: 400, Message: "The certificate request is in process and the certificate in your account is not yet available."},
 	ErrorInvalidNetworkAclIDNotFound:                           {HTTPCode: 404, Message: "The specified network ACL does not exist. Ensure that you specify the AWS Region in which the network ACL is located, if it's not in the default Region."},
 	ErrorInvalidNetworkAclIdMalformed:                          {HTTPCode: 400, Message: "The specified network ACL ID is malformed. Ensure that you provide the ID in the form acl-xxxxxxxxxxxxxxxxx."},
 	ErrorInvalidNetworkInterfaceInUse:                          {HTTPCode: 409, Message: "The specified interface is currently in use and cannot be deleted or attached to another instance. Ensure that you have detached the network interface first. If a network interface is in use, you may also receive the InvalidParameterValue error."},
@@ -980,6 +1145,24 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorIAMMalformedPolicyDocument: {HTTPCode: 400, Message: "The policy document is malformed."},
 	ErrorAccessDenied:               {HTTPCode: 403, Message: "User is not authorized to perform this action."},
 
+	// RDS error codes
+	ErrorDBInstanceNotFound:       {HTTPCode: 404, Message: "DBInstanceIdentifier does not refer to an existing DB instance."},
+	ErrorDBInstanceAlreadyExists:  {HTTPCode: 400, Message: "The user already has a DB instance with the given identifier."},
+	ErrorDBInstanceInvalidState:   {HTTPCode: 400, Message: "The DB instance is not in a state that allows the requested operation."},
+	ErrorDBSnapshotAlreadyExists:  {HTTPCode: 400, Message: "The user already has a DB snapshot with the given identifier."},
+	ErrorDBSnapshotNotFound:       {HTTPCode: 404, Message: "DBSnapshotIdentifier does not refer to an existing DB snapshot."},
+	ErrorDBSnapshotInvalidState:   {HTTPCode: 400, Message: "The DB snapshot is not in a state that allows the requested operation."},
+	ErrorDBSubnetGroupNotFound:    {HTTPCode: 404, Message: "DBSubnetGroupName does not refer to an existing DB subnet group."},
+	ErrorDBParameterGroupNotFound: {HTTPCode: 404, Message: "DBParameterGroupName does not refer to an existing DB parameter group."},
+	ErrorDBInvalidVPCNetworkState: {HTTPCode: 400, Message: "The DB subnet group does not cover all Availability Zones after it is created because of changes that were made."},
+
+	ErrorDBSubnetGroupAlreadyExists:    {HTTPCode: 400, Message: "The user already has a DB subnet group with the given name."},
+	ErrorDBSubnetGroupInvalidState:     {HTTPCode: 400, Message: "The DB subnet group is not in a state that allows the requested operation."},
+	ErrorDBSubnetGroupDoesNotCoverAZs:  {HTTPCode: 400, Message: "The DB subnet group does not cover enough Availability Zones."},
+	ErrorDBSubnetInvalid:               {HTTPCode: 400, Message: "The requested subnet is not valid, or multiple subnets were requested that are not all in a common VPC."},
+	ErrorDBParameterGroupAlreadyExists: {HTTPCode: 400, Message: "The user already has a DB parameter group with the given name."},
+	ErrorDBParameterGroupInvalidState:  {HTTPCode: 400, Message: "The DB parameter group is in use or is in an invalid state. It cannot be deleted."},
+
 	// ECR error codes
 	ErrorRepositoryNotFound:       {HTTPCode: 400, Message: "The repository could not be found. Check the spelling of the specified repository and ensure that you are performing operations on the correct registry."},
 	ErrorRepositoryPolicyNotFound: {HTTPCode: 400, Message: "The repository and registry do not have an associated repository policy."},
@@ -1021,4 +1204,14 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorELBv2IncompatibleProtocols:        {HTTPCode: 400, Message: "The listener protocol is incompatible with the target group protocol."},
 	ErrorELBv2CertificateNotFound:          {HTTPCode: 400, Message: "One or more specified certificates do not exist."},
 	ErrorELBv2SSLPolicyNotFound:            {HTTPCode: 400, Message: "The specified SSL policy does not exist."},
+
+	// Bedrock/bedrock-runtime error codes. ResourceNotFoundException reuses the
+	// EKS entry (ErrorEKSResourceNotFound) — same wire code, same HTTP status.
+	ErrorValidationException:           {HTTPCode: 400, Message: "The input fails to satisfy the constraints specified by the model or service."},
+	ErrorAccessDeniedException:         {HTTPCode: 403, Message: "You do not have sufficient access to perform this action."},
+	ErrorThrottlingException:           {HTTPCode: 429, Message: "The request was denied due to request throttling."},
+	ErrorModelNotReadyException:        {HTTPCode: 429, Message: "The model specified in the request is not ready to serve inference requests."},
+	ErrorServiceUnavailableException:   {HTTPCode: 503, Message: "The service isn't currently available. Try again later."},
+	ErrorModelErrorException:           {HTTPCode: 424, Message: "The request failed because of an error while running the model."},
+	ErrorServiceQuotaExceededException: {HTTPCode: 400, Message: "The number of requests exceeds the service quota. Resubmit your request later."},
 }

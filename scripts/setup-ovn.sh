@@ -18,12 +18,54 @@
 #   --wan-bridge=NAME    OVS bridge for WAN traffic (default: auto-detect from default route)
 #   --wan-iface=NAME     Physical NIC to add to the WAN bridge (use with --wan-bridge)
 #   --dhcp               Obtain gateway IP via DHCP on the WAN bridge interface
+#   --nat-uplink         Routed NAT mode: no WAN NIC is bridged. Creates br-ext
+#                        with a transit veth (spx-nat-host 100.127.0.1/24) and
+#                        host masquerade rules; VMs get outbound-only WAN over
+#                        any uplink (ethernet, WiFi, cellular, PPP). Pair with
+#                        `spx admin init --external-mode=nat`.
 #   --mgmt-bridge=NAME   OVS bridge for system-instance control plane (default: br-mgmt)
 #   --mgmt-cidr=CIDR     IPv4 CIDR to assign on the mgmt bridge (default: 10.15.8.1/24)
 #   --mgmt-iface=NAME    Physical/virtual NIC to enslave to the mgmt bridge (multi-node only)
 #   --no-mgmt-bridge     Skip mgmt bridge provisioning (for dev-networking hosts)
-#   --ovn-remote=ADDR    OVN SB DB address (default: tcp:127.0.0.1:6642)
+#   --ovn-remote=ADDR    OVN SB DB address; accepts a comma-separated list of
+#                        SB endpoints for compute nodes pointing at a RAFT
+#                        cluster (default: tcp:127.0.0.1:6642)
 #   --encap-ip=IP        Geneve tunnel endpoint IP (default: auto-detect)
+#   --db-cluster-local-addr=IP   This DB node's own IP for OVSDB RAFT clustering.
+#                        Enables clustered NB(6643)/SB(6644) DBs (requires
+#                        --management). Empty --db-cluster-remote-addr ⇒ create
+#                        the cluster; set ⇒ join it.
+#   --db-cluster-remote-addr=IP  An existing cluster DB node's IP to join. Omit
+#                        on the first (init) DB node that forms the cluster.
+#   --recreate-db        Destroy and recreate the NB/SB DBs so they can be
+#                        created in clustered format. Required when converting
+#                        a node that has already run a standalone ovn-central
+#                        (which is every node — the ovn-central package starts
+#                        one on install). DISCARDS ALL LOGICAL NETWORK STATE:
+#                        safe on a fresh node, destroys every VPC on a live one.
+#
+# Cluster Sizing — which DB topology to run:
+#
+#   Nodes  DB topology                              Tolerates
+#   1-2    standalone ovn-central on node 1         nothing
+#   3      RAFT across all 3                        1 node
+#   4+     RAFT across 3, remainder compute-only    1 node
+#
+#   Three nodes is the minimum recommended multi-server deployment.
+#
+#   NEVER run RAFT with 2 members. Quorum is a majority, so 2-of-2 tolerates
+#   zero failures — and it is strictly worse than standalone, because either
+#   node failing loses quorum rather than only node 1. Two-node deployments
+#   run standalone and accept the single point of failure.
+#
+#   Do not scale DB members past 3. RAFT write latency is bounded by the
+#   slowest member of the majority, and a 4th member buys no extra fault
+#   tolerance. Nodes beyond the third are compute-only, pointing at all three
+#   SB endpoints via the comma-separated --ovn-remote form.
+#
+#   Losing ovn-central does not stop the data plane: ovn-controller has already
+#   programmed flows into br-int, so running instances keep networking. Only
+#   control-plane change stops — new VPCs, instance launches, port bindings.
 #
 # WAN Bridge Auto-Detection:
 #   When no --wan-bridge is given, the script checks the default route interface:
@@ -42,8 +84,21 @@
 #   # Compute node joining an existing cluster:
 #   ./scripts/setup-ovn.sh --ovn-remote=tcp:10.0.0.1:6642 --encap-ip=10.0.0.2
 #
+#   # DB node 1 — create an OVSDB RAFT cluster (init):
+#   ./scripts/setup-ovn.sh --management --db-cluster-local-addr=10.0.0.1
+#
+#   # DB nodes 2,3 — join the cluster:
+#   ./scripts/setup-ovn.sh --management --db-cluster-local-addr=10.0.0.2 \
+#       --db-cluster-remote-addr=10.0.0.1
+#
+#   # Compute node pointing at all 3 clustered SB endpoints:
+#   ./scripts/setup-ovn.sh --ovn-remote=tcp:10.0.0.1:6642,tcp:10.0.0.2:6642,tcp:10.0.0.3:6642
+#
 #   # No WAN bridge (overlay-only, no public subnet):
 #   ./scripts/setup-ovn.sh --management --encap-ip=10.0.0.1
+#
+#   # Non-bridgeable uplink (WiFi/cellular) — routed NAT, outbound-only VMs:
+#   ./scripts/setup-ovn.sh --management --nat-uplink
 
 set -e
 
@@ -52,12 +107,21 @@ MANAGEMENT=false
 WAN_BRIDGE=""
 WAN_IFACE=""
 EXTERNAL_DHCP=false
+NAT_UPLINK=false
 MGMT_BRIDGE_ENABLED=true
 MGMT_BRIDGE="br-mgmt"
 MGMT_CIDR="10.15.8.1/24"
 MGMT_IFACE=""
 OVN_REMOTE="tcp:127.0.0.1:6642"
 ENCAP_IP=""
+# OVSDB RAFT clustering. Empty by default ⇒ single, non-clustered ovn-central
+# (dev box, existing single-node clusters). When LOCAL_ADDR is set, the NB/SB
+# DBs run clustered; REMOTE_ADDR empty ⇒ create the cluster, set ⇒ join it.
+DB_CLUSTER_LOCAL_ADDR=""
+DB_CLUSTER_REMOTE_ADDR=""
+# Recreating the NB/SB DBs discards all logical network state, so it is opt-in.
+RECREATE_DB=false
+OVN_DBDIR="${OVN_DBDIR:-/var/lib/ovn}"
 # NODE_NAME is left empty by default. The chassis-id pin block at Step 4
 # only runs when --node-name=NAME is explicitly given. Passing nothing
 # preserves whatever system-id already lives in OVS (gold-image UUID,
@@ -72,6 +136,7 @@ for arg in "$@"; do
     case "$arg" in
         --management)       MANAGEMENT=true ;;
         --dhcp)             EXTERNAL_DHCP=true ;;
+        --nat-uplink)       NAT_UPLINK=true ;;
         --wan-bridge=*)     WAN_BRIDGE="${arg#*=}" ;;
         --wan-iface=*)      WAN_IFACE="${arg#*=}" ;;
         --mgmt-bridge=*)    MGMT_BRIDGE="${arg#*=}" ;;
@@ -80,9 +145,12 @@ for arg in "$@"; do
         --no-mgmt-bridge)   MGMT_BRIDGE_ENABLED=false ;;
         --ovn-remote=*)     OVN_REMOTE="${arg#*=}" ;;
         --encap-ip=*)       ENCAP_IP="${arg#*=}" ;;
+        --db-cluster-local-addr=*)  DB_CLUSTER_LOCAL_ADDR="${arg#*=}" ;;
+        --db-cluster-remote-addr=*) DB_CLUSTER_REMOTE_ADDR="${arg#*=}" ;;
+        --recreate-db)      RECREATE_DB=true ;;
         --node-name=*)      NODE_NAME="${arg#*=}" ;;
         --help|-h)
-            head -50 "$0" | tail -48
+            sed -n '3,/^set -e/{/^set -e/!p}' "$0"
             exit 0
             ;;
         *)
@@ -91,6 +159,23 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# OVSDB RAFT clustering runs the NB/SB DBs, so it only applies to management
+# (DB) nodes. A remote addr without a local addr is meaningless (nothing to
+# join with). Fail loudly rather than silently starting a single-node DB.
+if [ -n "$DB_CLUSTER_LOCAL_ADDR" ] && [ "$MANAGEMENT" != true ]; then
+    echo "ERROR: --db-cluster-local-addr requires --management (clustered DBs run on management nodes)"
+    exit 1
+fi
+if [ -n "$DB_CLUSTER_REMOTE_ADDR" ] && [ -z "$DB_CLUSTER_LOCAL_ADDR" ]; then
+    echo "ERROR: --db-cluster-remote-addr requires --db-cluster-local-addr"
+    exit 1
+fi
+if [ "$RECREATE_DB" = true ] && [ -z "$DB_CLUSTER_LOCAL_ADDR" ]; then
+    echo "ERROR: --recreate-db requires --db-cluster-local-addr (it exists to allow"
+    echo "       clustered DB creation over an existing standalone DB)"
+    exit 1
+fi
 
 # --- WAN bridge auto-detection ---
 # Determine the WAN bridge name and how to set it up.
@@ -167,12 +252,28 @@ detect_wan_bridge() {
     echo ""
     echo "  3. No external networking (overlay-only):"
     echo "     ./scripts/setup-ovn.sh --management --encap-ip=$wan_ip"
+    echo ""
+    echo "  4. Non-bridgeable uplink (WiFi/cellular/PPP) — routed NAT mode"
+    echo "     (VMs get outbound-only internet, no public IPs):"
+    echo "     ./scripts/setup-ovn.sh --management --nat-uplink"
+    echo "     then: spx admin init --external-mode=nat"
     echo "============================================================"
     echo ""
     exit 1
 }
 
-detect_wan_bridge
+if [ "$NAT_UPLINK" = true ]; then
+    # Routed NAT: nothing is bridged, so the uplink type is irrelevant.
+    if [ -n "$WAN_BRIDGE" ] || [ -n "$WAN_IFACE" ]; then
+        echo "ERROR: --nat-uplink does not take --wan-bridge/--wan-iface (no WAN NIC is bridged)"
+        exit 1
+    fi
+    WAN_BRIDGE="br-ext"
+    WAN_BRIDGE_MODE="nat"
+    echo "  Routed NAT uplink: br-ext + transit veth, host masquerade (no WAN bridge)"
+else
+    detect_wan_bridge
+fi
 
 # Auto-detect encap IP if not specified
 if [ -z "$ENCAP_IP" ]; then
@@ -195,6 +296,13 @@ fi
 
 echo "=== Spinifex OVN Compute Node Setup ==="
 echo "  Management node:  $MANAGEMENT"
+if [ -n "$DB_CLUSTER_LOCAL_ADDR" ]; then
+    if [ -n "$DB_CLUSTER_REMOTE_ADDR" ]; then
+        echo "  DB RAFT role:     join (local=$DB_CLUSTER_LOCAL_ADDR remote=$DB_CLUSTER_REMOTE_ADDR)"
+    else
+        echo "  DB RAFT role:     create (local=$DB_CLUSTER_LOCAL_ADDR)"
+    fi
+fi
 if [ -n "$WAN_BRIDGE" ]; then
     echo "  WAN bridge:       $WAN_BRIDGE ($WAN_BRIDGE_MODE)"
     if [ -n "$LINUX_BRIDGE" ]; then
@@ -237,6 +345,46 @@ if [ -d /etc/apparmor.d/local ]; then
 fi
 
 # --- Step 2: Enable services ---
+# ovn-ctl consults the RAFT flags only when it creates a database. The
+# ovn-central package starts a standalone ovsdb-server on install, so a
+# standalone-format DB is always already present by the time this script first
+# runs: without this check ovn-ctl serves that DB, silently ignores the cluster
+# flags, and the script reports success on a cluster that was never formed.
+ensure_clustered_db_storage() {
+    local db
+    local standalone=()
+    for db in "$OVN_DBDIR/ovnnb_db.db" "$OVN_DBDIR/ovnsb_db.db"; do
+        if [ -f "$db" ] && ! sudo ovsdb-tool db-is-clustered "$db" 2>/dev/null; then
+            standalone+=("$db")
+        fi
+    done
+    if [ ${#standalone[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    if [ "$RECREATE_DB" != true ]; then
+        echo "ERROR: clustered DBs requested, but these are in standalone format:" >&2
+        printf '         %s\n' "${standalone[@]}" >&2
+        echo "" >&2
+        echo "  A clustered DB can only be created from scratch, so these must be" >&2
+        echo "  removed first. That DISCARDS ALL LOGICAL NETWORK STATE — every logical" >&2
+        echo "  switch, router, port and ACL, and so every VPC on this node." >&2
+        echo "" >&2
+        echo "  A freshly installed node has nothing to lose: re-run with --recreate-db." >&2
+        echo "  A node running workloads does: do not." >&2
+        exit 1
+    fi
+
+    echo "  --recreate-db: removing standalone DBs so ovn-ctl can create clustered ones"
+
+    # ovn-controller must go down with them. Left running, it reconnects to the
+    # fresh SB and re-registers under whatever system-id it started with — which
+    # on a renamed node is the old one, and that row then holds this node's encap
+    # IP so the correctly-named chassis can never commit. Step 5 restarts it.
+    sudo systemctl stop ovn-northd ovn-ovsdb-server-nb ovn-ovsdb-server-sb ovn-central ovn-controller 2>/dev/null || true
+    sudo rm -f "${standalone[@]}"
+}
+
 echo ""
 echo "Step 2: Enabling services..."
 
@@ -246,8 +394,61 @@ echo "  openvswitch-switch: started"
 
 if [ "$MANAGEMENT" = true ]; then
     sudo systemctl enable ovn-central
-    sudo systemctl start ovn-central
-    echo "  ovn-central: started (NB DB + SB DB + ovn-northd)"
+
+    if [ -n "$DB_CLUSTER_LOCAL_ADDR" ]; then
+        ensure_clustered_db_storage
+
+        # Clustered NB/SB via native OVSDB RAFT. Both per-DB units source one
+        # shared OVN_CTL_OPTS from /etc/default/ovn-central; each run_*_ovsdb
+        # consumes only its own --db-{nb,sb}-* flags. RAFT ports default to NB
+        # 6643 / SB 6644. ovn-ctl creates the cluster when no remote-addr is
+        # given (and no existing .db file), joins when one is.
+        OVN_CTL_OPTS="--db-nb-cluster-local-addr=$DB_CLUSTER_LOCAL_ADDR --db-sb-cluster-local-addr=$DB_CLUSTER_LOCAL_ADDR"
+        if [ -n "$DB_CLUSTER_REMOTE_ADDR" ]; then
+            OVN_CTL_OPTS="$OVN_CTL_OPTS --db-nb-cluster-remote-addr=$DB_CLUSTER_REMOTE_ADDR --db-sb-cluster-remote-addr=$DB_CLUSTER_REMOTE_ADDR"
+            echo "  ovn-central: joining RAFT cluster (local=$DB_CLUSTER_LOCAL_ADDR remote=$DB_CLUSTER_REMOTE_ADDR)"
+        else
+            echo "  ovn-central: creating RAFT cluster (local=$DB_CLUSTER_LOCAL_ADDR)"
+        fi
+
+        # Point ovn-northd's client NB/SB connections at the full RAFT member
+        # list so the active northd follows the leader. Without this it dials the
+        # local member only and stops advancing SB_Global.nb_cfg once leadership
+        # moves off this node, wedging the ovn-nbctl --wait=hv flows barrier.
+        # Derived from OVN_REMOTE (the SB list); the NB list is the same hosts on
+        # 6641. Skipped when OVN_REMOTE is the localhost default (caller passed no
+        # member list) so a lone standalone DB node is unaffected.
+        if [ "$OVN_REMOTE" != "tcp:127.0.0.1:6642" ]; then
+            OVN_REMOTE_NB="${OVN_REMOTE//:6642/:6641}"
+            OVN_CTL_OPTS="$OVN_CTL_OPTS --ovn-northd-nb-db=$OVN_REMOTE_NB --ovn-northd-sb-db=$OVN_REMOTE"
+            echo "  ovn-northd: NB=$OVN_REMOTE_NB SB=$OVN_REMOTE (RAFT member list)"
+        fi
+
+        echo "OVN_CTL_OPTS=\"$OVN_CTL_OPTS\"" | sudo tee /etc/default/ovn-central >/dev/null
+        echo "  wrote /etc/default/ovn-central"
+
+        # The packaged ovn-northd.service ExecStop runs `ovn-ctl stop_northd`
+        # without --ovn-manage-ovsdb=no, so restarting northd also tears down the
+        # NB/SB ovsdb-server units. With the split clustered units those DBs are
+        # owned by their own units, so override ExecStop to leave them alone —
+        # otherwise the restart below races and kills the freshly-started DBs.
+        sudo mkdir -p /etc/systemd/system/ovn-northd.service.d
+        sudo tee /etc/systemd/system/ovn-northd.service.d/no-manage-ovsdb.conf >/dev/null <<'EOF'
+[Service]
+ExecStop=
+ExecStop=/usr/share/ovn/scripts/ovn-ctl stop_northd --no-monitor --ovn-manage-ovsdb=no
+EOF
+        sudo systemctl daemon-reload
+
+        # The ovn-central aggregator is ExecStart=/bin/true, so restarting it
+        # won't restart the children — restart the per-DB units directly to
+        # pick up the new OVN_CTL_OPTS.
+        sudo systemctl restart ovn-ovsdb-server-nb ovn-ovsdb-server-sb ovn-northd
+        echo "  ovn-central: started clustered (NB DB + SB DB + ovn-northd)"
+    else
+        sudo systemctl start ovn-central
+        echo "  ovn-central: started (NB DB + SB DB + ovn-northd)"
+    fi
 
     # Wait for OVN NB DB socket to become available
     for i in $(seq 1 15); do
@@ -258,11 +459,51 @@ if [ "$MANAGEMENT" = true ]; then
         sleep 1
     done
 
-    # Allow remote connections to NB and SB databases
-    sudo ovn-nbctl set-connection ptcp:6641
-    sudo ovn-sbctl set-connection ptcp:6642
-    echo "  OVN NB DB listening on tcp:6641"
-    echo "  OVN SB DB listening on tcp:6642"
+    # Verify rather than assume: a DB that came up standalone despite the RAFT
+    # flags is the exact failure this guards against, and it stays invisible
+    # until a node goes down and the cluster turns out not to exist.
+    if [ -n "$DB_CLUSTER_LOCAL_ADDR" ]; then
+        for db in "$OVN_DBDIR/ovnnb_db.db" "$OVN_DBDIR/ovnsb_db.db"; do
+            if ! sudo ovsdb-tool db-is-clustered "$db" 2>/dev/null; then
+                echo "ERROR: $db is not in clustered format after startup." >&2
+                echo "       The RAFT configuration did not take effect." >&2
+                exit 1
+            fi
+        done
+        echo "  DB storage:       clustered (NB + SB verified)"
+    fi
+
+    # Wait for the Southbound DB to be serving before ovn-controller (Step 5)
+    # dials it. On a single node ovn-controller races a fresh SB RAFT election
+    # with no join step to absorb the window — attaching before the leader is
+    # elected (and before northd writes the gateway logical flows) leaves it with
+    # a partial datapath that never reconverges. Gate on SB reachable and, when
+    # clustered, an elected leader.
+    for i in $(seq 1 30); do
+        if sudo ovn-sbctl --timeout=2 show >/dev/null 2>&1; then
+            if [ -z "$DB_CLUSTER_LOCAL_ADDR" ]; then
+                break
+            fi
+            SB_LEADER=$(sudo ovs-appctl -t /var/run/ovn/ovnsb_db.ctl \
+                cluster/status OVN_Southbound 2>/dev/null \
+                | awk '/^Leader:/{print $2; exit}')
+            if [ -n "$SB_LEADER" ] && [ "$SB_LEADER" != "unknown" ]; then
+                break
+            fi
+        fi
+        echo "  Waiting for OVN SB DB leader... ($i/30)"
+        sleep 1
+    done
+
+    # Set the NB/SB client listen addresses. set-connection writes through RAFT
+    # (replicated cluster-wide), so it only runs on the create node — a joining
+    # node would redirect to the leader, which the init node already configured.
+    if [ -z "$DB_CLUSTER_REMOTE_ADDR" ]; then
+        sudo ovn-nbctl set-connection ptcp:6641
+        sudo ovn-sbctl set-connection ptcp:6642
+        echo "  OVN NB DB listening on tcp:6641"
+        echo "  OVN SB DB listening on tcp:6642"
+    fi
 fi
 
 # --- Step 3: Create and configure br-int ---
@@ -303,7 +544,7 @@ if [ -n "$WAN_BRIDGE" ]; then
     # when switching to any non-veth mode. Idempotent — each command uses
     # --if-exists / 2>/dev/null to tolerate absence. Without this, the
     # veth pair re-materialises on reboot and fights the current mode's
-    # bridge plumbing (Fix 1, mulga-998.b, per D17).
+    # Bridge plumbing for the host-to-OVN datapath.
     if [ "$WAN_BRIDGE_MODE" != "veth" ]; then
         sudo rm -f /etc/systemd/network/14-spinifex-br-wan.netdev \
                    /etc/systemd/network/15-spinifex-veth-wan.netdev \
@@ -312,6 +553,16 @@ if [ -n "$WAN_BRIDGE" ]; then
         sudo networkctl reload 2>/dev/null || true
         sudo ovs-vsctl --if-exists del-port veth-wan-ovs 2>/dev/null || true
         sudo ip link del veth-wan-br 2>/dev/null || true
+    fi
+
+    # Same ripdown for stale routed-NAT plumbing when switching away from nat.
+    if [ "$WAN_BRIDGE_MODE" != "nat" ]; then
+        sudo rm -f /etc/systemd/network/17-spinifex-nat.netdev \
+                   /etc/systemd/network/17-spinifex-nat.network \
+                   /etc/systemd/network/18-spinifex-nat-ovs.network
+        sudo networkctl reload 2>/dev/null || true
+        sudo ovs-vsctl --if-exists del-port spx-nat-ovs 2>/dev/null || true
+        sudo ip link del spx-nat-host 2>/dev/null || true
     fi
 
     case "$WAN_BRIDGE_MODE" in
@@ -370,7 +621,7 @@ if [ -n "$WAN_BRIDGE" ]; then
             # Persist the veth pair across reboot via systemd-networkd. Veths
             # are kernel-only and vanish on reboot; without persistence vpcd
             # starts with the OVS port pointing at a nonexistent peer and
-            # silently falls back to direct mode (Fix 1, mulga-998.b).
+            # silently falls back to direct mode.
             #
             # networkd's Bridge= directive requires the target bridge to be a
             # known NetDev. On ISO-installed nodes the installer writes
@@ -422,7 +673,7 @@ NETWORK
             # (enslaved via ovs-vsctl add-port above) but does not flip admin
             # state on external ports — that's networkd's job. Without this,
             # veth-wan-ovs stays DOWN after reboot, peer goes LOWERLAYERDOWN,
-            # br-wan loses carrier (Fix 1 follow-up, mulga-998.b).
+            # br-wan loses carrier.
             sudo tee "$VETH_OVS_NETWORK" >/dev/null <<NETWORK
 [Match]
 Name=veth-wan-ovs
@@ -461,10 +712,101 @@ NETWORK
             echo "  $WAN_BRIDGE: direct bridge on $WAN_IFACE"
             echo "  NOTE: $WAN_IFACE is now an OVS port — no host IP on this NIC"
             ;;
+
+        nat)
+            # Routed NAT: br-ext carries no WAN NIC. A transit veth pair links
+            # it to the host stack (spx-nat-host owns 100.127.0.1/24); the host
+            # forwards and masquerades the transit /24 out whatever uplink it
+            # has. OVN SNATs each VPC CIDR to its gateway LRP transit IP, so
+            # the masquerade rule below is the only host-side NAT state.
+            NAT_TRANSIT_CIDR="100.127.0.0/24"
+            NAT_TRANSIT_GW_CIDR="100.127.0.1/24"
+
+            if ! sudo ovs-vsctl br-exists "$WAN_BRIDGE" 2>/dev/null; then
+                sudo ovs-vsctl --may-exist add-br "$WAN_BRIDGE"
+                echo "  created OVS bridge: $WAN_BRIDGE"
+            fi
+            sudo ip link set "$WAN_BRIDGE" up
+
+            # Create transit veth pair (idempotent)
+            if ! ip link show spx-nat-host >/dev/null 2>&1; then
+                sudo ip link add spx-nat-host type veth peer name spx-nat-ovs
+                echo "  created veth pair: spx-nat-host ↔ spx-nat-ovs"
+            else
+                echo "  veth pair already exists: spx-nat-host ↔ spx-nat-ovs"
+            fi
+            sudo ip addr replace "$NAT_TRANSIT_GW_CIDR" dev spx-nat-host
+
+            # Add the OVS end to br-ext
+            if ! sudo ovs-vsctl port-to-br spx-nat-ovs >/dev/null 2>&1; then
+                sudo ovs-vsctl --may-exist add-port "$WAN_BRIDGE" spx-nat-ovs
+                echo "  spx-nat-ovs → $WAN_BRIDGE (OVS bridge)"
+            fi
+            sudo ip link set spx-nat-host up
+            sudo ip link set spx-nat-ovs up
+            echo "  host (spx-nat-host $NAT_TRANSIT_GW_CIDR) ↔ veth pair ↔ $WAN_BRIDGE (OVS)"
+
+            # Persist the veth pair + transit IP across reboot (veths are
+            # kernel-only; same rationale as veth mode above).
+            NAT_NETDEV="/etc/systemd/network/17-spinifex-nat.netdev"
+            NAT_NETWORK="/etc/systemd/network/17-spinifex-nat.network"
+            NAT_OVS_NETWORK="/etc/systemd/network/18-spinifex-nat-ovs.network"
+            sudo tee "$NAT_NETDEV" >/dev/null <<NETDEV
+[NetDev]
+Name=spx-nat-host
+Kind=veth
+
+[Peer]
+Name=spx-nat-ovs
+NETDEV
+            sudo tee "$NAT_NETWORK" >/dev/null <<NETWORK
+[Match]
+Name=spx-nat-host
+
+[Network]
+Address=$NAT_TRANSIT_GW_CIDR
+ConfigureWithoutCarrier=yes
+NETWORK
+            # Admin-up the OVS end after reboot (OVS owns the port but does
+            # not flip admin state on external ports — same as veth mode).
+            sudo tee "$NAT_OVS_NETWORK" >/dev/null <<NETWORK
+[Match]
+Name=spx-nat-ovs
+
+[Link]
+RequiredForOnline=no
+
+[Network]
+ConfigureWithoutCarrier=yes
+NETWORK
+            sudo networkctl reload 2>/dev/null || true
+            echo "  wrote $NAT_NETDEV + $NAT_NETWORK + $NAT_OVS_NETWORK (transit veth persists on reboot)"
+
+            # Kernel egress: masquerade the transit /24 out any uplink and
+            # accept forwarded transit traffic even under FORWARD-policy DROP.
+            # vpcd re-ensures these on every start; installing here too means
+            # the wiring is testable before services run.
+            sudo iptables -t nat -C POSTROUTING -s "$NAT_TRANSIT_CIDR" ! -d "$NAT_TRANSIT_CIDR" \
+                -m comment --comment "spinifex-nat-egress" -j MASQUERADE 2>/dev/null || \
+            sudo iptables -t nat -A POSTROUTING -s "$NAT_TRANSIT_CIDR" ! -d "$NAT_TRANSIT_CIDR" \
+                -m comment --comment "spinifex-nat-egress" -j MASQUERADE
+            sudo iptables -C FORWARD -i spx-nat-host -s "$NAT_TRANSIT_CIDR" \
+                -m comment --comment "spinifex-nat-egress" -j ACCEPT 2>/dev/null || \
+            sudo iptables -A FORWARD -i spx-nat-host -s "$NAT_TRANSIT_CIDR" \
+                -m comment --comment "spinifex-nat-egress" -j ACCEPT
+            sudo iptables -C FORWARD -o spx-nat-host -m conntrack --ctstate RELATED,ESTABLISHED \
+                -m comment --comment "spinifex-nat-egress" -j ACCEPT 2>/dev/null || \
+            sudo iptables -A FORWARD -o spx-nat-host -m conntrack --ctstate RELATED,ESTABLISHED \
+                -m comment --comment "spinifex-nat-egress" -j ACCEPT
+            echo "  installed masquerade + forward rules for $NAT_TRANSIT_CIDR (comment: spinifex-nat-egress)"
+            ;;
     esac
 
     # --- DHCP: obtain gateway IP for OVN SNAT ---
-    if [ "$EXTERNAL_DHCP" = true ]; then
+    if [ "$EXTERNAL_DHCP" = true ] && [ "$WAN_BRIDGE_MODE" = "nat" ]; then
+        echo ""
+        echo "  Skipping --dhcp: routed NAT mode has a fixed transit gateway (100.127.0.1)"
+    elif [ "$EXTERNAL_DHCP" = true ]; then
         echo ""
         echo "Step 3c: Obtaining external gateway IP via DHCP..."
 
@@ -515,6 +857,22 @@ fi
 if [ "$MGMT_BRIDGE_ENABLED" = true ]; then
     echo ""
     echo "Step 3d: Configuring management bridge ($MGMT_BRIDGE)..."
+
+    # --may-exist is idempotent against OVS, not against the kernel. When a
+    # Linux bridge already holds the name, OVS creates the bridge record but
+    # cannot create the internal netdev, leaving a half-built bridge whose
+    # only symptom is an error buried in `ovs-vsctl show`.
+    if ip link show "$MGMT_BRIDGE" >/dev/null 2>&1 && \
+       ! sudo ovs-vsctl br-exists "$MGMT_BRIDGE" 2>/dev/null; then
+        echo "  ERROR: '$MGMT_BRIDGE' already exists as a non-OVS link"
+        ip -d link show "$MGMT_BRIDGE" | head -2
+        echo ""
+        echo "  The management bridge must be an OVS bridge. Either:"
+        echo "    1. Point this script elsewhere:  --mgmt-bridge=<name>"
+        echo "    2. Rename the existing link (a plane bridge belongs on br-wan/br-lan/br-vpc)"
+        echo "    3. Skip mgmt provisioning entirely:  --no-mgmt-bridge"
+        exit 1
+    fi
 
     sudo ovs-vsctl --may-exist add-br "$MGMT_BRIDGE"
     sudo ovs-vsctl set Bridge "$MGMT_BRIDGE" \
@@ -598,9 +956,21 @@ fi
 # refused to start. Preserving the on-disk value is always safe — any
 # caller that needs IPsec cert identity matching pins it themselves.
 if [ -n "$NODE_NAME" ]; then
+    OLD_ID=$(sudo ovs-vsctl get Open_vSwitch . external_ids:system-id 2>/dev/null | tr -d '"')
     echo "$NODE_NAME" | sudo tee /etc/openvswitch/system-id.conf >/dev/null
     sudo ovs-vsctl set Open_vSwitch . external_ids:system-id="$NODE_NAME"
     echo "  system-id:      $NODE_NAME (pinned via --node-name)"
+
+    # A renamed chassis cannot register while the row it left behind still
+    # holds this node's encap IP: ovn-controller loops on "OVNSB commit
+    # failed" and never appears in `ovn-sbctl show`. The stale row owns no
+    # state worth keeping — ovn-controller rebuilds everything on register —
+    # but it must go before Step 5 restarts the controller under the new name.
+    if [ -n "$OLD_ID" ] && [ "$OLD_ID" != "$NODE_NAME" ]; then
+        if sudo ovn-sbctl --db="$OVN_REMOTE" --timeout=10 chassis-del "$OLD_ID" 2>/dev/null; then
+            echo "  stale chassis:  removed '$OLD_ID' (renamed to $NODE_NAME)"
+        fi
+    fi
 else
     CURRENT_ID=$(sudo ovs-vsctl get Open_vSwitch . external_ids:system-id 2>/dev/null | tr -d '"')
     echo "  system-id:      ${CURRENT_ID:-<unset>} (preserved; no --node-name given)"
@@ -627,6 +997,25 @@ echo "  ovn-controller log level: file:warn (via systemd drop-in)"
 
 sudo systemctl restart ovn-controller
 echo "  ovn-controller: started"
+
+# Force a full datapath recompute once ovn-controller has connected to the SB.
+# On a fresh single-node RAFT the controller can attach mid-election and program
+# a partial datapath (SNAT ct-commit without output/delivery), then never
+# reconverge. Recomputing after the SB connection is up rebuilds all OpenFlow
+# from the converged Southbound. Compute nodes race a remote SB too, so this
+# runs on every node.
+for i in $(seq 1 30); do
+    CTRL_STATUS=$(sudo OVS_RUNDIR=/var/run/ovn ovs-appctl -t ovn-controller \
+        connection-status 2>/dev/null)
+    if [ "$CTRL_STATUS" = "connected" ]; then
+        break
+    fi
+    echo "  Waiting for ovn-controller SB connection... ($i/30)"
+    sleep 1
+done
+sudo OVS_RUNDIR=/var/run/ovn ovs-appctl -t ovn-controller inc-engine/recompute \
+    2>/dev/null || true
+echo "  ovn-controller: forced datapath recompute"
 
 # --- Step 6: Sysctl tuning ---
 echo ""
@@ -674,40 +1063,109 @@ else
     echo "  WARNING: geneve module not available (tunnels may not work)"
 fi
 
-# --- Step 8: Grant non-root access to OVS/OVN ---
+# --- Step 8: Grant the spinifex service users access to OVS/OVN ---
 echo ""
-echo "Step 8: Configuring non-root access..."
+echo "Step 8: Configuring service-user access..."
 
-# Open OVS DB socket so non-root processes can use ovs-vsctl
-OVS_SOCK="/var/run/openvswitch/db.sock"
-if [ -S "$OVS_SOCK" ]; then
-    sudo chmod 0666 "$OVS_SOCK"
-    echo "  OVS DB socket: opened ($OVS_SOCK)"
+# Group-scoped, never world. spinifex-daemon and spinifex-vpcd both run with
+# Group=spinifex, so 0660 root:spinifex is exactly the reach they need. A
+# world-writable db.sock hands the local datapath — bridges, ports, ovn-remote —
+# to any account on the box, and a world-writable ctl socket lets any account
+# run `ovn-appctl exit`.
+PERMS_HELPER="/usr/local/lib/spinifex/ovs-socket-perms.sh"
+sudo mkdir -p "$(dirname "$PERMS_HELPER")"
+sudo tee "$PERMS_HELPER" >/dev/null <<'HELPER'
+#!/bin/sh
+# Group-own the OVS/OVN control sockets to `spinifex` so the service users reach
+# them without sudo. Driven from ExecStartPost on both openvswitch-switch and
+# ovn-controller: each recreates its own sockets on start, and the ovn-controller
+# ctl socket name embeds the pid, so it is a new file every time.
+#
+# $1 is an optional glob for the caller's own socket, waited on before the sweep.
+set -eu
+GROUP=spinifex
+WAIT_FOR="${1:-}"
+
+if ! getent group "$GROUP" >/dev/null 2>&1; then
+    exit 0
 fi
 
-# Open OVN runtime directory and ctl sockets for ovs-appctl access
-if [ -d "/var/run/ovn" ]; then
-    sudo chmod 0755 /var/run/ovn
-    sudo chmod 0666 /var/run/ovn/*.ctl 2>/dev/null || true
-    echo "  OVN ctl sockets: opened (/var/run/ovn/)"
-fi
-if [ -d "/var/run/openvswitch" ]; then
-    sudo chmod 0666 /var/run/openvswitch/*.ctl 2>/dev/null || true
+# Unquoted so the caller's pattern globs. A caller passing nothing sweeps at once.
+wait_target_present() {
+    if [ -z "$WAIT_FOR" ]; then
+        return 0
+    fi
+    for s in $WAIT_FOR; do
+        if [ -S "$s" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ExecStartPost can outrun socket creation, so poll briefly rather than miss the
+# socket and leave the health probe unable to read connection-status.
+i=0
+while [ "$i" -lt 25 ]; do
+    if wait_target_present; then
+        break
+    fi
+    i=$((i + 1))
+    sleep 0.2
+done
+
+# The dir must be traversable by the group before the sockets inside it matter.
+# Only the group changes; the owner keeps full access whoever it is.
+if [ -d /var/run/ovn ]; then
+    chgrp "$GROUP" /var/run/ovn 2>/dev/null || true
+    chmod 0750 /var/run/ovn 2>/dev/null || true
 fi
 
-# Create persistent systemd override so permissions survive OVS restarts
-OVERRIDE_DIR="/etc/systemd/system/openvswitch-switch.service.d"
-if [ ! -f "$OVERRIDE_DIR/spinifex-perms.conf" ]; then
+# ovn??_db.sock are the NB/SB databases themselves, which ovn-nbctl and
+# ovn-sbctl connect to. Bridge <name>.mgmt sockets are deliberately NOT here:
+# ovs-vswitchd creates one whenever a bridge appears, including bridges spinifex
+# creates at runtime, so ovs-ofctl keeps its sudo grant.
+for s in /var/run/openvswitch/db.sock /var/run/openvswitch/*.ctl \
+    /var/run/ovn/*.ctl /var/run/ovn/ovnnb_db.sock /var/run/ovn/ovnsb_db.sock; do
+    if [ -S "$s" ]; then
+        chgrp "$GROUP" "$s" 2>/dev/null || true
+        chmod 0660 "$s" 2>/dev/null || true
+    fi
+done
+
+# Group-WRITE on the pidfiles, not just read: `ovn-appctl -t <daemon>` resolves
+# the pid-named ctl socket through the pidfile, and OVS opens it O_RDWR to test
+# the fcntl liveness lock. Read-only fails the probe with EACCES. This also
+# tightens them from the 0644 they ship with.
+for p in /var/run/openvswitch/*.pid /var/run/ovn/*.pid; do
+    if [ -f "$p" ]; then
+        chgrp "$GROUP" "$p" 2>/dev/null || true
+        chmod 0660 "$p" 2>/dev/null || true
+    fi
+done
+HELPER
+sudo chmod 0755 "$PERMS_HELPER"
+sudo "$PERMS_HELPER"
+echo "  OVS/OVN sockets: 0660 root:spinifex (group-scoped, no world access)"
+
+# Persist across restarts of both daemons. Rewritten unconditionally: an existing
+# file is the old 0666 override, and skipping would leave that exposure in place.
+# openvswitch-ipsec is included because Step 10 restarts it after this sweep,
+# so its ctl socket would otherwise be the one file left at the shipped mode.
+for unit in openvswitch-switch:/var/run/openvswitch/db.sock \
+    "ovn-controller:/var/run/ovn/*.ctl" \
+    "openvswitch-ipsec:/var/run/openvswitch/ovs-monitor-ipsec.*.ctl"; do
+    UNIT="${unit%%:*}"
+    WAIT_GLOB="${unit#*:}"
+    OVERRIDE_DIR="/etc/systemd/system/${UNIT}.service.d"
     sudo mkdir -p "$OVERRIDE_DIR"
-    sudo tee "$OVERRIDE_DIR/spinifex-perms.conf" >/dev/null <<'OVERRIDE'
+    sudo tee "$OVERRIDE_DIR/spinifex-perms.conf" >/dev/null <<OVERRIDE
 [Service]
-ExecStartPost=/bin/chmod 0666 /var/run/openvswitch/db.sock
+ExecStartPost=$PERMS_HELPER "$WAIT_GLOB"
 OVERRIDE
-    sudo systemctl daemon-reload
-    echo "  systemd override: created (db.sock permissions persist across restarts)"
-else
-    echo "  systemd override: already exists"
-fi
+    echo "  systemd override: ${UNIT}.service.d/spinifex-perms.conf"
+done
+sudo systemctl daemon-reload
 
 # Sudoers rules for spinifex-daemon and spinifex-vpcd are managed by setup.sh
 # (install_sudoers). Skip writing here to avoid conflicts.

@@ -1,25 +1,27 @@
 package handlers_ec2_instance
 
 import (
+	"context"
+
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/mulgadc/spinifex/spinifex/gpu"
 	"github.com/mulgadc/spinifex/spinifex/vm"
 	"github.com/mulgadc/viperblock/viperblock"
 )
 
-// InstanceService defines the interface for EC2 instance operations business logic
+// InstanceService defines the interface for EC2 instance operations business logic.
 type InstanceService interface {
-	RunInstances(input *ec2.RunInstancesInput, accountID string) (*ec2.Reservation, error)
-	DescribeInstances(input *ec2.DescribeInstancesInput, accountID string) (*ec2.DescribeInstancesOutput, error)
-	DescribeInstanceStatus(input *ec2.DescribeInstanceStatusInput, accountID string) (*ec2.DescribeInstanceStatusOutput, error)
-	DescribeInstanceTypes(input *ec2.DescribeInstanceTypesInput, accountID string) (*ec2.DescribeInstanceTypesOutput, error)
-	DescribeInstanceAttribute(input *ec2.DescribeInstanceAttributeInput, accountID string) (*ec2.DescribeInstanceAttributeOutput, error)
-	DescribeStoppedInstances(input *ec2.DescribeInstancesInput, accountID string) (*ec2.DescribeInstancesOutput, error)
-	DescribeTerminatedInstances(input *ec2.DescribeInstancesInput, accountID string) (*ec2.DescribeInstancesOutput, error)
-	ModifyInstanceAttribute(input *ec2.ModifyInstanceAttributeInput, accountID string) (*ec2.ModifyInstanceAttributeOutput, error)
-	ModifyInstanceMetadataOptions(input *ec2.ModifyInstanceMetadataOptionsInput, accountID string) (*ec2.ModifyInstanceMetadataOptionsOutput, error)
-	StartStoppedInstance(input *StartStoppedInstanceInput, accountID string) (*StartStoppedInstanceOutput, error)
-	TerminateStoppedInstance(input *TerminateStoppedInstanceInput, accountID string) (*TerminateStoppedInstanceOutput, error)
+	RunInstances(ctx context.Context, input *ec2.RunInstancesInput, accountID string) (*ec2.Reservation, error)
+	DescribeInstances(ctx context.Context, input *ec2.DescribeInstancesInput, accountID string) (*ec2.DescribeInstancesOutput, error)
+	DescribeInstanceStatus(ctx context.Context, input *ec2.DescribeInstanceStatusInput, accountID string) (*ec2.DescribeInstanceStatusOutput, error)
+	DescribeInstanceTypes(ctx context.Context, input *ec2.DescribeInstanceTypesInput, accountID string) (*ec2.DescribeInstanceTypesOutput, error)
+	DescribeInstanceAttribute(ctx context.Context, input *ec2.DescribeInstanceAttributeInput, accountID string) (*ec2.DescribeInstanceAttributeOutput, error)
+	DescribeStoppedInstances(ctx context.Context, input *ec2.DescribeInstancesInput, accountID string) (*ec2.DescribeInstancesOutput, error)
+	DescribeTerminatedInstances(ctx context.Context, input *ec2.DescribeInstancesInput, accountID string) (*ec2.DescribeInstancesOutput, error)
+	ModifyInstanceAttribute(ctx context.Context, input *ec2.ModifyInstanceAttributeInput, accountID string) (*ec2.ModifyInstanceAttributeOutput, error)
+	ModifyInstanceMetadataOptions(ctx context.Context, input *ec2.ModifyInstanceMetadataOptionsInput, accountID string) (*ec2.ModifyInstanceMetadataOptionsOutput, error)
+	StartStoppedInstance(ctx context.Context, input *StartStoppedInstanceInput, accountID string) (*StartStoppedInstanceOutput, error)
+	TerminateStoppedInstance(ctx context.Context, input *TerminateStoppedInstanceInput, accountID string) (*TerminateStoppedInstanceOutput, error)
 }
 
 // StartStoppedInstanceInput is the payload for ec2.StartStoppedInstance.
@@ -83,37 +85,67 @@ type StoppedInstanceStore interface {
 	ListTerminatedInstances() ([]*vm.VM, error)
 	WriteStoppedInstance(instanceID string, instance *vm.VM) error
 	DeleteStoppedInstance(instanceID string) error
+	// UpdateStoppedInstance atomically applies mutate to the current stopped
+	// record under optimistic concurrency (CAS) with createIfAbsent=false, so
+	// a caller racing a winning ClaimStoppedInstance gets a clean
+	// jetstream.ErrKeyNotFound instead of resurrecting a deleted record.
+	UpdateStoppedInstance(instanceID string, mutate func(*vm.VM)) (*vm.VM, error)
 	WriteTerminatedInstance(instanceID string, instance *vm.VM) error
+	// ClaimStoppedInstance atomically removes instanceID's record and
+	// returns the VM it held, so at most one caller can ever win a race to
+	// (re)launch the same stopped instance. Returns vm.ErrStoppedInstanceClaimed
+	// if a concurrent caller already claimed (or otherwise removed) the record.
+	ClaimStoppedInstance(instanceID string) (*vm.VM, error)
+}
+
+// InstanceTagWriter projects an instance record's full tag set into the
+// central tag store, and removes it on terminate. Implemented by
+// handlers/ec2/tags.TagsServiceImpl.
+type InstanceTagWriter interface {
+	PutResourceTags(ctx context.Context, accountID, resourceID string, tags map[string]string) error
+	DeleteAllTags(ctx context.Context, accountID, resourceID string) error
 }
 
 // VolumeDeleter deletes EBS volumes. Implemented by handlers/ec2/volume's
 // VolumeServiceImpl (used by the daemon).
 type VolumeDeleter interface {
-	DeleteVolume(input *ec2.DeleteVolumeInput, accountID string) (*ec2.DeleteVolumeOutput, error)
+	DeleteVolume(ctx context.Context, input *ec2.DeleteVolumeInput, accountID string) (*ec2.DeleteVolumeOutput, error)
+
+	// DeleteVolumeOnTerminate deletes a DeleteOnTermination volume as part of
+	// an instance terminate: it clears any stale attachment (terminate
+	// implies detach) before deleting, so a still-attached boot volume left
+	// over from Stop is not rejected by DeleteVolume's in-use guard.
+	DeleteVolumeOnTerminate(ctx context.Context, volumeID, accountID string) error
+
+	// DetachVolumeOnTerminate clears a still-attached volume's attachment on
+	// terminate without deleting it, matching AWS semantics for a
+	// DeleteOnTermination=false volume: terminate still implies detach, it
+	// just leaves the volume behind as available rather than deleting it.
+	DetachVolumeOnTerminate(ctx context.Context, volumeID, accountID string) error
 }
 
 // ENIDeleter deletes ENIs. Implemented by handlers/ec2/vpc's VPCServiceImpl.
 type ENIDeleter interface {
-	DeleteNetworkInterface(input *ec2.DeleteNetworkInterfaceInput, accountID string) (*ec2.DeleteNetworkInterfaceOutput, error)
+	DeleteNetworkInterface(ctx context.Context, input *ec2.DeleteNetworkInterfaceInput, accountID string) (*ec2.DeleteNetworkInterfaceOutput, error)
 }
 
 // PublicIPReleaser releases a previously allocated public IP back to a pool.
 // Implemented by handlers/ec2/vpc.ExternalIPAM. ownerENIID scopes the release
 // to the ENI that owns the lease so a stale teardown for a recycled IP no-ops.
 type PublicIPReleaser interface {
-	ReleaseIP(pool, ip, ownerENIID string) error
+	ReleaseIP(ctx context.Context, pool, ip, ownerENIID string) error
 }
 
 // AMIMetaLoader resolves an AMI ID to its metadata for ownership/validation
 // during RunInstances. Implemented by handlers/ec2/image.ImageServiceImpl.
 type AMIMetaLoader interface {
-	GetAMIConfig(imageID string) (viperblock.AMIMetadata, error)
+	GetAMIConfig(ctx context.Context, imageID string) (viperblock.AMIMetadata, error)
 }
 
 // KeyPairValidator checks that a named key pair exists for an account during
 // RunInstances. Implemented by handlers/ec2/key.KeyServiceImpl.
 type KeyPairValidator interface {
-	ValidateKeyPairExists(accountID, keyName string) error
+	ValidateKeyPairExists(ctx context.Context, accountID, keyName string) error
 }
 
 // SubnetInfo carries the subset of subnet metadata RunInstances needs to
@@ -134,23 +166,31 @@ type ENIInfo struct {
 	MacAddress         string
 	Status             string
 	SecurityGroupIDs   []string
+	// DeleteOnTermination mirrors the stored ENIRecord field, defaulted true
+	// when unset. Read by the terminate sweep to decide detach-only vs delete.
+	DeleteOnTermination bool
 }
 
 // ENICreator covers the VPC/ENI operations RunInstances uses to auto-attach a
-// primary interface. DetachENI is here (not ENIDeleter) so the NAT-rollback
-// path can flip the ENI to "available" before deletion.
+// primary interface, plus the enumeration the terminate path uses to release
+// every ENI attached to an instance. DetachENI is here (not ENIDeleter) so the
+// NAT-rollback path can flip the ENI to "available" before deletion.
 type ENICreator interface {
-	GetDefaultSubnet(accountID string) (*SubnetInfo, error)
-	GetSubnet(accountID, subnetID string) (*SubnetInfo, error)
-	GetENI(accountID, eniID string) (*ENIInfo, error)
-	CreateNetworkInterface(input *ec2.CreateNetworkInterfaceInput, accountID string) (*ec2.CreateNetworkInterfaceOutput, error)
-	AttachENI(accountID, eniID, instanceID string, deviceIndex int64) (string, error)
-	DetachENI(accountID, eniID string) error
-	UpdateENIPublicIP(accountID, eniID, publicIP, poolName string) error
+	GetDefaultSubnet(ctx context.Context, accountID string) (*SubnetInfo, error)
+	GetSubnet(ctx context.Context, accountID, subnetID string) (*SubnetInfo, error)
+	GetENI(ctx context.Context, accountID, eniID string) (*ENIInfo, error)
+	CreateNetworkInterface(ctx context.Context, input *ec2.CreateNetworkInterfaceInput, accountID string) (*ec2.CreateNetworkInterfaceOutput, error)
+	AttachENI(ctx context.Context, accountID, eniID, instanceID string, deviceIndex int64) (string, error)
+	DetachENI(ctx context.Context, accountID, eniID string) error
+	UpdateENIPublicIP(ctx context.Context, accountID, eniID, publicIP, poolName string) error
+	// ListInstanceENIs returns every ENI currently attached to instanceID.
+	// Used by the terminate sweep for post-launch attachments the launch-time
+	// ENIId scalar on vm.VM never carries.
+	ListInstanceENIs(ctx context.Context, accountID, instanceID string) ([]ENIInfo, error)
 }
 
 // PublicIPAllocator allocates a public IP to an instance/ENI from a pool.
 // Implemented by handlers/ec2/vpc.ExternalIPAM.
 type PublicIPAllocator interface {
-	AllocateIP(region, az, allocType, allocID, eniID, instanceID string) (publicIP, poolName string, err error)
+	AllocateIP(ctx context.Context, region, az, allocType, allocID, eniID, instanceID string) (publicIP, poolName string, err error)
 }

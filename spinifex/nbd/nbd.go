@@ -7,6 +7,15 @@ import (
 	"strconv"
 )
 
+// accessKeyEnv and secretKeyEnv name the environment variables the nbdkit
+// child process reads S3 credentials from. Passing credentials this way
+// instead of via argv keeps them out of /proc/<pid>/cmdline, which is
+// world-readable for the life of the process.
+const (
+	accessKeyEnv = "VB_ACCESS_KEY"
+	secretKeyEnv = "VB_SECRET_KEY" //nolint:gosec // G101 false positive: env var name, not a credential value
+)
+
 type NBDKitConfig struct {
 	Port       int    `json:"port"`   // TCP port (when using TCP transport)
 	Socket     string `json:"socket"` // Unix socket path (when using socket transport)
@@ -30,6 +39,11 @@ type NBDKitConfig struct {
 	// it is forwarded to the viperblock plugin so encrypted volumes open with
 	// matching encryption state. Empty → plugin opens in cleartext mode.
 	EncryptionKeyFile string `json:"encryption_key_file"`
+
+	// GCEnabled forwards spinifex's [viperblock] gc_enabled toggle to the
+	// plugin's gc_enabled param, gating chunk garbage collection on the VB
+	// this nbdkit process constructs. Default false, matching ShardWAL.
+	GCEnabled bool `json:"gc_enabled"`
 }
 
 // buildArgs constructs the nbdkit command-line arguments from the config.
@@ -57,20 +71,20 @@ func (cfg *NBDKitConfig) buildArgs() ([]string, error) {
 		args = append(args, "-v")
 	}
 
-	// Add plugin-specific arguments
+	// Add plugin-specific arguments. Credentials are deliberately not here —
+	// they are passed via cmd.Env in Execute so they never appear in argv,
+	// which is world-readable via /proc/<pid>/cmdline.
 	pluginArgs := []string{
 		fmt.Sprintf("size=%d", cfg.Size),
 		fmt.Sprintf("volume=%s", cfg.Volume),
 		fmt.Sprintf("bucket=%s", cfg.Bucket),
 		fmt.Sprintf("region=%s", cfg.Region),
-		fmt.Sprintf("access_key=%s", cfg.AccessKey),
-		fmt.Sprintf("secret_key=%s", cfg.SecretKey),
 		fmt.Sprintf("base_dir=%s", cfg.BaseDir),
 		fmt.Sprintf("host=%s", cfg.Host),
 		fmt.Sprintf("cache_size=%d", cfg.CacheSize),
 		fmt.Sprintf("shardwal=%t", cfg.ShardWAL),
+		fmt.Sprintf("gc_enabled=%t", cfg.GCEnabled),
 	}
-
 	// Only forward the key when configured; an empty value would explicitly
 	// set the plugin to cleartext and override its ENCRYPTION_KEY_FILE fallback.
 	if cfg.EncryptionKeyFile != "" {
@@ -81,15 +95,33 @@ func (cfg *NBDKitConfig) buildArgs() ([]string, error) {
 	return args, nil
 }
 
-func (cfg *NBDKitConfig) Execute() (*exec.Cmd, error) {
+// buildCmd constructs the nbdkit exec.Cmd with argv and environment set, but
+// does not start it. Split out from Execute so tests can inspect cmd.Env and
+// cmd.Args without spawning the real nbdkit binary.
+func (cfg *NBDKitConfig) buildCmd() (*exec.Cmd, error) {
 	args, err := cfg.buildArgs()
 	if err != nil {
 		return nil, err
 	}
 
 	cmd := exec.Command("nbdkit", args...)
+	// Credentials travel via the environment, not argv, so nbdkit's plugin
+	// can read them without exposing them in /proc/<pid>/cmdline.
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("%s=%s", accessKeyEnv, cfg.AccessKey),
+		fmt.Sprintf("%s=%s", secretKeyEnv, cfg.SecretKey),
+	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+
+	return cmd, nil
+}
+
+func (cfg *NBDKitConfig) Execute() (*exec.Cmd, error) {
+	cmd, err := cfg.buildCmd()
+	if err != nil {
+		return nil, err
+	}
 
 	return cmd, cmd.Start()
 }

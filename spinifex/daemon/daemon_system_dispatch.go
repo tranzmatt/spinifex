@@ -202,8 +202,8 @@ func (d *Daemon) handleSystemTerminateInstance(msg *nats.Msg) {
 func (d *Daemon) serveSystemTerminateInstance(msg *nats.Msg) {
 	// Subject suffix is the instance ID; payload is unused but reserved for
 	// future flags. Tolerate empty payloads.
-	parts := splitSubjectTail(msg.Subject, "system.TerminateInstance.")
-	if parts == "" {
+	parts, ok := strings.CutPrefix(msg.Subject, "system.TerminateInstance.")
+	if !ok || parts == "" {
 		slog.Error("system.TerminateInstance: subject missing instance ID", "subject", msg.Subject)
 		respondWithSystemTerminateError(msg, awserrors.ErrorInvalidInstanceIDNotFound)
 		return
@@ -287,14 +287,4 @@ func respondWithSystemTerminateError(msg *nats.Msg, errMsg string) {
 	if err := msg.Respond(payload); err != nil {
 		slog.Error("system.TerminateInstance: respond (error) failed", "err", err)
 	}
-}
-
-// splitSubjectTail returns the portion of subject after prefix, or empty
-// string if subject does not start with prefix. Helper kept local to avoid
-// touching utils for a one-liner.
-func splitSubjectTail(subject, prefix string) string {
-	if len(subject) <= len(prefix) || subject[:len(prefix)] != prefix {
-		return ""
-	}
-	return subject[len(prefix):]
 }

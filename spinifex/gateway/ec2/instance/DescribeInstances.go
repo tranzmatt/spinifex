@@ -1,6 +1,7 @@
 package gateway_ec2_instance
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go"
@@ -17,10 +19,17 @@ import (
 
 // DescribeInstances fans out to all nodes via NATS and aggregates the results.
 // It is lenient: partial results from a slow or unreachable node are returned
-// without error, which is correct for user-facing describes. Callers that must
-// not act on a partial view (the quota reconcile) use DescribeInstancesForReconcile.
-func DescribeInstances(input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string) (*ec2.DescribeInstancesOutput, error) {
-	reservations, _, firstClient4xx, err := gatherInstances(input, natsConn, expectedNodes, accountID)
+// without error, and an explicitly named instance ID that is simply absent
+// from the aggregate is not an error either — the caller sees an empty list.
+// That silence is required by internal callers (the IMDS instance lookup, the
+// RDS instance-state resolver, the EKS control-plane reconciler) which treat
+// "not found" as "not currently running/present" rather than a fault.
+// The customer-facing gateway action uses DescribeInstancesChecked instead,
+// which adds the InvalidInstanceID.NotFound assertion AWS callers expect.
+// Callers that must not act on a partial view at all (the quota reconcile)
+// use DescribeInstancesForReconcile.
+func DescribeInstances(ctx context.Context, input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string) (*ec2.DescribeInstancesOutput, error) {
+	reservations, _, firstClient4xx, err := gatherInstances(ctx, input, natsConn, expectedNodes, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -31,14 +40,51 @@ func DescribeInstances(input *ec2.DescribeInstancesInput, natsConn *nats.Conn, e
 	return &ec2.DescribeInstancesOutput{Reservations: reservations}, nil
 }
 
+// DescribeInstancesChecked is the customer-facing variant served by the
+// gateway's DescribeInstances action. On top of DescribeInstances' aggregation,
+// it asserts InvalidInstanceID.NotFound for any explicitly named instance ID
+// absent from the result — but only when the sweep is provably complete
+// (every expected node answered, both KV buckets succeeded). A partial sweep
+// stays silent, the same as DescribeInstances: a node timing out during the
+// fan-out must never turn into a false NotFound for an instance that actually
+// exists on that node. A --filters-only query (no explicit IDs) is never
+// affected and keeps returning an empty list with no error.
+func DescribeInstancesChecked(ctx context.Context, input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string) (*ec2.DescribeInstancesOutput, error) {
+	reservations, complete, firstClient4xx, err := gatherInstances(ctx, input, natsConn, expectedNodes, accountID)
+	if err != nil {
+		return nil, err
+	}
+	if firstClient4xx != "" && len(reservations) == 0 {
+		return nil, errors.New(firstClient4xx)
+	}
+
+	if len(input.InstanceIds) > 0 && complete {
+		found := make(map[string]bool)
+		for _, res := range reservations {
+			for _, inst := range res.Instances {
+				if inst != nil && inst.InstanceId != nil {
+					found[*inst.InstanceId] = true
+				}
+			}
+		}
+		for _, id := range input.InstanceIds {
+			if id != nil && !found[*id] {
+				return nil, errors.New(awserrors.ErrorInvalidInstanceIDNotFound)
+			}
+		}
+	}
+
+	return &ec2.DescribeInstancesOutput{Reservations: reservations}, nil
+}
+
 // DescribeInstancesForReconcile is the strict variant the quota reconcile uses.
 // complete is true only when the sweep observed every expected node and both
 // instance buckets, so reconcile may lower a counter only from a provably
 // complete view. A partial sweep — a node down, a timed-out fan-out, or a failed
 // bucket query — returns complete=false, and reconcile leaves the counter for the
 // next clean pass rather than under-counting usage and lifting the cap.
-func DescribeInstancesForReconcile(input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string) (reservations []*ec2.Reservation, complete bool, err error) {
-	reservations, complete, _, err = gatherInstances(input, natsConn, expectedNodes, accountID)
+func DescribeInstancesForReconcile(ctx context.Context, input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string) (reservations []*ec2.Reservation, complete bool, err error) {
+	reservations, complete, _, err = gatherInstances(ctx, input, natsConn, expectedNodes, accountID)
 	return reservations, complete, err
 }
 
@@ -48,14 +94,14 @@ func DescribeInstancesForReconcile(input *ec2.DescribeInstancesInput, natsConn *
 // both bucket queries succeeded — the precondition reconcile needs before it may
 // lower a counter. firstClient4xx carries the first deterministic 4xx for the
 // lenient caller to surface when nothing was collected.
-func gatherInstances(input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string) (reservations []*ec2.Reservation, complete bool, firstClient4xx string, err error) {
+func gatherInstances(ctx context.Context, input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string) (reservations []*ec2.Reservation, complete bool, firstClient4xx string, err error) {
 	jsonData, err := json.Marshal(input)
 	if err != nil {
-		slog.Error("DescribeInstances: Failed to marshal input", "err", err)
+		slog.ErrorContext(ctx, "DescribeInstances: Failed to marshal input", "err", err)
 		return nil, false, "", fmt.Errorf("failed to marshal input: %w", err)
 	}
 
-	frames, sum, err := utils.Gather(natsConn, "ec2.DescribeInstances", jsonData,
+	frames, sum, err := utils.Gather(ctx, natsConn, "ec2.DescribeInstances", jsonData,
 		utils.GatherOpts{Timeout: 3 * time.Second, ExpectedNodes: expectedNodes, AccountID: accountID})
 	if err != nil {
 		return nil, false, "", err
@@ -82,7 +128,7 @@ func gatherInstances(input *ec2.DescribeInstancesInput, natsConn *nats.Conn, exp
 		kvWg.Add(1)
 		go func(topic string) {
 			defer kvWg.Done()
-			reservations, ok := queryInstanceBucket(natsConn, topic, jsonData, accountID)
+			reservations, ok := queryInstanceBucket(ctx, natsConn, topic, jsonData, accountID)
 			kvMu.Lock()
 			defer kvMu.Unlock()
 			if !ok {
@@ -93,7 +139,7 @@ func gatherInstances(input *ec2.DescribeInstancesInput, natsConn *nats.Conn, exp
 	}
 	kvWg.Wait()
 
-	slog.Info("DescribeInstances: Aggregated response", "total_reservations", len(allReservations))
+	slog.InfoContext(ctx, "DescribeInstances: Aggregated response", "total_reservations", len(allReservations))
 	return allReservations, fanoutComplete && bucketsOK, sum.FirstClient4xx, nil
 }
 
@@ -141,26 +187,27 @@ func EnrichInstanceProfileIDs(out *ec2.DescribeInstancesOutput, iamSvc handlers_
 // reservations. ok is false when the query failed (request error or error
 // payload), so a reconcile caller can treat the sweep as incomplete rather than
 // silently dropping the bucket's instances.
-func queryInstanceBucket(natsConn *nats.Conn, topic string, jsonData []byte, accountID string) (reservations []*ec2.Reservation, ok bool) {
+func queryInstanceBucket(ctx context.Context, natsConn *nats.Conn, topic string, jsonData []byte, accountID string) (reservations []*ec2.Reservation, ok bool) {
 	reqMsg := nats.NewMsg(topic)
 	reqMsg.Data = jsonData
 	reqMsg.Header.Set(utils.AccountIDHeader, accountID)
+	utils.InjectTraceContext(ctx, reqMsg.Header)
 	msg, err := natsConn.RequestMsg(reqMsg, 3*time.Second)
 	if err != nil {
-		slog.Warn("DescribeInstances: Failed to query instance bucket", "topic", topic, "err", err)
+		slog.WarnContext(ctx, "DescribeInstances: Failed to query instance bucket", "topic", topic, "err", err)
 		return nil, false
 	}
 	if responseError, parseErr := utils.ValidateErrorPayload(msg.Data); parseErr != nil {
-		slog.Warn("DescribeInstances: Instance bucket query returned error", "topic", topic, "code", responseError.Code)
+		slog.WarnContext(ctx, "DescribeInstances: Instance bucket query returned error", "topic", topic, "code", responseError.Code)
 		return nil, false
 	}
 	var output ec2.DescribeInstancesOutput
 	if err := json.Unmarshal(msg.Data, &output); err != nil {
-		slog.Error("DescribeInstances: Failed to unmarshal instance bucket response", "topic", topic, "err", err)
+		slog.ErrorContext(ctx, "DescribeInstances: Failed to unmarshal instance bucket response", "topic", topic, "err", err)
 		return nil, false
 	}
 	if len(output.Reservations) > 0 {
-		slog.Info("DescribeInstances: Collected reservations from bucket", "topic", topic, "count", len(output.Reservations))
+		slog.InfoContext(ctx, "DescribeInstances: Collected reservations from bucket", "topic", topic, "count", len(output.Reservations))
 	}
 	return output.Reservations, true
 }

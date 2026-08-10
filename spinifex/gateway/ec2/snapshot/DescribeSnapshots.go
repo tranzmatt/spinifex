@@ -1,6 +1,7 @@
 package gateway_ec2_snapshot
 
 import (
+	"context"
 	"errors"
 	"strings"
 
@@ -10,7 +11,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// ValidateDescribeSnapshotsInput validates the input parameters for DescribeSnapshots
+// ValidateDescribeSnapshotsInput validates the input parameters for DescribeSnapshots.
 func ValidateDescribeSnapshotsInput(input *ec2.DescribeSnapshotsInput) error {
 	if input == nil {
 		return nil
@@ -25,8 +26,8 @@ func ValidateDescribeSnapshotsInput(input *ec2.DescribeSnapshotsInput) error {
 	return nil
 }
 
-// DescribeSnapshots handles the EC2 DescribeSnapshots API call
-func DescribeSnapshots(input *ec2.DescribeSnapshotsInput, natsConn *nats.Conn, accountID string) (ec2.DescribeSnapshotsOutput, error) {
+// DescribeSnapshots handles the EC2 DescribeSnapshots API call.
+func DescribeSnapshots(ctx context.Context, input *ec2.DescribeSnapshotsInput, natsConn *nats.Conn, accountID string) (ec2.DescribeSnapshotsOutput, error) {
 	var output ec2.DescribeSnapshotsOutput
 
 	if err := ValidateDescribeSnapshotsInput(input); err != nil {
@@ -34,7 +35,7 @@ func DescribeSnapshots(input *ec2.DescribeSnapshotsInput, natsConn *nats.Conn, a
 	}
 
 	svc := handlers_ec2_snapshot.NewNATSSnapshotService(natsConn)
-	result, err := svc.DescribeSnapshots(input, accountID)
+	result, err := svc.DescribeSnapshots(ctx, input, accountID)
 	if err != nil {
 		return output, err
 	}

@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/spinifex/spinifex/utils"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // ReconcileInterval is how often the gateway recomputes vCPU counters. It is
@@ -27,6 +27,14 @@ const KVBucketQuotaReconcile = "spinifex-quota-reconcile"
 
 // Limits mirrors the [quota] block in awsgw.toml. The zero value (Enabled
 // false) is a valid no-op, so gateways without a [quota] block are unaffected.
+//
+// TokensPerMonthEnabled and RequestsPerMinuteEnabled are deliberately
+// separate from Enabled above: a deployment already
+// enforcing standing-infra quotas (Enabled=true for VCPUs/VPCs/...) must opt
+// in to Bedrock token/RPM enforcement independently, since a bare Enabled
+// would otherwise silently cap Bedrock usage at zero the moment any other
+// dimension turns on. Both default to disabled, matching the block's
+// existing opt-in convention.
 type Limits struct {
 	Enabled    bool `toml:"enabled"`
 	VCPUs      int  `toml:"vcpus"`
@@ -34,6 +42,11 @@ type Limits struct {
 	Subnets    int  `toml:"subnets"`
 	EIPs       int  `toml:"eips"`
 	VolumesGiB int  `toml:"volumes_gib"`
+
+	TokensPerMonthEnabled    bool  `toml:"tokens_per_month_enabled"`
+	TokensPerMonth           int64 `toml:"tokens_per_month"`
+	RequestsPerMinuteEnabled bool  `toml:"requests_per_minute_enabled"`
+	RequestsPerMinute        int   `toml:"requests_per_minute"`
 }
 
 // Service enforces per-account quotas for one gateway. It holds the configured
@@ -44,14 +57,25 @@ type Service struct {
 	// usage holds the per-account vCPU counters (key {accountID}). Nil when
 	// quotas are disabled, in which case Exempt short-circuits every check
 	// before the counter is touched.
-	usage nats.KeyValue
+	usage jetstream.KeyValue
+
+	// bedrockUsage resolves the stream-fed Bedrock token counter
+	// Nil until SetBedrockUsage is called, in which case
+	// CheckBedrockTokens treats the dimension as unconfigured rather than
+	// erroring — a wiring gap must not block every Bedrock call.
+	bedrockUsage BedrockUsageReader
+
+	// rpm holds the local, per-gateway, per-account token buckets enforcing
+	// the requests-per-minute dimension. Always non-nil so CheckBedrockRPM
+	// never needs a nil guard beyond Service itself.
+	rpm *rpmLimiter
 }
 
 // New constructs a quota Service from the configured limits and the gateway-owned
 // account-usage KV bucket. usage may be nil when quotas are disabled; Exempt then
 // short-circuits every check before the counter is read.
-func New(limits Limits, usage nats.KeyValue) *Service {
-	return &Service{limits: limits, usage: usage}
+func New(limits Limits, usage jetstream.KeyValue) *Service {
+	return &Service{limits: limits, usage: usage, rpm: newRPMLimiter()}
 }
 
 // Exempt returns true for the global/system account and whenever quotas are

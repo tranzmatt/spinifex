@@ -199,6 +199,115 @@ func TestErrorHandler_UnknownError(t *testing.T) {
 	assert.Contains(t, xmlStr, "<Errors>")
 }
 
+func TestErrorHandler_WrappedErrorCode(t *testing.T) {
+	gw := &GatewayConfig{DisableLogging: true}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), ctxService, "ec2")
+		r = r.WithContext(ctx)
+		cause := errors.New(awserrors.ErrorInsufficientAddressCapacity)
+		gw.ErrorHandler(w, r, fmt.Errorf("launch on node-1: %w", fmt.Errorf("allocate address: %w", cause)))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	resp := doRequest(handler, req)
+	assert.Equal(t, 503, resp.StatusCode)
+
+	body, _ := io.ReadAll(resp.Body)
+	xmlStr := string(body)
+	assert.Contains(t, xmlStr, "<Code>"+awserrors.ErrorInsufficientAddressCapacity+"</Code>")
+	assert.Contains(t, xmlStr, awserrors.ErrorLookup[awserrors.ErrorInsufficientAddressCapacity].Message)
+	assert.NotContains(t, xmlStr, "launch on node-1")
+}
+
+// TestErrorHandler_PrefersCallSiteMessage covers the DeleteVpc DependencyViolation
+// fidelity gap: a call site that names the blocking resource via awserrors.Errorf
+// must have that wording reach the client instead of the generic ErrorLookup text.
+func TestErrorHandler_PrefersCallSiteMessage(t *testing.T) {
+	gw := &GatewayConfig{DisableLogging: true}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), ctxService, "ec2")
+		r = r.WithContext(ctx)
+		err := awserrors.Errorf(awserrors.ErrorDependencyViolation,
+			"the VPC has a dependent subnet %s that must be deleted first", "subnet-abc123")
+		gw.ErrorHandler(w, r, err)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	resp := doRequest(handler, req)
+	assert.Equal(t, 400, resp.StatusCode)
+
+	body, _ := io.ReadAll(resp.Body)
+	xmlStr := string(body)
+	assert.Contains(t, xmlStr, "<Code>"+awserrors.ErrorDependencyViolation+"</Code>")
+	assert.Contains(t, xmlStr, "subnet-abc123")
+	assert.NotContains(t, xmlStr, awserrors.ErrorLookup[awserrors.ErrorDependencyViolation].Message)
+}
+
+// TestErrorHandler_ACMResourceInUse_UsesACMWording is one direction of the
+// ResourceInUseException collision check: ACM's DeleteCertificate must not
+// surface EKS's "cluster already exists" wording for the shared wire code.
+func TestErrorHandler_ACMResourceInUse_UsesACMWording(t *testing.T) {
+	gw := &GatewayConfig{DisableLogging: true}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx := context.WithValue(req.Context(), ctxService, "acm")
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+
+	gw.ErrorHandler(w, req, errors.New(awserrors.ErrorACMResourceInUse))
+
+	var env struct {
+		Type    string `json:"__type"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &env))
+	assert.NotEqual(t, awserrors.ErrorLookup[awserrors.ErrorEKSResourceInUse].Message, env.Message)
+	assert.NotContains(t, env.Message, "cluster")
+}
+
+// TestErrorHandler_EKSResourceInUse_UsesEKSWording is the other direction: EKS's
+// own ResourceInUseException must keep its existing wording, unaffected by the
+// ACM-specific override.
+func TestErrorHandler_EKSResourceInUse_UsesEKSWording(t *testing.T) {
+	gw := &GatewayConfig{DisableLogging: true}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx := context.WithValue(req.Context(), ctxService, "eks")
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+
+	gw.ErrorHandler(w, req, errors.New(awserrors.ErrorEKSResourceInUse))
+
+	var env struct {
+		Type    string `json:"__type"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &env))
+	assert.Equal(t, awserrors.ErrorLookup[awserrors.ErrorEKSResourceInUse].Message, env.Message)
+}
+
+// TestErrorHandler_NoMessageSupplied_MatchesErrorLookup is the compatibility
+// case: an error path that supplies no message (the vast majority of call
+// sites) must keep rendering exactly today's ErrorLookup text, unchanged.
+func TestErrorHandler_NoMessageSupplied_MatchesErrorLookup(t *testing.T) {
+	gw := &GatewayConfig{DisableLogging: true}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), ctxService, "ec2")
+		r = r.WithContext(ctx)
+		gw.ErrorHandler(w, r, errors.New(awserrors.ErrorInvalidParameterValue))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	resp := doRequest(handler, req)
+	assert.Equal(t, 400, resp.StatusCode)
+
+	body, _ := io.ReadAll(resp.Body)
+	xmlStr := string(body)
+	assert.Contains(t, xmlStr, "<Code>"+awserrors.ErrorInvalidParameterValue+"</Code>")
+	assert.Contains(t, xmlStr, awserrors.ErrorLookup[awserrors.ErrorInvalidParameterValue].Message)
+}
+
 func TestErrorHandler_ELBv2Service(t *testing.T) {
 	gw := &GatewayConfig{DisableLogging: true}
 
@@ -285,7 +394,7 @@ func TestDiscoverActiveNodes_NilNATS(t *testing.T) {
 		NATSConn:      nil,
 	}
 
-	result := gw.DiscoverActiveNodes()
+	result := gw.DiscoverActiveNodes(context.Background())
 	assert.Equal(t, 3, result)
 }
 
@@ -297,7 +406,7 @@ func TestDiscoverActiveNodes_NoResponders(t *testing.T) {
 		NATSConn:      nc,
 	}
 
-	result := gw.DiscoverActiveNodes()
+	result := gw.DiscoverActiveNodes(context.Background())
 	assert.Equal(t, 5, result)
 }
 
@@ -320,7 +429,7 @@ func TestDiscoverActiveNodes_WithResponders(t *testing.T) {
 		NATSConn:      nc,
 	}
 
-	result := gw.DiscoverActiveNodes()
+	result := gw.DiscoverActiveNodes(context.Background())
 	assert.Equal(t, 2, result)
 }
 
@@ -338,7 +447,7 @@ func TestDiscoverActiveNodes_InvalidJSON(t *testing.T) {
 		NATSConn:      nc,
 	}
 
-	result := gw.DiscoverActiveNodes()
+	result := gw.DiscoverActiveNodes(context.Background())
 	assert.Equal(t, 4, result)
 }
 
@@ -360,7 +469,7 @@ func TestDiscoverActiveNodes_DuplicateNodes(t *testing.T) {
 		NATSConn:      nc,
 	}
 
-	result := gw.DiscoverActiveNodes()
+	result := gw.DiscoverActiveNodes(context.Background())
 	assert.Equal(t, 1, result)
 }
 
@@ -396,7 +505,7 @@ func TestParseAWSQueryArgs(t *testing.T) {
 		{
 			name:     "empty string",
 			query:    "",
-			expected: map[string]string{"": ""},
+			expected: map[string]string{},
 		},
 		{
 			name:  "multiple parameters",
@@ -424,6 +533,51 @@ func TestParseAWSQueryArgs(t *testing.T) {
 				"Tag.Name": "my tag",
 			},
 		},
+		{
+			name:  "plus decodes to space",
+			query: "Name=my+volume&Description=a+b+c",
+			expected: map[string]string{
+				"Name":        "my volume",
+				"Description": "a b c",
+			},
+		},
+		{
+			name:  "duplicate key takes the last value",
+			query: "Action=DescribeInstances&Action=RunInstances",
+			expected: map[string]string{
+				"Action": "RunInstances",
+			},
+		},
+		{
+			name:  "empty value",
+			query: "Action=DescribeVolumes&NextToken=",
+			expected: map[string]string{
+				"Action":    "DescribeVolumes",
+				"NextToken": "",
+			},
+		},
+		{
+			name:  "empty segments are skipped",
+			query: "Action=DescribeInstances&&Version=2016-11-15&",
+			expected: map[string]string{
+				"Action":  "DescribeInstances",
+				"Version": "2016-11-15",
+			},
+		},
+		{
+			name:  "encoded reserved characters in a value",
+			query: "Filter.1.Value.1=a%3Bb%26c%3Dd",
+			expected: map[string]string{
+				"Filter.1.Value.1": "a;b&c=d",
+			},
+		},
+		{
+			name:  "base64 user data round-trips",
+			query: "UserData=IyEvYmluL2Jhc2gKZWNobyAiaGVsbG8i%0A",
+			expected: map[string]string{
+				"UserData": "IyEvYmluL2Jhc2gKZWNobyAiaGVsbG8i\n",
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -445,11 +599,96 @@ func TestParseAWSQueryArgs_MalformedURLEncoding(t *testing.T) {
 		{"bad value encoding", "Action=DescribeInstances&Name=%ZZ"},
 		{"bad key encoding", "Bad%ZZKey=value"},
 		{"bad lone key encoding", "Lone%ZZ"},
+		{"truncated escape", "Action=DescribeInstances&Name=%A"},
+		// url.ParseQuery rejects a raw ";" as an ambiguous separator. Every AWS
+		// SDK and the CLI send it as %3B, so only a non-conforming client sees this.
+		{"raw semicolon separator", "Action=DescribeInstances;Version=2016-11-15"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := ParseAWSQueryArgs(tc.query)
+			args, err := ParseAWSQueryArgs(tc.query)
 			require.Error(t, err)
+			// Callers must not act on a partially decoded request.
+			assert.Nil(t, args)
+		})
+	}
+}
+
+// Request bodies captured off the wire from aws-cli v2, covering the payloads
+// most likely to break a parser: a base64 user-data blob, a percent-encoded IAM
+// policy document, and tag values holding ";", "&", "=" and "%". These are
+// verbatim, not regenerated by an encoder, so the expectations stay honest even
+// if the parser and the test were ever to share an encoding bug.
+func TestParseAWSQueryArgs_CapturedClientBodies(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		expected map[string]string
+	}{
+		{
+			name: "ec2 create-tags with reserved characters in values",
+			body: "Action=CreateTags&Version=2016-11-15&ResourceId.1=i-123&Tag.1.Key=Cmd" +
+				"&Tag.1.Value=echo+hi%3B+ls&Tag.2.Key=Note&Tag.2.Value=a%3Bb%26c%3Dd+100%25",
+			expected: map[string]string{
+				"Action":       "CreateTags",
+				"Version":      "2016-11-15",
+				"ResourceId.1": "i-123",
+				"Tag.1.Key":    "Cmd",
+				// The CLI escapes ";" as %3B and a space as "+", so a semicolon in a
+				// tag value never reaches the parser as a raw separator.
+				"Tag.1.Value": "echo hi; ls",
+				"Tag.2.Key":   "Note",
+				"Tag.2.Value": "a;b&c=d 100%",
+			},
+		},
+		{
+			name: "ec2 run-instances with base64 user data",
+			body: "Action=RunInstances&Version=2016-11-15&ImageId=ami-0abc123&InstanceType=t2.micro" +
+				"&UserData=IyEvYmluL2Jhc2gKZWNobyAiaGVsbG87IHdvcmxkIgpleHBvcnQgWD0nYT1iJmM9ZCcK" +
+				"&TagSpecification.1.ResourceType=instance&TagSpecification.1.Tag.1.Key=Name" +
+				"&TagSpecification.1.Tag.1.Value=web%3B+prod&TagSpecification.1.Tag.2.Key=Cost" +
+				"&TagSpecification.1.Tag.2.Value=100%25&MinCount=1&MaxCount=1" +
+				"&ClientToken=6072fd95-41f0-4339-8099-0e68d873af82",
+			expected: map[string]string{
+				"Action":       "RunInstances",
+				"Version":      "2016-11-15",
+				"ImageId":      "ami-0abc123",
+				"InstanceType": "t2.micro",
+				// Base64 survives intact: "+" inside the blob would decode to a space,
+				// so the CLI emits a padding-free alphabet the parser must not mangle.
+				"UserData":                        "IyEvYmluL2Jhc2gKZWNobyAiaGVsbG87IHdvcmxkIgpleHBvcnQgWD0nYT1iJmM9ZCcK",
+				"TagSpecification.1.ResourceType": "instance",
+				"TagSpecification.1.Tag.1.Key":    "Name",
+				"TagSpecification.1.Tag.1.Value":  "web; prod",
+				"TagSpecification.1.Tag.2.Key":    "Cost",
+				"TagSpecification.1.Tag.2.Value":  "100%",
+				"MinCount":                        "1",
+				"MaxCount":                        "1",
+				"ClientToken":                     "6072fd95-41f0-4339-8099-0e68d873af82",
+			},
+		},
+		{
+			name: "iam put-role-policy with a JSON policy document",
+			body: "Action=PutRolePolicy&Version=2010-05-08&RoleName=TestRole&PolicyName=TestPolicy" +
+				"&PolicyDocument=%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B" +
+				"%22Effect%22%3A%22Allow%22%2C%22Action%22%3A%5B%22s3%3AGetObject%22%5D%2C" +
+				"%22Resource%22%3A%22arn%3Aaws%3As3%3A%3A%3Abucket%2F%2A%22%7D%5D%7D%0A",
+			expected: map[string]string{
+				"Action":     "PutRolePolicy",
+				"Version":    "2010-05-08",
+				"RoleName":   "TestRole",
+				"PolicyName": "TestPolicy",
+				"PolicyDocument": `{"Version":"2012-10-17","Statement":[{"Effect":"Allow",` +
+					`"Action":["s3:GetObject"],"Resource":"arn:aws:s3:::bucket/*"}]}` + "\n",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			parsed, err := ParseAWSQueryArgs(tc.body)
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, parsed)
 		})
 	}
 }
@@ -459,7 +698,8 @@ func TestGetService(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		ctxVal    any // value to set in ctxService, nil means no value
+		ctxVal    any    // value to set in ctxService, nil means no value
+		path      string // request path, empty means "/"
 		wantSvc   string
 		wantError string
 	}{
@@ -489,20 +729,47 @@ func TestGetService(t *testing.T) {
 			wantSvc: "iam",
 		},
 		{
-			name:    "account service",
-			ctxVal:  "account",
-			wantSvc: "account",
-		},
-		{
 			name:    "tagging service",
 			ctxVal:  "tagging",
 			wantSvc: "tagging",
+		},
+		{
+			// bedrock and bedrock-runtime share the SigV4 signing name
+			// "bedrock"; a /model/ path is data-plane-exclusive, so it must
+			// resolve to bedrock-runtime even though the scope reads "bedrock".
+			name:    "bedrock scope on data-plane path resolves to bedrock-runtime",
+			ctxVal:  "bedrock",
+			path:    "/model/meta.llama3-70b-instruct-v1:0/converse",
+			wantSvc: "bedrock-runtime",
+		},
+		{
+			name:    "bedrock scope on streaming data-plane path resolves to bedrock-runtime",
+			ctxVal:  "bedrock",
+			path:    "/model/meta.llama3-70b-instruct-v1:0/converse-stream",
+			wantSvc: "bedrock-runtime",
+		},
+		{
+			name:    "bedrock scope on control-plane path stays bedrock",
+			ctxVal:  "bedrock",
+			path:    "/foundation-models",
+			wantSvc: "bedrock",
+		},
+		{
+			// A native bedrock-runtime scope is left untouched by the path check.
+			name:    "bedrock-runtime scope on data-plane path stays bedrock-runtime",
+			ctxVal:  "bedrock-runtime",
+			path:    "/model/meta.llama3-70b-instruct-v1:0/invoke",
+			wantSvc: "bedrock-runtime",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			path := tc.path
+			if path == "" {
+				path = "/"
+			}
+			req := httptest.NewRequest(http.MethodPost, path, nil)
 			if tc.ctxVal != nil {
 				ctx := context.WithValue(req.Context(), ctxService, tc.ctxVal)
 				req = req.WithContext(ctx)
@@ -984,40 +1251,8 @@ func TestImportKeyPair_Base64PaddingWorkaround(t *testing.T) {
 
 	assert.True(t, strings.HasSuffix(q["PublicKeyMaterial"], "=="),
 		"Expected PublicKeyMaterial to end with == but got: %s", q["PublicKeyMaterial"])
-	assert.False(t, strings.Contains(q["PublicKeyMaterial"], "%3D"),
+	assert.NotContains(t, q["PublicKeyMaterial"], "%3D",
 		"Expected no URL-encoded padding remaining")
-}
-
-func TestParseArgsToStruct(t *testing.T) {
-	// ParseArgsToStruct wraps QueryParamsToStruct errors as ErrorInvalidParameter.
-	// The *any parameter causes a reflection kind mismatch, so this always errors.
-	type simpleInput struct {
-		Action string `locationName:"Action"`
-	}
-
-	t.Run("struct pointer wrapped in any returns InvalidParameter", func(t *testing.T) {
-		args := map[string]string{"Action": "RunInstances"}
-		var input any = &simpleInput{}
-		err := ParseArgsToStruct(&input, args)
-		assert.Error(t, err)
-		assert.Equal(t, "InvalidParameter", err.Error())
-	})
-
-	t.Run("non-pointer input returns InvalidParameter", func(t *testing.T) {
-		args := map[string]string{"Action": "Test"}
-		var input any = "not a struct"
-		err := ParseArgsToStruct(&input, args)
-		assert.Error(t, err)
-		assert.Equal(t, "InvalidParameter", err.Error())
-	})
-
-	t.Run("empty args still returns InvalidParameter", func(t *testing.T) {
-		args := map[string]string{}
-		var input any = &simpleInput{}
-		err := ParseArgsToStruct(&input, args)
-		assert.Error(t, err)
-		assert.Equal(t, "InvalidParameter", err.Error())
-	})
 }
 
 // --- Throttle middleware integration tests ---
@@ -1301,7 +1536,7 @@ func TestGenerateEC2ErrorResponse_SDKRoundTrip(t *testing.T) {
 	require.Error(t, err)
 
 	var awsErr awserr.Error
-	require.True(t, errors.As(err, &awsErr), "expected awserr.Error, got %T: %v", err, err)
+	require.ErrorAs(t, err, &awsErr, "expected awserr.Error, got %T: %v", err, err)
 	assert.Equal(t, wantCode, awsErr.Code())
 	assert.NotEqual(t, "SerializationError", awsErr.Code(), "SDK could not parse the envelope")
 }

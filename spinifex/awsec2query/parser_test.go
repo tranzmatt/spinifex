@@ -3,10 +3,12 @@ package awsec2query
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/elbv2"
+	"github.com/aws/aws-sdk-go/service/rds"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -109,7 +111,7 @@ func TestQueryParamsToStruct_StopInstances(t *testing.T) {
 	assert.Len(t, input.InstanceIds, 2)
 	assert.Equal(t, "i-1234567890abcdef0", aws.StringValue(input.InstanceIds[0]))
 	assert.Equal(t, "i-0987654321fedcba0", aws.StringValue(input.InstanceIds[1]))
-	assert.Equal(t, true, aws.BoolValue(input.Force))
+	assert.True(t, aws.BoolValue(input.Force))
 }
 
 func TestQueryParamsToStruct_StartInstances(t *testing.T) {
@@ -248,7 +250,7 @@ func TestQueryParamsToStruct_BlockDeviceMappingsWithEBS(t *testing.T) {
 	assert.NotNil(t, bdm.Ebs)
 	assert.Equal(t, int64(100), aws.Int64Value(bdm.Ebs.VolumeSize))
 	assert.Equal(t, "gp3", aws.StringValue(bdm.Ebs.VolumeType))
-	assert.Equal(t, true, aws.BoolValue(bdm.Ebs.DeleteOnTermination))
+	assert.True(t, aws.BoolValue(bdm.Ebs.DeleteOnTermination))
 }
 
 func TestQueryParamsToStruct_BlockDeviceMappingsWithEphemeral(t *testing.T) {
@@ -311,8 +313,8 @@ func TestQueryParamsToStruct_MultipleBlockDeviceMappings(t *testing.T) {
 	assert.Equal(t, "snap-1234567890abcdef0", aws.StringValue(bdm1.Ebs.SnapshotId))
 	assert.Equal(t, int64(30), aws.Int64Value(bdm1.Ebs.VolumeSize))
 	assert.Equal(t, "gp3", aws.StringValue(bdm1.Ebs.VolumeType))
-	assert.Equal(t, true, aws.BoolValue(bdm1.Ebs.Encrypted))
-	assert.Equal(t, true, aws.BoolValue(bdm1.Ebs.DeleteOnTermination))
+	assert.True(t, aws.BoolValue(bdm1.Ebs.Encrypted))
+	assert.True(t, aws.BoolValue(bdm1.Ebs.DeleteOnTermination))
 
 	// Second mapping - Empty EBS
 	bdm2 := input.BlockDeviceMappings[1]
@@ -471,7 +473,44 @@ func TestQueryParamsToStruct_LocationNameDryRun(t *testing.T) {
 	err := QueryParamsToStruct(args, input)
 
 	assert.NoError(t, err)
-	assert.Equal(t, true, aws.BoolValue(input.DryRun))
+	assert.True(t, aws.BoolValue(input.DryRun))
+}
+
+// RDS declares locationNameList:"Tag" on its tag lists, so the wrapper segment
+// is "Tag" rather than the default "member". Parsing it as either of the other
+// two shapes would drop every tag silently.
+func TestQueryParamsToStruct_LocationNameListWrapper(t *testing.T) {
+	args := map[string]string{
+		"ResourceName":     "arn:aws:rds:ap-southeast-2:123456789012:db:orders-db",
+		"Tags.Tag.1.Key":   "env",
+		"Tags.Tag.1.Value": "prod",
+		"Tags.Tag.2.Key":   "team",
+		"Tags.Tag.2.Value": "platform",
+	}
+
+	input := &rds.AddTagsToResourceInput{}
+	require.NoError(t, QueryParamsToStruct(args, input))
+
+	require.Len(t, input.Tags, 2)
+	assert.Equal(t, "env", aws.StringValue(input.Tags[0].Key))
+	assert.Equal(t, "prod", aws.StringValue(input.Tags[0].Value))
+	assert.Equal(t, "team", aws.StringValue(input.Tags[1].Key))
+	assert.Equal(t, "platform", aws.StringValue(input.Tags[1].Value))
+}
+
+// A shape that declares a locationNameList still accepts the default wrapper,
+// so an SDK that serializes the list either way is understood.
+func TestQueryParamsToStruct_LocationNameListFallsBackToMember(t *testing.T) {
+	args := map[string]string{
+		"Tags.member.1.Key":   "env",
+		"Tags.member.1.Value": "prod",
+	}
+
+	input := &rds.AddTagsToResourceInput{}
+	require.NoError(t, QueryParamsToStruct(args, input))
+
+	require.Len(t, input.Tags, 1)
+	assert.Equal(t, "env", aws.StringValue(input.Tags[0].Key))
 }
 
 func TestQueryParamsToStruct_NonStructPointer(t *testing.T) {
@@ -648,4 +687,28 @@ func TestQueryParamsToStruct_SparseHugeIndexNoOp(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Empty(t, input.Filters)
+}
+
+func TestQueryParamsToStruct_CreateLaunchTemplateNestedData(t *testing.T) {
+	args := map[string]string{
+		"LaunchTemplateName":                                              "web-template",
+		"LaunchTemplateData.ImageId":                                      "ami-0abcdef1234567890",
+		"LaunchTemplateData.InstanceType":                                 "t3.micro",
+		"LaunchTemplateData.BlockDeviceMapping.1.DeviceName":              "/dev/sda1",
+		"LaunchTemplateData.BlockDeviceMapping.1.Ebs.VolumeSize":          "20",
+		"LaunchTemplateData.InstanceMarketOptions.SpotOptions.ValidUntil": "2026-07-10T12:00:00Z",
+	}
+
+	input := &ec2.CreateLaunchTemplateInput{}
+	err := QueryParamsToStruct(args, input)
+
+	require.NoError(t, err)
+	require.NotNil(t, input.LaunchTemplateData)
+	assert.Equal(t, "ami-0abcdef1234567890", aws.StringValue(input.LaunchTemplateData.ImageId))
+	require.Len(t, input.LaunchTemplateData.BlockDeviceMappings, 1)
+	assert.Equal(t, int64(20), aws.Int64Value(input.LaunchTemplateData.BlockDeviceMappings[0].Ebs.VolumeSize))
+	require.NotNil(t, input.LaunchTemplateData.InstanceMarketOptions)
+	require.NotNil(t, input.LaunchTemplateData.InstanceMarketOptions.SpotOptions)
+	assert.Equal(t, time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC),
+		*input.LaunchTemplateData.InstanceMarketOptions.SpotOptions.ValidUntil)
 }

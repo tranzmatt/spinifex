@@ -1,7 +1,7 @@
 package handlers_elbv2
 
 import (
-	"strings"
+	"context"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -25,7 +25,7 @@ func TestCreateRule_InputValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := env.svc.CreateRule(tc.input, testAccountID)
+			_, err := env.svc.CreateRule(context.Background(), tc.input, testAccountID)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.want)
 		})
@@ -34,7 +34,7 @@ func TestCreateRule_InputValidation(t *testing.T) {
 
 func TestCreateRule_WrongAccount(t *testing.T) {
 	env := newRuleTestEnv(t, "cr-acct")
-	_, err := env.svc.CreateRule(&elbv2.CreateRuleInput{
+	_, err := env.svc.CreateRule(context.Background(), &elbv2.CreateRuleInput{
 		ListenerArn: aws.String(env.listenerArn),
 		Priority:    aws.Int64(1),
 		Conditions:  []*elbv2.RuleCondition{{Field: aws.String("path-pattern"), Values: aws.StringSlice([]string{"/a"})}},
@@ -46,22 +46,22 @@ func TestCreateRule_WrongAccount(t *testing.T) {
 
 func TestModifyRule_InputValidation(t *testing.T) {
 	env := newRuleTestEnv(t, "mod-val")
-	_, err := env.svc.ModifyRule(nil, testAccountID)
+	_, err := env.svc.ModifyRule(context.Background(), nil, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "MissingParameter")
 
-	_, err = env.svc.ModifyRule(&elbv2.ModifyRuleInput{RuleArn: aws.String("")}, testAccountID)
+	_, err = env.svc.ModifyRule(context.Background(), &elbv2.ModifyRuleInput{RuleArn: aws.String("")}, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "MissingParameter")
 
-	_, err = env.svc.ModifyRule(&elbv2.ModifyRuleInput{RuleArn: aws.String("arn:nope")}, testAccountID)
+	_, err = env.svc.ModifyRule(context.Background(), &elbv2.ModifyRuleInput{RuleArn: aws.String("arn:nope")}, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "RuleNotFound")
 }
 
 func TestModifyRule_RewriteActions(t *testing.T) {
 	env := newRuleTestEnv(t, "mod-act")
-	cr, err := env.svc.CreateRule(&elbv2.CreateRuleInput{
+	cr, err := env.svc.CreateRule(context.Background(), &elbv2.CreateRuleInput{
 		ListenerArn: aws.String(env.listenerArn),
 		Priority:    aws.Int64(5),
 		Conditions:  []*elbv2.RuleCondition{{Field: aws.String("path-pattern"), Values: aws.StringSlice([]string{"/a"})}},
@@ -69,7 +69,7 @@ func TestModifyRule_RewriteActions(t *testing.T) {
 	}, testAccountID)
 	require.NoError(t, err)
 
-	out, err := env.svc.ModifyRule(&elbv2.ModifyRuleInput{
+	out, err := env.svc.ModifyRule(context.Background(), &elbv2.ModifyRuleInput{
 		RuleArn: cr.Rules[0].RuleArn,
 		Actions: []*elbv2.Action{{Type: aws.String("forward"), TargetGroupArn: aws.String(env.tgArn)}},
 	}, testAccountID)
@@ -79,34 +79,34 @@ func TestModifyRule_RewriteActions(t *testing.T) {
 
 func TestDeleteRule_InputValidation(t *testing.T) {
 	env := newRuleTestEnv(t, "del-val")
-	_, err := env.svc.DeleteRule(nil, testAccountID)
+	_, err := env.svc.DeleteRule(context.Background(), nil, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "MissingParameter")
 
-	_, err = env.svc.DeleteRule(&elbv2.DeleteRuleInput{RuleArn: aws.String("")}, testAccountID)
+	_, err = env.svc.DeleteRule(context.Background(), &elbv2.DeleteRuleInput{RuleArn: aws.String("")}, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "MissingParameter")
 
 	// AWS ELBv2 delete is idempotent: absent rule -> success, not NotFound.
-	out, err := env.svc.DeleteRule(&elbv2.DeleteRuleInput{RuleArn: aws.String("arn:none")}, testAccountID)
+	out, err := env.svc.DeleteRule(context.Background(), &elbv2.DeleteRuleInput{RuleArn: aws.String("arn:none")}, testAccountID)
 	require.NoError(t, err)
 	assert.NotNil(t, out)
 }
 
 func TestDescribeRules_InputValidation(t *testing.T) {
 	env := newRuleTestEnv(t, "desc-val")
-	_, err := env.svc.DescribeRules(nil, testAccountID)
+	_, err := env.svc.DescribeRules(context.Background(), nil, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "MissingParameter")
 
-	_, err = env.svc.DescribeRules(&elbv2.DescribeRulesInput{}, testAccountID)
+	_, err = env.svc.DescribeRules(context.Background(), &elbv2.DescribeRulesInput{}, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "MissingParameter")
 }
 
 func TestDescribeRules_ByRuleArns(t *testing.T) {
 	env := newRuleTestEnv(t, "desc-arns")
-	cr, err := env.svc.CreateRule(&elbv2.CreateRuleInput{
+	cr, err := env.svc.CreateRule(context.Background(), &elbv2.CreateRuleInput{
 		ListenerArn: aws.String(env.listenerArn),
 		Priority:    aws.Int64(1),
 		Conditions:  []*elbv2.RuleCondition{{Field: aws.String("path-pattern"), Values: aws.StringSlice([]string{"/a"})}},
@@ -114,14 +114,14 @@ func TestDescribeRules_ByRuleArns(t *testing.T) {
 	}, testAccountID)
 	require.NoError(t, err)
 
-	out, err := env.svc.DescribeRules(&elbv2.DescribeRulesInput{
+	out, err := env.svc.DescribeRules(context.Background(), &elbv2.DescribeRulesInput{
 		RuleArns: []*string{cr.Rules[0].RuleArn},
 	}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, out.Rules, 1)
 	assert.Equal(t, *cr.Rules[0].RuleArn, *out.Rules[0].RuleArn)
 
-	_, err = env.svc.DescribeRules(&elbv2.DescribeRulesInput{
+	_, err = env.svc.DescribeRules(context.Background(), &elbv2.DescribeRulesInput{
 		RuleArns: []*string{aws.String("arn:nope")},
 	}, testAccountID)
 	require.Error(t, err)
@@ -130,15 +130,15 @@ func TestDescribeRules_ByRuleArns(t *testing.T) {
 
 func TestSetRulePriorities_InputValidation(t *testing.T) {
 	env := newRuleTestEnv(t, "spri-val")
-	_, err := env.svc.SetRulePriorities(nil, testAccountID)
+	_, err := env.svc.SetRulePriorities(context.Background(), nil, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "MissingParameter")
 
-	_, err = env.svc.SetRulePriorities(&elbv2.SetRulePrioritiesInput{}, testAccountID)
+	_, err = env.svc.SetRulePriorities(context.Background(), &elbv2.SetRulePrioritiesInput{}, testAccountID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "MissingParameter")
 
-	_, err = env.svc.SetRulePriorities(&elbv2.SetRulePrioritiesInput{
+	_, err = env.svc.SetRulePriorities(context.Background(), &elbv2.SetRulePrioritiesInput{
 		RulePriorities: []*elbv2.RulePriorityPair{nil},
 	}, testAccountID)
 	require.Error(t, err)
@@ -147,14 +147,14 @@ func TestSetRulePriorities_InputValidation(t *testing.T) {
 
 func TestSetRulePriorities_InvalidPriority(t *testing.T) {
 	env := newRuleTestEnv(t, "spri-bad")
-	cr, _ := env.svc.CreateRule(&elbv2.CreateRuleInput{
+	cr, _ := env.svc.CreateRule(context.Background(), &elbv2.CreateRuleInput{
 		ListenerArn: aws.String(env.listenerArn),
 		Priority:    aws.Int64(1),
 		Conditions:  []*elbv2.RuleCondition{{Field: aws.String("path-pattern"), Values: aws.StringSlice([]string{"/a"})}},
 		Actions:     []*elbv2.Action{{Type: aws.String("forward"), TargetGroupArn: aws.String(env.tgAltArn)}},
 	}, testAccountID)
 
-	_, err := env.svc.SetRulePriorities(&elbv2.SetRulePrioritiesInput{
+	_, err := env.svc.SetRulePriorities(context.Background(), &elbv2.SetRulePrioritiesInput{
 		RulePriorities: []*elbv2.RulePriorityPair{
 			{RuleArn: cr.Rules[0].RuleArn, Priority: aws.Int64(0)},
 		},
@@ -162,7 +162,7 @@ func TestSetRulePriorities_InvalidPriority(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "InvalidRulePriority")
 
-	_, err = env.svc.SetRulePriorities(&elbv2.SetRulePrioritiesInput{
+	_, err = env.svc.SetRulePriorities(context.Background(), &elbv2.SetRulePrioritiesInput{
 		RulePriorities: []*elbv2.RulePriorityPair{
 			{RuleArn: aws.String("arn:none"), Priority: aws.Int64(1)},
 		},
@@ -266,7 +266,7 @@ func TestValidateConditions_QueryString(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, out[0].QueryStringKVs, 2)
 	assert.Equal(t, "k", out[0].QueryStringKVs[0].Key)
-	assert.Equal(t, "", out[0].QueryStringKVs[1].Key)
+	assert.Empty(t, out[0].QueryStringKVs[1].Key)
 }
 
 func TestValidateConditions_SourceIP(t *testing.T) {
@@ -352,8 +352,8 @@ func TestHAProxyRender_AllConditionFields(t *testing.T) {
 			Actions:    []ListenerAction{{Type: ActionTypeForward, TargetGroupArn: "arn:aws:elbv2:tg/ip"}}},
 	}
 
-	cfg, err := GenerateHAProxyConfig(lb, []*ListenerRecord{listener}, tgByArn,
-		map[string][]*RuleRecord{"arn:lst1": rules}, "0.0.0.0")
+	cfg, _, err := GenerateHAProxyConfigWithCerts(lb, []*ListenerRecord{listener}, tgByArn,
+		map[string][]*RuleRecord{"arn:lst1": rules}, "0.0.0.0", nil)
 	require.NoError(t, err)
 
 	for _, want := range []string{
@@ -369,7 +369,7 @@ func TestHAProxyRender_AllConditionFields(t *testing.T) {
 		"use_backend bk_q if",
 		"use_backend bk_ip if",
 	} {
-		assert.Truef(t, strings.Contains(cfg, want), "expected %q in config; got:\n%s", want, cfg)
+		assert.Containsf(t, cfg, want, "expected %q in config; got:\n%s", want, cfg)
 	}
 }
 
@@ -403,7 +403,7 @@ func TestRegisterRuleBackend_RejectsUnknownAction(t *testing.T) {
 // and they time out at 0/1 healthy (TargetGroupsForLB walked only DefaultActions).
 func TestTargetGroupsForLB_IncludesRuleTGs(t *testing.T) {
 	env := newRuleTestEnv(t, "tgs-rule")
-	_, err := env.svc.CreateRule(&elbv2.CreateRuleInput{
+	_, err := env.svc.CreateRule(context.Background(), &elbv2.CreateRuleInput{
 		ListenerArn: aws.String(env.listenerArn),
 		Priority:    aws.Int64(1),
 		Conditions:  []*elbv2.RuleCondition{{Field: aws.String("path-pattern"), Values: aws.StringSlice([]string{"/a"})}},
@@ -411,11 +411,11 @@ func TestTargetGroupsForLB_IncludesRuleTGs(t *testing.T) {
 	}, testAccountID)
 	require.NoError(t, err)
 
-	lb, err := env.svc.store.GetLoadBalancerByArn(env.lbArn)
+	lb, err := env.svc.store.GetLoadBalancerByArn(t.Context(), env.lbArn)
 	require.NoError(t, err)
 	require.NotNil(t, lb)
 
-	tgs, err := env.svc.store.TargetGroupsForLB(lb.LoadBalancerID)
+	tgs, err := env.svc.store.TargetGroupsForLB(t.Context(), lb.LoadBalancerID)
 	require.NoError(t, err)
 
 	arns := make(map[string]bool, len(tgs))

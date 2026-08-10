@@ -6,6 +6,9 @@ After=spinifex-nats.service spinifex-viperblock.service openvswitch-switch.servi
 Wants=openvswitch-ipsec.service
 
 [Service]
+EnvironmentFile=-/etc/spinifex/telemetry.env
+# ZFS root: installer raises SPINIFEX_RESERVED_MEM_GB by the ARC ceiling the admission gate cannot see
+EnvironmentFile=-/etc/spinifex/host.env
 Type=simple
 Slice=spinifex-system.slice
 User=spinifex-daemon
@@ -18,13 +21,17 @@ KillMode=process
 TimeoutStopSec=15
 # RG-4: infra tier — reaped only after every guest
 OOMScoreAdjust=-500
+# Guest QEMU shares this cgroup: the ceiling tracks the slice budget, not daemon overhead
+MemoryHigh=75%
+MemoryMax=85%
 Environment=SPINIFEX_CONFIG_PATH=/etc/spinifex/spinifex.toml
 Environment=SPINIFEX_BASE_DIR=/var/lib/spinifex/spinifex/
 Environment=SPINIFEX_WAL_DIR=/var/lib/spinifex/spinifex/
 # Pin to host tmpfs: QEMU pidfiles/QMP sockets must survive PrivateTmp namespace churn (DDIL)
 Environment=XDG_RUNTIME_DIR=/run/spinifex
 
-# RG-9: daemon tier — privileged by necessity (GPU vfio). NoNewPrivileges omitted (RG-10: sudo ip/ovs-vsctl/dhcpcd)
+# RG-9: daemon tier — privileged by necessity (GPU vfio). No CAP_NET_ADMIN here,
+# so unlike vpcd it still escalates ip/sysctl and NoNewPrivileges stays omitted.
 AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_OVERRIDE
 ProtectSystem=full
 PrivateDevices=no

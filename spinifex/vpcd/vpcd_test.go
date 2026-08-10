@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	handlers_imds "github.com/mulgadc/spinifex/spinifex/handlers/imds"
+	"github.com/mulgadc/spinifex/spinifex/network/external"
 )
 
 func TestPreflightOVN_AllPass(t *testing.T) {
@@ -145,7 +148,7 @@ func TestPreflightOVN_BothFail_ReportsFirst(t *testing.T) {
 	}
 }
 
-// verifyBridgeMode is the post-detect sanity check — mulga-998.b Fix 2.
+// verifyBridgeMode is the post-detect sanity check.
 // portToBr and readLinkMaster are injected for tests.
 
 func stubBridgeProbes(t *testing.T, ovsPorts map[string]string, links map[string]string) {
@@ -245,7 +248,7 @@ func TestVerifyBridgeMode_UnknownModeLists(t *testing.T) {
 func TestVerifyBridgeMode_EmptyModeRejected(t *testing.T) {
 	err := verifyBridgeMode("", "", "")
 	if err == nil {
-		t.Fatal("expected error for empty mode (D12)")
+		t.Fatal("expected error for empty mode")
 	}
 }
 
@@ -280,7 +283,7 @@ func TestVerifyBridgeMode_VethLinuxBrMissing(t *testing.T) {
 	}
 }
 
-// detectBridgeMode — mulga-998.b Fix 2.
+// detectBridgeMode selects the bridge mode after detection.
 
 func stubDetectProbes(t *testing.T, links []string) {
 	t.Helper()
@@ -328,7 +331,7 @@ func TestResolveBridgeConfig_AutoDetects(t *testing.T) {
 func TestResolveBridgeConfig_EmptyStaysEmptyWithNoIface(t *testing.T) {
 	mode, _ := resolveBridgeConfig("", "")
 	if mode != "" {
-		t.Errorf("empty mode + no iface should stay empty (D12); got %q", mode)
+		t.Errorf("empty mode + no iface should stay empty; got %q", mode)
 	}
 }
 
@@ -360,6 +363,20 @@ type externalCIDRResponse struct {
 	err    error
 }
 
+// stubExternalCIDRTiming shortens the resolve retry delay and startup timeout to
+// a few milliseconds so retry/timeout paths do not burn real wall-clock seconds.
+func stubExternalCIDRTiming(t *testing.T) {
+	t.Helper()
+	origDelay := externalCIDRRetryDelay
+	origTimeout := externalCIDRResolveTimeout
+	t.Cleanup(func() {
+		externalCIDRRetryDelay = origDelay
+		externalCIDRResolveTimeout = origTimeout
+	})
+	externalCIDRRetryDelay = time.Millisecond
+	externalCIDRResolveTimeout = 20 * time.Millisecond
+}
+
 func TestResolveExternalCIDR_ImmediateSuccess(t *testing.T) {
 	want := netip.MustParsePrefix("192.168.1.10/24")
 	stubExternalCIDR(t, []externalCIDRResponse{{prefix: want}})
@@ -373,6 +390,7 @@ func TestResolveExternalCIDR_ImmediateSuccess(t *testing.T) {
 }
 
 func TestResolveExternalCIDR_RetriesThenSucceeds(t *testing.T) {
+	stubExternalCIDRTiming(t)
 	want := netip.MustParsePrefix("10.0.0.5/16")
 	stubExternalCIDR(t, []externalCIDRResponse{
 		{err: fmt.Errorf("no IPv4")},
@@ -389,8 +407,9 @@ func TestResolveExternalCIDR_RetriesThenSucceeds(t *testing.T) {
 }
 
 func TestResolveExternalCIDR_TimeoutFailsStart(t *testing.T) {
+	stubExternalCIDRTiming(t)
 	stubExternalCIDR(t, []externalCIDRResponse{{err: fmt.Errorf("no IPv4")}})
-	_, err := resolveExternalCIDR(context.Background(), "br-wan", 100*time.Millisecond)
+	_, err := resolveExternalCIDR(context.Background(), "br-wan", 10*time.Millisecond)
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
@@ -452,9 +471,28 @@ func TestEnsureExternalCIDRReady_ResolvesSuccessfully(t *testing.T) {
 }
 
 func TestEnsureExternalCIDRReady_PropagatesError(t *testing.T) {
+	stubExternalCIDRTiming(t)
 	stubExternalCIDR(t, []externalCIDRResponse{{err: fmt.Errorf("no IPv4")}})
 	err := ensureExternalCIDRReady(context.Background(), "direct", "br-wan")
 	if err == nil {
 		t.Fatal("expected error when resolveExternalCIDR fails")
+	}
+}
+
+func TestResolverDNSServer(t *testing.T) {
+	// With northstar configured, guests get the link-local VPC DNS address
+	// served by the per-tap shim; the nameservers are its forward targets.
+	cfg := &Config{
+		ResolverNameservers: []string{"192.168.1.31", "192.168.1.32"},
+		ExternalPools:       []external.ExternalPoolConfig{{DNSServers: []string{"8.8.8.8"}}},
+	}
+	if got := resolverDNSServer(cfg); got != handlers_imds.VPCDNSServerIP {
+		t.Errorf("resolverDNSServer = %q, want %q", got, handlers_imds.VPCDNSServerIP)
+	}
+
+	// Without resolvers, fall back to the upstream pool DNS.
+	cfg = &Config{ExternalPools: []external.ExternalPoolConfig{{DNSServers: []string{"8.8.8.8", "1.1.1.1"}}}}
+	if got := resolverDNSServer(cfg); got != "{8.8.8.8, 1.1.1.1}" {
+		t.Errorf("resolverDNSServer fallback = %q, want pool DNS", got)
 	}
 }

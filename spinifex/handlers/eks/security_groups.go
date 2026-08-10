@@ -1,6 +1,7 @@
 package handlers_eks
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,12 +15,12 @@ import (
 
 // sgProvisioner is the narrow VPC surface needed by cluster SG helpers.
 type sgProvisioner interface {
-	CreateSecurityGroup(input *ec2.CreateSecurityGroupInput, accountID string) (*ec2.CreateSecurityGroupOutput, error)
-	DescribeSecurityGroups(input *ec2.DescribeSecurityGroupsInput, accountID string) (*ec2.DescribeSecurityGroupsOutput, error)
-	DeleteSecurityGroup(input *ec2.DeleteSecurityGroupInput, accountID string) (*ec2.DeleteSecurityGroupOutput, error)
-	AuthorizeSecurityGroupIngress(input *ec2.AuthorizeSecurityGroupIngressInput, accountID string) (*ec2.AuthorizeSecurityGroupIngressOutput, error)
-	RevokeSecurityGroupIngress(input *ec2.RevokeSecurityGroupIngressInput, accountID string) (*ec2.RevokeSecurityGroupIngressOutput, error)
-	RevokeSecurityGroupEgress(input *ec2.RevokeSecurityGroupEgressInput, accountID string) (*ec2.RevokeSecurityGroupEgressOutput, error)
+	CreateSecurityGroup(ctx context.Context, input *ec2.CreateSecurityGroupInput, accountID string) (*ec2.CreateSecurityGroupOutput, error)
+	DescribeSecurityGroups(ctx context.Context, input *ec2.DescribeSecurityGroupsInput, accountID string) (*ec2.DescribeSecurityGroupsOutput, error)
+	DeleteSecurityGroup(ctx context.Context, input *ec2.DeleteSecurityGroupInput, accountID string) (*ec2.DeleteSecurityGroupOutput, error)
+	AuthorizeSecurityGroupIngress(ctx context.Context, input *ec2.AuthorizeSecurityGroupIngressInput, accountID string) (*ec2.AuthorizeSecurityGroupIngressOutput, error)
+	RevokeSecurityGroupIngress(ctx context.Context, input *ec2.RevokeSecurityGroupIngressInput, accountID string) (*ec2.RevokeSecurityGroupIngressOutput, error)
+	RevokeSecurityGroupEgress(ctx context.Context, input *ec2.RevokeSecurityGroupEgressInput, accountID string) (*ec2.RevokeSecurityGroupEgressOutput, error)
 }
 
 // clusterEKSClusterTagKey groups all cluster-scoped resources for DeleteCluster sweeps.
@@ -62,7 +63,7 @@ func ClusterNodegroupSGName(clusterName string) string {
 
 // EnsureClusterSGs creates or reuses the control-plane and nodegroup SGs in the customer VPC.
 // Idempotent; the two creates are independent (DeleteCluster handles partial teardown).
-func EnsureClusterSGs(sgp sgProvisioner, accountID, clusterName, vpcID string) (controlPlaneSGID, nodegroupSGID string, err error) {
+func EnsureClusterSGs(ctx context.Context, sgp sgProvisioner, accountID, clusterName, vpcID string) (controlPlaneSGID, nodegroupSGID string, err error) {
 	if clusterName == "" {
 		return "", "", errors.New("eks: EnsureClusterSGs empty cluster name")
 	}
@@ -70,7 +71,7 @@ func EnsureClusterSGs(sgp sgProvisioner, accountID, clusterName, vpcID string) (
 		return "", "", errors.New("eks: EnsureClusterSGs empty vpc id")
 	}
 
-	controlPlaneSGID, err = ensureClusterSG(sgp, accountID, vpcID, clusterName,
+	controlPlaneSGID, err = ensureClusterSG(ctx, sgp, accountID, vpcID, clusterName,
 		ClusterControlPlaneSGName(clusterName),
 		fmt.Sprintf("EKS control-plane SG for cluster %s", clusterName),
 		clusterEKSRoleControlPlane)
@@ -78,7 +79,7 @@ func EnsureClusterSGs(sgp sgProvisioner, accountID, clusterName, vpcID string) (
 		return "", "", err
 	}
 
-	nodegroupSGID, err = ensureClusterSG(sgp, accountID, vpcID, clusterName,
+	nodegroupSGID, err = ensureClusterSG(ctx, sgp, accountID, vpcID, clusterName,
 		ClusterNodegroupSGName(clusterName),
 		fmt.Sprintf("EKS nodegroup SG for cluster %s", clusterName),
 		clusterEKSRoleNodegroup)
@@ -98,7 +99,7 @@ func EnsureClusterSGs(sgp sgProvisioner, accountID, clusterName, vpcID string) (
 // cluster-owned SGs are deleted. Referrer SGs are owned and deleted by their own
 // teardown — only the cluster SGs are deleted here. Missing SGs are no-ops; the
 // first error is returned after the full sweep.
-func DeleteClusterSGs(sgp sgProvisioner, accountID, clusterName, vpcID string) error {
+func DeleteClusterSGs(ctx context.Context, sgp sgProvisioner, accountID, clusterName, vpcID string) error {
 	if clusterName == "" {
 		return errors.New("eks: DeleteClusterSGs empty cluster name")
 	}
@@ -116,16 +117,22 @@ func DeleteClusterSGs(sgp sgProvisioner, accountID, clusterName, vpcID string) e
 	// Break every cross-reference in the VPC before deleting any SG. Revoking
 	// both directions on every non-default SG guarantees no rule still points at
 	// a cluster SG, so the deletes below succeed regardless of order.
-	out, err := sgp.DescribeSecurityGroups(&ec2.DescribeSecurityGroupsInput{
+	out, err := sgp.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("vpc-id"), Values: aws.StringSlice([]string{vpcID})},
 		},
 	}, accountID)
 	if err != nil {
-		slog.Warn("DeleteClusterSGs: describe SGs failed", "vpc", vpcID, "err", err)
+		slog.WarnContext(ctx, "DeleteClusterSGs: describe SGs failed", "vpc", vpcID, "err", err)
 		record(fmt.Errorf("describe SGs in vpc %s: %w", vpcID, err))
 	}
-	for _, g := range out.SecurityGroups {
+	// A failed describe returns a nil out; fall back to an empty set so the two
+	// cross-reference sweeps below become no-ops while the targeted deletes still run.
+	var sgs []*ec2.SecurityGroup
+	if out != nil {
+		sgs = out.SecurityGroups
+	}
+	for _, g := range sgs {
 		if g == nil || g.GroupId == nil {
 			continue
 		}
@@ -134,8 +141,8 @@ func DeleteClusterSGs(sgp sgProvisioner, accountID, clusterName, vpcID string) e
 		if aws.StringValue(g.GroupName) == "default" {
 			continue
 		}
-		if revokeErr := revokeAllSGRules(sgp, accountID, g); revokeErr != nil {
-			slog.Warn("DeleteClusterSGs: revoke rules failed", "sg", aws.StringValue(g.GroupId), "err", revokeErr)
+		if revokeErr := revokeAllSGRules(ctx, sgp, accountID, g); revokeErr != nil {
+			slog.WarnContext(ctx, "DeleteClusterSGs: revoke rules failed", "sg", aws.StringValue(g.GroupId), "err", revokeErr)
 			record(revokeErr)
 		}
 	}
@@ -145,32 +152,32 @@ func DeleteClusterSGs(sgp sgProvisioner, accountID, clusterName, vpcID string) e
 	// so nothing else deletes them and they pin the VPC on DependencyViolation.
 	// Match by the LBC ownership tag; rules were already revoked above. Runs after
 	// the matching ALB reap, so the LB no longer references the SG.
-	for _, g := range out.SecurityGroups {
+	for _, g := range sgs {
 		if g == nil || g.GroupId == nil || aws.StringValue(g.GroupName) == "default" {
 			continue
 		}
 		if !sgHasLBCClusterTag(g, clusterName) {
 			continue
 		}
-		if delErr := deleteSGAwaitingDetach(sgp, accountID, aws.StringValue(g.GroupId)); delErr != nil {
-			slog.Warn("DeleteClusterSGs: LBC SG delete failed", "sg", aws.StringValue(g.GroupId), "err", delErr)
+		if delErr := deleteSGAwaitingDetach(ctx, sgp, accountID, aws.StringValue(g.GroupId)); delErr != nil {
+			slog.WarnContext(ctx, "DeleteClusterSGs: LBC SG delete failed", "sg", aws.StringValue(g.GroupId), "err", delErr)
 			record(fmt.Errorf("delete LBC SG %s: %w", aws.StringValue(g.GroupId), delErr))
 		}
 	}
 
 	// Delete only the cluster-owned SGs.
 	for _, name := range []string{ClusterControlPlaneSGName(clusterName), ClusterNodegroupSGName(clusterName)} {
-		id, lookupErr := lookupSGByName(sgp, accountID, vpcID, name)
+		id, lookupErr := lookupSGByName(ctx, sgp, accountID, vpcID, name)
 		if lookupErr != nil {
-			slog.Warn("DeleteClusterSGs: SG lookup failed", "sg", name, "err", lookupErr)
+			slog.WarnContext(ctx, "DeleteClusterSGs: SG lookup failed", "sg", name, "err", lookupErr)
 			record(lookupErr)
 			continue
 		}
 		if id == "" {
 			continue
 		}
-		if delErr := deleteSGAwaitingDetach(sgp, accountID, id); delErr != nil {
-			slog.Warn("DeleteClusterSGs: SG delete failed", "sg", id, "err", delErr)
+		if delErr := deleteSGAwaitingDetach(ctx, sgp, accountID, id); delErr != nil {
+			slog.WarnContext(ctx, "DeleteClusterSGs: SG delete failed", "sg", id, "err", delErr)
 			record(fmt.Errorf("delete SG %s: %w", id, delErr))
 		}
 	}
@@ -193,10 +200,10 @@ var (
 // DependencyViolation past the budget is surfaced so the teardown backstop retries
 // rather than leaking the SG — a leaked cluster SG sits in the customer VPC and
 // pins it on DependencyViolation.
-func deleteSGAwaitingDetach(sgp sgProvisioner, accountID, sgID string) error {
+func deleteSGAwaitingDetach(ctx context.Context, sgp sgProvisioner, accountID, sgID string) error {
 	deadline := time.Now().Add(sgDeleteWaitBudget)
 	for {
-		_, err := sgp.DeleteSecurityGroup(&ec2.DeleteSecurityGroupInput{GroupId: aws.String(sgID)}, accountID)
+		_, err := sgp.DeleteSecurityGroup(ctx, &ec2.DeleteSecurityGroupInput{GroupId: aws.String(sgID)}, accountID)
 		switch {
 		case err == nil, awserrors.IsNotFound(err):
 			return nil
@@ -216,13 +223,13 @@ func deleteSGAwaitingDetach(sgp sgProvisioner, accountID, sgID string) error {
 // SGs delete in any order. An egress cross-reference pins an SG on
 // DependencyViolation just as an ingress one does, so both must go. Empty rule
 // sets are no-ops; a raced-away SG (NotFound) is tolerated.
-func revokeAllSGRules(sgp sgProvisioner, accountID string, g *ec2.SecurityGroup) error {
+func revokeAllSGRules(ctx context.Context, sgp sgProvisioner, accountID string, g *ec2.SecurityGroup) error {
 	if g == nil || g.GroupId == nil {
 		return nil
 	}
 	sgID := aws.StringValue(g.GroupId)
 	if len(g.IpPermissions) > 0 {
-		if _, err := sgp.RevokeSecurityGroupIngress(&ec2.RevokeSecurityGroupIngressInput{
+		if _, err := sgp.RevokeSecurityGroupIngress(ctx, &ec2.RevokeSecurityGroupIngressInput{
 			GroupId:       g.GroupId,
 			IpPermissions: g.IpPermissions,
 		}, accountID); err != nil && !awserrors.IsNotFound(err) {
@@ -230,7 +237,7 @@ func revokeAllSGRules(sgp sgProvisioner, accountID string, g *ec2.SecurityGroup)
 		}
 	}
 	if len(g.IpPermissionsEgress) > 0 {
-		if _, err := sgp.RevokeSecurityGroupEgress(&ec2.RevokeSecurityGroupEgressInput{
+		if _, err := sgp.RevokeSecurityGroupEgress(ctx, &ec2.RevokeSecurityGroupEgressInput{
 			GroupId:       g.GroupId,
 			IpPermissions: g.IpPermissionsEgress,
 		}, accountID); err != nil && !awserrors.IsNotFound(err) {
@@ -245,7 +252,7 @@ func revokeAllSGRules(sgp sgProvisioner, accountID string, g *ec2.SecurityGroup)
 // :6443, so in-VPC workers + kubectl reach the apiserver via the Set A NIC. :6443
 // carries worker pods to the in-cluster `kubernetes` Endpoints (apiserver
 // advertised on :6443). Idempotent: SG lookup-or-create + duplicate-tolerant authorize.
-func EnsurePrivateEndpointSG(sgp sgProvisioner, accountID, clusterName, vpcID, vpcCIDR string) (string, error) {
+func EnsurePrivateEndpointSG(ctx context.Context, sgp sgProvisioner, accountID, clusterName, vpcID, vpcCIDR string) (string, error) {
 	if clusterName == "" {
 		return "", errors.New("eks: EnsurePrivateEndpointSG empty cluster name")
 	}
@@ -256,7 +263,7 @@ func EnsurePrivateEndpointSG(sgp sgProvisioner, accountID, clusterName, vpcID, v
 		return "", errors.New("eks: EnsurePrivateEndpointSG empty vpc cidr")
 	}
 
-	sgID, err := ensureClusterSG(sgp, accountID, vpcID, clusterName,
+	sgID, err := ensureClusterSG(ctx, sgp, accountID, vpcID, clusterName,
 		ClusterPrivateEndpointSGName(clusterName),
 		fmt.Sprintf("EKS private-endpoint SG for cluster %s", clusterName),
 		clusterEKSRolePrivateEndpoint)
@@ -264,7 +271,9 @@ func EnsurePrivateEndpointSG(sgp sgProvisioner, accountID, clusterName, vpcID, v
 		return "", err
 	}
 
-	for _, port := range []int64{clusterNLBListenPort, k3sAPIServerPort} {
+	// :443/:6443 carry kubectl/SDK + the in-cluster `kubernetes` Endpoints; :8132
+	// carries the worker konnectivity-agents' tunnel dial to the CP servers.
+	for _, port := range []int64{clusterNLBListenPort, k3sAPIServerPort, konnectivityAgentPort} {
 		perm := &ec2.IpPermission{
 			IpProtocol: aws.String("tcp"),
 			FromPort:   aws.Int64(port),
@@ -274,7 +283,7 @@ func EnsurePrivateEndpointSG(sgp sgProvisioner, accountID, clusterName, vpcID, v
 				Description: aws.String("EKS in-VPC clients to private apiserver endpoint"),
 			}},
 		}
-		_, err = sgp.AuthorizeSecurityGroupIngress(&ec2.AuthorizeSecurityGroupIngressInput{
+		_, err = sgp.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
 			GroupId:       aws.String(sgID),
 			IpPermissions: []*ec2.IpPermission{perm},
 		}, accountID)
@@ -287,34 +296,34 @@ func EnsurePrivateEndpointSG(sgp sgProvisioner, accountID, clusterName, vpcID, v
 
 // DeletePrivateEndpointSG removes the cluster's private-endpoint SG. Missing SG
 // is a no-op. The private-endpoint ENI must be deleted first (it references this SG).
-func DeletePrivateEndpointSG(sgp sgProvisioner, accountID, clusterName, vpcID string) error {
+func DeletePrivateEndpointSG(ctx context.Context, sgp sgProvisioner, accountID, clusterName, vpcID string) error {
 	if clusterName == "" {
 		return errors.New("eks: DeletePrivateEndpointSG empty cluster name")
 	}
 	if vpcID == "" {
 		return errors.New("eks: DeletePrivateEndpointSG empty vpc id")
 	}
-	id, err := lookupSGByName(sgp, accountID, vpcID, ClusterPrivateEndpointSGName(clusterName))
+	id, err := lookupSGByName(ctx, sgp, accountID, vpcID, ClusterPrivateEndpointSGName(clusterName))
 	if err != nil {
 		return err
 	}
 	if id == "" {
 		return nil
 	}
-	if _, err := sgp.DeleteSecurityGroup(&ec2.DeleteSecurityGroupInput{GroupId: aws.String(id)}, accountID); err != nil && !awserrors.IsNotFound(err) {
+	if _, err := sgp.DeleteSecurityGroup(ctx, &ec2.DeleteSecurityGroupInput{GroupId: aws.String(id)}, accountID); err != nil && !awserrors.IsNotFound(err) {
 		return fmt.Errorf("delete private-endpoint SG %s: %w", id, err)
 	}
 	return nil
 }
 
-func ensureClusterSG(sgp sgProvisioner, accountID, vpcID, clusterName, name, description, role string) (string, error) {
-	if id, err := lookupSGByName(sgp, accountID, vpcID, name); err != nil {
+func ensureClusterSG(ctx context.Context, sgp sgProvisioner, accountID, vpcID, clusterName, name, description, role string) (string, error) {
+	if id, err := lookupSGByName(ctx, sgp, accountID, vpcID, name); err != nil {
 		return "", err
 	} else if id != "" {
 		return id, nil
 	}
 
-	out, err := sgp.CreateSecurityGroup(&ec2.CreateSecurityGroupInput{
+	out, err := sgp.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{
 		GroupName:   aws.String(name),
 		Description: aws.String(description),
 		VpcId:       aws.String(vpcID),
@@ -338,7 +347,7 @@ func ensureClusterSG(sgp sgProvisioner, accountID, vpcID, clusterName, name, des
 
 // EnsureNodegroupSGRules authorizes ingress for flannel VXLAN (8472/udp), apiserver
 // (6443/tcp), and kubelet (10250/tcp) between CP and nodegroup SGs. Idempotent.
-func EnsureNodegroupSGRules(sgp sgProvisioner, accountID, clusterName, cpSGID, ngSGID string) error {
+func EnsureNodegroupSGRules(ctx context.Context, sgp sgProvisioner, accountID, clusterName, cpSGID, ngSGID string) error {
 	if cpSGID == "" || ngSGID == "" {
 		return errors.New("eks: EnsureNodegroupSGRules empty SG id")
 	}
@@ -372,7 +381,7 @@ func EnsureNodegroupSGRules(sgp sgProvisioner, accountID, clusterName, cpSGID, n
 			perm.FromPort = aws.Int64(r.from)
 			perm.ToPort = aws.Int64(r.to)
 		}
-		_, err := sgp.AuthorizeSecurityGroupIngress(&ec2.AuthorizeSecurityGroupIngressInput{
+		_, err := sgp.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
 			GroupId:       aws.String(r.targetSG),
 			IpPermissions: []*ec2.IpPermission{perm},
 		}, accountID)
@@ -386,9 +395,11 @@ func EnsureNodegroupSGRules(sgp sgProvisioner, accountID, clusterName, cpSGID, n
 	return nil
 }
 
-// EnsureControlPlaneIngress admits the NLB→apiserver hop from the VPC CIDR on k3sAPIServerPort.
-// Public access is gated separately at the NLB front-end. Idempotent.
-func EnsureControlPlaneIngress(sgp sgProvisioner, accountID, cpSGID, vpcCIDR string) error {
+// EnsureControlPlaneIngress admits the NLB→CP hops from the VPC CIDR: the
+// apiserver (k3sAPIServerPort) and the konnectivity-server agent port
+// (konnectivityAgentPort). Public access is gated separately at the NLB
+// front-end. Idempotent.
+func EnsureControlPlaneIngress(ctx context.Context, sgp sgProvisioner, accountID, cpSGID, vpcCIDR string) error {
 	if cpSGID == "" {
 		return errors.New("eks: EnsureControlPlaneIngress empty control-plane SG id")
 	}
@@ -396,28 +407,36 @@ func EnsureControlPlaneIngress(sgp sgProvisioner, accountID, cpSGID, vpcCIDR str
 		return errors.New("eks: EnsureControlPlaneIngress empty vpc cidr")
 	}
 
-	perm := &ec2.IpPermission{
-		IpProtocol: aws.String("tcp"),
-		FromPort:   aws.Int64(k3sAPIServerPort),
-		ToPort:     aws.Int64(k3sAPIServerPort),
-		IpRanges: []*ec2.IpRange{{
-			CidrIp:      aws.String(vpcCIDR),
-			Description: aws.String("EKS NLB to apiserver"),
-		}},
-	}
-	_, err := sgp.AuthorizeSecurityGroupIngress(&ec2.AuthorizeSecurityGroupIngressInput{
-		GroupId:       aws.String(cpSGID),
-		IpPermissions: []*ec2.IpPermission{perm},
-	}, accountID)
-	if err != nil && !awserrors.IsErrorCode(err, awserrors.ErrorInvalidPermissionDuplicate) {
-		return fmt.Errorf("authorize control-plane apiserver ingress on %s: %w", cpSGID, err)
+	for _, p := range []struct {
+		port int64
+		desc string
+	}{
+		{k3sAPIServerPort, "EKS NLB to apiserver"},
+		{konnectivityAgentPort, "EKS NLB to konnectivity-server"},
+	} {
+		perm := &ec2.IpPermission{
+			IpProtocol: aws.String("tcp"),
+			FromPort:   aws.Int64(p.port),
+			ToPort:     aws.Int64(p.port),
+			IpRanges: []*ec2.IpRange{{
+				CidrIp:      aws.String(vpcCIDR),
+				Description: aws.String(p.desc),
+			}},
+		}
+		_, err := sgp.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
+			GroupId:       aws.String(cpSGID),
+			IpPermissions: []*ec2.IpPermission{perm},
+		}, accountID)
+		if err != nil && !awserrors.IsErrorCode(err, awserrors.ErrorInvalidPermissionDuplicate) {
+			return fmt.Errorf("authorize control-plane %s ingress on %s: %w", p.desc, cpSGID, err)
+		}
 	}
 	return nil
 }
 
 // EnsureControlPlaneHAIngress authorizes self-referencing CP SG rules for HA etcd peering:
 // etcd client+peer (2379-2380/tcp) and kubelet (10250/tcp) within cpSG. Idempotent.
-func EnsureControlPlaneHAIngress(sgp sgProvisioner, accountID, cpSGID string) error {
+func EnsureControlPlaneHAIngress(ctx context.Context, sgp sgProvisioner, accountID, cpSGID string) error {
 	if cpSGID == "" {
 		return errors.New("eks: EnsureControlPlaneHAIngress empty control-plane SG id")
 	}
@@ -443,7 +462,7 @@ func EnsureControlPlaneHAIngress(sgp sgProvisioner, accountID, cpSGID string) er
 				Description: aws.String(r.desc),
 			}},
 		}
-		_, err := sgp.AuthorizeSecurityGroupIngress(&ec2.AuthorizeSecurityGroupIngressInput{
+		_, err := sgp.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
 			GroupId:       aws.String(cpSGID),
 			IpPermissions: []*ec2.IpPermission{perm},
 		}, accountID)
@@ -468,8 +487,8 @@ func sgHasLBCClusterTag(g *ec2.SecurityGroup, clusterName string) bool {
 	return false
 }
 
-func lookupSGByName(sgp sgProvisioner, accountID, vpcID, name string) (string, error) {
-	out, err := sgp.DescribeSecurityGroups(&ec2.DescribeSecurityGroupsInput{
+func lookupSGByName(ctx context.Context, sgp sgProvisioner, accountID, vpcID, name string) (string, error) {
+	out, err := sgp.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
 		Filters: []*ec2.Filter{
 			{Name: aws.String("group-name"), Values: aws.StringSlice([]string{name})},
 			{Name: aws.String("vpc-id"), Values: aws.StringSlice([]string{vpcID})},

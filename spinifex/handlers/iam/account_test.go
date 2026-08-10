@@ -95,7 +95,7 @@ func TestListAccounts_Empty(t *testing.T) {
 
 	accounts, err := svc.ListAccounts()
 	require.NoError(t, err)
-	assert.Len(t, accounts, 0)
+	assert.Empty(t, accounts)
 }
 
 // ============================================================================
@@ -350,7 +350,7 @@ func TestCrossAccount_LookupAccessKeyReturnsCorrectAccount(t *testing.T) {
 func TestSeedBootstrap_AccountScoped(t *testing.T) {
 	svc := setupTestIAMService(t)
 
-	encryptedSecret, err := EncryptSecret("root-secret", svc.masterKey)
+	encryptedSecret, err := svc.key.EncryptBase64("root-secret")
 	require.NoError(t, err)
 
 	err = svc.SeedBootstrap(&BootstrapData{
@@ -408,7 +408,7 @@ func TestCreateAccount_PublishesEvent(t *testing.T) {
 	masterKey, err := GenerateMasterKey()
 	require.NoError(t, err)
 
-	svc, err := NewIAMServiceImpl(nc, masterKey, 1)
+	svc, err := NewIAMServiceImpl(t.Context(), nc, masterKey, 1)
 	require.NoError(t, err)
 
 	eventCh := make(chan *nats.Msg, 1)

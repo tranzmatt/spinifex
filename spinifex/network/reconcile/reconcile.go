@@ -60,6 +60,15 @@ type GatewayClaimVerifier interface {
 	// blackholes after DNAT and the public IP is dark against an otherwise-running
 	// instance — the post-reboot state until an ovn-controller recompute binds it.
 	GuestPortUp(ctx context.Context, lspName string) (bool, error)
+	// SBConnectionState returns ovn-controller's Southbound OVSDB connection status
+	// ("connected" when healthy). A sustained non-"connected" status is the stale-SB
+	// RAFT wedge that stops new Port_Binding realisation; a recompute cannot clear it
+	// because it re-evaluates flows from the same stale SB view.
+	SBConnectionState(ctx context.Context) (string, error)
+	// ResetSBClusterState forces ovn-controller to re-sync its SB cluster state,
+	// clearing a stale-index wedge without a process restart or a flow wipe. Escalated
+	// to when a recompute nudge cannot converge a binding and the SB is not connected.
+	ResetSBClusterState(ctx context.Context) error
 }
 
 // Config is the construction-time bag for the reconciler. All fields except
@@ -78,23 +87,35 @@ type Config struct {
 	Chassis []string
 	// GatewayClaim verifies/repairs the SB chassis claim after rebinding. Optional.
 	GatewayClaim GatewayClaimVerifier
-	// DNSServer is the OVN dhcp_options dns_server value ("{a, b}"). Empty falls
-	// back to the topology default to keep both code paths in sync.
+	// DNSServer is the OVN dhcp_options dns_server value (a single IP or
+	// "{a, b}"). Empty falls back to the topology default to keep both code
+	// paths in sync.
 	DNSServer string
+	// FreshIntent re-reads intent from the control-plane store on demand.
+	// pruneOrphanEIPs uses it to refresh its live-port view at prune time: a
+	// prune pass lists OVN NAT rows live but is otherwise driven by the intent
+	// snapshot captured at the start of the pass, and the apply phase can block
+	// for tens of seconds, so a guest launched mid-pass has a live dnat_and_snat
+	// row that the stale snapshot does not know about. Matching that live row
+	// against the snapshot alone sweeps it and blackholes the guest's public IP.
+	// Optional: nil leaves the start-of-pass snapshot as the sole liveness source
+	// (unit tests, or callers with no store).
+	FreshIntent func(ctx context.Context) (IntentState, error)
 }
 
 type reconciler struct {
-	ovn       ovn.Client
-	sg        policy.SecurityGroupManager
-	nat       policy.NATManager
-	routes    policy.RouteManager
-	igw       external.IGWManager
-	topology  topology.Manager
-	localAZ   string
-	host      string
-	chassis   []string
-	gwClaim   GatewayClaimVerifier
-	dnsServer string
+	ovn          ovn.Client
+	sg           policy.SecurityGroupManager
+	nat          policy.NATManager
+	routes       policy.RouteManager
+	igw          external.IGWManager
+	topology     topology.Manager
+	localAZ      string
+	host         string
+	chassis      []string
+	gwClaim      GatewayClaimVerifier
+	dnsServer    string
+	reloadIntent func(ctx context.Context) (IntentState, error)
 }
 
 var _ Reconciler = (*reconciler)(nil)
@@ -123,17 +144,18 @@ func New(cfg Config) (Reconciler, error) {
 		dnsServer = topology.FormatDNSServerList(nil)
 	}
 	return &reconciler{
-		ovn:       cfg.OVN,
-		sg:        cfg.SG,
-		nat:       cfg.NAT,
-		routes:    cfg.Routes,
-		igw:       cfg.IGW,
-		topology:  cfg.Topology,
-		localAZ:   cfg.LocalAZ,
-		host:      cfg.NodeHostname,
-		chassis:   cfg.Chassis,
-		gwClaim:   cfg.GatewayClaim,
-		dnsServer: dnsServer,
+		ovn:          cfg.OVN,
+		sg:           cfg.SG,
+		nat:          cfg.NAT,
+		routes:       cfg.Routes,
+		igw:          cfg.IGW,
+		topology:     cfg.Topology,
+		localAZ:      cfg.LocalAZ,
+		host:         cfg.NodeHostname,
+		chassis:      cfg.Chassis,
+		gwClaim:      cfg.GatewayClaim,
+		dnsServer:    dnsServer,
+		reloadIntent: cfg.FreshIntent,
 	}, nil
 }
 
@@ -174,6 +196,9 @@ func (r *reconciler) reconcile(ctx context.Context, intent IntentState, pruneOrp
 	r.applyPorts(ctx, intent, actual, pruneOrphans)
 	r.applyIGWs(ctx, intent, actual)
 	r.applyEIPs(ctx, intent, actual)
+	if pruneOrphans {
+		r.pruneOrphanEIPs(ctx, intent)
+	}
 	r.applyNATGWs(ctx, intent, actual)
 	r.applyIGWRoutes(ctx, intent, actual)
 	r.applyNATGWRoutes(ctx, intent, actual)

@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"net"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -21,16 +23,19 @@ const renewJitter = time.Second
 
 // postExpiryBackoff is the cool-off applied after a re-DORA fails post
 // lease expiry. Bounded — the manager keeps re-DORAing in the
-// background until the server comes back (per plan §Failure modes).
+// background until the server comes back.
 const postExpiryBackoff = 30 * time.Second
 
-// defaultAcquireSchedule is the per-attempt timeout schedule for the
-// outer DORA backoff. Mirrors the deleted dhcp_manager.go retransmit
-// schedule — recovers under STP convergence on a freshly-up bridge.
-var defaultAcquireSchedule = []time.Duration{4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second}
+// defaultAcquireSchedule is the per-attempt timeout schedule for the outer DORA
+// backoff. Four attempts still ride out STP convergence on a freshly-up bridge,
+// but the total is held under an AWS client's read timeout: botocore defaults to
+// 60s and sends no retry token, so a ladder that outlasts it turns one
+// AllocateAddress into two leases with no way to tell them apart.
+var defaultAcquireSchedule = []time.Duration{4 * time.Second, 8 * time.Second, 12 * time.Second, 16 * time.Second}
 
-// defaultAcquireBudget caps the wallclock for the full DORA loop.
-const defaultAcquireBudget = 90 * time.Second
+// defaultAcquireBudget caps the wallclock for the full DORA loop. Sized to leave
+// the daemon room to answer inside a 60s client read timeout, per the schedule.
+const defaultAcquireBudget = 45 * time.Second
 
 // acquireAttemptJitter is the ± window applied to each per-attempt
 // timeout so concurrent acquires across vpcds don't synchronise.
@@ -45,6 +50,12 @@ type ManagerConfig struct {
 	Now             func() time.Time
 	AcquireSchedule []time.Duration
 	AcquireBudget   time.Duration
+	// IfaceIPs lists the IPs bound to a named interface; tests override.
+	// Used to detect MAC-keyed upstream routers on interface-MAC pools.
+	IfaceIPs func(iface string) ([]net.IP, error)
+	// NodeName labels outbound option 12 so upstream lease tables group by the
+	// host that took the lease. Defaults to the OS hostname.
+	NodeName string
 }
 
 // Manager owns active DHCP leases in vpcd: one renewal goroutine per
@@ -56,6 +67,8 @@ type Manager struct {
 	now             func() time.Time
 	acquireSchedule []time.Duration
 	acquireBudget   time.Duration
+	ifaceIPs        func(iface string) ([]net.IP, error)
+	nodeName        string
 
 	sf singleflight.Group
 
@@ -64,15 +77,25 @@ type Manager struct {
 	closed       bool
 	parentCtx    context.Context
 	parentCancel context.CancelFunc
+	ipChangeHook IPChangeHook
+	leaseOwner   LeaseOwner
 
 	wg sync.WaitGroup
 }
 
+// IPChangeHook rebinds whatever the caller bound to a lease's old address
+// after the lease came back on a different IP. A re-DORA following a NAK or an
+// expiry is free to land anywhere in the server's pool, and the manager owns
+// only the lease — not the datapath configured from it.
+type IPChangeHook func(ctx context.Context, e Entry, oldIP net.IP) error
+
 // leaseLoop is the handle stored in Manager.loops. Pointer-identity lets
 // run() distinguish its own loop from a successor (e.g. re-acquired lease
-// with the same client-id).
+// with the same client-id). done closes when run() exits so release can
+// wait for an in-flight renewal Put to quiesce before deleting the KV entry.
 type leaseLoop struct {
 	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // NewManager constructs a Manager. Start must be called before
@@ -97,19 +120,68 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if budget <= 0 {
 		budget = defaultAcquireBudget
 	}
+	ifaceIPs := cfg.IfaceIPs
+	if ifaceIPs == nil {
+		ifaceIPs = defaultIfaceIPs
+	}
+	nodeName := cfg.NodeName
+	if nodeName == "" {
+		// A missing hostname only costs attribution, so it is not fatal.
+		nodeName, _ = os.Hostname()
+	}
 	return &Manager{
 		client:          cfg.Client,
 		store:           cfg.Store,
 		now:             now,
 		acquireSchedule: schedule,
 		acquireBudget:   budget,
+		ifaceIPs:        ifaceIPs,
+		nodeName:        nodeName,
 		loops:           map[string]*leaseLoop{},
 	}, nil
 }
 
-// Start scans the KV bucket and spawns a renewal goroutine per live lease,
-// re-issuing a RENEW to confirm the upstream binding (RFC 2131 INIT-REBOOT).
-// Expired entries are deleted. Repeated calls return an error.
+// SetIPChangeHook registers the datapath rebind callback. It is a setter rather
+// than a ManagerConfig field because the managers that own the datapath are
+// constructed after the DHCP manager is already running.
+func (m *Manager) SetIPChangeHook(h IPChangeHook) {
+	m.mu.Lock()
+	m.ipChangeHook = h
+	m.mu.Unlock()
+}
+
+// ipChange copies the hook under the lock so lease loops never invoke it while
+// holding m.mu — a hook that calls back into the manager would deadlock.
+func (m *Manager) ipChange() IPChangeHook {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ipChangeHook
+}
+
+// leaseHostname composes option 12 as "<node>-<client-id>". chaddr is a derived
+// HashMAC and option 61 carries that same MAC, so without this the upstream
+// lease table has no field identifying which physical host took the lease.
+func (m *Manager) leaseHostname(clientID string) string {
+	if m.nodeName == "" {
+		return clientID
+	}
+	return m.nodeName + "-" + clientID
+}
+
+// leaseVendorClass tags option 60 with the node. Option 12 already carries the
+// node, but it is unique per lease; this keeps one value per host so an upstream
+// lease table can group on it directly.
+func (m *Manager) leaseVendorClass() string {
+	if m.nodeName == "" {
+		return defaultVendorClass
+	}
+	return defaultVendorClass + "/" + m.nodeName
+}
+
+// Start scans the KV bucket and spawns a renewal goroutine per lease, re-issuing
+// a RENEW to confirm the upstream binding (RFC 2131 INIT-REBOOT). Leases that
+// expired while the manager was down get a loop too, which re-DORAs immediately.
+// Repeated calls return an error.
 func (m *Manager) Start(ctx context.Context) error {
 	m.mu.Lock()
 	if m.closed {
@@ -125,7 +197,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.parentCancel = cancel
 	m.mu.Unlock()
 
-	entries, err := m.store.List()
+	entries, err := m.store.List(ctx)
 	if err != nil {
 		return fmt.Errorf("list dhcp leases: %w", err)
 	}
@@ -134,15 +206,55 @@ func (m *Manager) Start(ctx context.Context) error {
 		if e.Lease == nil {
 			continue
 		}
-		if !e.Lease.ExpiresAt().After(now) {
-			if delErr := m.store.Delete(e.Lease.ClientID); delErr != nil {
-				slog.Warn("dhcp manager: drop expired lease failed", "client_id", e.Lease.ClientID, "err", delErr)
-			}
-			continue
+		expired := !e.Lease.ExpiresAt().After(now)
+		if expired {
+			// Deleting the entry here would strand whatever was configured from
+			// it: the caller still holds the resource, so the datapath keeps
+			// forwarding on an address nothing renews. The loop re-DORAs on its
+			// first pass instead, and the IP change hook rebinds from there.
+			slog.Warn("dhcp manager: lease expired while stopped; re-acquiring",
+				"client_id", e.Lease.ClientID, "purpose", e.Purpose, "ip", e.Lease.IP)
 		}
-		m.spawnLoop(e, true)
+		// A reaffirm RENEW is pointless on a lease the server has already aged
+		// out, and would only delay the re-DORA behind its timeout.
+		m.spawnLoop(e, !expired)
 	}
 	return nil
+}
+
+// staleReleaseTimeout bounds the best-effort RELEASE sent for a lease this
+// manager has stopped tracking. Adoption and renewal must not stall behind an
+// unreachable server, so this is deliberately short.
+const staleReleaseTimeout = 5 * time.Second
+
+// releaseStaleUpstream returns a lease the manager no longer holds — expired, or
+// superseded by a re-DORA onto a different address — to the server on a
+// best-effort basis. Failure is logged and swallowed: the local entry is gone
+// either way, and a lease persisted without raw offer/ack bytes cannot be
+// reconstructed, so it is skipped rather than attempted and logged as an error.
+// The server may already have rebound the address to someone else, in which case
+// a conformant one drops a RELEASE whose chaddr does not match the binding.
+func (m *Manager) releaseStaleUpstream(ctx context.Context, l *Lease) {
+	if l == nil {
+		return
+	}
+	if len(l.RawOffer) == 0 || len(l.RawACK) == 0 {
+		slog.Warn("dhcp manager: stale lease has no raw offer/ack; cannot release, address stays bound upstream",
+			"client_id", l.ClientID, "ip", l.IP)
+		return
+	}
+	relCtx, cancel := context.WithTimeout(ctx, staleReleaseTimeout)
+	defer cancel()
+	if err := m.client.Release(relCtx, l); err != nil {
+		slog.Warn("dhcp manager: release of stale lease failed; address may be stranded upstream",
+			"client_id", l.ClientID, "ip", l.IP, "err", err)
+		return
+	}
+	// A server drops a RELEASE whose chaddr does not match its binding, and says
+	// nothing. The chaddr is logged so a still-bound address can be traced to a
+	// mismatch rather than to a RELEASE that was never sent.
+	slog.Info("dhcp manager: released stale lease upstream",
+		"client_id", l.ClientID, "ip", l.IP, "chaddr", l.HWAddr.String())
 }
 
 // Stop cancels every renewal goroutine and waits for them to exit.
@@ -211,7 +323,7 @@ func (m *Manager) spawnLoop(e Entry, reaffirm bool) {
 		delete(m.loops, e.Lease.ClientID)
 	}
 	loopCtx, cancel := context.WithCancel(m.parentCtx)
-	loop := &leaseLoop{cancel: cancel}
+	loop := &leaseLoop{cancel: cancel, done: make(chan struct{})}
 	m.loops[e.Lease.ClientID] = loop
 	m.wg.Add(1)
 	m.mu.Unlock()
@@ -221,6 +333,7 @@ func (m *Manager) spawnLoop(e Entry, reaffirm bool) {
 
 func (m *Manager) run(ctx context.Context, self *leaseLoop, e Entry, reaffirm bool) {
 	defer m.wg.Done()
+	defer close(self.done)
 	defer func() {
 		m.mu.Lock()
 		if cur, ok := m.loops[e.Lease.ClientID]; ok && cur == self {
@@ -300,13 +413,44 @@ func (m *Manager) doAcquire(ctx context.Context, e *Entry) error {
 		Hostname:    e.Lease.Hostname,
 		VendorClass: e.Lease.VendorClass,
 		HWAddr:      e.Lease.HWAddr,
+		UseIfaceMAC: e.Lease.UseIfaceMAC,
 	})
 	if err != nil {
 		return err
 	}
-	e.Lease = lease
-	if err := m.store.Put(*e); err != nil {
-		return fmt.Errorf("persist re-acquired lease: %w", err)
+	return m.applyLease(ctx, e, lease)
+}
+
+// applyLease persists a replacement lease for e and reconciles an address change.
+// A re-DORA after a NAK or an expiry can return a different IP; the old address
+// then has no renewer and no owner, so it is handed back and whatever was bound
+// to it is told to follow. Without both halves each such event permanently burns
+// one address: squatted by the datapath, renewed by nobody, released by nobody.
+func (m *Manager) applyLease(ctx context.Context, e *Entry, fresh *Lease) error {
+	old := e.Lease
+	e.Lease = fresh
+	if err := m.store.Put(ctx, *e); err != nil {
+		return fmt.Errorf("persist lease: %w", err)
+	}
+	if old == nil || fresh == nil || old.IP.Equal(fresh.IP) {
+		return nil
+	}
+
+	slog.Error("dhcp manager: lease IP changed mid-life; rebinding datapath",
+		"client_id", fresh.ClientID, "purpose", e.Purpose, "old_ip", old.IP, "new_ip", fresh.IP)
+	m.releaseStaleUpstream(ctx, old)
+
+	hook := m.ipChange()
+	if hook == nil {
+		slog.Error("dhcp manager: no IP change hook registered; datapath still bound to the old address",
+			"client_id", fresh.ClientID, "old_ip", old.IP, "new_ip", fresh.IP)
+		return nil
+	}
+	// The new lease is held either way, so a failed rebind must not fail the
+	// lease loop — dropping the lease here would strand the new address too.
+	if err := hook(ctx, *e, old.IP); err != nil {
+		slog.Error("dhcp manager: rebind to new lease IP failed; datapath still on the old address",
+			"client_id", fresh.ClientID, "old_ip", old.IP, "new_ip", fresh.IP, "err", err)
 	}
 	return nil
 }
@@ -362,9 +506,10 @@ func (m *Manager) doRenew(ctx context.Context, e *Entry) error {
 	if err != nil {
 		return err
 	}
-	e.Lease = renewed
-	if err := m.store.Put(*e); err != nil {
-		return fmt.Errorf("persist renewed lease: %w", err)
+	// A rebind is a broadcast REQUEST; the answering server is free to hand back
+	// a different address, so this goes through the same reconcile as a re-DORA.
+	if err := m.applyLease(ctx, e, renewed); err != nil {
+		return err
 	}
 	return nil
 }
@@ -402,22 +547,30 @@ func (m *Manager) handleReleaseMsg(msg *nats.Msg) {
 		respondReleaseErr(msg, fmt.Sprintf("decode release: %v", err))
 		return
 	}
+	// A release must run to completion once started — the upstream DHCPRELEASE
+	// and the KV delete have to stay paired — so it is not tied to a caller
+	// deadline or to manager shutdown.
+	ctx := context.Background()
 	clientID := req.ClientID
 	if clientID == "" && req.IP != "" {
-		entry, err := m.store.LookupByIP(req.PoolName, req.IP)
+		entry, err := m.store.LookupByIP(ctx, req.PoolName, req.IP)
 		switch {
 		case err == nil:
 			clientID = entry.Lease.ClientID
-		case errors.Is(err, nats.ErrKeyNotFound):
-			slog.Warn("dhcp manager: release for unknown IP", "pool", req.PoolName, "ip", req.IP)
-			_ = msg.Respond(emptyReleaseReply)
+		case errors.Is(err, jetstream.ErrKeyNotFound):
+			// Answering SUCCESS here told the caller the address was freed when
+			// nothing went on the wire, so the upstream lease sat stranded and
+			// silent. Callers log-and-continue on a release error, so failing
+			// loudly surfaces the strand without wedging teardown.
+			slog.Warn("dhcp manager: release for untracked IP; nothing sent upstream", "pool", req.PoolName, "ip", req.IP)
+			respondReleaseErr(msg, fmt.Sprintf("no tracked lease for ip %s in pool %q; upstream lease may be stranded", req.IP, req.PoolName))
 			return
 		default:
 			respondReleaseErr(msg, fmt.Sprintf("lookup release ip: %v", err))
 			return
 		}
 	}
-	if err := m.handleRelease(context.Background(), clientID); err != nil {
+	if err := m.handleRelease(ctx, clientID); err != nil {
 		respondReleaseErr(msg, err.Error())
 		return
 	}
@@ -445,13 +598,13 @@ func (m *Manager) handleAcquire(ctx context.Context, req acquireWireRequest) (*E
 }
 
 func (m *Manager) acquireLocked(ctx context.Context, req acquireWireRequest) (*Entry, error) {
-	existing, err := m.store.Get(req.ClientID)
+	existing, err := m.store.Get(ctx, req.ClientID)
 	switch {
 	case err == nil:
 		if existing != nil && existing.Lease != nil && existing.Lease.ExpiresAt().After(m.now()) {
 			return existing, nil
 		}
-	case errors.Is(err, nats.ErrKeyNotFound):
+	case errors.Is(err, jetstream.ErrKeyNotFound):
 		// fall through to fresh acquire
 	default:
 		return nil, fmt.Errorf("look up lease: %w", err)
@@ -461,29 +614,97 @@ func (m *Manager) acquireLocked(ctx context.Context, req acquireWireRequest) (*E
 	if err != nil {
 		return nil, err
 	}
+	hostname := req.Hostname
+	if hostname == "" {
+		hostname = m.leaseHostname(req.ClientID)
+	}
+	vendorClass := req.VendorClass
+	if vendorClass == "" {
+		vendorClass = m.leaseVendorClass()
+	}
 	lease, err := m.acquireWithBackoff(ctx, AcquireRequest{
 		Bridge:      req.Bridge,
 		ClientID:    req.ClientID,
-		Hostname:    req.Hostname,
-		VendorClass: req.VendorClass,
+		Hostname:    hostname,
+		VendorClass: vendorClass,
 		HWAddr:      hw,
+		UseIfaceMAC: req.UseIfaceMAC,
 	})
 	if err != nil {
 		return nil, err
 	}
+	if req.UseIfaceMAC {
+		if cerr := m.checkIfaceMACCollision(ctx, req.Bridge, req.ClientID, lease.IP); cerr != nil {
+			if relErr := m.client.Release(ctx, lease); relErr != nil {
+				slog.Warn("dhcp manager: release of colliding lease failed", "client_id", req.ClientID, "err", relErr)
+			}
+			return nil, cerr
+		}
+	}
 	entry := Entry{Purpose: req.Purpose, PoolName: req.PoolName, VPCID: req.VPCID, Lease: lease}
-	if err := m.store.Put(entry); err != nil {
+	if err := m.store.Put(ctx, entry); err != nil {
 		return nil, fmt.Errorf("persist new lease: %w", err)
 	}
 	m.spawnLoop(entry, false)
 	return &entry, nil
 }
 
+// checkIfaceMACCollision detects upstream routers that key leases on MAC and
+// ignore option 61: every interface-MAC client then ACKs the same IP. The
+// ACK IP matching the interface's own address or another client-id's live
+// lease is a hard error — the operator must switch the pool to a static range.
+func (m *Manager) checkIfaceMACCollision(ctx context.Context, iface, clientID string, ip net.IP) error {
+	if ip == nil {
+		return nil
+	}
+	const advice = "the upstream router keys leases on MAC and ignores client-id; use source=\"static\" with a range outside its DHCP scope"
+	if ips, err := m.ifaceIPs(iface); err == nil {
+		for _, own := range ips {
+			if own.Equal(ip) {
+				return fmt.Errorf("dhcp manager: upstream leased %s to client %q but %s already owns that IP — %s", ip, clientID, iface, advice)
+			}
+		}
+	}
+	entries, err := m.store.List(ctx)
+	if err != nil {
+		slog.Warn("dhcp manager: lease list for MAC-collision check failed", "err", err)
+		return nil
+	}
+	for _, e := range entries {
+		if e.Lease == nil || e.Lease.ClientID == clientID || e.Lease.IP == nil {
+			continue
+		}
+		if e.Lease.IP.Equal(ip) && e.Lease.ExpiresAt().After(m.now()) {
+			return fmt.Errorf("dhcp manager: upstream leased %s to client %q but client %q already holds it — %s", ip, clientID, e.Lease.ClientID, advice)
+		}
+	}
+	return nil
+}
+
+// defaultIfaceIPs lists the addresses bound to a named interface.
+func defaultIfaceIPs(name string) ([]net.IP, error) {
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, err
+	}
+	var ips []net.IP
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			ips = append(ips, ipn.IP)
+		}
+	}
+	return ips, nil
+}
+
 // DrainAll DHCPRELEASEs every lease in this vpcd's per-AZ store and deletes
 // the KV records. Best-effort (per-lease failures logged, not fatal). Used on
 // destructive teardown; Stop() preserves leases for adopt-on-reboot.
 func (m *Manager) DrainAll(ctx context.Context) (int, error) {
-	entries, err := m.store.List()
+	entries, err := m.store.List(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("list leases for drain: %w", err)
 	}
@@ -524,9 +745,9 @@ func (m *Manager) handleRelease(ctx context.Context, clientID string) error {
 	if clientID == "" {
 		return errors.New("client_id required")
 	}
-	entry, err := m.store.Get(clientID)
+	entry, err := m.store.Get(ctx, clientID)
 	if err != nil {
-		if errors.Is(err, nats.ErrKeyNotFound) {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			slog.Warn("dhcp manager: release for unknown client", "client_id", clientID)
 			return nil
 		}
@@ -534,16 +755,27 @@ func (m *Manager) handleRelease(ctx context.Context, clientID string) error {
 	}
 
 	m.mu.Lock()
-	if loop, ok := m.loops[clientID]; ok {
+	loop, ok := m.loops[clientID]
+	if ok {
 		loop.cancel()
 		delete(m.loops, clientID)
 	}
 	m.mu.Unlock()
 
+	// Wait for the renewal goroutine to exit so any in-flight reaffirm/renew
+	// Put has landed before we Delete; otherwise a late Put re-creates the
+	// lease after drain, leaking a KV record.
+	if ok {
+		<-loop.done
+	}
+
 	if err := m.client.Release(ctx, entry.Lease); err != nil {
 		slog.Warn("dhcp manager: client release failed; deleting KV entry anyway", "client_id", clientID, "err", err)
+	} else if entry.Lease != nil {
+		slog.Info("dhcp manager: released lease upstream",
+			"client_id", clientID, "ip", entry.Lease.IP, "chaddr", entry.Lease.HWAddr.String())
 	}
-	return m.store.Delete(clientID)
+	return m.store.Delete(ctx, clientID)
 }
 
 // LoopCount returns the number of active renewal goroutines. Test
@@ -623,5 +855,5 @@ func jitter(span time.Duration) time.Duration {
 	if span <= 0 {
 		return 0
 	}
-	return time.Duration(rand.Int63n(int64(span*2))) - span //nolint:gosec // jitter, not cryptographic
+	return time.Duration(rand.Int64N(int64(span*2))) - span //nolint:gosec // jitter, not cryptographic
 }

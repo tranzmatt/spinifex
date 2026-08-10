@@ -1,14 +1,23 @@
 package handlers_elbv2
 
 import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"encoding/xml"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	handlers_acm "github.com/mulgadc/spinifex/spinifex/handlers/acm"
+	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	"github.com/mulgadc/spinifex/spinifex/lbagent"
+	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -75,13 +84,6 @@ func TestGenerateHAProxyConfigWithCerts_MissingCertRendersPlain(t *testing.T) {
 	assert.Empty(t, certFiles)
 }
 
-func TestGenerateHAProxyConfig_BackwardCompatNoTLS(t *testing.T) {
-	lb := &LoadBalancerRecord{LoadBalancerID: "lb-abc123", Name: "my-alb"}
-	config, err := GenerateHAProxyConfig(lb, []*ListenerRecord{httpsListener()}, nil, nil, "0.0.0.0")
-	require.NoError(t, err)
-	assert.NotContains(t, config, "ssl crt", "legacy entrypoint resolves no certs")
-}
-
 func TestConfigCertHash_ChangesOnRotation(t *testing.T) {
 	const cfg = "frontend ft\n    bind *:443 ssl crt /etc/haproxy/certs/x.pem\n"
 	path := "/etc/haproxy/certs/x.pem"
@@ -99,7 +101,7 @@ func TestConfigCertHash_ChangesOnRotation(t *testing.T) {
 
 func putTestCert(t *testing.T, svc *ELBv2ServiceImpl, arn, account, leaf, chain, key string) {
 	t.Helper()
-	require.NoError(t, svc.acmStore.PutCert(&handlers_acm.CertRecord{
+	require.NoError(t, svc.acmStore.PutCert(t.Context(), &handlers_acm.CertRecord{
 		CertificateArn:   arn,
 		AccountID:        account,
 		Certificate:      leaf,
@@ -114,17 +116,62 @@ func TestResolveCertPEM_ConcatOrderAndOwnership(t *testing.T) {
 	require.NotNil(t, svc.acmStore)
 	putTestCert(t, svc, certTestArn, testAccountID, "LEAF", "CHAIN", "KEY")
 
-	pem, err := svc.resolveCertPEM(certTestArn, testAccountID)
+	pem, err := svc.resolveCertPEM(t.Context(), certTestArn, testAccountID)
 	require.NoError(t, err)
 	assert.Equal(t, "LEAF\nCHAIN\nKEY\n", pem)
 
 	// Wrong account → treated as not found.
-	_, err = svc.resolveCertPEM(certTestArn, "999999999999")
+	_, err = svc.resolveCertPEM(t.Context(), certTestArn, "999999999999")
 	require.Error(t, err)
 
 	// Unknown ARN → not found.
-	_, err = svc.resolveCertPEM("arn:aws:acm:ap-southeast-2:123456789012:certificate/missing", testAccountID)
+	_, err = svc.resolveCertPEM(t.Context(), "arn:aws:acm:ap-southeast-2:123456789012:certificate/missing", testAccountID)
 	require.Error(t, err)
+}
+
+// TestResolveCertPEM_CrossesACMServiceKeyBoundary writes a certificate through
+// a Store constructed the way the ACM service constructs its own — NewStore
+// wired with the shared deployment master key — then resolves it through
+// ELBv2's independently-constructed Store via resolveCertPEM. Every other
+// cert test in this file goes through putTestCert, which writes and reads
+// via svc.acmStore itself, so it never crosses from one Store instance to
+// another; this test exercises the real daemon topology, where
+// ACMServiceImpl and ELBv2ServiceImpl each open their own Store over the
+// same JetStream bucket and must agree on the same key.
+func TestResolveCertPEM_CrossesACMServiceKeyBoundary(t *testing.T) {
+	_, nc, _ := testutil.StartTestJetStream(t)
+
+	masterKey, err := handlers_iam.GenerateMasterKey()
+	require.NoError(t, err)
+
+	svc, err := NewELBv2ServiceImplWithNATS(nil, nc, masterKey)
+	require.NoError(t, err)
+
+	// ACM-service-style writer: its own Store over the same bucket, wired with
+	// the same deployment key rather than svc's own acmStore.
+	acmStore, err := handlers_acm.NewStore(t.Context(), nc, masterKey)
+	require.NoError(t, err)
+
+	// A realistic EC private key PEM, not a placeholder — a non-PEM value
+	// would take the legacy-plaintext guard's rejection path instead of the
+	// real decrypt path this test exercises.
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	require.NoError(t, err)
+	keyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
+
+	arn := "arn:aws:acm:ap-southeast-2:123456789012:certificate/cross-boundary"
+	require.NoError(t, acmStore.PutCert(t.Context(), &handlers_acm.CertRecord{
+		CertificateArn: arn,
+		AccountID:      testAccountID,
+		Certificate:    "LEAF",
+		PrivateKey:     keyPEM,
+	}))
+
+	got, err := svc.resolveCertPEM(t.Context(), arn, testAccountID)
+	require.NoError(t, err)
+	assert.Equal(t, "LEAF\n"+strings.TrimRight(keyPEM, "\n")+"\n", got)
 }
 
 func TestValidateListenerCerts_RejectsUnknownAndWrongAccount(t *testing.T) {
@@ -132,22 +179,22 @@ func TestValidateListenerCerts_RejectsUnknownAndWrongAccount(t *testing.T) {
 	putTestCert(t, svc, certTestArn, testAccountID, "LEAF", "", "KEY")
 
 	// Known, owned cert → accepted.
-	require.NoError(t, svc.validateListenerCerts(
+	require.NoError(t, svc.validateListenerCerts(t.Context(),
 		[]ListenerCertificate{{CertificateArn: certTestArn}}, testAccountID))
 
 	// Unknown ARN → CertificateNotFound, rejected at the API boundary.
-	err := svc.validateListenerCerts(
+	err := svc.validateListenerCerts(t.Context(),
 		[]ListenerCertificate{{CertificateArn: "arn:aws:acm:ap-southeast-2:123456789012:certificate/missing"}}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorELBv2CertificateNotFound)
 
 	// Cert owned by another account → not found.
-	err = svc.validateListenerCerts(
+	err = svc.validateListenerCerts(t.Context(),
 		[]ListenerCertificate{{CertificateArn: certTestArn}}, "999999999999")
 	require.EqualError(t, err, awserrors.ErrorELBv2CertificateNotFound)
 
 	// No ACM store (degraded) → validation skipped, never blocks.
 	svc.acmStore = nil
-	require.NoError(t, svc.validateListenerCerts(
+	require.NoError(t, svc.validateListenerCerts(t.Context(),
 		[]ListenerCertificate{{CertificateArn: certTestArn}}, testAccountID))
 }
 
@@ -155,7 +202,7 @@ func TestResolveCertPEM_NoChain(t *testing.T) {
 	svc := setupTestService(t)
 	putTestCert(t, svc, certTestArn, testAccountID, "LEAF", "", "KEY")
 
-	pem, err := svc.resolveCertPEM(certTestArn, testAccountID)
+	pem, err := svc.resolveCertPEM(t.Context(), certTestArn, testAccountID)
 	require.NoError(t, err)
 	assert.Equal(t, "LEAF\nKEY\n", pem)
 }
@@ -165,13 +212,13 @@ func TestResolveListenerCerts_DedupAndResolve(t *testing.T) {
 	putTestCert(t, svc, certTestArn, testAccountID, "LEAF", "", "KEY")
 
 	// Two listeners share the same cert ARN — resolved once.
-	got, err := svc.resolveListenerCerts([]*ListenerRecord{httpsListener(), httpsListener()}, testAccountID)
+	got, err := svc.resolveListenerCerts(t.Context(), []*ListenerRecord{httpsListener(), httpsListener()}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, "LEAF\nKEY\n", got[certTestArn])
 
 	// HTTP-only listeners → nil map, no error.
-	got, err = svc.resolveListenerCerts([]*ListenerRecord{{Protocol: ProtocolHTTP}}, testAccountID)
+	got, err = svc.resolveListenerCerts(t.Context(), []*ListenerRecord{{Protocol: ProtocolHTTP}}, testAccountID)
 	require.NoError(t, err)
 	assert.Nil(t, got)
 }
@@ -185,9 +232,9 @@ func TestGetLBConfig_DeliversCertFiles(t *testing.T) {
 		ConfigHash:     "hash123",
 		CertFiles:      map[string]string{"/etc/haproxy/certs/lb-deliver1-lst.pem": "LEAF\nKEY\n"},
 	}
-	require.NoError(t, svc.store.PutLoadBalancer(rec))
+	require.NoError(t, svc.store.PutLoadBalancer(t.Context(), rec))
 
-	out, err := svc.GetLBConfig(&GetLBConfigInput{LBID: aws.String("lb-deliver1")}, testAccountID)
+	out, err := svc.GetLBConfig(context.Background(), &GetLBConfigInput{LBID: aws.String("lb-deliver1")}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, out.CertFiles, 1)
 	assert.Equal(t, "/etc/haproxy/certs/lb-deliver1-lst.pem", *out.CertFiles[0].Path)

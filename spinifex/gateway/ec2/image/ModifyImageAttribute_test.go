@@ -1,6 +1,7 @@
 package gateway_ec2_image
 
 import (
+	"context"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -167,11 +168,11 @@ func TestValidateModifyImageAttributeInput_NormalizesEmptyDescriptionToEmptyStri
 	}
 	require.NoError(t, ValidateModifyImageAttributeInput(input))
 	require.NotNil(t, input.Value)
-	assert.Equal(t, "", *input.Value)
+	assert.Empty(t, *input.Value)
 }
 
 func TestModifyImageAttribute_GatewayValidationFailureReturnsEarly(t *testing.T) {
-	_, err := ModifyImageAttribute(&ec2.ModifyImageAttributeInput{}, nil, "000000000001")
+	_, err := ModifyImageAttribute(context.Background(), &ec2.ModifyImageAttributeInput{}, nil, "000000000001")
 	assert.Error(t, err)
 	assert.Equal(t, awserrors.ErrorMissingParameter, err.Error())
 }

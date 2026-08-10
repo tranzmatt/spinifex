@@ -2,6 +2,7 @@ package vm
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -21,7 +22,41 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/viperblock/viperblock"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+const vmTracerName = "github.com/mulgadc/spinifex/spinifex/vm"
+
+// noTraceKey marks a context whose QMP commands should not open spans —
+// used by the heartbeat poller, which would otherwise root a trace per tick.
+type noTraceKey struct{}
+
+// endSpanWithError records err (if any) on span and ends it.
+func endSpanWithError(span trace.Span, err error) {
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.End()
+}
+
+// recordInstanceFailure surfaces a reaped-launch as an APM error event on the
+// active span so the failure reason is queryable in the error stream,
+// correlated by trace id. No-op when ctx carries no recording span.
+func recordInstanceFailure(ctx context.Context, instanceID, reason string) {
+	span := trace.SpanFromContext(ctx)
+	if !span.IsRecording() {
+		return
+	}
+	span.RecordError(fmt.Errorf("instance %s launch failed: %s", instanceID, reason),
+		trace.WithAttributes(
+			attribute.String("instance.id", instanceID),
+			attribute.String("failure.reason", reason),
+		))
+}
 
 // RG-4 guest OOM tiers: user guests are reaped first; system instances (ELBv2,
 // EKS) rank above user guests but below infra (OOMScoreAdjust=-500).
@@ -42,13 +77,13 @@ func guestOOMScore(managedBy string) int {
 // Run launches a VM: validate state, mount volumes, exec QEMU, attach QMP,
 // transition to Running, fire OnInstanceUp. Inserts the instance before
 // transitioning. Used by RunInstances, start-stopped handler, restore, and crash recovery.
-func (m *Manager) Run(instance *VM) error {
-	return m.launch(instance)
+func (m *Manager) Run(ctx context.Context, instance *VM) error {
+	return m.launch(ctx, instance)
 }
 
 // Start re-launches a stopped instance by id. Returns ErrInstanceNotFound when
 // id is unknown so callers can map the failure to InvalidInstanceID.NotFound.
-func (m *Manager) Start(id string) error {
+func (m *Manager) Start(ctx context.Context, id string) error {
 	instance, ok := m.Get(id)
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrInstanceNotFound, id)
@@ -60,12 +95,12 @@ func (m *Manager) Start(id string) error {
 			return err
 		}
 	}
-	return m.launch(instance)
+	return m.launch(ctx, instance)
 }
 
 // Reboot issues a QMP system_reset; the VM stays in StateRunning while QEMU
 // re-runs firmware. Returns ErrInstanceNotFound or ErrInvalidTransition as appropriate.
-func (m *Manager) Reboot(id string) error {
+func (m *Manager) Reboot(ctx context.Context, id string) error {
 	instance, ok := m.Get(id)
 	if !ok {
 		return ErrInstanceNotFound
@@ -74,7 +109,7 @@ func (m *Manager) Reboot(id string) error {
 		return fmt.Errorf("%w: cannot reboot instance %s in state %s",
 			ErrInvalidTransition, id, status)
 	}
-	if _, err := sendQMPCommand(instance.QMPClient, qmp.QMPCommand{Execute: "system_reset"}, id); err != nil {
+	if _, err := sendQMPCommand(ctx, instance.QMPClient, qmp.QMPCommand{Execute: "system_reset"}, id); err != nil {
 		return fmt.Errorf("QMP system_reset: %w", err)
 	}
 	return nil
@@ -93,7 +128,14 @@ func (m *Manager) launchStillValid(instance *VM) bool {
 
 // launch is the orchestrator: pid check, mount volumes, exec QEMU, attach
 // QMP, fire OnInstanceUp, transition to Running.
-func (m *Manager) launch(instance *VM) error {
+func (m *Manager) launch(ctx context.Context, instance *VM) (err error) {
+	ctx, span := otel.Tracer(vmTracerName).Start(ctx, "vm.launch",
+		trace.WithAttributes(
+			attribute.String("instance.id", instance.ID),
+			attribute.String("instance.type", instance.InstanceType),
+		))
+	defer func() { endSpanWithError(span, err) }()
+
 	if !m.launchStillValid(instance) {
 		return nil
 	}
@@ -105,14 +147,17 @@ func (m *Manager) launch(instance *VM) error {
 			return err
 		}
 		if err := process.Signal(syscall.Signal(0)); err == nil {
-			slog.Error("Instance is already running", "InstanceID", instance.ID, "pid", pid)
+			slog.ErrorContext(ctx, "Instance is already running", "InstanceID", instance.ID, "pid", pid)
 			return errors.New("instance is already running")
 		}
 	}
 
-	if err := m.deps.VolumeMounter.Mount(instance); err != nil {
-		slog.Error("Failed to mount volumes", "err", err)
-		return err
+	_, mountSpan := otel.Tracer(vmTracerName).Start(ctx, "vm.launch.mount_volumes")
+	mountErr := m.deps.VolumeMounter.Mount(instance)
+	endSpanWithError(mountSpan, mountErr)
+	if mountErr != nil {
+		slog.ErrorContext(ctx, "Failed to mount volumes", "err", mountErr)
+		return mountErr
 	}
 
 	// Re-check status — Mount can take 30+s on cold AMIs, and a terminate may
@@ -121,14 +166,32 @@ func (m *Manager) launch(instance *VM) error {
 		return nil
 	}
 
-	if err := m.startQEMU(instance); err != nil {
-		slog.Error("Failed to launch instance", "err", err)
-		return err
+	// Make the routing record durable before QEMU can write. If persistence
+	// fails, unmounting seals the untouched backend and keeps the launch from
+	// exposing a writer that snapshots would classify as available.
+	if stateErr := m.markAttachedVolumesInUse(instance); stateErr != nil {
+		if unmountErr := m.deps.VolumeMounter.Unmount(instance); unmountErr != nil {
+			return errors.Join(
+				fmt.Errorf("persist attached volume state: %w", stateErr),
+				fmt.Errorf("rollback mounted volumes: %w", unmountErr),
+			)
+		}
+		return fmt.Errorf("persist attached volume state: %w", stateErr)
 	}
 
-	qmpClient, err := newQMPClientWithHandshake(instance)
+	_, qemuSpan := otel.Tracer(vmTracerName).Start(ctx, "vm.launch.start_qemu")
+	qemuErr := m.startQEMU(instance)
+	endSpanWithError(qemuSpan, qemuErr)
+	if qemuErr != nil {
+		slog.ErrorContext(ctx, "Failed to launch instance", "err", qemuErr)
+		return qemuErr
+	}
+
+	_, qmpSpan := otel.Tracer(vmTracerName).Start(ctx, "vm.launch.qmp_connect")
+	qmpClient, err := newQMPClientWithHandshake(ctx, instance)
+	endSpanWithError(qmpSpan, err)
 	if err != nil {
-		slog.Error("Failed to create QMP client", "err", err)
+		slog.ErrorContext(ctx, "Failed to create QMP client", "err", err)
 		// QEMU started but QMP handshake failed. Kill it synchronously so the
 		// VFIO device is released before the caller frees the GPU pool entry;
 		// otherwise the next Claim gets the same PCI address while QEMU still
@@ -142,7 +205,7 @@ func (m *Manager) launch(instance *VM) error {
 		return err
 	}
 	instance.QMPClient = qmpClient
-	go m.qmpHeartbeat(instance)
+	go m.qmpHeartbeat(instance) //nolint:gosec // heartbeat outlives the launch request; must not inherit its cancellation
 
 	m.Insert(instance)
 
@@ -153,14 +216,14 @@ func (m *Manager) launch(instance *VM) error {
 	}
 
 	if m.deps.TransitionState != nil {
-		if err := m.deps.TransitionState(instance, StateRunning); err != nil {
-			slog.Error("Failed to transition instance to running", "instanceId", instance.ID, "err", err)
-			return err
+		_, stateSpan := otel.Tracer(vmTracerName).Start(ctx, "vm.launch.persist_state")
+		transitionErr := m.deps.TransitionState(instance, StateRunning)
+		endSpanWithError(stateSpan, transitionErr)
+		if transitionErr != nil {
+			slog.ErrorContext(ctx, "Failed to transition instance to running", "instanceId", instance.ID, "err", transitionErr)
+			return transitionErr
 		}
 	}
-
-	// Mark boot volumes as "in-use" now that instance is confirmed running.
-	m.markBootVolumesInUse(instance)
 
 	if m.deps.Hooks.OnInstanceUp != nil {
 		// Launch path: per-instance subscribe failures are logged and the
@@ -168,7 +231,7 @@ func (m *Manager) launch(instance *VM) error {
 		// fan-out (DescribeInstances) and the next OnInstanceUp on a
 		// state-touching event will reinstall the subs idempotently.
 		if err := m.deps.Hooks.OnInstanceUp(instance); err != nil {
-			slog.Error("OnInstanceUp hook reported error during launch",
+			slog.ErrorContext(ctx, "OnInstanceUp hook reported error during launch",
 				"instance", instance.ID, "err", err)
 		}
 	}
@@ -176,24 +239,28 @@ func (m *Manager) launch(instance *VM) error {
 	return nil
 }
 
-// markBootVolumesInUse re-asserts "in-use" status for an instance's boot
-// volumes once it is confirmed running. Used by the launch path and the
-// daemon-restart reconnect path so both keep volume state consistent with a
-// running instance. Errors are logged, not fatal.
-func (m *Manager) markBootVolumesInUse(instance *VM) {
-	if m.deps.VolumeStateUpdater == nil {
-		return
-	}
+// markAttachedVolumesInUse persists routing state for every attached EBS
+// volume before a launch exposes them to QEMU. Callers must abort or fail
+// recovery when an update fails; logging and continuing would let snapshots
+// mistake a live writer for an available volume.
+func (m *Manager) markAttachedVolumesInUse(instance *VM) error {
 	instance.EBSRequests.Mu.Lock()
-	defer instance.EBSRequests.Mu.Unlock()
-	for _, ebsReq := range instance.EBSRequests.Requests {
-		if !ebsReq.Boot {
+	requests := append([]types.EBSRequest(nil), instance.EBSRequests.Requests...)
+	instance.EBSRequests.Mu.Unlock()
+
+	for _, ebsReq := range requests {
+		// EFI pflash is not a KV-tracked EBS volume; skip it like the unmount gate.
+		if ebsReq.EFI {
 			continue
 		}
-		if err := m.deps.VolumeStateUpdater.UpdateVolumeState(ebsReq.Name, "in-use", instance.ID, ""); err != nil {
-			slog.Error("Failed to update volume state to in-use", "volumeId", ebsReq.Name, "err", err)
+		if m.deps.VolumeStateUpdater == nil {
+			return errors.New("volume state updater not wired")
+		}
+		if err := m.deps.VolumeStateUpdater.UpdateVolumeState(ebsReq.Name, "in-use", instance.ID, ebsReq.DeviceName); err != nil {
+			return fmt.Errorf("persist in-use state for volume %s: %w", ebsReq.Name, err)
 		}
 	}
+	return nil
 }
 
 const (
@@ -234,14 +301,15 @@ func (m *Manager) startQEMU(instance *VM) error {
 		m.initENIRequests(instance)
 
 		instance.EBSRequests.Mu.Lock()
-		drives, iothreads, devices, err := buildDrives(instance.EBSRequests.Requests, spec.VCPUs, instance.Config.MachineType)
+		driveCfg, err := buildDrives(instance.EBSRequests.Requests, spec.VCPUs, instance.Config.MachineType)
 		instance.EBSRequests.Mu.Unlock()
 		if err != nil {
 			return err
 		}
-		instance.Config.Drives = append(instance.Config.Drives, drives...)
-		instance.Config.IOThreads = append(instance.Config.IOThreads, iothreads...)
-		instance.Config.Devices = append(instance.Config.Devices, devices...)
+		instance.Config.Drives = append(instance.Config.Drives, driveCfg.Drives...)
+		instance.Config.IOThreads = append(instance.Config.IOThreads, driveCfg.IOThreads...)
+		instance.Config.Devices = append(instance.Config.Devices, driveCfg.Devices...)
+		instance.Config.Blockdevs = append(instance.Config.Blockdevs, driveCfg.Blockdevs...)
 	}
 
 	if instance.DirectBoot {
@@ -336,6 +404,17 @@ func (m *Manager) startQEMU(instance *VM) error {
 
 		if instance.MgmtMAC != "" {
 			mgmtTap := MgmtTapName(instance.ID)
+			// Pre-create the mgmt tap owned by the daemon euid, mirroring the
+			// direct-boot branch above. The non-root daemon has no CAP_NET_ADMIN,
+			// so QEMU can only attach a tap it already owns; without this the
+			// disk-boot/restart path fails with /dev/net/tun: Operation not
+			// permitted (blocks stopped-instance restart incl. EKS CP recovery).
+			if m.deps.NetworkPlumber != nil {
+				if err := m.deps.NetworkPlumber.SetupTap(TapSpec{Name: mgmtTap, Bridge: "br-mgmt"}); err != nil {
+					slog.Error("Failed to set up mgmt tap", "tap", mgmtTap, "err", err)
+					return fmt.Errorf("setup mgmt tap: %w", err)
+				}
+			}
 			instance.Config.NetDevs = append(instance.Config.NetDevs, NetDev{
 				Value: fmt.Sprintf("tap,id=mgmt0,ifname=%s,script=no,downscript=no", mgmtTap),
 			})
@@ -372,6 +451,26 @@ func (m *Manager) startQEMU(instance *VM) error {
 		return err
 	}
 	instance.Config.QMPSocket = qmpSocket
+
+	// A predecessor QEMU killed with SIGKILL (crash/etcd-reset restart) leaves its
+	// qmp-<id>.sock inode behind. QEMU rebinds the socket, but the stale inode
+	// makes the startup os.Stat probe and the QMP dial race a dead listener
+	// (connection refused). Unlink it so the socket that appears is the fresh
+	// QEMU's. The launch pid-check above already ruled out a live owner.
+	if err := removeStaleQMPSocket(qmpSocket); err != nil {
+		slog.Warn("Failed to remove stale QMP socket", "path", qmpSocket, "err", err)
+	}
+
+	// Second QMP monitor for the metrics collector; a stale socket from a
+	// SIGKILLed QEMU is unlinked so the fresh process can bind. Telemetry
+	// never blocks a launch — failures degrade to no metrics for this VM.
+	if telemetrySocket, terr := utils.GenerateSocketFile(utils.QMPTelemetryPrefix + instance.ID); terr != nil {
+		slog.Warn("Failed to generate telemetry QMP socket", "instanceId", instance.ID, "err", terr)
+	} else {
+		_ = os.Remove(telemetrySocket)
+		instance.Config.TelemetryQMPSocket = telemetrySocket
+		refreshTelemetryMeta(instance)
+	}
 
 	instance.EBSRequests.Mu.Lock()
 	nbdEndpoints := make([]struct{ name, uri string }, 0, len(instance.EBSRequests.Requests))
@@ -566,7 +665,8 @@ func (m *Manager) appendDevHostfwdNIC(instance *VM) {
 // AttachQMP connects a QMP client to an already-running QEMU process and
 // starts the heartbeat goroutine. Used by reconnect callers on daemon restart.
 func (m *Manager) AttachQMP(instance *VM) error {
-	client, err := newQMPClientWithHandshake(instance)
+	// Reconnect path runs outside any request; not request-scoped.
+	client, err := newQMPClientWithHandshake(context.Background(), instance)
 	if err != nil {
 		return err
 	}
@@ -575,23 +675,117 @@ func (m *Manager) AttachQMP(instance *VM) error {
 	return nil
 }
 
+const (
+	// qmpDialTimeout bounds how long the QMP dial retries a transient connect
+	// failure after a QEMU relaunch before giving up.
+	qmpDialTimeout = 3 * time.Second
+	// qmpDialRetryInterval is the backoff between QMP connect retries.
+	qmpDialRetryInterval = 50 * time.Millisecond
+)
+
+// qmpSocketWaitTimeout bounds how long newQMPClientWithHandshake waits for the
+// QMP socket inode to appear before dialling. Mirrors qmpDialTimeout; a test
+// seam overrides it to keep dial-failure tests off the wall clock.
+var qmpSocketWaitTimeout = 3 * time.Second
+
+const (
+	// qmpVFIOGreetingBase is the fixed VFIO startup overhead before RAM pinning
+	// dominates (IOMMU domain setup, device realize). The RAM term is added on
+	// top; the result is floored so small guests keep the proven deadline.
+	qmpVFIOGreetingBase = 30 * time.Second
+	// qmpVFIOGreetingPerGiB is the wait added per GiB of guest RAM: the VFIO pin
+	// is synchronous and its cost grows ~linearly with RAM and host memory
+	// pressure, so a flat deadline under-waits large guests and SIGKILLs a QEMU
+	// that would have come up. Generous to cover a loaded host.
+	qmpVFIOGreetingPerGiB = 8 * time.Second
+	// qmpVFIOGreetingFloor is the minimum VFIO greeting wait. QEMU must
+	// lock+DMA-map the whole guest RAM before the monitor answers, which far
+	// exceeds the plain-VM default even for a small guest (a 16GB EKS GPU worker
+	// takes >30s on wattle). Small guests land here.
+	qmpVFIOGreetingFloor = 180 * time.Second
+	// qmpVFIOGreetingCap bounds the scaled wait so a mis-sized guest cannot
+	// wedge a launch indefinitely.
+	qmpVFIOGreetingCap = 600 * time.Second
+)
+
+// qmpGreetingTimeout picks the QMP greeting deadline for a VM: the plain default
+// unless the guest has GPU/VFIO passthrough, whose synchronous RAM pin delays the
+// monitor. For VFIO the deadline is base + perGiB*RAM, floored so small guests
+// keep the proven deadline and capped so a huge guest cannot wedge a launch.
+func qmpGreetingTimeout(v *VM) time.Duration {
+	if len(v.GPUAttachments) == 0 {
+		return qmp.DefaultGreetingTimeout
+	}
+	memGiB := v.Config.Memory / 1024
+	scaled := qmpVFIOGreetingBase + time.Duration(memGiB)*qmpVFIOGreetingPerGiB
+	scaled = max(scaled, qmpVFIOGreetingFloor)
+	scaled = min(scaled, qmpVFIOGreetingCap)
+	return scaled
+}
+
+// removeStaleQMPSocket unlinks a leftover QMP socket inode from a prior QEMU so
+// the startup probe and QMP dial cannot race a dead listener. A missing file is
+// not an error.
+func removeStaleQMPSocket(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// dialQMPWithRetry redials the QMP socket until the connect+greeting succeeds or
+// the deadline passes. A just-relaunched QEMU can present the socket inode a beat
+// before it listen()s, and a stale inode from a SIGKILLed predecessor refuses the
+// first connect; a fresh QEMU also accepts the connect then resets mid-greeting
+// while it initialises. A single dial then loses the race. Only transient connect
+// or reset errors are retried — a decode/handshake failure from a settled QEMU
+// surfaces immediately.
+func dialQMPWithRetry(path string, greetingTimeout time.Duration) (*qmp.QMPClient, error) {
+	deadline := time.Now().Add(qmpDialTimeout)
+	for {
+		client, err := qmp.NewQMPClientWithGreetingTimeout(path, greetingTimeout)
+		if err == nil {
+			return client, nil
+		}
+		if time.Now().After(deadline) || !isTransientDialError(err) {
+			return nil, err
+		}
+		time.Sleep(qmpDialRetryInterval)
+	}
+}
+
+// isTransientDialError reports whether a QMP connect failed because the listener
+// is not up yet: connection refused (bound but pre-listen, or a stale dead
+// inode), the socket momentarily absent between unlink and rebind, or the peer
+// tearing the connection down mid-greeting (reset/broken pipe) — a fresh QEMU
+// that accepts then resets before it can service the monitor. Each clears once
+// QEMU finishes initialising, so the dial is retried rather than surfaced.
+func isTransientDialError(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+}
+
 // newQMPClientWithHandshake dials the QMP socket and runs the qmp_capabilities
 // handshake. The caller is responsible for starting the heartbeat goroutine.
-func newQMPClientWithHandshake(v *VM) (*qmp.QMPClient, error) {
+func newQMPClientWithHandshake(ctx context.Context, v *VM) (*qmp.QMPClient, error) {
 	// QMP socket bind lags the pidfile under recovery load; wait for the
 	// socket inode to exist before dialling to avoid an ENOENT race.
-	if err := utils.WaitForUnixSocket(v.Config.QMPSocket, 3*time.Second); err != nil {
+	if err := utils.WaitForUnixSocket(v.Config.QMPSocket, qmpSocketWaitTimeout); err != nil {
 		return nil, fmt.Errorf("connect QMP socket %s: %w", v.Config.QMPSocket, err)
 	}
-	client, err := qmp.NewQMPClient(v.Config.QMPSocket)
+	client, err := dialQMPWithRetry(v.Config.QMPSocket, qmpGreetingTimeout(v))
 	if err != nil {
 		return nil, fmt.Errorf("connect QMP socket %s: %w", v.Config.QMPSocket, err)
 	}
-	if _, err := sendQMPCommand(client, qmp.QMPCommand{Execute: "qmp_capabilities"}, v.ID); err != nil {
+	// A VFIO guest greets before its RAM pin completes, then cannot service
+	// qmp_capabilities until the pin finishes — which scales with guest RAM and
+	// host memory pressure. Give the handshake the same budget as the greeting so
+	// the reply is not decode-timed-out and the launch SIGKILLed mid-pin.
+	if _, err := sendQMPCommandWithTimeout(ctx, client, qmp.QMPCommand{Execute: "qmp_capabilities"}, v.ID, qmpGreetingTimeout(v)); err != nil {
 		_ = client.Conn.Close()
 		return nil, err
 	}
-	slog.Debug("QMP handshake complete", "instance", v.ID)
+	slog.DebugContext(ctx, "QMP handshake complete", "instance", v.ID)
 	return client, nil
 }
 
@@ -627,7 +821,8 @@ func (m *Manager) qmpHeartbeat(instance *VM) {
 		}
 
 		slog.Debug("QMP heartbeat", "instance", instance.ID)
-		qmpStatus, err := sendQMPCommand(instance.QMPClient, qmp.QMPCommand{Execute: "query-status"}, instance.ID)
+		qmpStatus, err := sendQMPCommand(context.WithValue(context.Background(), noTraceKey{}, true),
+			instance.QMPClient, qmp.QMPCommand{Execute: "query-status"}, instance.ID)
 		if err != nil {
 			failures := m.recordQMPFailure(instance)
 			slog.Warn("QMP heartbeat failed", "instance", instance.ID, "consecutiveFailures", failures, "err", err)
@@ -674,8 +869,29 @@ func (m *Manager) recordQMPSuccess(instance *VM) {
 	})
 }
 
+// qmpCommandTimeout bounds a QMP command's response decode for a running guest.
+// The handshake on a VFIO launch needs longer (the monitor greets before the RAM
+// pin finishes, then stalls the qmp_capabilities reply) and passes its own value.
+const qmpCommandTimeout = 30 * time.Second
+
 // sendQMPCommand encodes cmd and decodes the response, skipping event messages.
-func sendQMPCommand(q *qmp.QMPClient, cmd qmp.QMPCommand, instanceID string) (*qmp.QMPResponse, error) {
+func sendQMPCommand(ctx context.Context, q *qmp.QMPClient, cmd qmp.QMPCommand, instanceID string) (*qmp.QMPResponse, error) {
+	return sendQMPCommandWithTimeout(ctx, q, cmd, instanceID, qmpCommandTimeout)
+}
+
+// sendQMPCommandWithTimeout is sendQMPCommand with an explicit response deadline,
+// re-armed after each interleaved event. VFIO handshakes pass a RAM-scaled value.
+func sendQMPCommandWithTimeout(ctx context.Context, q *qmp.QMPClient, cmd qmp.QMPCommand, instanceID string, timeout time.Duration) (_ *qmp.QMPResponse, err error) {
+	if ctx.Value(noTraceKey{}) == nil {
+		var span trace.Span
+		_, span = otel.Tracer(vmTracerName).Start(ctx, "qmp "+cmd.Execute,
+			trace.WithAttributes(
+				attribute.String("qmp.command", cmd.Execute),
+				attribute.String("instance.id", instanceID),
+			))
+		defer func() { endSpanWithError(span, err) }()
+	}
+
 	if q == nil || q.Encoder == nil || q.Decoder == nil {
 		return nil, fmt.Errorf("QMP client is not initialized")
 	}
@@ -692,7 +908,7 @@ func sendQMPCommand(q *qmp.QMPClient, cmd qmp.QMPCommand, instanceID string) (*q
 		}
 	}
 
-	if err := q.Conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+	if err := q.Conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, fmt.Errorf("set read deadline: %w", err)
 	}
 	defer func() { _ = q.Conn.SetReadDeadline(time.Time{}) }()
@@ -710,8 +926,8 @@ func sendQMPCommand(q *qmp.QMPClient, cmd qmp.QMPCommand, instanceID string) (*q
 			return nil, fmt.Errorf("decode error: %w", err)
 		}
 		if _, ok := msg["event"]; ok {
-			slog.Info("QMP event", "event", msg["event"], "instanceId", instanceID)
-			if err := q.Conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			slog.InfoContext(ctx, "QMP event", "event", msg["event"], "instanceId", instanceID)
+			if err := q.Conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 				return nil, fmt.Errorf("set read deadline: %w", err)
 			}
 			continue
@@ -741,7 +957,19 @@ func reconnectQMP(q *qmp.QMPClient, instanceID string) error {
 	if q.Path == "" {
 		return fmt.Errorf("QMP client has no socket path")
 	}
-	fresh, err := qmp.NewQMPClient(q.Path)
+
+	// QEMU's monitor is a single-client `server,nowait` listener: the old
+	// connection must be closed before redialing, or it still holds the
+	// only client slot and the fresh dial gets no greeting, blocking until
+	// NewQMPClient's read deadline expires. dialQMPWithRetry absorbs the
+	// brief post-close ECONNREFUSED window while the listener re-arms.
+	if q.Conn != nil {
+		_ = q.Conn.Close()
+	}
+
+	// A reconnect targets an already-running QEMU whose RAM is long pinned, so
+	// the greeting returns promptly — the plain default deadline is enough.
+	fresh, err := dialQMPWithRetry(q.Path, qmp.DefaultGreetingTimeout)
 	if err != nil {
 		return fmt.Errorf("redial QMP socket %s: %w", q.Path, err)
 	}
@@ -774,9 +1002,6 @@ func reconnectQMP(q *qmp.QMPClient, instanceID string) error {
 	}
 	_ = fresh.Conn.SetReadDeadline(time.Time{})
 
-	if q.Conn != nil {
-		_ = q.Conn.Close()
-	}
 	q.Conn = fresh.Conn
 	q.Decoder = fresh.Decoder
 	q.Encoder = fresh.Encoder
@@ -796,8 +1021,11 @@ const EBSHotPlugSlotCount = 11
 // which. The primary data ENI is marked DHCP (OVN serves it; it carries the
 // default route, and bringing it up before cloud-init's network stage is what
 // lets the Ec2 datasource reach IMDS — without it cloud-init brings up the mgmt
-// NIC instead and falls to DataSourceNone). mgmt0 lives on br-mgmt with no DHCP,
-// so its static address is delivered here; it is never the default route. The
+// NIC instead and falls to DataSourceNone). Every extra ENI is DHCP too, but
+// never the default route. mgmt0 lives on br-mgmt with no DHCP, so its static
+// address is delivered here; it is never the default route either. The blob
+// must name every NIC QEMU is given: the guest configures by MAC, so a NIC the
+// blob omits is left down and address-less, unreachable at its own VPC IP. The
 // blob key format matches daemon.buildNetcfgBlob and build/microvm/init.sh.
 // No-op without a mgmt NIC, so single-NIC guests are untouched — cloud-init
 // brings their one NIC up.
@@ -810,6 +1038,17 @@ func (m *Manager) appendSystemNetcfgFwCfg(instance *VM) error {
 	// Primary data ENI: DHCP (OVN-served) + default route.
 	if instance.ENIMac != "" {
 		fmt.Fprintf(&b, "NIC%d_MAC=%s\nNIC%d_DHCP=1\nNIC%d_DEFAULT=1\n", n, instance.ENIMac, n, n)
+		n++
+	}
+	// Additional VPC ENIs: an RDS DB VM's customer-VPC NIC is the case. OVN
+	// serves DHCP on each, which is also what supplies their subnet routes.
+	// None may take the default route — that stays with the primary ENI,
+	// which carries the IMDS path.
+	for _, extra := range instance.ExtraENIs {
+		if extra.ENIMac == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "NIC%d_MAC=%s\nNIC%d_DHCP=1\nNIC%d_DEFAULT=0\n", n, extra.ENIMac, n, n)
 		n++
 	}
 	// Management NIC: static, off br-mgmt, never the default route.
@@ -889,42 +1128,115 @@ func (m *Manager) initENIRequests(instance *VM) {
 	}
 }
 
-// buildDrives converts EBS requests into QEMU drive/iothread/device configs.
-// Returns an error if any volume is missing its NBDURI. EFI volumes emit
-// pflash unit=1; the readonly CODE blob (unit=0) is added by Config.Execute.
-func buildDrives(requests []types.EBSRequest, cpuCount int, machineType string) ([]Drive, []IOThread, []Device, error) {
-	var drives []Drive
-	var iothreads []IOThread
-	var devices []Device
+// driveConfig is buildDrives' output: the QEMU drive/iothread/device/blockdev
+// entries derived from one instance's EBS requests.
+type driveConfig struct {
+	Drives    []Drive
+	IOThreads []IOThread
+	Devices   []Device
+	Blockdevs []Blockdev
+}
 
-	for _, v := range requests {
+// buildDrives converts EBS requests into QEMU drive/iothread/device/blockdev
+// configs. Returns an error if any volume is missing its NBDURI, or if the
+// EBS hot-plug port pool is exhausted while allocating one for a data volume.
+//
+// Boot volumes keep the existing anonymous if=none -drive shape exactly as
+// before — they are not detachable (see ErrVolumeNotDetachable), so the
+// anonymous-node problem this function otherwise fixes does not apply, and
+// changing the boot drive risks boot order. EFI volumes emit pflash unit=1;
+// the readonly CODE blob (unit=0) is added by Config.Execute.
+//
+// Every other (data) volume is given the same named node-name/device-id/
+// iothread-id shape AttachVolume's hot-plug path uses, via a -blockdev entry
+// and a matching -device, instead of the old bare -drive with no id and no
+// node-name. Without this a relaunched (stop/start, reboot, resize) data
+// volume was undetachable: device_del/blockdev-del had nothing to address,
+// so DetachVolume could never complete and the NBD socket stayed open until
+// the unmount burned its full kill grace.
+//
+// requests is mutated in place: a data volume with no persisted HotplugPort
+// (state written before hot-plug port accounting existed, or a volume
+// attached at RunInstances time) gets one allocated and written back, so a
+// later relaunch reuses the same port instead of reallocating it.
+func buildDrives(requests []types.EBSRequest, cpuCount int, machineType string) (driveConfig, error) {
+	var cfg driveConfig
+
+	for i := range requests {
+		v := &requests[i]
 		if v.NBDURI == "" {
-			return nil, nil, nil, fmt.Errorf("NBDURI not set for volume %s - was volume mounted?", v.Name)
+			return driveConfig{}, fmt.Errorf("NBDURI not set for volume %s - was volume mounted?", v.Name)
 		}
 
-		drive := Drive{File: v.NBDURI}
+		switch {
+		case v.Boot:
+			drive := Drive{
+				File:   v.NBDURI,
+				Format: "raw",
+				If:     "none",
+				Media:  "disk",
+				ID:     "os",
+				Cache:  "none",
 
-		if v.Boot {
-			drive.Format = "raw"
-			drive.If = "none"
-			drive.Media = "disk"
-			drive.ID = "os"
-			drive.Cache = "none"
+				// Report backend write errors to the guest rather than letting
+				// QEMU's default werror=enospc pause the VM: when the storage
+				// pool exhausts, the guest fs then returns a clean ENOSPC to
+				// userspace and the VM stays reachable instead of freezing.
+				Werror: "report",
+				Rerror: "report",
+			}
 
 			iothreadID := "ioth-os"
-			iothreads = append(iothreads, IOThread{ID: iothreadID})
-			devices = append(devices, BlkDevice(machineType, drive.ID, iothreadID, cpuCount, 1))
-		}
+			cfg.IOThreads = append(cfg.IOThreads, IOThread{ID: iothreadID})
+			cfg.Devices = append(cfg.Devices, BlkDevice(machineType, drive.ID, iothreadID, cpuCount, 1))
+			cfg.Drives = append(cfg.Drives, drive)
 
-		if v.EFI {
-			drive.Format = "raw"
-			drive.If = "pflash"
-			drive.Unit = 1
+		case v.EFI:
+			cfg.Drives = append(cfg.Drives, Drive{
+				File:   v.NBDURI,
+				Format: "raw",
+				If:     "pflash",
+				Unit:   1,
+			})
+
+		default:
+			// A data (non-boot, non-EFI) volume. Allocate a stable hot-plug
+			// port when the persisted state predates port accounting, or the
+			// volume was attached at RunInstances time without one;
+			// freeHotplugEBSPort re-scans requests as mutated so far in this
+			// loop, so two unset data volumes in one call cannot collide.
+			if v.HotplugPort == 0 {
+				port := freeHotplugEBSPort(requests)
+				if port == 0 {
+					return driveConfig{}, fmt.Errorf("no free EBS hot-plug port for volume %s", v.Name)
+				}
+				v.HotplugPort = port
+			}
+
+			serverType, socketPath, nbdHost, nbdPort, err := utils.ParseNBDURI(v.NBDURI)
+			if err != nil {
+				return driveConfig{}, fmt.Errorf("parse NBDURI for volume %s: %w", v.Name, err)
+			}
+
+			nodeName := VolumeNodeName(v.Name)
+			iothreadID := VolumeIOThreadID(v.Name)
+			bus := HotplugEBSBus(v.HotplugPort)
+
+			cfg.IOThreads = append(cfg.IOThreads, IOThread{ID: iothreadID})
+			cfg.Blockdevs = append(cfg.Blockdevs, VolumeBlockdev(nodeName, NBDServerOpts{
+				Type: serverType,
+				Path: socketPath,
+				Host: nbdHost,
+				Port: nbdPort,
+			}))
+			cfg.Devices = append(cfg.Devices, VolumeBlkDevice(v.Name, nodeName, iothreadID, bus))
+			// Deliberately no entry in cfg.Drives: the bare anonymous -drive
+			// this case used to emit (no id=, no node-name=) is exactly what
+			// left the volume undetachable.
 		}
 
 		slog.Info("Using NBD URI for drive", "volume", v.Name, "uri", v.NBDURI)
-		drives = append(drives, drive)
 	}
 
-	return drives, iothreads, devices, nil
+	return cfg, nil
 }

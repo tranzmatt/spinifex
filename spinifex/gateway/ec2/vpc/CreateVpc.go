@@ -1,6 +1,7 @@
 package gateway_ec2_vpc
 
 import (
+	"context"
 	"errors"
 
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -19,8 +20,8 @@ func ValidateCreateVpcInput(input *ec2.CreateVpcInput) error {
 	return nil
 }
 
-// CreateVpc handles the EC2 CreateVpc API call
-func CreateVpc(input *ec2.CreateVpcInput, natsConn *nats.Conn, accountID string) (ec2.CreateVpcOutput, error) {
+// CreateVpc handles the EC2 CreateVpc API call.
+func CreateVpc(ctx context.Context, input *ec2.CreateVpcInput, natsConn *nats.Conn, accountID string) (ec2.CreateVpcOutput, error) {
 	var output ec2.CreateVpcOutput
 
 	if err := ValidateCreateVpcInput(input); err != nil {
@@ -28,7 +29,7 @@ func CreateVpc(input *ec2.CreateVpcInput, natsConn *nats.Conn, accountID string)
 	}
 
 	svc := handlers_ec2_vpc.NewNATSVPCService(natsConn)
-	result, err := svc.CreateVpc(input, accountID)
+	result, err := svc.CreateVpc(ctx, input, accountID)
 	if err != nil {
 		return output, err
 	}

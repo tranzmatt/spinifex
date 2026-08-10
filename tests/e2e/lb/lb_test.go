@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -49,12 +50,23 @@ const (
 	kindNLB lbKind = "NLB"
 )
 
-// TestLoadBalancer runs 4 LB variants (ALB/NLB × internet-facing/internal) as sequential
-// subtests, each with its own LB + listener + TG. Sequential scheduling keeps peak instance
-// count low (≤4) so the suite passes on capacity-constrained dev nodes.
+// TestLoadBalancer runs 8 LB scenarios (ALB/NLB × internet-facing/internal, plus
+// HTTPS/UDP/ModifyListener/ListenerRules variants) against a shared VPC and app-instance
+// fixture. Each scenario stands up its own dedicated LB (+ target group) — never shared
+// across scenarios, since ModifyListener and ListenerRules mutate their LB's listener/rules
+// in place and must not race a sibling reading the same LB.
+//
+// On multinode clusters (peer != "", i.e. the cluster has the node2 the internet-facing
+// scenarios drive traffic from — this suite's multinode target is a 3-node cluster) there is
+// enough spare capacity to stand up every scenario's dedicated LB at once, so subtests run
+// concurrently via t.Parallel() instead of serially tearing one LB down before the next is
+// created. Single-node dev boxes lack that headroom and keep the original serial
+// create -> verify -> teardown path, where createActiveLB's retry/backoff absorbs the wait
+// for the previous LB's sys.micro slot to be reclaimed.
 func TestLoadBalancer(t *testing.T) {
 	env := harness.LoadEnv(t)
 	skipIfDevNetworking(t, env)
+	harness.RequireDNSEnabled(t, env)
 
 	// Resolve peer availability before building the shared fixture so the "skip" message
 	// appears immediately rather than after minutes of VPC/VM setup.
@@ -78,15 +90,31 @@ func TestLoadBalancer(t *testing.T) {
 	client := harness.NewAWSClient(t, env)
 	fixture := setupSharedFixture(t, client, artifacts)
 
+	// A live peer implies the 3-node multinode cluster this restructure targets, which has
+	// the spare capacity to stand up every scenario's LB concurrently (see doc comment
+	// above). Single-node dev boxes (peer == "") fall through to the serial path below.
+	parallelizeLBs := peer != ""
+
+	// Internal and internet-facing LB records share one zone object: ELBChanges
+	// sets Zone to the base domain for both, and the names differ only by an
+	// "internal-" prefix. Concurrent registrations used to clobber each other
+	// there, which is why these ran serially; the writer now takes a per-zone lock,
+	// so all of them register in parallel.
 	t.Run("InternetFacing_ALB", func(t *testing.T) {
 		if peer == "" {
 			t.Skip("no peer node available")
+		}
+		if parallelizeLBs {
+			t.Parallel()
 		}
 		runLBSuite(t, client, fixture, kindALB, "internet-facing", ssh, peer)
 	})
 	t.Run("InternetFacing_NLB", func(t *testing.T) {
 		if peer == "" {
 			t.Skip("no peer node available")
+		}
+		if parallelizeLBs {
+			t.Parallel()
 		}
 		runLBSuite(t, client, fixture, kindNLB, "internet-facing", ssh, peer)
 	})
@@ -97,10 +125,47 @@ func TestLoadBalancer(t *testing.T) {
 			// internet-facing subtests use, where driver→LB reachability holds.
 			t.Skip("no peer node available")
 		}
+		if parallelizeLBs {
+			t.Parallel()
+		}
 		runHTTPSCertSuite(t, client, fixture)
 	})
-	// Gate remaining internal subtests on Internal_ALB: if the LB never reaches active,
-	// the rest will time out identically — fail fast instead of burning ~5min each.
+
+	if parallelizeLBs {
+		// Multinode: each internal subtest stands up its own independent LB and they start
+		// together with the internet-facing group above, so there is no serial queue for one
+		// stuck LB to back up behind.
+		// A single LB never reaching active only fails that one subtest — it can no longer
+		// cascade into 5x sequential 5-minute timeouts, so the serial path's fail-fast gate
+		// (below) is unnecessary here: concurrency itself bounds the worst-case wall time to
+		// one timeout window instead of five.
+		t.Run("Internal_ALB", func(t *testing.T) {
+			t.Parallel()
+			runLBSuite(t, client, fixture, kindALB, "internal", nil, "")
+		})
+		t.Run("Internal_NLB", func(t *testing.T) {
+			t.Parallel()
+			runLBSuite(t, client, fixture, kindNLB, "internal", nil, "")
+		})
+		t.Run("Internal_NLB_UDP", func(t *testing.T) {
+			t.Parallel()
+			runUDPNLBSuite(t, client, fixture)
+		})
+		t.Run("Internal_ALB_ModifyListener", func(t *testing.T) {
+			t.Parallel()
+			runModifyListenerSuite(t, client, fixture)
+		})
+		t.Run("Internal_ALB_ListenerRules", func(t *testing.T) {
+			t.Parallel()
+			runListenerRulesSuite(t, client, fixture)
+		})
+		return
+	}
+
+	// Single-node: gate remaining internal subtests on Internal_ALB — if the LB never
+	// reaches active, the rest will time out identically, so fail fast instead of burning
+	// ~5min each. No fixed inter-subtest sleeps: createActiveLB retries with backoff when
+	// the previous LB's sys.micro slot is still being reclaimed.
 	albOK := t.Run("Internal_ALB", func(t *testing.T) {
 		runLBSuite(t, client, fixture, kindALB, "internal", nil, "")
 	})
@@ -111,24 +176,18 @@ func TestLoadBalancer(t *testing.T) {
 	}
 	t.Run("Internal_NLB", func(t *testing.T) {
 		skipIfInternalBroken(t)
-		// Allow time for the ALB sys.micro VM's resources to be reclaimed before
-		// NLB races the deallocate on capacity-tight hosts.
-		time.Sleep(15 * time.Second)
 		runLBSuite(t, client, fixture, kindNLB, "internal", nil, "")
 	})
 	t.Run("Internal_NLB_UDP", func(t *testing.T) {
 		skipIfInternalBroken(t)
-		time.Sleep(15 * time.Second)
 		runUDPNLBSuite(t, client, fixture)
 	})
 	t.Run("Internal_ALB_ModifyListener", func(t *testing.T) {
 		skipIfInternalBroken(t)
-		time.Sleep(15 * time.Second)
 		runModifyListenerSuite(t, client, fixture)
 	})
 	t.Run("Internal_ALB_ListenerRules", func(t *testing.T) {
 		skipIfInternalBroken(t)
-		time.Sleep(15 * time.Second)
 		runListenerRulesSuite(t, client, fixture)
 	})
 }
@@ -500,11 +559,14 @@ func runLBSuite(t *testing.T, c *harness.AWSClient, f *sharedFixture, kind lbKin
 	registerTargets(t, c, tgArn, f.AppInstanceIDs)
 	t.Cleanup(func() { deregisterTargets(t, c, tgArn, f.AppInstanceIDs) })
 
-	lb := createLB(t, c, f, fmt.Sprintf("lb-e2e-%s-%s", lbName, suffix), lbType, scheme)
-	t.Cleanup(func() { deleteLB(t, c, lb) })
+	// ALB scenarios get their own LB-facing SG so concurrent scenarios (parallel
+	// internal group) never share one SG; NLBs auto-isolate via their managed SG.
+	var sgIDs []string
+	if kind == kindALB {
+		sgIDs = []string{createScenarioSG(t, c, f, fmt.Sprintf("lb-e2e-%s-%s-sg", lbName, suffix), port)}
+	}
 
-	listener := createListener(t, c, lb.ARN, proto, port, tgArn)
-	t.Cleanup(func() { deleteListener(t, c, listener) })
+	lb, _ := createActiveLB(t, c, f, fmt.Sprintf("lb-e2e-%s-%s", lbName, suffix), lbType, scheme, proto, port, tgArn, label, sgIDs)
 
 	assert.Equal(t, scheme, lb.Scheme, label+" scheme")
 	assert.Equal(t, lbType, lb.Type, label+" type")
@@ -512,7 +574,6 @@ func runLBSuite(t *testing.T, c *harness.AWSClient, f *sharedFixture, kind lbKin
 		assert.Contains(t, lb.ARN, "/net/", label+" ARN must contain /net/")
 	}
 
-	harness.WaitForLBActive(t, c, lb.ARN, label, 5*time.Minute)
 	if kind == kindNLB {
 		captureLBConsoleOnFailure(t, c, eniDescPrefix, lb)
 	}
@@ -523,6 +584,7 @@ func runLBSuite(t *testing.T, c *harness.AWSClient, f *sharedFixture, kind lbKin
 	if scheme == "internet-facing" {
 		ip := publicIP(eni)
 		require.NotEmpty(t, ip, label+" needs public IP")
+		assertLBDNSResolves(t, lb.DNSName, ip, label)
 		runInternetFacingTrafficSingle(t, kind, ssh, peer, ip)
 		if kind == kindNLB {
 			runNLBDeregisterDraining(t, c, tgArn, f.AppInstanceIDs[0])
@@ -535,6 +597,7 @@ func runLBSuite(t *testing.T, c *harness.AWSClient, f *sharedFixture, kind lbKin
 	priv := privateIP(eni)
 	require.NotEmpty(t, priv, label+" needs private IP")
 	assertInternalDNS(t, c, lb.ARN, label)
+	assertLBDNSResolves(t, lb.DNSName, priv, label)
 	runInternalTrafficViaClient(t, c, f, kind, priv)
 }
 
@@ -550,17 +613,14 @@ func runHTTPSCertSuite(t *testing.T, c *harness.AWSClient, f *sharedFixture) {
 	const label = "ALB internet-facing HTTPS (ACM)"
 	const httpsPort int64 = 443
 
-	authorizeSGPort(t, c, f, "tcp", httpsPort)
+	sgIDs := []string{createScenarioSG(t, c, f, "lb-e2e-https-sg", httpsPort)}
 
 	tgArn := createTargetGroup(t, c, f, "lb-e2e-https-tg", "HTTP", httpPort, "/index.html")
 	t.Cleanup(func() { deleteTargetGroup(t, c, tgArn) })
 	registerTargets(t, c, tgArn, f.AppInstanceIDs)
 	t.Cleanup(func() { deregisterTargets(t, c, tgArn, f.AppInstanceIDs) })
 
-	lb := createLB(t, c, f, "lb-e2e-https", "application", "internet-facing")
-	t.Cleanup(func() { deleteLB(t, c, lb) })
-
-	harness.WaitForLBActive(t, c, lb.ARN, label, 5*time.Minute)
+	lb, _ := createActiveLB(t, c, f, "lb-e2e-https", "application", "internet-facing", "", 0, "", label, sgIDs)
 	eni := lbENI(t, c, "app", lb)
 	pubIP := publicIP(eni)
 	require.NotEmpty(t, pubIP, label+" needs a public IP for the TLS handshake")
@@ -653,24 +713,59 @@ func createHTTPSListener(t *testing.T, c *harness.AWSClient, lbArn string, port 
 	return arn
 }
 
-// authorizeSGPort idempotently opens proto/port from 0.0.0.0/0 on the shared
-// default SG, tolerating the Duplicate code on re-runs.
-func authorizeSGPort(t *testing.T, c *harness.AWSClient, f *sharedFixture, proto string, port int64) {
+// createScenarioSG creates a dedicated security group for one ALB scenario's
+// frontend/listener ports and authorizes tcp/0.0.0.0/0 on each of ports. Giving
+// each ALB scenario its own SG means concurrent scenarios (see the parallel
+// internal group in TestLoadBalancer) never authorize into, or otherwise
+// mutate, the same SG object.
+//
+// This only isolates the LB-FACING side. The shared app-instance/probe-client
+// SG (f.SecurityGroup, set up by configureDefaultSG) is left untouched and
+// keeps permitting LB->target health-check and data traffic: SG ingress rules
+// gate inbound traffic at the DESTINATION ENI's own SG regardless of which SG
+// the source ENI carries, so targets never needed to share the LB's SG in the
+// first place.
+//
+// NLBs don't need this: CreateLoadBalancer with no explicit SecurityGroups
+// already gives every NLB its own auto-managed SG with listener ports opened
+// automatically, so only ALB scenarios (which otherwise fall back onto the one
+// shared VPC default SG) require an explicit dedicated SG here.
+func createScenarioSG(t *testing.T, c *harness.AWSClient, f *sharedFixture, name string, ports ...int64) string {
 	t.Helper()
-	_, err := c.EC2.AuthorizeSecurityGroupIngress(&ec2.AuthorizeSecurityGroupIngressInput{
-		GroupId: aws.String(f.SecurityGroup),
-		IpPermissions: []*ec2.IpPermission{{
-			IpProtocol: aws.String(proto),
-			FromPort:   aws.Int64(port),
-			ToPort:     aws.Int64(port),
-			IpRanges:   []*ec2.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
-		}},
+	out, err := c.EC2.CreateSecurityGroup(&ec2.CreateSecurityGroupInput{ // e2e:allow-create — a dedicated per-scenario LB SG is the isolation under test; a shared Ensure* fixture would defeat it.
+		VpcId:       aws.String(f.VPCID),
+		GroupName:   aws.String(name),
+		Description: aws.String("lb-e2e dedicated LB-facing security group"),
 	})
-	if err != nil {
-		var aerr awserr.Error
-		if !errors.As(err, &aerr) || aerr.Code() != "InvalidPermission.Duplicate" {
-			t.Fatalf("authorize %s/%d: %v", proto, port, err)
-		}
+	require.NoErrorf(t, err, "create-security-group %s", name)
+	sgID := aws.StringValue(out.GroupId)
+	t.Cleanup(func() { deleteSecurityGroup(t, c, sgID) })
+
+	for _, port := range ports {
+		_, err := c.EC2.AuthorizeSecurityGroupIngress(&ec2.AuthorizeSecurityGroupIngressInput{
+			GroupId: aws.String(sgID),
+			IpPermissions: []*ec2.IpPermission{{
+				IpProtocol: aws.String("tcp"),
+				FromPort:   aws.Int64(port),
+				ToPort:     aws.Int64(port),
+				IpRanges:   []*ec2.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
+			}},
+		})
+		require.NoErrorf(t, err, "authorize tcp/%d on %s", port, name)
+	}
+	t.Logf("scenario SG %s: %s (tcp ports=%v)", name, sgID, ports)
+	return sgID
+}
+
+// deleteSecurityGroup best-effort deletes a scenario SG created by
+// createScenarioSG. Registered via t.Cleanup after the LB's own teardown
+// (LIFO order means the LB, and the ENI referencing this SG, is gone first).
+func deleteSecurityGroup(t *testing.T, c *harness.AWSClient, sgID string) {
+	if sgID == "" {
+		return
+	}
+	if _, err := c.EC2.DeleteSecurityGroup(&ec2.DeleteSecurityGroupInput{GroupId: aws.String(sgID)}); err != nil {
+		t.Logf("delete security group %s: %v", sgID, err)
 	}
 }
 
@@ -687,20 +782,20 @@ func runUDPNLBSuite(t *testing.T, c *harness.AWSClient, f *sharedFixture) {
 	registerTargets(t, c, tgArn, f.AppInstanceIDs)
 	t.Cleanup(func() { deregisterTargets(t, c, tgArn, f.AppInstanceIDs) })
 
-	lb := createLB(t, c, f, "lb-e2e-nlb-udp", "network", "internal")
-	t.Cleanup(func() { deleteLB(t, c, lb) })
-
-	listener := createListener(t, c, lb.ARN, "UDP", udpPort, tgArn)
-	t.Cleanup(func() { deleteListener(t, c, listener) })
+	// NLB — no dedicated SG needed; CreateLoadBalancer auto-provisions one.
+	lb, _ := createActiveLB(t, c, f, "lb-e2e-nlb-udp", "network", "internal", "UDP", udpPort, tgArn, label, nil)
 
 	assert.Equal(t, "network", lb.Type, label+" type")
 	assert.Contains(t, lb.ARN, "/net/", label+" ARN must contain /net/")
 
-	harness.WaitForLBActive(t, c, lb.ARN, label, 5*time.Minute)
 	captureLBConsoleOnFailure(t, c, "net", lb)
 	// The key assertion: NLB targets reach healthy via the agent's active
 	// prober. Pre-feature this timed out (nginx reported empty server lists).
 	harness.WaitForTargetsHealthy(t, c, tgArn, 2, label, 2*time.Minute)
+	// Targets only reach healthy if the lb-agent authenticated to the gateway;
+	// with static keys dropped from user-data that auth is IMDS-only, so assert
+	// the cred provenance explicitly (no baked keys, assumed-role principal).
+	assertLBAgentAuthViaIMDS(t)
 
 	eni := lbENI(t, c, "net", lb)
 	priv := privateIP(eni)
@@ -826,10 +921,16 @@ func deregisterTargets(t *testing.T, c *harness.AWSClient, tgArn string, instanc
 }
 
 type lbInfo struct {
-	ARN, ID, Scheme, Type string
+	ARN, ID, Scheme, Type, DNSName string
 }
 
-func createLB(t *testing.T, c *harness.AWSClient, f *sharedFixture, name, lbType, scheme string) lbInfo {
+// createLB builds the CreateLoadBalancer request. sgIDs, when non-empty, is
+// passed as the LB's SecurityGroups — for ALB scenarios this is a dedicated
+// per-scenario SG (see createScenarioSG); nil for NLBs, which get their own
+// managed SG automatically. Nil/empty SecurityGroups on an ALB falls back to
+// the VPC's shared default SG, which is the multi-scenario contention this
+// per-scenario SG threading avoids.
+func createLB(t *testing.T, c *harness.AWSClient, f *sharedFixture, name, lbType, scheme string, sgIDs []string) lbInfo {
 	t.Helper()
 	in := &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String(name),
@@ -839,6 +940,9 @@ func createLB(t *testing.T, c *harness.AWSClient, f *sharedFixture, name, lbType
 	if lbType == "network" {
 		in.Type = aws.String("network")
 	}
+	if len(sgIDs) > 0 {
+		in.SecurityGroups = aws.StringSlice(sgIDs)
+	}
 	out, err := c.ELBv2.CreateLoadBalancer(in)
 	require.NoErrorf(t, err, "create-load-balancer %s", name)
 	require.NotEmpty(t, out.LoadBalancers)
@@ -846,13 +950,61 @@ func createLB(t *testing.T, c *harness.AWSClient, f *sharedFixture, name, lbType
 	arn := aws.StringValue(lb.LoadBalancerArn)
 	parts := strings.Split(arn, "/")
 	info := lbInfo{
-		ARN:    arn,
-		ID:     parts[len(parts)-1],
-		Scheme: aws.StringValue(lb.Scheme),
-		Type:   aws.StringValue(lb.Type),
+		ARN:     arn,
+		ID:      parts[len(parts)-1],
+		Scheme:  aws.StringValue(lb.Scheme),
+		Type:    aws.StringValue(lb.Type),
+		DNSName: aws.StringValue(lb.DNSName),
 	}
-	t.Logf("LB %s: %s (scheme=%s type=%s)", name, info.ARN, info.Scheme, info.Type)
+	t.Logf("LB %s: %s (scheme=%s type=%s dns=%s)", name, info.ARN, info.Scheme, info.Type, info.DNSName)
 	return info
+}
+
+// lbCreateAttempts bounds retries when an LB lands in terminal state failed.
+// On single-node dev boxes (serial subtests, one LB torn down before the next
+// is created) this is usually the previous suite's sys.micro VM still being
+// deallocated. On multinode clusters (subtests run concurrently, each owning
+// an independent LB — see TestLoadBalancer) there is no such reclaim wait, so
+// a terminal failure here reflects a genuine transient issue; the same retry
+// serves as a defensive fallback either way.
+const lbCreateAttempts = 3
+
+// createActiveLB creates an LB (plus a listener when proto is non-empty) and
+// waits for state=active. A terminal state failed is retried with backoff
+// (see lbCreateAttempts) rather than failing the suite outright. Cleanups for
+// the surviving LB/listener are registered on success.
+func createActiveLB(t *testing.T, c *harness.AWSClient, f *sharedFixture, name, lbType, scheme, proto string, port int64, tgArn, label string, sgIDs []string) (lbInfo, string) {
+	t.Helper()
+	var lastErr error
+	for attempt := 1; attempt <= lbCreateAttempts; attempt++ {
+		if attempt > 1 {
+			wait := time.Duration(attempt-1) * 15 * time.Second
+			t.Logf("%s: waiting %s before retry (serial-mode capacity reclaim, or a transient failure)", label, wait)
+			time.Sleep(wait)
+		}
+		lb := createLB(t, c, f, name, lbType, scheme, sgIDs)
+		// Register idempotent teardown up-front so no exit path (fatal, timeout,
+		// or success) can leak the LB/listener into the shared VPC. Deletes are
+		// idempotent server-side, so a retry's explicit teardown below is safe.
+		t.Cleanup(func() { deleteLB(t, c, lb) })
+		listener := ""
+		if proto != "" {
+			listener = createListener(t, c, lb.ARN, proto, port, tgArn)
+			t.Cleanup(func() { deleteListener(t, c, listener) })
+		}
+		lastErr = harness.WaitForLBActiveErr(t, c, lb.ARN, label, 5*time.Minute)
+		if lastErr == nil {
+			return lb, listener
+		}
+		if !errors.Is(lastErr, harness.ErrLBTerminalFailed) && !errors.Is(lastErr, harness.ErrLBProvisioningTimeout) {
+			t.Fatalf("%s: %v", label, lastErr)
+		}
+		t.Logf("%s: attempt %d/%d: %v — tearing down and retrying", label, attempt, lbCreateAttempts, lastErr)
+		deleteListener(t, c, listener)
+		deleteLB(t, c, lb)
+	}
+	t.Fatalf("%s: LB never reached active after %d attempts: %v", label, lbCreateAttempts, lastErr)
+	return lbInfo{}, ""
 }
 
 func deleteLB(t *testing.T, c *harness.AWSClient, lb lbInfo) {
@@ -1011,13 +1163,11 @@ func runModifyListenerSuite(t *testing.T, c *harness.AWSClient, f *sharedFixture
 	registerTargets(t, c, tgB, f.AppInstanceIDs)
 	t.Cleanup(func() { deregisterTargets(t, c, tgB, f.AppInstanceIDs) })
 
-	lb := createLB(t, c, f, "lb-e2e-mod", "application", "internal")
-	t.Cleanup(func() { deleteLB(t, c, lb) })
+	// Both the original listener port and the port it's modified to (altPort)
+	// must be open on this scenario's own dedicated SG up front.
+	sgIDs := []string{createScenarioSG(t, c, f, "lb-e2e-mod-sg", httpPort, altPort)}
 
-	listener := createListener(t, c, lb.ARN, "HTTP", httpPort, tgA)
-	t.Cleanup(func() { deleteListener(t, c, listener) })
-
-	harness.WaitForLBActive(t, c, lb.ARN, label, 5*time.Minute)
+	lb, listener := createActiveLB(t, c, f, "lb-e2e-mod", "application", "internal", "HTTP", httpPort, tgA, label, sgIDs)
 	harness.WaitForTargetsHealthy(t, c, tgA, 2, label+" tgA", 2*time.Minute)
 
 	eni := lbENI(t, c, "app", lb)
@@ -1062,12 +1212,9 @@ func runListenerRulesSuite(t *testing.T, c *harness.AWSClient, f *sharedFixture)
 	registerTargets(t, c, tgB, []string{appB})
 	t.Cleanup(func() { deregisterTargets(t, c, tgB, []string{appB}) })
 
-	lb := createLB(t, c, f, "lb-e2e-rul", "application", "internal")
-	t.Cleanup(func() { deleteLB(t, c, lb) })
-	listener := createListener(t, c, lb.ARN, "HTTP", httpPort, tgA)
-	t.Cleanup(func() { deleteListener(t, c, listener) })
+	sgIDs := []string{createScenarioSG(t, c, f, "lb-e2e-rul-sg", httpPort)}
 
-	harness.WaitForLBActive(t, c, lb.ARN, label, 5*time.Minute)
+	lb, listener := createActiveLB(t, c, f, "lb-e2e-rul", "application", "internal", "HTTP", httpPort, tgA, label, sgIDs)
 	harness.WaitForTargetsHealthy(t, c, tgA, 1, label+" tgA", 2*time.Minute)
 
 	eni := lbENI(t, c, "app", lb)
@@ -1463,6 +1610,35 @@ func assertInternalDNS(t *testing.T, c *harness.AWSClient, lbArn, label string) 
 	assert.True(t, strings.HasPrefix(dns, "internal-"), "%s internal DNS missing internal- prefix: %s", label, dns)
 }
 
+// assertLBDNSResolves confirms the SDK-returned DNSName resolves to the LB's
+// frontend IP through the host resolver (the same path an AWS SDK/CLI client
+// uses). The suite requires Northstar, so an empty or legacy name is a failure.
+// Retries because the control-plane writer publishes the record asynchronously
+// (best-effort + reconcile).
+func assertLBDNSResolves(t *testing.T, dnsName, wantIP, label string) {
+	t.Helper()
+	require.NotEmptyf(t, dnsName, "%s: load balancer returned no DNS name despite required Northstar DNS", label)
+	require.Falsef(t, strings.HasSuffix(dnsName, ".spinifex.local"),
+		"%s: load balancer returned legacy DNS name %q despite required Northstar DNS", label, dnsName)
+	harness.Step(t, "resolve LB DNS %s → %s (northstar path)", dnsName, wantIP)
+	deadline := time.Now().Add(90 * time.Second)
+	var last []string
+	for time.Now().Before(deadline) {
+		addrs, err := net.LookupHost(dnsName)
+		if err == nil {
+			last = addrs
+			for _, a := range addrs {
+				if a == wantIP {
+					return
+				}
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+	t.Fatalf("%s: LB DNS %q never resolved to frontend IP %s within 90s (last=%v) — northstar did not serve the A record",
+		label, dnsName, wantIP, last)
+}
+
 // --- Internet-facing traffic ---------------------------------------------
 
 // runInternetFacingTrafficSingle drives one LB (ALB or NLB) over its public
@@ -1647,6 +1823,52 @@ func dumpDaemonLogs(t *testing.T, dir, label string) {
 	t.Helper()
 	harness.DumpCmd(t, dir, fmt.Sprintf("daemon-%s.log", label),
 		"journalctl", "-u", "spinifex-daemon", "--no-pager", "-n", "200")
+}
+
+// assertLBAgentAuthViaIMDS proves the LB VM authenticated to the gateway with
+// IMDS-served instance-role credentials rather than baked static keys. The LB VM
+// is a system-account instance plugged into a customer-account ENI, so it is
+// invisible to the customer AWS API; the gateway journal on the cluster nodes is
+// the only surface that observes its principal. The awsgw hosts the in-process
+// IMDS STS responder, which logs "AssumeRoleForInstance success" at INFO when the
+// LB VM's IMDS request mints assumed-role (ASIA) creds for the spinifex-lb-agent
+// role — a regression to the three boot-path defects strands the agent on an
+// empty role list, so no recent mint appears and this fails. Keying on that INFO
+// line, not the gateway's per-request SigV4 debug log, keeps the check
+// independent of the awsgw debug level. Skips when no node is SSH-reachable.
+//
+// The window is time-bounded on purpose: console logs accumulate across every VM
+// the node has ever run (including pre-fix failures), so a flat-file scan for the
+// old error would false-fail; the gateway's recent successes do not have that
+// problem.
+func assertLBAgentAuthViaIMDS(t *testing.T) {
+	t.Helper()
+	env := harness.LoadEnv(t)
+	if len(env.NodeIPs) == 0 {
+		t.Skip("no node IPs in env; cannot observe the LB VM gateway principal")
+	}
+	ssh := harness.NewPeerSSH()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	sawAssumedRole, anyReachable := false, false
+	for _, ip := range env.NodeIPs {
+		gw, err := ssh.Run(ctx, ip,
+			"sudo journalctl -u spinifex-awsgw --no-pager --since '5 minutes ago' 2>/dev/null | "+
+				`grep -F 'AssumeRoleForInstance success' | grep -F 'role/spinifex-lb-agent' | grep -F '"akid":"ASIA' | tail -1`)
+		if err != nil {
+			continue // node unreachable; another node carries the heartbeat
+		}
+		anyReachable = true
+		if strings.TrimSpace(string(gw)) != "" {
+			sawAssumedRole = true
+		}
+	}
+	if !anyReachable {
+		t.Skip("no node SSH-reachable; cannot observe the LB VM gateway principal")
+	}
+	require.True(t, sawAssumedRole,
+		"no assumed-role (ASIA) gateway auth on any node — LB agent did not authenticate via IMDS creds")
 }
 
 func base64Encode(s string) string {

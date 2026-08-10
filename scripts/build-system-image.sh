@@ -72,8 +72,10 @@ for field in IMAGE_NAME IMAGE_SIZE; do
     fi
 done
 
-# Derived paths
-BUILD_DIR="/tmp/${IMAGE_NAME}-image-build"
+# Derived paths. BUILD_DIR defaults to /tmp, but Ubuntu GPU images are 16G and a
+# typical /tmp is a RAM-backed tmpfs too small to hold the qcow2 + expanded raw,
+# so allow an override onto a real disk (SYSTEM_IMAGE_BUILD_DIR).
+BUILD_DIR="${SYSTEM_IMAGE_BUILD_DIR:-/tmp}/${IMAGE_NAME}-image-build"
 
 case "$DISTRO" in
     alpine)
@@ -116,7 +118,7 @@ import_ami() {
         args+=(--ami-name "$AMI_NAME")
     fi
     if [[ -n "${SYSTEM_TAG:-}" ]]; then
-        args+=(--tag "$SYSTEM_TAG")
+        for _tag in ${SYSTEM_TAG}; do args+=(--tag "$_tag"); done
     fi
     spx admin images import "${args[@]}"
 }
@@ -143,6 +145,10 @@ for tool in virt-customize qemu-img; do
 done
 if [[ "$DISTRO" == "alpine" ]] && ! command -v guestfish &>/dev/null; then
     echo "ERROR: guestfish not found. Install libguestfs-tools."
+    exit 1
+fi
+if [[ "$DISTRO" == "alpine" ]] && ! command -v virt-sparsify &>/dev/null; then
+    echo "ERROR: virt-sparsify not found. Install libguestfs-tools."
     exit 1
 fi
 if [[ "$DISTRO" == "ubuntu" ]] && ! command -v virt-resize &>/dev/null; then
@@ -263,6 +269,15 @@ else
     CUST+=(--memsize 2048)
 fi
 
+# The guest's /etc/resolv.conf symlinks to systemd-resolved's stub
+# (127.0.0.53), which isn't running inside the appliance chroot, so DNS is
+# dead until package installs need it. Point it at a real resolver first, then
+# restore the stub symlink after package installs so the shipped AMI still
+# gets its DNS from systemd-resolved at boot like a stock cloud image.
+if [[ -n "${APK_PACKAGES:-}${APT_PACKAGES:-}" ]]; then
+    CUST+=(--run-command 'rm -f /etc/resolv.conf; printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf')
+fi
+
 # Packages
 if [[ "$DISTRO" == "alpine" ]] && [[ -n "${APK_PACKAGES:-}" ]]; then
     echo "Will install packages: ${APK_PACKAGES}"
@@ -336,8 +351,28 @@ else
     CUST+=(--run-command 'export DEBIAN_FRONTEND=noninteractive; apt-get clean; rm -rf /var/lib/apt/lists/* /tmp/* 2>/dev/null || true')
 fi
 
+# Restore the stock systemd-resolved stub symlink so the shipped AMI gets its
+# DNS from the instance's own resolver at boot, not the static appliance one.
+if [[ "$DISTRO" == "ubuntu" ]] && [[ -n "${APK_PACKAGES:-}${APT_PACKAGES:-}${SETUP_SCRIPT:-}" ]]; then
+    CUST+=(--run-command 'rm -f /etc/resolv.conf; ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf')
+fi
+
 echo "Customizing image (libguestfs appliance)..."
 "${CUST[@]}"
+
+# Step 4b: Sparsify (Alpine only). qemu-img resize + guestfish resize2fs grow
+# the disk file in place, and resize2fs scatters inode-table/journal metadata
+# across the whole newly-grown region — those clusters are non-zero even
+# though the filesystem never allocates most of them, so the plain raw
+# conversion below cannot detect them as holes. virt-sparsify explicitly zeros
+# a guest's unused blocks so the conversion turns them into real holes.
+# Ubuntu's virt-resize path never has this problem: it builds a fresh
+# destination qcow2 and copies only live data, so it stays sparse without
+# this step.
+if [[ "$DISTRO" == "alpine" ]]; then
+    echo "Sparsifying image (virt-sparsify)..."
+    virt-sparsify --in-place "$OUTPUT_IMAGE"
+fi
 
 # Step 5: Convert to raw for import
 echo "Converting to raw format..."
@@ -367,7 +402,9 @@ else
     fi
     if [[ -n "${SYSTEM_TAG:-}" ]]; then
         echo -e "    --distro ${DISTRO} --version ${DISTRO_VERSION} --arch x86_64 --boot-mode ${BOOT_MODE}${NAME_HINT} \\"
-        echo "    --tag ${SYSTEM_TAG}"
+        _tag_line=""
+        for _tag in ${SYSTEM_TAG}; do _tag_line="${_tag_line} --tag ${_tag}"; done
+        echo "   ${_tag_line}"
     else
         echo -e "    --distro ${DISTRO} --version ${DISTRO_VERSION} --arch x86_64 --boot-mode ${BOOT_MODE}${NAME_HINT}"
     fi

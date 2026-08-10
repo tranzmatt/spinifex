@@ -1,6 +1,7 @@
 package handlers_elbv2
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"maps"
@@ -20,7 +21,7 @@ type taggable struct {
 // resolveTaggable loads the ELBv2 resource by ARN and returns a tag read/write handle.
 // found is false when the resource doesn't exist; notFoundError is the per-type error.
 // Store failures are logged and returned as ErrorServerInternal.
-func (s *ELBv2ServiceImpl) resolveTaggable(arn string) (h taggable, notFoundError string, found bool, err error) {
+func (s *ELBv2ServiceImpl) resolveTaggable(ctx context.Context, arn string) (h taggable, notFoundError string, found bool, err error) {
 	resourceType, terr := elbv2ResourceTypeFromArn(arn)
 	if terr != nil {
 		return taggable{}, "", false, terr
@@ -29,7 +30,7 @@ func (s *ELBv2ServiceImpl) resolveTaggable(arn string) (h taggable, notFoundErro
 	switch resourceType {
 	case elbv2ResourceLoadBalancer:
 		notFoundError = awserrors.ErrorELBv2LoadBalancerNotFound
-		lb, e := s.store.GetLoadBalancerByArn(arn)
+		lb, e := s.store.GetLoadBalancerByArn(ctx, arn)
 		if e != nil {
 			slog.Error("resolveTaggable: failed to get LB", "arn", arn, "err", e)
 			return taggable{}, notFoundError, false, errors.New(awserrors.ErrorServerInternal)
@@ -38,12 +39,12 @@ func (s *ELBv2ServiceImpl) resolveTaggable(arn string) (h taggable, notFoundErro
 			found = true
 			h = taggable{tags: lb.Tags, owner: lb.AccountID, save: func(t map[string]string) error {
 				lb.Tags = t
-				return s.store.PutLoadBalancer(lb)
+				return s.store.PutLoadBalancer(ctx, lb)
 			}}
 		}
 	case elbv2ResourceTargetGroup:
 		notFoundError = awserrors.ErrorELBv2TargetGroupNotFound
-		tg, e := s.store.GetTargetGroupByArn(arn)
+		tg, e := s.store.GetTargetGroupByArn(ctx, arn)
 		if e != nil {
 			slog.Error("resolveTaggable: failed to get target group", "arn", arn, "err", e)
 			return taggable{}, notFoundError, false, errors.New(awserrors.ErrorServerInternal)
@@ -52,12 +53,12 @@ func (s *ELBv2ServiceImpl) resolveTaggable(arn string) (h taggable, notFoundErro
 			found = true
 			h = taggable{tags: tg.Tags, owner: tg.AccountID, save: func(t map[string]string) error {
 				tg.Tags = t
-				return s.store.PutTargetGroup(tg)
+				return s.store.PutTargetGroup(ctx, tg)
 			}}
 		}
 	case elbv2ResourceListener:
 		notFoundError = awserrors.ErrorELBv2ListenerNotFound
-		l, e := s.store.GetListenerByArn(arn)
+		l, e := s.store.GetListenerByArn(ctx, arn)
 		if e != nil {
 			slog.Error("resolveTaggable: failed to get listener", "arn", arn, "err", e)
 			return taggable{}, notFoundError, false, errors.New(awserrors.ErrorServerInternal)
@@ -66,12 +67,12 @@ func (s *ELBv2ServiceImpl) resolveTaggable(arn string) (h taggable, notFoundErro
 			found = true
 			h = taggable{tags: l.Tags, owner: l.AccountID, save: func(t map[string]string) error {
 				l.Tags = t
-				return s.store.PutListener(l)
+				return s.store.PutListener(ctx, l)
 			}}
 		}
 	case elbv2ResourceListenerRule:
 		notFoundError = awserrors.ErrorELBv2RuleNotFound
-		r, e := s.store.GetRuleByArn(arn)
+		r, e := s.store.GetRuleByArn(ctx, arn)
 		if e != nil {
 			slog.Error("resolveTaggable: failed to get rule", "arn", arn, "err", e)
 			return taggable{}, notFoundError, false, errors.New(awserrors.ErrorServerInternal)
@@ -80,7 +81,7 @@ func (s *ELBv2ServiceImpl) resolveTaggable(arn string) (h taggable, notFoundErro
 			found = true
 			h = taggable{tags: r.Tags, owner: r.AccountID, save: func(t map[string]string) error {
 				r.Tags = t
-				return s.store.PutRule(r)
+				return s.store.PutRule(ctx, r)
 			}}
 		}
 	}
@@ -91,7 +92,7 @@ func (s *ELBv2ServiceImpl) resolveTaggable(arn string) (h taggable, notFoundErro
 // AddTags adds or overwrites tags on ELBv2 resources. Tags are validated up-front
 // so a malformed key can't leave a partial apply; cross-account or unknown ARNs
 // yield the per-resource not-found error.
-func (s *ELBv2ServiceImpl) AddTags(input *elbv2.AddTagsInput, accountID string) (*elbv2.AddTagsOutput, error) {
+func (s *ELBv2ServiceImpl) AddTags(ctx context.Context, input *elbv2.AddTagsInput, accountID string) (*elbv2.AddTagsOutput, error) {
 	if input == nil || len(input.ResourceArns) == 0 || len(input.Tags) == 0 {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
 	}
@@ -114,7 +115,7 @@ func (s *ELBv2ServiceImpl) AddTags(input *elbv2.AddTagsInput, accountID string) 
 		}
 		arn := *arnPtr
 
-		h, notFoundError, found, err := s.resolveTaggable(arn)
+		h, notFoundError, found, err := s.resolveTaggable(ctx, arn)
 		if err != nil {
 			return nil, err
 		}
@@ -128,7 +129,7 @@ func (s *ELBv2ServiceImpl) AddTags(input *elbv2.AddTagsInput, accountID string) 
 		}
 		maps.Copy(merged, newTags)
 		if err := h.save(merged); err != nil {
-			slog.Error("AddTags: failed to persist", "arn", arn, "err", err)
+			slog.ErrorContext(ctx, "AddTags: failed to persist", "arn", arn, "err", err)
 			return nil, errors.New(awserrors.ErrorServerInternal)
 		}
 	}
@@ -139,7 +140,7 @@ func (s *ELBv2ServiceImpl) AddTags(input *elbv2.AddTagsInput, accountID string) 
 // RemoveTags removes tag keys from ELBv2 resources; absent keys are silently ignored
 // (idempotent, matching AWS). Cross-account or unknown ARNs yield the per-resource
 // not-found error.
-func (s *ELBv2ServiceImpl) RemoveTags(input *elbv2.RemoveTagsInput, accountID string) (*elbv2.RemoveTagsOutput, error) {
+func (s *ELBv2ServiceImpl) RemoveTags(ctx context.Context, input *elbv2.RemoveTagsInput, accountID string) (*elbv2.RemoveTagsOutput, error) {
 	if input == nil || len(input.ResourceArns) == 0 || len(input.TagKeys) == 0 {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
 	}
@@ -158,7 +159,7 @@ func (s *ELBv2ServiceImpl) RemoveTags(input *elbv2.RemoveTagsInput, accountID st
 		}
 		arn := *arnPtr
 
-		h, notFoundError, found, err := s.resolveTaggable(arn)
+		h, notFoundError, found, err := s.resolveTaggable(ctx, arn)
 		if err != nil {
 			return nil, err
 		}
@@ -173,7 +174,7 @@ func (s *ELBv2ServiceImpl) RemoveTags(input *elbv2.RemoveTagsInput, accountID st
 			delete(h.tags, k)
 		}
 		if err := h.save(h.tags); err != nil {
-			slog.Error("RemoveTags: failed to persist", "arn", arn, "err", err)
+			slog.ErrorContext(ctx, "RemoveTags: failed to persist", "arn", arn, "err", err)
 			return nil, errors.New(awserrors.ErrorServerInternal)
 		}
 	}

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -19,8 +20,8 @@ import (
 // handleAttachNetworkInterface updates KV first (crash-safe attaching state),
 // then runs the QMP hot-plug pipeline. On QMP failure the KV record rolls
 // back to available with the error persisted in LastAttachError.
-func (d *Daemon) handleAttachNetworkInterface(msg *nats.Msg, command types.EC2InstanceCommand, instance *vm.VM) {
-	slog.Info("Attaching ENI to instance", "instanceId", command.ID)
+func (d *Daemon) handleAttachNetworkInterface(ctx context.Context, msg *nats.Msg, command types.EC2InstanceCommand, instance *vm.VM) {
+	slog.InfoContext(ctx, "Attaching ENI to instance", "instanceId", command.ID)
 
 	if command.AttachENIData == nil || command.AttachENIData.NetworkInterfaceID == "" {
 		respondWithError(msg, awserrors.ErrorInvalidParameterValue)
@@ -38,7 +39,7 @@ func (d *Daemon) handleAttachNetworkInterface(msg *nats.Msg, command types.EC2In
 
 	record, err := d.vpcService.GetENIRecord(accountID, eniID)
 	if err != nil {
-		respondWithError(msg, errorCodeFor(err))
+		respondWithServiceError(msg, err)
 		return
 	}
 	if record.Status == "in-use" && record.InstanceId != instance.ID {
@@ -48,7 +49,7 @@ func (d *Daemon) handleAttachNetworkInterface(msg *nats.Msg, command types.EC2In
 
 	attachmentID, err := d.vpcService.AttachENI(accountID, eniID, instance.ID, deviceIndex)
 	if err != nil {
-		respondWithError(msg, errorCodeFor(err))
+		respondWithServiceError(msg, err)
 		return
 	}
 	if err := d.vpcService.UpdateENI(accountID, eniID, func(r *handlers_ec2_vpc.ENIRecord) {
@@ -56,16 +57,16 @@ func (d *Daemon) handleAttachNetworkInterface(msg *nats.Msg, command types.EC2In
 		r.AttachmentStateAt = time.Now()
 		r.LastAttachError = ""
 	}); err != nil {
-		slog.Warn("AttachNetworkInterface: failed to mark attaching state",
+		slog.WarnContext(ctx, "AttachNetworkInterface: failed to mark attaching state",
 			"eniId", eniID, "err", err)
 	}
 
-	res, hotPlugErr := d.vmMgr.HotPlugENI(instance, eniID, record.MacAddress)
+	res, hotPlugErr := d.vmMgr.HotPlugENI(ctx, instance, eniID, record.MacAddress)
 	if hotPlugErr != nil {
-		slog.Error("AttachNetworkInterface: hot-plug pipeline failed, rolling back KV",
+		slog.ErrorContext(ctx, "AttachNetworkInterface: hot-plug pipeline failed, rolling back KV",
 			"eniId", eniID, "instanceId", instance.ID, "err", hotPlugErr)
-		if rollbackErr := d.vpcService.DetachENI(accountID, eniID); rollbackErr != nil {
-			slog.Error("AttachNetworkInterface: KV rollback failed",
+		if rollbackErr := d.vpcService.DetachENI(ctx, accountID, eniID); rollbackErr != nil {
+			slog.ErrorContext(ctx, "AttachNetworkInterface: KV rollback failed",
 				"eniId", eniID, "err", rollbackErr)
 		}
 		_ = d.vpcService.UpdateENI(accountID, eniID, func(r *handlers_ec2_vpc.ENIRecord) {
@@ -82,7 +83,7 @@ func (d *Daemon) handleAttachNetworkInterface(msg *nats.Msg, command types.EC2In
 		r.HotPlugSlot = res.Slot
 		r.AttachmentStateAt = time.Now()
 	}); err != nil {
-		slog.Warn("AttachNetworkInterface: failed to mark attached state",
+		slog.WarnContext(ctx, "AttachNetworkInterface: failed to mark attached state",
 			"eniId", eniID, "err", err)
 	}
 
@@ -102,8 +103,8 @@ func (d *Daemon) handleAttachNetworkInterface(msg *nats.Msg, command types.EC2In
 // handleDetachNetworkInterface marks the KV record as detaching first
 // (crash-safe), runs the QMP hot-unplug pipeline, then returns the
 // record to available on success.
-func (d *Daemon) handleDetachNetworkInterface(msg *nats.Msg, command types.EC2InstanceCommand, instance *vm.VM) {
-	slog.Info("Detaching ENI from instance", "instanceId", command.ID)
+func (d *Daemon) handleDetachNetworkInterface(ctx context.Context, msg *nats.Msg, command types.EC2InstanceCommand, instance *vm.VM) {
+	slog.InfoContext(ctx, "Detaching ENI from instance", "instanceId", command.ID)
 
 	if command.DetachENIData == nil || command.DetachENIData.AttachmentID == "" {
 		respondWithError(msg, awserrors.ErrorInvalidParameterValue)
@@ -116,7 +117,7 @@ func (d *Daemon) handleDetachNetworkInterface(msg *nats.Msg, command types.EC2In
 
 	record, err := d.vpcService.FindENIByAttachment(accountID, attachmentID)
 	if err != nil {
-		respondWithError(msg, errorCodeFor(err))
+		respondWithServiceError(msg, err)
 		return
 	}
 	if record.InstanceId != instance.ID {
@@ -135,12 +136,12 @@ func (d *Daemon) handleDetachNetworkInterface(msg *nats.Msg, command types.EC2In
 		r.DetachInFlight = true
 		r.DetachForce = force
 	}); err != nil {
-		slog.Warn("DetachNetworkInterface: failed to mark detaching state",
+		slog.WarnContext(ctx, "DetachNetworkInterface: failed to mark detaching state",
 			"eniId", record.NetworkInterfaceId, "err", err)
 	}
 
-	if err := d.vmMgr.HotUnplugENI(instance, record.NetworkInterfaceId, force); err != nil {
-		slog.Error("DetachNetworkInterface: hot-unplug pipeline failed",
+	if err := d.vmMgr.HotUnplugENI(ctx, instance, record.NetworkInterfaceId, force); err != nil {
+		slog.ErrorContext(ctx, "DetachNetworkInterface: hot-unplug pipeline failed",
 			"eniId", record.NetworkInterfaceId, "instanceId", instance.ID, "err", err)
 		_ = d.vpcService.UpdateENI(accountID, record.NetworkInterfaceId, func(r *handlers_ec2_vpc.ENIRecord) {
 			r.DetachInFlight = false
@@ -149,8 +150,8 @@ func (d *Daemon) handleDetachNetworkInterface(msg *nats.Msg, command types.EC2In
 		return
 	}
 
-	if err := d.vpcService.DetachENI(accountID, record.NetworkInterfaceId); err != nil {
-		slog.Warn("DetachNetworkInterface: KV detach failed after QMP success",
+	if err := d.vpcService.DetachENI(ctx, accountID, record.NetworkInterfaceId); err != nil {
+		slog.WarnContext(ctx, "DetachNetworkInterface: KV detach failed after QMP success",
 			"eniId", record.NetworkInterfaceId, "err", err)
 	}
 	_ = d.vpcService.UpdateENI(accountID, record.NetworkInterfaceId, func(r *handlers_ec2_vpc.ENIRecord) {
@@ -190,17 +191,8 @@ func eniHotplugErrorCode(err error) string {
 	}
 }
 
-// errorCodeFor passes through errors whose message is already a valid AWS
-// code (the convention VPCServiceImpl uses for its sentinel errors).
-func errorCodeFor(err error) string {
-	if err == nil {
-		return ""
-	}
-	return awserrors.ValidErrorCode(err.Error())
-}
-
 // publishENIHotplugEvent emits the per-instance NATS event on best-effort
-// basis — observers (Phase 4 ecs-agent, future vpcd subscribers) read it
+// basis — observers such as the ecs-agent and future vpcd subscribers read it
 // for fanout. A publish failure does not roll back the pipeline.
 func publishENIHotplugEvent(nc *nats.Conn, subject, instanceID string, payload map[string]any) {
 	if nc == nil {

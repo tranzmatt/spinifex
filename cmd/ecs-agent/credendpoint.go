@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -143,7 +144,7 @@ func (c *credEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	creds, roleARN, err := c.fetch(r.Context(), credID)
 	if err != nil {
-		if err == errUnknownCredID {
+		if errors.Is(err, errUnknownCredID) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -190,6 +191,45 @@ func (c *credEndpoint) fetch(ctx context.Context, credID string) (stsauth.Creden
 	c.cache[credID] = credEntry{roleARN: roleARN, creds: creds}
 	c.mu.Unlock()
 	return creds, roleARN, nil
+}
+
+// AssumeProvider returns a CredentialsProvider that mints credentials by assuming
+// roleARN over the gateway — the execution-role path for ECR image pulls. It
+// caches the assumed set and re-assumes within the refresh margin. session scopes
+// the STS session name.
+func (c *credEndpoint) AssumeProvider(roleARN, session string) credentials.CredentialsProvider {
+	return &assumeProvider{ep: c, roleARN: roleARN, session: session}
+}
+
+// assumeProvider adapts a credEndpoint's AssumeRole path to the agent's
+// CredentialsProvider interface, caching the assumed credentials.
+type assumeProvider struct {
+	ep      *credEndpoint
+	roleARN string
+	session string
+
+	mu     sync.Mutex
+	cached stsauth.Credentials
+}
+
+var _ credentials.CredentialsProvider = (*assumeProvider)(nil)
+
+func (p *assumeProvider) Retrieve(ctx context.Context) (credentials.Credentials, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !credValid(p.cached, credRefreshMargin) {
+		creds, err := p.ep.assume(ctx, p.roleARN, p.session)
+		if err != nil {
+			return credentials.Credentials{}, err
+		}
+		p.cached = creds
+	}
+	return credentials.Credentials{
+		AccessKeyID:     p.cached.AccessKeyID,
+		SecretAccessKey: p.cached.SecretAccessKey,
+		SessionToken:    p.cached.SessionToken,
+		Expiration:      p.cached.Expiration,
+	}, nil
 }
 
 // assumeOverGateway mints credentials for roleARN by SigV4-signing AssumeRole

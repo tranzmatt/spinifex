@@ -1,21 +1,32 @@
 import {
+  GetGroupCommand,
+  GetGroupPolicyCommand,
   GetInstanceProfileCommand,
   GetPolicyCommand,
   GetPolicyVersionCommand,
   GetRoleCommand,
+  GetRolePolicyCommand,
   GetUserCommand,
+  GetUserPolicyCommand,
   ListAccessKeysCommand,
+  ListAttachedGroupPoliciesCommand,
   ListAttachedRolePoliciesCommand,
   ListAttachedUserPoliciesCommand,
+  ListGroupPoliciesCommand,
+  ListGroupsCommand,
+  ListGroupsForUserCommand,
   ListInstanceProfilesCommand,
   ListInstanceProfilesForRoleCommand,
   ListPoliciesCommand,
+  ListRolePoliciesCommand,
   ListRolesCommand,
+  ListUserPoliciesCommand,
   ListUsersCommand,
 } from "@aws-sdk/client-iam"
 import { queryOptions } from "@tanstack/react-query"
 
 import { getIamClient } from "@/lib/awsClient"
+import { decodePolicyDocument } from "@/lib/json"
 
 export const iamUsersQueryOptions = queryOptions({
   queryKey: ["iam", "users"],
@@ -93,6 +104,35 @@ export const iamAttachedUserPoliciesQueryOptions = (userName: string) =>
     staleTime: 300_000,
   })
 
+export const iamUserPoliciesQueryOptions = (userName: string) =>
+  queryOptions({
+    queryKey: ["iam", "user-inline-policies", userName],
+    queryFn: async () => {
+      const command = new ListUserPoliciesCommand({ UserName: userName })
+      return await getIamClient().send(command)
+    },
+    staleTime: 300_000,
+  })
+
+export const iamUserPolicyQueryOptions = (
+  userName: string,
+  policyName: string,
+) =>
+  queryOptions({
+    queryKey: ["iam", "user-inline-policies", userName, policyName],
+    queryFn: async () => {
+      const command = new GetUserPolicyCommand({
+        UserName: userName,
+        PolicyName: policyName,
+      })
+      const result = await getIamClient().send(command)
+      return result.PolicyDocument
+        ? decodePolicyDocument(result.PolicyDocument, true)
+        : ""
+    },
+    staleTime: 300_000,
+  })
+
 export const iamRolesQueryOptions = queryOptions({
   queryKey: ["iam", "roles"],
   queryFn: async () => {
@@ -120,6 +160,35 @@ export const iamAttachedRolePoliciesQueryOptions = (roleName: string) =>
         RoleName: roleName,
       })
       return await getIamClient().send(command)
+    },
+    staleTime: 300_000,
+  })
+
+export const iamRolePoliciesQueryOptions = (roleName: string) =>
+  queryOptions({
+    queryKey: ["iam", "role-inline-policies", roleName],
+    queryFn: async () => {
+      const command = new ListRolePoliciesCommand({ RoleName: roleName })
+      return await getIamClient().send(command)
+    },
+    staleTime: 300_000,
+  })
+
+export const iamRolePolicyQueryOptions = (
+  roleName: string,
+  policyName: string,
+) =>
+  queryOptions({
+    queryKey: ["iam", "role-inline-policies", roleName, policyName],
+    queryFn: async () => {
+      const command = new GetRolePolicyCommand({
+        RoleName: roleName,
+        PolicyName: policyName,
+      })
+      const result = await getIamClient().send(command)
+      return result.PolicyDocument
+        ? decodePolicyDocument(result.PolicyDocument, false)
+        : ""
     },
     staleTime: 300_000,
   })
@@ -152,6 +221,76 @@ export const iamInstanceProfilesForRoleQueryOptions = (roleName: string) =>
       const command = new ListInstanceProfilesForRoleCommand({
         RoleName: roleName,
       })
+      return await getIamClient().send(command)
+    },
+    staleTime: 300_000,
+  })
+
+export const iamGroupsQueryOptions = queryOptions({
+  queryKey: ["iam", "groups"],
+  queryFn: async () => {
+    const command = new ListGroupsCommand({})
+    return await getIamClient().send(command)
+  },
+  staleTime: 300_000,
+})
+
+export const iamGroupQueryOptions = (groupName: string) =>
+  queryOptions({
+    queryKey: ["iam", "groups", groupName],
+    queryFn: async () => {
+      const command = new GetGroupCommand({ GroupName: groupName })
+      return await getIamClient().send(command)
+    },
+    staleTime: 300_000,
+  })
+
+export const iamAttachedGroupPoliciesQueryOptions = (groupName: string) =>
+  queryOptions({
+    queryKey: ["iam", "attached-group-policies", groupName],
+    queryFn: async () => {
+      const command = new ListAttachedGroupPoliciesCommand({
+        GroupName: groupName,
+      })
+      return await getIamClient().send(command)
+    },
+    staleTime: 300_000,
+  })
+
+export const iamGroupPoliciesQueryOptions = (groupName: string) =>
+  queryOptions({
+    queryKey: ["iam", "group-inline-policies", groupName],
+    queryFn: async () => {
+      const command = new ListGroupPoliciesCommand({ GroupName: groupName })
+      return await getIamClient().send(command)
+    },
+    staleTime: 300_000,
+  })
+
+export const iamGroupPolicyQueryOptions = (
+  groupName: string,
+  policyName: string,
+) =>
+  queryOptions({
+    queryKey: ["iam", "group-inline-policies", groupName, policyName],
+    queryFn: async () => {
+      const command = new GetGroupPolicyCommand({
+        GroupName: groupName,
+        PolicyName: policyName,
+      })
+      const result = await getIamClient().send(command)
+      return result.PolicyDocument
+        ? decodePolicyDocument(result.PolicyDocument, true)
+        : ""
+    },
+    staleTime: 300_000,
+  })
+
+export const iamGroupsForUserQueryOptions = (userName: string) =>
+  queryOptions({
+    queryKey: ["iam", "groups-for-user", userName],
+    queryFn: async () => {
+      const command = new ListGroupsForUserCommand({ UserName: userName })
       return await getIamClient().send(command)
     },
     staleTime: 300_000,

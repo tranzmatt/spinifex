@@ -1,6 +1,7 @@
 package handlers_ecs
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 // RegisterContainerInstance through the gateway handler.
 func reRegister(t *testing.T, svc *Service, cluster, id string) {
 	t.Helper()
-	_, err := svc.RegisterContainerInstance(&ecs.RegisterContainerInstanceInput{
+	_, err := svc.RegisterContainerInstance(context.Background(), &ecs.RegisterContainerInstanceInput{
 		Cluster:                  aws.String(cluster),
 		InstanceIdentityDocument: aws.String(id),
 	}, testAccountID)
@@ -23,10 +24,10 @@ func reRegister(t *testing.T, svc *Service, cluster, id string) {
 
 func instanceStatus(t *testing.T, svc *Service, cluster, id string) InstanceRecord {
 	t.Helper()
-	kv, err := svc.bucket(testAccountID)
+	kv, err := svc.bucket(t.Context(), testAccountID)
 	require.NoError(t, err)
 	var rec InstanceRecord
-	found, err := getJSON(kv, InstanceKey(cluster, id), &rec)
+	found, err := getJSON(t.Context(), kv, InstanceKey(cluster, id), &rec)
 	require.NoError(t, err)
 	require.True(t, found)
 	return rec
@@ -37,17 +38,17 @@ func instanceStatus(t *testing.T, svc *Service, cluster, id string) InstanceReco
 // self-heals instead of stranding them in DRAINING.
 func TestRegister_RestoresReapedInstanceToActive(t *testing.T) {
 	svc, nc := newTestService(t)
-	_, err := svc.CreateCluster(&ecs.CreateClusterInput{ClusterName: aws.String("web")}, testAccountID)
+	_, err := svc.CreateCluster(context.Background(), &ecs.CreateClusterInput{ClusterName: aws.String("web")}, testAccountID)
 	require.NoError(t, err)
 	registerInstance(t, svc, "web", "i-1", 1024, 2048)
 
-	kv, err := svc.bucket(testAccountID)
+	kv, err := svc.bucket(t.Context(), testAccountID)
 	require.NoError(t, err)
 	rec := instanceStatus(t, svc, "web", "i-1")
 	rec.LastSeen = time.Now().UTC().Add(-2 * heartbeatTimeout)
-	require.NoError(t, putJSON(kv, InstanceKey("web", "i-1"), &rec))
+	require.NoError(t, putJSON(t.Context(), kv, InstanceKey("web", "i-1"), &rec))
 
-	NewScheduler(nc, svc, "test-holder").reapBucket(kv, testAccountID, time.Now().UTC())
+	NewScheduler(nc, svc, "test-holder").reapBucket(context.Background(), kv, testAccountID, time.Now().UTC())
 
 	reaped := instanceStatus(t, svc, "web", "i-1")
 	require.Equal(t, InstanceStatusDraining, reaped.Status)
@@ -65,12 +66,12 @@ func TestRegister_RestoresReapedInstanceToActive(t *testing.T) {
 // carries stale ReservedCPU/Memory or PlacedTasks into the re-activated instance.
 func TestReaper_ReleasesCapacityAndRecoversClean(t *testing.T) {
 	svc, nc := newTestService(t)
-	_, err := svc.CreateCluster(&ecs.CreateClusterInput{ClusterName: aws.String("web")}, testAccountID)
+	_, err := svc.CreateCluster(context.Background(), &ecs.CreateClusterInput{ClusterName: aws.String("web")}, testAccountID)
 	require.NoError(t, err)
 	registerTaskDef(t, svc, "app", 128, 256)
 	registerInstance(t, svc, "web", "i-1", 1024, 2048)
 
-	out, err := svc.RunTask(&ecs.RunTaskInput{
+	out, err := svc.RunTask(context.Background(), &ecs.RunTaskInput{
 		Cluster: aws.String("web"), TaskDefinition: aws.String("app"), Count: aws.Int64(1),
 	}, testAccountID)
 	require.NoError(t, err)
@@ -82,12 +83,12 @@ func TestReaper_ReleasesCapacityAndRecoversClean(t *testing.T) {
 	require.Equal(t, 256, seeded.ReservedMemoryMiB)
 	require.Contains(t, seeded.PlacedTasks, taskID)
 
-	kv, err := svc.bucket(testAccountID)
+	kv, err := svc.bucket(t.Context(), testAccountID)
 	require.NoError(t, err)
 	seeded.LastSeen = time.Now().UTC().Add(-2 * heartbeatTimeout)
-	require.NoError(t, putJSON(kv, InstanceKey("web", "i-1"), &seeded))
+	require.NoError(t, putJSON(t.Context(), kv, InstanceKey("web", "i-1"), &seeded))
 
-	NewScheduler(nc, svc, "test-holder").reapBucket(kv, testAccountID, time.Now().UTC())
+	NewScheduler(nc, svc, "test-holder").reapBucket(context.Background(), kv, testAccountID, time.Now().UTC())
 
 	reaped := instanceStatus(t, svc, "web", "i-1")
 	require.Equal(t, InstanceStatusDraining, reaped.Status)
@@ -96,7 +97,7 @@ func TestReaper_ReleasesCapacityAndRecoversClean(t *testing.T) {
 	assert.Zero(t, reaped.ReservedMemoryMiB, "reaped instance must release reserved memory")
 	assert.Empty(t, reaped.PlacedTasks, "reaped instance must drop placed tasks")
 
-	dt, err := svc.DescribeTasks(&ecs.DescribeTasksInput{
+	dt, err := svc.DescribeTasks(context.Background(), &ecs.DescribeTasksInput{
 		Cluster: aws.String("web"), Tasks: []*string{aws.String(taskID)},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -114,12 +115,12 @@ func TestReaper_ReleasesCapacityAndRecoversClean(t *testing.T) {
 // persist even though the live agent keeps re-registering.
 func TestRegister_DoesNotUndoOperatorDrain(t *testing.T) {
 	svc, _ := newTestService(t)
-	_, err := svc.CreateCluster(&ecs.CreateClusterInput{ClusterName: aws.String("web")}, testAccountID)
+	_, err := svc.CreateCluster(context.Background(), &ecs.CreateClusterInput{ClusterName: aws.String("web")}, testAccountID)
 	require.NoError(t, err)
 	registerInstance(t, svc, "web", "i-1", 1024, 2048)
 
 	arn := instanceStatus(t, svc, "web", "i-1").ARN
-	_, err = svc.UpdateContainerInstancesState(&ecs.UpdateContainerInstancesStateInput{
+	_, err = svc.UpdateContainerInstancesState(context.Background(), &ecs.UpdateContainerInstancesStateInput{
 		Cluster:            aws.String("web"),
 		ContainerInstances: []*string{aws.String(arn)},
 		Status:             aws.String(InstanceStatusDraining),

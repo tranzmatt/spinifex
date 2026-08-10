@@ -1,16 +1,19 @@
 package handlers_eks
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
+	"github.com/mulgadc/spinifex/spinifex/kvutil"
 	"github.com/mulgadc/spinifex/spinifex/migrate"
-	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // JetStream KV bucket and key-path constants for the EKS control plane.
@@ -146,6 +149,18 @@ func AddonManifestKey(cluster, addon string) string {
 	return AddonsPrefix(cluster) + addon + "/manifest"
 }
 
+// RecoveryPrefix returns the KV key prefix under which a cluster's per-member
+// control-plane recovery directives live.
+func RecoveryPrefix(cluster string) string {
+	return fmt.Sprintf("clusters/%s/recovery/", cluster)
+}
+
+// RecoveryDirectiveKey returns the KV key for a control-plane member's recovery
+// directive, keyed by instance ID so a replacement VM (new ID) starts with none.
+func RecoveryDirectiveKey(cluster, instanceID string) string {
+	return RecoveryPrefix(cluster) + instanceID
+}
+
 // Store is the per-daemon EKS KV handle. Per-account and leader buckets are
 // accessed via the package-level factories below.
 type Store struct {
@@ -168,40 +183,67 @@ func AccountBucketName(accountID string) string {
 	return KVBucketEKSAccountPrefix + accountID
 }
 
+// accountBucketNames returns the name of every EKS per-account KV bucket. It
+// fails rather than returning a short list when the enumeration could not be
+// completed: the lister behind it closes its channel identically on success and
+// on error, so a caller that ignored the failure would read an unreachable
+// JetStream as "no accounts" — and prune every tenant's endpoint record on that
+// empty view.
+func accountBucketNames(ctx context.Context, nc *nats.Conn) ([]string, error) {
+	js, err := jetstream.New(nc)
+	if err != nil {
+		return nil, fmt.Errorf("jetstream: %w", err)
+	}
+	all, err := kvutil.BucketNames(ctx, js)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(all))
+	for _, name := range all {
+		if strings.HasPrefix(name, KVBucketEKSAccountPrefix) {
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+
 // GetOrCreateAccountBucket returns the per-account KV bucket for accountID,
-// creating it on first use. Idempotent: subsequent calls with the same
-// accountID return the existing handle.
-func GetOrCreateAccountBucket(js nats.JetStreamContext, accountID string) (nats.KeyValue, error) {
+// creating it on first use at the given replica count (clamped to a minimum
+// of 1). Idempotent: subsequent calls with the same accountID return the
+// existing handle.
+func GetOrCreateAccountBucket(ctx context.Context, js jetstream.JetStream, accountID string, replicas int) (jetstream.KeyValue, error) {
 	bucket := AccountBucketName(accountID)
-	kv, err := utils.GetOrCreateKVBucket(js, bucket, KVBucketEKSAccountHistory)
+	kv, err := kvutil.GetOrCreateBucketWithReplicas(ctx, js, bucket, KVBucketEKSAccountHistory, replicas)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create EKS per-account KV bucket %s: %w", bucket, err)
 	}
-	if err := migrate.DefaultRegistry.RunKV(bucket, kv, KVBucketEKSAccountVersion); err != nil {
+	if err := migrate.DefaultRegistry.RunKV(ctx, bucket, kv, KVBucketEKSAccountVersion); err != nil {
 		return nil, fmt.Errorf("migrate %s: %w", bucket, err)
 	}
 	return kv, nil
 }
 
 // InitLeaderBucket creates (or attaches to) the shared spinifex-eks-leader
-// bucket used for per-cluster reconciler leader-lease CAS locks. The bucket
-// is configured with History=1 and a 60s TTL so stale leases expire on their
-// own when a leader dies mid-cycle. utils.GetOrCreateKVBucket doesn't expose
-// a TTL knob, so this function takes the direct js.CreateKeyValue path and
-// falls back to js.KeyValue on already-exists.
-func InitLeaderBucket(js nats.JetStreamContext) (nats.KeyValue, error) {
-	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{
-		Bucket:  KVBucketEKSLeader,
-		History: 1,
-		TTL:     KVBucketEKSLeaderTTL,
+// bucket used for per-cluster reconciler leader-lease CAS locks, at the given
+// replica count (clamped to a minimum of 1). The bucket is configured with
+// History=1 and a 60s TTL so stale leases expire on their own when a leader
+// dies mid-cycle. kvutil.GetOrCreateBucketWithReplicas doesn't expose a TTL
+// knob, so this function sets Replicas directly on its own js.CreateKeyValue
+// call and falls back to js.KeyValue on already-exists.
+func InitLeaderBucket(ctx context.Context, js jetstream.JetStream, replicas int) (jetstream.KeyValue, error) {
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket:   KVBucketEKSLeader,
+		History:  1,
+		TTL:      KVBucketEKSLeaderTTL,
+		Replicas: max(replicas, 1),
 	})
 	if err != nil {
-		kv, err = js.KeyValue(KVBucketEKSLeader)
+		kv, err = js.KeyValue(ctx, KVBucketEKSLeader)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create or open EKS leader bucket %s: %w", KVBucketEKSLeader, err)
 		}
 	}
-	if err := migrate.DefaultRegistry.RunKV(KVBucketEKSLeader, kv, KVBucketEKSLeaderVersion); err != nil {
+	if err := migrate.DefaultRegistry.RunKV(ctx, KVBucketEKSLeader, kv, KVBucketEKSLeaderVersion); err != nil {
 		return nil, fmt.Errorf("migrate %s: %w", KVBucketEKSLeader, err)
 	}
 	slog.Info("EKS leader bucket initialized", "bucket", KVBucketEKSLeader, "ttl", KVBucketEKSLeaderTTL)

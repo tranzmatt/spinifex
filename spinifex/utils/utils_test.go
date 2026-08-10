@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -134,7 +135,7 @@ func TestExecProcessAndKill(t *testing.T) {
 	err = WaitForPidFileRemoval("utilsunittest", 100*time.Millisecond)
 	assert.Error(t, err) // Should timeout since file should still exist
 
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 
 	// Kill the process
 	err = StopProcess("utilsunittest")
@@ -302,7 +303,7 @@ func TestUnmarshalJsonPayload(t *testing.T) {
 			jsonData:    `{}`,
 			expectError: false,
 			validate: func(t *testing.T, result *TestStruct) {
-				assert.Equal(t, "", result.Name)
+				assert.Empty(t, result.Name)
 				assert.Equal(t, 0, result.Value)
 			},
 		},
@@ -359,7 +360,7 @@ func TestGenerateErrorPayload(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			payload := GenerateErrorPayload(tt.code)
 			assert.NotNil(t, payload)
-			assert.Greater(t, len(payload), 0)
+			assert.NotEmpty(t, payload)
 			if tt.validate != nil {
 				tt.validate(t, payload)
 			}
@@ -1611,9 +1612,10 @@ func TestAvailableImages_Rocky(t *testing.T) {
 			// Rocky 10 cloud images are UEFI-only on both architectures.
 			assert.Equal(t, "uefi", img.BootMode)
 			assert.Equal(t, "sha256", img.ChecksumType)
-			// URL must be pinned to a dated build (no moving "latest" symlink)
-			// and the checksum URL must be the BSD-style .CHECKSUM companion.
-			assert.NotContains(t, img.URL, "latest")
+			// URL must track the moving .latest. alias — Rocky prunes dated
+			// builds, so a pinned dated URL 404s once it ages out. The checksum
+			// URL must be the BSD-style .CHECKSUM companion of that same alias.
+			assert.Contains(t, img.URL, ".latest.")
 			assert.Contains(t, img.URL, tc.filenameSub)
 			assert.True(t, strings.HasSuffix(img.Checksum, ".CHECKSUM"),
 				"Rocky publishes BSD-style .CHECKSUM files; got %q", img.Checksum)
@@ -1675,4 +1677,90 @@ func TestAvailableImages_ECSNodeEntry(t *testing.T) {
 	require.True(t, ok, "spinifex-ecs-node must be in the system image catalog")
 	assert.Equal(t, "ecs", img.Tags["spinifex:managed-by"],
 		"ECS node image must carry the managed-by=ecs tag the UI guard resolves on")
+}
+
+func TestAvailableImages_RDSPostgresEntry(t *testing.T) {
+	img, ok := AvailableImages["spinifex-rds-postgres"]
+	require.True(t, ok, "spinifex-rds-postgres must be in the system image catalog")
+	assert.Equal(t, "rds", img.Tags["spinifex:managed-by"],
+		"RDS image must carry the managed-by=rds tag instance launches resolve on")
+	assert.Equal(t, "postgres", img.Tags["engine"])
+	assert.Equal(t, "18", img.Tags["engine-version"],
+		"the pinned PostgreSQL major version is what EngineVersion resolves against")
+}
+
+// --- NormalizeXMLOutput / normalizeNilSlices ---
+
+type normalizeInner struct {
+	Tags []string
+}
+
+type normalizeOuter struct {
+	Names    []string
+	Nested   *normalizeInner
+	Children []*normalizeInner
+	Value    normalizeInner
+}
+
+func TestNormalizeXMLOutput_InvalidValue(t *testing.T) {
+	var output any
+	assert.Nil(t, NormalizeXMLOutput(output))
+}
+
+func TestNormalizeXMLOutput_TopLevelNilSlice(t *testing.T) {
+	out := NormalizeXMLOutput(normalizeOuter{}).(normalizeOuter)
+	require.NotNil(t, out.Names)
+	assert.Empty(t, out.Names)
+}
+
+func TestNormalizeXMLOutput_NestedPointerStruct(t *testing.T) {
+	out := NormalizeXMLOutput(normalizeOuter{
+		Nested: &normalizeInner{},
+	}).(normalizeOuter)
+	require.NotNil(t, out.Nested)
+	require.NotNil(t, out.Nested.Tags, "nil slice inside a pointer field must be normalized")
+	assert.Empty(t, out.Nested.Tags)
+}
+
+func TestNormalizeXMLOutput_NestedValueStruct(t *testing.T) {
+	out := NormalizeXMLOutput(normalizeOuter{}).(normalizeOuter)
+	require.NotNil(t, out.Value.Tags, "nil slice inside a nested struct field must be normalized")
+}
+
+func TestNormalizeXMLOutput_RecursesIntoSliceElements(t *testing.T) {
+	out := NormalizeXMLOutput(normalizeOuter{
+		Children: []*normalizeInner{{}, {Tags: []string{"a"}}},
+	}).(normalizeOuter)
+	require.Len(t, out.Children, 2)
+	require.NotNil(t, out.Children[0].Tags, "nil slice inside a slice element must be normalized")
+	assert.Equal(t, []string{"a"}, out.Children[1].Tags, "an already-populated slice element must be left untouched")
+}
+
+func TestNormalizeXMLOutput_NilPointerFieldUntouched(t *testing.T) {
+	out := NormalizeXMLOutput(normalizeOuter{}).(normalizeOuter)
+	assert.Nil(t, out.Nested, "a nil pointer field must not be allocated")
+}
+
+// --- WithRequestID ---
+
+type requestIDPayload struct {
+	Names []string
+}
+
+func TestWithRequestID_NonStruct(t *testing.T) {
+	assert.Equal(t, "not-a-struct", WithRequestID("not-a-struct", "req-1"))
+}
+
+func TestWithRequestID_StructValue(t *testing.T) {
+	composite := WithRequestID(requestIDPayload{Names: []string{"a"}}, "req-123")
+	v := reflect.ValueOf(composite)
+	require.Equal(t, "req-123", v.FieldByName("RequestId").String())
+	require.Equal(t, []string{"a"}, v.FieldByName("Names").Interface())
+}
+
+func TestWithRequestID_PointerToStruct(t *testing.T) {
+	composite := WithRequestID(&requestIDPayload{Names: []string{"b"}}, "req-456")
+	v := reflect.ValueOf(composite)
+	require.Equal(t, "req-456", v.FieldByName("RequestId").String())
+	require.Equal(t, []string{"b"}, v.FieldByName("Names").Interface())
 }

@@ -7,14 +7,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mulgadc/spinifex/spinifex/utils"
+	"github.com/mulgadc/spinifex/spinifex/kvutil"
 	"github.com/mulgadc/spinifex/spinifex/vm"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// TestJetStreamManager_WriteAndLoadState tests round-trip write and load of instance state
+// TestJetStreamManager_WriteAndLoadState tests round-trip write and load of instance state.
 func TestJetStreamManager_WriteAndLoadState(t *testing.T) {
 	natsURL := sharedJSNATSURL
 
@@ -65,7 +66,7 @@ func TestJetStreamManager_WriteAndLoadState(t *testing.T) {
 	assert.Equal(t, "t3.small", loadedInstances["i-test-002"].InstanceType)
 }
 
-// TestJetStreamManager_LoadState_KeyNotFound tests that LoadState returns empty state when key doesn't exist
+// TestJetStreamManager_LoadState_KeyNotFound tests that LoadState returns empty state when key doesn't exist.
 func TestJetStreamManager_LoadState_KeyNotFound(t *testing.T) {
 	natsURL := sharedJSNATSURL
 
@@ -86,7 +87,7 @@ func TestJetStreamManager_LoadState_KeyNotFound(t *testing.T) {
 	assert.Empty(t, instances, "Should return empty VMS map")
 }
 
-// TestJetStreamManager_BucketCreation tests that InitKVBucket creates the bucket when it doesn't exist
+// TestJetStreamManager_BucketCreation tests that InitKVBucket creates the bucket when it doesn't exist.
 func TestJetStreamManager_BucketCreation(t *testing.T) {
 	natsURL := sharedJSNATSURL
 
@@ -105,7 +106,7 @@ func TestJetStreamManager_BucketCreation(t *testing.T) {
 	assert.NotNil(t, jsm.kv, "KV bucket should be initialized")
 }
 
-// TestJetStreamManager_BucketReconnection tests that InitKVBucket connects to existing bucket
+// TestJetStreamManager_BucketReconnection tests that InitKVBucket connects to existing bucket.
 func TestJetStreamManager_BucketReconnection(t *testing.T) {
 	natsURL := sharedJSNATSURL
 
@@ -150,7 +151,7 @@ func TestJetStreamManager_BucketReconnection(t *testing.T) {
 	assert.Equal(t, vm.StateRunning, loadedInstances["i-persist"].Status)
 }
 
-// TestJetStreamManager_DeleteState tests deleting state from the KV store
+// TestJetStreamManager_DeleteState tests deleting state from the KV store.
 func TestJetStreamManager_DeleteState(t *testing.T) {
 	natsURL := sharedJSNATSURL
 
@@ -190,7 +191,7 @@ func TestJetStreamManager_DeleteState(t *testing.T) {
 	assert.Empty(t, loadedInstances, "Should return empty state after deletion")
 }
 
-// TestJetStreamManager_DeleteState_NonExistent tests deleting state that doesn't exist
+// TestJetStreamManager_DeleteState_NonExistent tests deleting state that doesn't exist.
 func TestJetStreamManager_DeleteState_NonExistent(t *testing.T) {
 	natsURL := sharedJSNATSURL
 
@@ -209,7 +210,7 @@ func TestJetStreamManager_DeleteState_NonExistent(t *testing.T) {
 	require.NoError(t, err, "Deleting non-existent state should not error")
 }
 
-// TestJetStreamManager_WriteState_UpdateExisting tests that writing state updates existing entry
+// TestJetStreamManager_WriteState_UpdateExisting tests that writing state updates existing entry.
 func TestJetStreamManager_WriteState_UpdateExisting(t *testing.T) {
 	natsURL := sharedJSNATSURL
 
@@ -257,7 +258,7 @@ func TestJetStreamManager_WriteState_UpdateExisting(t *testing.T) {
 	assert.NotNil(t, loadedInstances["i-new"], "Should have new instance")
 }
 
-// TestJetStreamManager_MultipleNodes tests storing state for multiple nodes
+// TestJetStreamManager_MultipleNodes tests storing state for multiple nodes.
 func TestJetStreamManager_MultipleNodes(t *testing.T) {
 	natsURL := sharedJSNATSURL
 
@@ -304,7 +305,7 @@ func TestJetStreamManager_MultipleNodes(t *testing.T) {
 	assert.False(t, exists, "Node-1 should not have node-2's instances")
 }
 
-// TestJetStreamManager_KVNotInitialized tests error handling when KV is not initialized
+// TestJetStreamManager_KVNotInitialized tests error handling when KV is not initialized.
 func TestJetStreamManager_KVNotInitialized(t *testing.T) {
 	natsURL := sharedJSNATSURL
 
@@ -327,7 +328,7 @@ func TestJetStreamManager_KVNotInitialized(t *testing.T) {
 	assert.Error(t, err, "DeleteState should error when KV not initialized")
 }
 
-// TestJetStreamManager_UpdateReplicas tests updating replica count for the KV bucket
+// TestJetStreamManager_UpdateReplicas tests updating replica count for the KV bucket.
 func TestJetStreamManager_UpdateReplicas(t *testing.T) {
 	natsURL := sharedJSNATSURL
 
@@ -343,8 +344,10 @@ func TestJetStreamManager_UpdateReplicas(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify initial replica count
-	js, _ := nc.JetStream()
-	streamInfo, err := js.StreamInfo("KV_" + InstanceStateBucket)
+	js, _ := jetstream.New(nc)
+	stream, err := js.Stream(t.Context(), "KV_"+InstanceStateBucket)
+	require.NoError(t, err)
+	streamInfo, err := stream.Info(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, 1, streamInfo.Config.Replicas, "Should start with 1 replica")
 
@@ -358,7 +361,7 @@ func TestJetStreamManager_UpdateReplicas(t *testing.T) {
 	// This test verifies the basic functionality works.
 }
 
-// TestJetStreamManager_UpdateReplicas_NoInit tests UpdateReplicas when JS not initialized
+// TestJetStreamManager_UpdateReplicas_NoInit tests UpdateReplicas when JS not initialized.
 func TestJetStreamManager_UpdateReplicas_NoInit(t *testing.T) {
 	// Test with nil JetStream context
 	jsm := &JetStreamManager{
@@ -372,7 +375,7 @@ func TestJetStreamManager_UpdateReplicas_NoInit(t *testing.T) {
 
 // --- Stopped instance KV tests ---
 
-// TestJetStreamManager_WriteAndLoadStoppedInstance tests round-trip write and load of a stopped instance
+// TestJetStreamManager_WriteAndLoadStoppedInstance tests round-trip write and load of a stopped instance.
 func TestJetStreamManager_WriteAndLoadStoppedInstance(t *testing.T) {
 	nc, err := nats.Connect(sharedJSNATSURL)
 	require.NoError(t, err)
@@ -407,7 +410,7 @@ func TestJetStreamManager_WriteAndLoadStoppedInstance(t *testing.T) {
 	_ = jsm.DeleteStoppedInstance(testVM.ID)
 }
 
-// TestJetStreamManager_LoadStoppedInstance_NotFound tests that LoadStoppedInstance returns nil for missing key
+// TestJetStreamManager_LoadStoppedInstance_NotFound tests that LoadStoppedInstance returns nil for missing key.
 func TestJetStreamManager_LoadStoppedInstance_NotFound(t *testing.T) {
 	nc, err := nats.Connect(sharedJSNATSURL)
 	require.NoError(t, err)
@@ -423,7 +426,7 @@ func TestJetStreamManager_LoadStoppedInstance_NotFound(t *testing.T) {
 	assert.Nil(t, loaded)
 }
 
-// TestJetStreamManager_DeleteStoppedInstance tests deleting a stopped instance (including non-existent)
+// TestJetStreamManager_DeleteStoppedInstance tests deleting a stopped instance (including non-existent).
 func TestJetStreamManager_DeleteStoppedInstance(t *testing.T) {
 	nc, err := nats.Connect(sharedJSNATSURL)
 	require.NoError(t, err)
@@ -456,7 +459,204 @@ func TestJetStreamManager_DeleteStoppedInstance(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestJetStreamManager_ListStoppedInstances tests listing multiple stopped instances
+// TestJetStreamManager_ClaimStoppedInstance_HappyPath verifies a claim
+// atomically removes the record and hands back the VM it held.
+func TestJetStreamManager_ClaimStoppedInstance_HappyPath(t *testing.T) {
+	nc, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	jsm, err := NewJetStreamManager(nc, 1)
+	require.NoError(t, err)
+	require.NoError(t, jsm.InitKVBucket())
+
+	testVM := &vm.VM{ID: "i-claim-happy", Status: vm.StateStopped, InstanceType: "t3.micro"}
+	require.NoError(t, jsm.WriteStoppedInstance(testVM.ID, testVM))
+
+	claimed, err := jsm.ClaimStoppedInstance(testVM.ID)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, testVM.ID, claimed.ID)
+	assert.Equal(t, "t3.micro", claimed.InstanceType)
+
+	// The claim must have removed the record — a second claim, or a plain
+	// Load, must both observe it gone.
+	loaded, err := jsm.LoadStoppedInstance(testVM.ID)
+	require.NoError(t, err)
+	assert.Nil(t, loaded, "a successful claim must remove the record")
+}
+
+// TestJetStreamManager_ClaimStoppedInstance_NotFound verifies claiming an id
+// with no record returns vm.ErrStoppedInstanceClaimed rather than a bare
+// nats not-found error, so callers can map it directly to the API error.
+func TestJetStreamManager_ClaimStoppedInstance_NotFound(t *testing.T) {
+	nc, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	jsm, err := NewJetStreamManager(nc, 1)
+	require.NoError(t, err)
+	require.NoError(t, jsm.InitKVBucket())
+
+	_, err = jsm.ClaimStoppedInstance("i-does-not-exist")
+	assert.ErrorIs(t, err, vm.ErrStoppedInstanceClaimed)
+}
+
+// TestJetStreamManager_ClaimStoppedInstance_ConcurrentClaim is the
+// lower-level regression test for the double-start bug: it fires N
+// concurrent ClaimStoppedInstance calls at the same key against a real
+// JetStream KV bucket and asserts exactly one succeeds — proving the
+// nats.LastRevision-guarded Delete this claim is built on is a genuine
+// mutual-exclusion primitive under real NATS wire semantics, not just at
+// the fake/mock layer exercised by the handlers-level test.
+func TestJetStreamManager_ClaimStoppedInstance_ConcurrentClaim(t *testing.T) {
+	nc, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	jsm, err := NewJetStreamManager(nc, 1)
+	require.NoError(t, err)
+	require.NoError(t, jsm.InitKVBucket())
+
+	testVM := &vm.VM{ID: "i-claim-race", Status: vm.StateStopped, InstanceType: "t3.micro"}
+	require.NoError(t, jsm.WriteStoppedInstance(testVM.ID, testVM))
+
+	const n = 8
+	results := make([]*vm.VM, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := range n {
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = jsm.ClaimStoppedInstance(testVM.ID)
+		}(i)
+	}
+	wg.Wait()
+
+	var won, lost int
+	for i := range n {
+		switch {
+		case errs[i] == nil:
+			won++
+			require.NotNil(t, results[i])
+			assert.Equal(t, testVM.ID, results[i].ID)
+		case errors.Is(errs[i], vm.ErrStoppedInstanceClaimed):
+			lost++
+		default:
+			t.Fatalf("unexpected error from ClaimStoppedInstance: %v", errs[i])
+		}
+	}
+
+	assert.Equal(t, 1, won, "exactly one concurrent claim must succeed")
+	assert.Equal(t, n-1, lost, "every other concurrent claim must lose with ErrStoppedInstanceClaimed")
+
+	loaded, err := jsm.LoadStoppedInstance(testVM.ID)
+	require.NoError(t, err)
+	assert.Nil(t, loaded, "the winning claim must have removed the record")
+}
+
+// TestJetStreamManager_UpdateStoppedInstance_ConflictRetry mirrors
+// UpdateTerminatedInstance's CAS contract for the stopped-instance bucket: a
+// concurrent writer landing between Get and Update must be detected via a
+// revision conflict and retried, and both updates must land.
+func TestJetStreamManager_UpdateStoppedInstance_ConflictRetry(t *testing.T) {
+	nc, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	jsm, err := NewJetStreamManager(nc, 1)
+	require.NoError(t, err)
+	require.NoError(t, jsm.InitKVBucket())
+
+	testVM := &vm.VM{ID: "i-stopped-cas-conflict", Status: vm.StateStopped, InstanceType: "t3.micro"}
+	require.NoError(t, jsm.WriteStoppedInstance(testVM.ID, testVM))
+	defer func() { _ = jsm.DeleteStoppedInstance(testVM.ID) }()
+
+	var attempts int
+	var injectOnce sync.Once
+	updated, err := jsm.UpdateStoppedInstance(testVM.ID, func(v *vm.VM) {
+		attempts++
+		v.InstanceType = "t3.small"
+
+		// Simulate a concurrent writer landing between our Get and Update on
+		// the first attempt only, forcing exactly one revision conflict.
+		injectOnce.Do(func() {
+			_, cerr := jsm.UpdateStoppedInstance(testVM.ID, func(cv *vm.VM) {
+				cv.LastNode = "node-concurrent"
+			})
+			require.NoError(t, cerr)
+		})
+	})
+	require.NoError(t, err, "the retried Update must eventually succeed against the fresh revision")
+	require.NotNil(t, updated)
+	assert.Equal(t, 2, attempts, "the injected concurrent write must force exactly one retry")
+	assert.Equal(t, "t3.small", updated.InstanceType)
+
+	loaded, err := jsm.LoadStoppedInstance(testVM.ID)
+	require.NoError(t, err)
+	require.NotNil(t, loaded)
+	assert.Equal(t, "node-concurrent", loaded.LastNode, "the concurrent writer's update must survive, not be clobbered")
+	assert.Equal(t, "t3.small", loaded.InstanceType, "the retried update must also land")
+}
+
+// TestJetStreamManager_UpdateStoppedInstance_NotFound verifies
+// UpdateStoppedInstance surfaces jetstream.ErrKeyNotFound rather than silently
+// creating a record when nothing exists to update.
+func TestJetStreamManager_UpdateStoppedInstance_NotFound(t *testing.T) {
+	nc, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	jsm, err := NewJetStreamManager(nc, 1)
+	require.NoError(t, err)
+	require.NoError(t, jsm.InitKVBucket())
+
+	_, err = jsm.UpdateStoppedInstance("i-does-not-exist", func(v *vm.VM) {})
+	assert.ErrorIs(t, err, jetstream.ErrKeyNotFound)
+}
+
+// TestJetStreamManager_UpdateStoppedInstance_NoResurrectAfterClaim is the
+// core TOCTOU regression test: a claim (delete) that lands between an
+// UpdateStoppedInstance caller's own Load and its CAS write must not be
+// undone. createIfAbsent=false means the CAS write observes the key gone and
+// fails with ErrKeyNotFound instead of recreating the stopped record after
+// ClaimStoppedInstance already handed it off to a winning start.
+func TestJetStreamManager_UpdateStoppedInstance_NoResurrectAfterClaim(t *testing.T) {
+	nc, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	jsm, err := NewJetStreamManager(nc, 1)
+	require.NoError(t, err)
+	require.NoError(t, jsm.InitKVBucket())
+
+	testVM := &vm.VM{ID: "i-stopped-claim-race", Status: vm.StateStopped, InstanceType: "t3.micro"}
+	require.NoError(t, jsm.WriteStoppedInstance(testVM.ID, testVM))
+
+	// A caller loads the record (as TagStoppedInstance / ModifyInstanceAttribute
+	// do) before a winning claim removes it.
+	loaded, err := jsm.LoadStoppedInstance(testVM.ID)
+	require.NoError(t, err)
+	require.NotNil(t, loaded)
+
+	claimed, err := jsm.ClaimStoppedInstance(testVM.ID)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	// The tag/attribute caller's CAS write now races the already-completed
+	// claim: it must fail cleanly, not resurrect the record.
+	_, err = jsm.UpdateStoppedInstance(testVM.ID, func(v *vm.VM) {
+		v.InstanceType = "should-not-land"
+	})
+	assert.ErrorIs(t, err, jetstream.ErrKeyNotFound, "a claim that deleted the record must not be resurrected by a losing racer's update")
+
+	stillGone, err := jsm.LoadStoppedInstance(testVM.ID)
+	require.NoError(t, err)
+	assert.Nil(t, stillGone, "the stopped record must stay deleted after the losing update")
+}
+
+// TestJetStreamManager_ListStoppedInstances tests listing multiple stopped instances.
 func TestJetStreamManager_ListStoppedInstances(t *testing.T) {
 	nc, err := nats.Connect(sharedJSNATSURL)
 	require.NoError(t, err)
@@ -498,7 +698,7 @@ func TestJetStreamManager_ListStoppedInstances(t *testing.T) {
 	}
 }
 
-// TestJetStreamManager_StoppedInstances_NoInterference tests that stopped instances don't interfere with per-node state
+// TestJetStreamManager_StoppedInstances_NoInterference tests that stopped instances don't interfere with per-node state.
 func TestJetStreamManager_StoppedInstances_NoInterference(t *testing.T) {
 	nc, err := nats.Connect(sharedJSNATSURL)
 	require.NoError(t, err)
@@ -538,7 +738,7 @@ func TestJetStreamManager_StoppedInstances_NoInterference(t *testing.T) {
 	_ = jsm.DeleteState("interference-test-node")
 }
 
-// TestJetStreamManager_StoppedInstance_KVNotInitialized tests error handling when KV is not initialized
+// TestJetStreamManager_StoppedInstance_KVNotInitialized tests error handling when KV is not initialized.
 func TestJetStreamManager_StoppedInstance_KVNotInitialized(t *testing.T) {
 	nc, err := nats.Connect(sharedJSNATSURL)
 	require.NoError(t, err)
@@ -579,7 +779,7 @@ func TestJetStreamManager_WriteServiceManifest(t *testing.T) {
 	require.NoError(t, err)
 
 	// Read the KV entry directly and verify JSON contents
-	entry, err := jsm.clusterKV.Get("node.test-node-svc.services")
+	entry, err := jsm.clusterKV.Get(t.Context(), "node.test-node-svc.services")
 	require.NoError(t, err)
 
 	var manifest map[string]any
@@ -614,7 +814,7 @@ func TestJetStreamManager_WriteServiceManifest_EmptyServices(t *testing.T) {
 	err = jsm.WriteServiceManifest("empty-svc-node", []string{}, "10.0.0.2:4222", "10.0.0.2:8443")
 	require.NoError(t, err)
 
-	entry, err := jsm.clusterKV.Get("node.empty-svc-node.services")
+	entry, err := jsm.clusterKV.Get(t.Context(), "node.empty-svc-node.services")
 	require.NoError(t, err)
 
 	var manifest map[string]any
@@ -650,9 +850,9 @@ func TestJetStreamManager_WriteServiceManifest_ClusterKVNotInitialized(t *testin
 // deleteInstanceStateBucket deletes the underlying JetStream stream for the instance-state KV bucket.
 func deleteInstanceStateBucket(t *testing.T, nc *nats.Conn) {
 	t.Helper()
-	js, err := nc.JetStream()
+	js, err := jetstream.New(nc)
 	require.NoError(t, err)
-	err = js.DeleteStream("KV_" + InstanceStateBucket)
+	err = js.DeleteStream(t.Context(), "KV_"+InstanceStateBucket)
 	require.NoError(t, err)
 }
 
@@ -809,7 +1009,7 @@ func swapToNonJSContext(t *testing.T, jsm *JetStreamManager) {
 	nc, err := nats.Connect(sharedNATSURL)
 	require.NoError(t, err)
 	t.Cleanup(func() { nc.Close() })
-	js, err := nc.JetStream()
+	js, err := jetstream.New(nc)
 	require.NoError(t, err)
 	jsm.js = js
 }
@@ -940,12 +1140,12 @@ func TestJetStreamManager_ListStoppedInstances_RecoveryFailure(t *testing.T) {
 
 func TestIsStreamUnavailable(t *testing.T) {
 	assert.False(t, isStreamUnavailable(nil))
-	assert.True(t, isStreamUnavailable(nats.ErrStreamNotFound))
-	assert.True(t, isStreamUnavailable(nats.ErrNoStreamResponse))
+	assert.True(t, isStreamUnavailable(jetstream.ErrStreamNotFound))
+	assert.True(t, isStreamUnavailable(jetstream.ErrNoStreamResponse))
 	assert.True(t, isStreamUnavailable(nats.ErrNoResponders))
 	assert.True(t, isStreamUnavailable(errors.New("nats: stream not found")))
 	assert.False(t, isStreamUnavailable(errors.New("some other error")))
-	assert.False(t, isStreamUnavailable(nats.ErrKeyNotFound))
+	assert.False(t, isStreamUnavailable(jetstream.ErrKeyNotFound))
 }
 
 // --- Terminated instance KV tests ---
@@ -1113,14 +1313,115 @@ func TestJetStreamManager_TerminatedInstance_KVNotInitialized(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// --- CAS conflict-retry tests ---
+
+// TestJetStreamManager_UpdateTerminatedInstance_ConflictRetry locks the CAS
+// contract for the multi-writer Teardown map: a concurrent writer that lands
+// between UpdateTerminatedInstance's Get and Update must be detected via a
+// revision conflict and retried, and BOTH updates — the injected concurrent
+// one and the retried one — must land, none silently dropped.
+func TestJetStreamManager_UpdateTerminatedInstance_ConflictRetry(t *testing.T) {
+	nc, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	jsm, err := NewJetStreamManager(nc, 1)
+	require.NoError(t, err)
+	require.NoError(t, jsm.InitTerminatedInstanceBucket())
+
+	testVM := &vm.VM{ID: "i-cas-conflict", Teardown: map[string]string{"volumes": "pending", "gpu": "pending"}}
+	require.NoError(t, jsm.WriteTerminatedInstance(testVM.ID, testVM))
+	defer func() { _ = jsm.DeleteTerminatedInstance(testVM.ID) }()
+
+	var attempts int
+	var injectOnce sync.Once
+	updated, err := jsm.UpdateTerminatedInstance(testVM.ID, func(v *vm.VM) {
+		attempts++
+		if v.Teardown == nil {
+			v.Teardown = map[string]string{}
+		}
+		v.Teardown["gpu"] = "done"
+
+		// Simulate a concurrent writer landing between our Get and Update on
+		// the first attempt only, forcing exactly one revision conflict.
+		injectOnce.Do(func() {
+			_, cerr := jsm.UpdateTerminatedInstance(testVM.ID, func(cv *vm.VM) {
+				if cv.Teardown == nil {
+					cv.Teardown = map[string]string{}
+				}
+				cv.Teardown["volumes"] = "done"
+			})
+			require.NoError(t, cerr)
+		})
+	})
+	require.NoError(t, err, "the retried Update must eventually succeed against the fresh revision")
+	require.NotNil(t, updated)
+	assert.Equal(t, 2, attempts, "the injected concurrent write must force exactly one retry")
+	assert.Equal(t, "done", updated.Teardown["gpu"])
+
+	loaded, err := jsm.LoadTerminatedInstance(testVM.ID)
+	require.NoError(t, err)
+	require.NotNil(t, loaded)
+	assert.Equal(t, "done", loaded.Teardown["volumes"], "the concurrent writer's update must survive, not be clobbered")
+	assert.Equal(t, "done", loaded.Teardown["gpu"], "the retried update must also land")
+}
+
+// TestJetStreamManager_UpdateTerminatedInstance_NotFound verifies
+// UpdateTerminatedInstance surfaces a clear error rather than silently
+// creating a record when there is nothing to merge into.
+func TestJetStreamManager_UpdateTerminatedInstance_NotFound(t *testing.T) {
+	nc, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	jsm, err := NewJetStreamManager(nc, 1)
+	require.NoError(t, err)
+	require.NoError(t, jsm.InitTerminatedInstanceBucket())
+
+	_, err = jsm.UpdateTerminatedInstance("i-does-not-exist", func(v *vm.VM) {})
+	assert.ErrorIs(t, err, jetstream.ErrKeyNotFound)
+}
+
+// TestJetStreamManager_WriteStoppedInstance_OverwritesConcurrentValue verifies
+// WriteStoppedInstance's CAS write still succeeds and lands the caller's full
+// snapshot even when a concurrent writer changed the key first — the
+// conflict-retry loop must not surface a spurious error for the common,
+// non-merging "replace wholesale" write path.
+func TestJetStreamManager_WriteStoppedInstance_OverwritesConcurrentValue(t *testing.T) {
+	nc, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	jsm, err := NewJetStreamManager(nc, 1)
+	require.NoError(t, err)
+	require.NoError(t, jsm.InitKVBucket())
+
+	first := &vm.VM{ID: "i-stopped-cas", InstanceType: "t3.micro"}
+	require.NoError(t, jsm.WriteStoppedInstance(first.ID, first))
+	defer func() { _ = jsm.DeleteStoppedInstance(first.ID) }()
+
+	// A concurrent writer changes the record between the caller's decision to
+	// write and WriteStoppedInstance's internal Get.
+	concurrent := &vm.VM{ID: "i-stopped-cas", InstanceType: "t3.small"}
+	require.NoError(t, jsm.WriteStoppedInstance(concurrent.ID, concurrent))
+
+	final := &vm.VM{ID: "i-stopped-cas", InstanceType: "t3.large"}
+	require.NoError(t, jsm.WriteStoppedInstance(final.ID, final))
+
+	loaded, err := jsm.LoadStoppedInstance(final.ID)
+	require.NoError(t, err)
+	require.NotNil(t, loaded)
+	assert.Equal(t, "t3.large", loaded.InstanceType)
+}
+
 // --- Terminated KV bucket recovery tests ---
 
 // deleteTerminatedInstanceBucket deletes the underlying JetStream stream for the terminated-instances KV bucket.
 func deleteTerminatedInstanceBucket(t *testing.T, nc *nats.Conn) {
 	t.Helper()
-	js, err := nc.JetStream()
+	js, err := jetstream.New(nc)
 	require.NoError(t, err)
-	err = js.DeleteStream("KV_" + TerminatedInstanceBucket)
+	err = js.DeleteStream(t.Context(), "KV_"+TerminatedInstanceBucket)
 	require.NoError(t, err)
 }
 
@@ -1206,15 +1507,15 @@ func TestJetStreamManager_InitBuckets_WritesVersion(t *testing.T) {
 	require.NoError(t, jsm.InitClusterStateBucket())
 	require.NoError(t, jsm.InitTerminatedInstanceBucket())
 
-	v, err := utils.ReadVersion(jsm.kv)
+	v, err := kvutil.ReadVersion(t.Context(), jsm.kv)
 	require.NoError(t, err)
 	assert.Equal(t, InstanceStateBucketVersion, v)
 
-	v, err = utils.ReadVersion(jsm.clusterKV)
+	v, err = kvutil.ReadVersion(t.Context(), jsm.clusterKV)
 	require.NoError(t, err)
 	assert.Equal(t, ClusterStateBucketVersion, v)
 
-	v, err = utils.ReadVersion(jsm.terminatedKV)
+	v, err = kvutil.ReadVersion(t.Context(), jsm.terminatedKV)
 	require.NoError(t, err)
 	assert.Equal(t, TerminatedInstanceBucketVersion, v)
 }
@@ -1335,4 +1636,91 @@ func TestJetStreamManager_BestEffort_NilObserver_NoPanic(t *testing.T) {
 
 	// No observer set — must not panic on success or failure paths.
 	jsm.WriteStateBytesBestEffort("obs-nil", []byte(`{"vms":{}}`), 5*time.Second)
+}
+
+// --- UpdateMgmtIPAM CAS tests ---
+
+// TestJetStreamManager_UpdateMgmtIPAM_ConflictRetry locks the CAS contract
+// for mgmt-ipam records: a concurrent writer landing between Get and Update
+// must be detected via a revision conflict and retried, and both the
+// injected concurrent write and the retried write must land — mirroring
+// UpdateStoppedInstance/UpdateTerminatedInstance's conflict-retry tests,
+// applied to the allocator's backing store.
+func TestJetStreamManager_UpdateMgmtIPAM_ConflictRetry(t *testing.T) {
+	nc, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	jsm, err := NewJetStreamManager(nc, 1)
+	require.NoError(t, err)
+	require.NoError(t, jsm.InitClusterStateBucket())
+
+	const subnet = "10.99.8.0/24"
+	defer func() { _ = jsm.clusterKV.Delete(t.Context(), mgmtIPAMKeyPrefix+subnet) }()
+
+	_, err = jsm.UpdateMgmtIPAM(subnet, func(r *MgmtIPRecord) {
+		r.Subnet = subnet
+		r.Allocated = append(r.Allocated, MgmtIPEntry{IP: "10.99.8.10", InstanceID: "i-seed", Node: "node-seed"})
+	}, true)
+	require.NoError(t, err)
+
+	var attempts int
+	var injectOnce sync.Once
+	updated, err := jsm.UpdateMgmtIPAM(subnet, func(r *MgmtIPRecord) {
+		attempts++
+		r.Allocated = append(r.Allocated, MgmtIPEntry{IP: "10.99.8.11", InstanceID: "i-retried", Node: "node-a"})
+
+		// Simulate a concurrent writer landing between our Get and Update on
+		// the first attempt only, forcing exactly one revision conflict.
+		injectOnce.Do(func() {
+			_, cerr := jsm.UpdateMgmtIPAM(subnet, func(cr *MgmtIPRecord) {
+				cr.Allocated = append(cr.Allocated, MgmtIPEntry{IP: "10.99.8.12", InstanceID: "i-concurrent", Node: "node-b"})
+			}, true)
+			require.NoError(t, cerr)
+		})
+	}, true)
+	require.NoError(t, err, "the retried Update must eventually succeed against the fresh revision")
+	require.NotNil(t, updated)
+	assert.Equal(t, 2, attempts, "the injected concurrent write must force exactly one retry")
+
+	ids := make(map[string]bool, len(updated.Allocated))
+	for _, e := range updated.Allocated {
+		ids[e.InstanceID] = true
+	}
+	assert.True(t, ids["i-seed"], "the original entry must survive")
+	assert.True(t, ids["i-concurrent"], "the concurrent writer's entry must survive, not be clobbered")
+	assert.True(t, ids["i-retried"], "the retried update must also land")
+}
+
+// TestJetStreamManager_UpdateMgmtIPAM_NotFound verifies createIfAbsent=false
+// surfaces jetstream.ErrKeyNotFound instead of silently creating a record —
+// MgmtIPAllocator.Release relies on this to no-op cleanly when there is
+// nothing to release.
+func TestJetStreamManager_UpdateMgmtIPAM_NotFound(t *testing.T) {
+	nc, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	jsm, err := NewJetStreamManager(nc, 1)
+	require.NoError(t, err)
+	require.NoError(t, jsm.InitClusterStateBucket())
+
+	_, err = jsm.UpdateMgmtIPAM("10.98.8.0/24-nonexistent", func(r *MgmtIPRecord) {}, false)
+	assert.ErrorIs(t, err, jetstream.ErrKeyNotFound)
+}
+
+// TestJetStreamManager_UpdateMgmtIPAM_ClusterKVNotInitialized tests error
+// handling when the cluster-state KV bucket has not been initialized.
+func TestJetStreamManager_UpdateMgmtIPAM_ClusterKVNotInitialized(t *testing.T) {
+	nc, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	jsm, err := NewJetStreamManager(nc, 1)
+	require.NoError(t, err)
+	// Don't call InitClusterStateBucket
+
+	_, err = jsm.UpdateMgmtIPAM("10.97.8.0/24", func(r *MgmtIPRecord) {}, true)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "cluster state KV not initialized")
 }

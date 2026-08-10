@@ -7,9 +7,10 @@ import (
 	"net"
 	"net/netip"
 
+	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/network/external"
 	"github.com/mulgadc/spinifex/spinifex/network/external/dhcp"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // Backward-compatible aliases so callers (daemon, EIP, EC2 handlers, tests)
@@ -25,31 +26,11 @@ const (
 	KVBucketExternalIPAMVersion = external.KVBucketStaticPoolVersion
 )
 
-// ExternalPoolConfig is the admin-defined IP pool from spinifex.toml.
-// Duplicated from network/external.ExternalPoolConfig pending consolidation.
-type ExternalPoolConfig struct {
-	Name       string
-	Source     string // "static" (default) or "dhcp"
-	BindBridge string // Linux bridge for DHCP DORA (source=dhcp only)
-	RangeStart string
-	RangeEnd   string
-	Gateway    string
-	GatewayIP  string
-	PrefixLen  int
-	Region     string
-	AZ         string
-	// GwLrpRangeStart/End reserves a sub-range of the LAN for OVN gateway
-	// LRP IPs in centralized NAT mode. IPAM must skip these addresses or
-	// the per-VM EIP allocator and vpcd will fight over them.
-	GwLrpRangeStart string
-	GwLrpRangeEnd   string
-}
-
 // ExternalIPAM is the AWS-facing entry point for external IP allocation,
 // dispatching to StaticPoolAllocator or dhcp.DHCPPoolAllocator per pool name.
 type ExternalIPAM struct {
-	kv      nats.KeyValue
-	pools   []ExternalPoolConfig
+	kv      jetstream.KeyValue
+	pools   []external.ExternalPoolConfig
 	static  *external.StaticPoolAllocator
 	perPool map[string]external.Allocator // dhcp overrides; static pools fall through to `static`
 }
@@ -57,15 +38,15 @@ type ExternalIPAM struct {
 // NewExternalIPAM creates a new ExternalIPAM. Static pools wire through
 // external.StaticPoolAllocator; DHCP-sourced pools wait for EnableDHCP
 // to install the per-pool dhcp.DHCPPoolAllocator.
-func NewExternalIPAM(js nats.JetStreamContext, pools []ExternalPoolConfig) (*ExternalIPAM, error) {
+func NewExternalIPAM(ctx context.Context, js jetstream.JetStream, pools []external.ExternalPoolConfig) (*ExternalIPAM, error) {
 	staticPools := filterStatic(pools)
 	var (
 		alloc *external.StaticPoolAllocator
-		kv    nats.KeyValue
+		kv    jetstream.KeyValue
 	)
 	if len(staticPools) > 0 {
 		var err error
-		alloc, err = external.NewStaticPoolAllocator(js, toExternalPools(staticPools))
+		alloc, err = external.NewStaticPoolAllocator(ctx, js, staticPools)
 		if err != nil {
 			return nil, err
 		}
@@ -75,8 +56,8 @@ func NewExternalIPAM(js nats.JetStreamContext, pools []ExternalPoolConfig) (*Ext
 }
 
 // NewExternalIPAMWithKV creates an ExternalIPAM with an existing KV bucket (for testing).
-func NewExternalIPAMWithKV(kv nats.KeyValue, pools []ExternalPoolConfig) *ExternalIPAM {
-	alloc := external.NewStaticPoolAllocatorWithKV(kv, toExternalPools(filterStatic(pools)))
+func NewExternalIPAMWithKV(kv jetstream.KeyValue, pools []external.ExternalPoolConfig) *ExternalIPAM {
+	alloc := external.NewStaticPoolAllocatorWithKV(kv, filterStatic(pools))
 	return &ExternalIPAM{kv: kv, pools: pools, static: alloc, perPool: map[string]external.Allocator{}}
 }
 
@@ -91,19 +72,19 @@ func (m *ExternalIPAM) EnableDHCP(client *dhcp.NATSClient) error {
 		if p.Source != external.SourceDHCP {
 			continue
 		}
-		m.perPool[p.Name] = dhcp.NewDHCPPoolAllocator(client, toExternalPools([]ExternalPoolConfig{p})[0])
+		m.perPool[p.Name] = dhcp.NewDHCPPoolAllocator(client, p)
 	}
 	return nil
 }
 
 // AllocateIP allocates the next available external IP from the best pool
 // matching the given region/AZ. Returns the allocated IP and pool name.
-func (m *ExternalIPAM) AllocateIP(region, az, purpose, allocID, eniID, instanceID string) (string, string, error) {
+func (m *ExternalIPAM) AllocateIP(ctx context.Context, region, az, purpose, allocID, eniID, instanceID string) (string, string, error) {
 	pool := m.findPool(region, az)
 	if pool == nil {
-		return "", "", fmt.Errorf("InsufficientAddressCapacity: no external pool available for region=%q az=%q", region, az)
+		return "", "", fmt.Errorf("no external pool available for region=%q az=%q: %w", region, az, errors.New(awserrors.ErrorInsufficientAddressCapacity))
 	}
-	ip, err := m.AllocateFromPool(pool.Name, purpose, allocID, eniID, instanceID)
+	ip, err := m.AllocateFromPool(ctx, pool.Name, purpose, allocID, eniID, instanceID)
 	if err != nil {
 		return "", "", err
 	}
@@ -111,12 +92,12 @@ func (m *ExternalIPAM) AllocateIP(region, az, purpose, allocID, eniID, instanceI
 }
 
 // AllocateFromPool allocates an IP from a specific named pool.
-func (m *ExternalIPAM) AllocateFromPool(poolName, purpose, allocID, eniID, instanceID string) (string, error) {
+func (m *ExternalIPAM) AllocateFromPool(ctx context.Context, poolName, purpose, allocID, eniID, instanceID string) (string, error) {
 	alloc, err := m.allocatorFor(poolName)
 	if err != nil {
 		return "", err
 	}
-	addr, err := alloc.Allocate(context.Background(), external.AllocateRequest{
+	addr, err := alloc.Allocate(ctx, external.AllocateRequest{
 		PoolName:     poolName,
 		Purpose:      purpose,
 		AllocationID: allocID,
@@ -132,7 +113,7 @@ func (m *ExternalIPAM) AllocateFromPool(poolName, purpose, allocID, eniID, insta
 // ReleaseIP releases a previously allocated external IP back to its pool.
 // ownerENIID, when non-empty, scopes the release to the ENI that currently owns
 // the lease so a stale or duplicated teardown for a recycled IP is a no-op.
-func (m *ExternalIPAM) ReleaseIP(poolName, ip, ownerENIID string) error {
+func (m *ExternalIPAM) ReleaseIP(ctx context.Context, poolName, ip, ownerENIID string) error {
 	addr, err := netip.ParseAddr(ip)
 	if err != nil {
 		return fmt.Errorf("parse release IP %q: %w", ip, err)
@@ -141,16 +122,20 @@ func (m *ExternalIPAM) ReleaseIP(poolName, ip, ownerENIID string) error {
 	if err != nil {
 		return err
 	}
-	return alloc.Release(context.Background(), poolName, addr, ownerENIID)
+	return alloc.Release(ctx, poolName, addr, ownerENIID)
 }
 
 // GetPoolRecord returns the current IPAM record for a pool. DHCP-sourced
 // pools have no static record — the per-AZ lease bucket is authoritative.
 func (m *ExternalIPAM) GetPoolRecord(poolName string) (*ExternalIPAMRecord, error) {
+	return m.getPoolRecord(context.Background(), poolName)
+}
+
+func (m *ExternalIPAM) getPoolRecord(ctx context.Context, poolName string) (*ExternalIPAMRecord, error) {
 	if m.static == nil {
 		return nil, fmt.Errorf("pool record unavailable: no static allocator")
 	}
-	return m.static.GetPoolRecord(poolName)
+	return m.static.GetPoolRecord(ctx, poolName)
 }
 
 func (m *ExternalIPAM) allocatorFor(poolName string) (external.Allocator, error) {
@@ -165,7 +150,7 @@ func (m *ExternalIPAM) allocatorFor(poolName string) (external.Allocator, error)
 
 // findPool returns the best pool for the given region/AZ using the same
 // fallback order as topology.go: AZ-scoped → region-scoped → unscoped.
-func (m *ExternalIPAM) findPool(region, az string) *ExternalPoolConfig {
+func (m *ExternalIPAM) findPool(region, az string) *external.ExternalPoolConfig {
 	for i := range m.pools {
 		p := &m.pools[i]
 		if p.AZ != "" && p.AZ == az && p.Region == region {
@@ -187,34 +172,9 @@ func (m *ExternalIPAM) findPool(region, az string) *ExternalPoolConfig {
 	return nil
 }
 
-// toExternalPools converts the handlers-side ExternalPoolConfig into the
-// network/external mirror. The duplicate type goes away in the deferred
-// L5 cleanup.
-func toExternalPools(pools []ExternalPoolConfig) []external.ExternalPoolConfig {
-	out := make([]external.ExternalPoolConfig, len(pools))
-	for i, p := range pools {
-		out[i] = external.ExternalPoolConfig{
-			Name:            p.Name,
-			Source:          p.Source,
-			BindBridge:      p.BindBridge,
-			RangeStart:      p.RangeStart,
-			RangeEnd:        p.RangeEnd,
-			Gateway:         p.Gateway,
-			GatewayIP:       p.GatewayIP,
-			PrefixLen:       p.PrefixLen,
-			DNSServers:      nil,
-			Region:          p.Region,
-			AZ:              p.AZ,
-			GwLrpRangeStart: p.GwLrpRangeStart,
-			GwLrpRangeEnd:   p.GwLrpRangeEnd,
-		}
-	}
-	return out
-}
-
 // filterStatic returns only the static pools (Source unset or "static").
-func filterStatic(pools []ExternalPoolConfig) []ExternalPoolConfig {
-	out := make([]ExternalPoolConfig, 0, len(pools))
+func filterStatic(pools []external.ExternalPoolConfig) []external.ExternalPoolConfig {
+	out := make([]external.ExternalPoolConfig, 0, len(pools))
 	for _, p := range pools {
 		if p.Source == "" || p.Source == external.SourceStatic {
 			out = append(out, p)
@@ -224,7 +184,7 @@ func filterStatic(pools []ExternalPoolConfig) []ExternalPoolConfig {
 }
 
 // ValidatePoolConfig checks that a pool config is valid.
-func ValidatePoolConfig(pool ExternalPoolConfig) error {
+func ValidatePoolConfig(pool external.ExternalPoolConfig) error {
 	if pool.Name == "" {
 		return fmt.Errorf("pool name is required")
 	}
@@ -270,8 +230,10 @@ func ValidatePoolConfig(pool ExternalPoolConfig) error {
 	return nil
 }
 
+// compareIPs orders two addresses. Callers parse both first, so an invalid Addr
+// only arises from a nil net.IP and sorts before every valid address.
 func compareIPs(a, b net.IP) int {
-	ai := ipToInt(a.To4())
-	bi := ipToInt(b.To4())
-	return ai.Cmp(bi)
+	x, _ := netip.AddrFromSlice(a)
+	y, _ := netip.AddrFromSlice(b)
+	return x.Unmap().Compare(y.Unmap())
 }

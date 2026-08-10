@@ -15,13 +15,17 @@
 #   VERBOSE                    Set to 1 to echo "[setup] <stage>" before each top-level step.
 #   SETUP_STAGES               Comma-separated subset of stages to run:
 #                                deps, aws, users, sudoers, files, directories,
-#                                env, systemd, logrotate, udev, fixown, migrations
+#                                env, systemd, logrotate, udev, fixown,
+#                                migrations
 #                              Unset = run every stage appropriate for the current mode.
 
 set -e
 
 INSTALL_SPINIFEX_CHANNEL="${INSTALL_SPINIFEX_CHANNEL:-latest}"
 INSTALL_BASE_URL="${INSTALL_BASE_URL:-https://install.mulgadc.com}"
+
+# Referenced by both the sudoers grant and the daemon, so the path is fixed here.
+ENDPOINT_SYSCTL_HELPER="/usr/local/lib/spinifex/spinifex-set-endpoint-sysctl"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -139,11 +143,12 @@ create_service_users() {
         [gw]="/var/lib/spinifex/awsgw"
         [daemon]="/var/lib/spinifex/spinifex"
         [storage]="/var/lib/spinifex/predastore"
+        [northstar]="/var/lib/spinifex/northstar"
         [viperblock]="/var/lib/spinifex/viperblock"
         [vpcd]="/var/lib/spinifex"
         [ui]="/var/lib/spinifex"
     )
-    for svc in nats gw daemon storage viperblock vpcd ui; do
+    for svc in nats gw daemon storage northstar viperblock vpcd ui; do
         local user="spinifex-${svc}"
         if ! id "$user" > /dev/null 2>&1; then
             $SUDO useradd --system --no-create-home \
@@ -175,33 +180,112 @@ create_service_users() {
     # Daemon consumes viperblock's NBD socket — join the producer-typed group.
     $SUDO usermod -aG spinifex-viperblock spinifex-daemon
 
-    info "Service users created (spinifex-{nats,gw,daemon,storage,viperblock,vpcd,ui})"
+    info "Service users created (spinifex-{nats,gw,daemon,storage,northstar,viperblock,vpcd,ui})"
 }
 
 # --- Install scoped sudoers rules ---
+# sudo-rs (Ubuntu's default sudo since 25.10) implements only a subset of
+# Defaults and rejects an unknown one outright, so pam_session must be omitted
+# there rather than emitted and ignored.
+sudo_is_sudo_rs() {
+    sudo --version 2>/dev/null | head -1 | grep -qi 'sudo-rs'
+}
+
+# The daemon only ever sets rp_filter and accept_local on an endpoint it just
+# created. A fixed-verb helper keeps that grant expressible without a wildcard,
+# which sudo-rs forbids inside command arguments.
+install_endpoint_sysctl_helper() {
+    $SUDO install -d -m 0755 /usr/local/lib/spinifex
+    $SUDO tee "${ENDPOINT_SYSCTL_HELPER}" > /dev/null << 'HELPER'
+#!/bin/sh
+# Sets one of two per-endpoint sysctls for the asymmetric IMDS reply path.
+# Interface, key and value are all constrained: this runs as root under a
+# NOPASSWD grant, so it must never pass an arbitrary key through to sysctl.
+set -eu
+
+if [ "$#" -ne 3 ]; then
+    echo "usage: $0 <interface> <rp_filter|accept_local> <0|1>" >&2
+    exit 2
+fi
+
+iface=$1
+key=$2
+value=$3
+
+# Reject anything that is not a plain interface name, so the key cannot be
+# steered elsewhere in the sysctl tree with a "." or a "/".
+case "${iface}" in
+    ''|*[!A-Za-z0-9_-]*) echo "invalid interface: ${iface}" >&2; exit 2 ;;
+esac
+
+case "${key}" in
+    rp_filter|accept_local) ;;
+    *) echo "key not permitted: ${key}" >&2; exit 2 ;;
+esac
+
+case "${value}" in
+    0|1) ;;
+    *) echo "value not permitted: ${value}" >&2; exit 2 ;;
+esac
+
+exec sysctl -qw "net.ipv4.conf.${iface}.${key}=${value}"
+HELPER
+    $SUDO chown root:root "${ENDPOINT_SYSCTL_HELPER}"
+    $SUDO chmod 0755 "${ENDPOINT_SYSCTL_HELPER}"
+}
+
 install_sudoers() {
     stage "installing scoped sudoers rules"
-    $SUDO tee /etc/sudoers.d/spinifex-network > /dev/null << 'SUDOERS'
-# Spinifex daemon: tap devices, OVS bridge management, and DHCP for external IPs
-# ovs-ofctl installs the per-tap IMDS datapath flows on br-imds; sysctl sets the
+    install_endpoint_sysctl_helper
+
+    if sudo_is_sudo_rs; then
+        $SUDO tee /etc/sudoers.d/spinifex-network > /dev/null << 'SUDOERS'
+# pam_session is omitted: this host runs sudo-rs, which does not implement it.
+SUDOERS
+    else
+        $SUDO tee /etc/sudoers.d/spinifex-network > /dev/null << 'SUDOERS'
+# No PAM session for the service users. Every sudo call otherwise logs
+# "pam_limits: Could not set limit for 'core'": the units set LimitCORE=0 and
+# their CapabilityBoundingSet omits CAP_SYS_RESOURCE, so pam_limits cannot apply
+# the limits.conf default and warns. It also means sudo children inherit the
+# unit's rlimits rather than the system defaults, which is the RG-9 intent.
+Defaults:spinifex-daemon !pam_session
+SUDOERS
+    fi
+
+    $SUDO tee -a /etc/sudoers.d/spinifex-network > /dev/null << 'SUDOERS'
+
+# The OVS/OVN client tools are deliberately absent. They do all their work over
+# control sockets that setup-ovn.sh group-owns to `spinifex`, so they run as the
+# service user. Granting them would be worse than pointless: a NOPASSWD rule for
+# them takes unrestricted args, and ovs-vsctl/ovn-nbctl/ovn-appctl all accept
+# --log-file=PATH, which writes a root-owned file wherever the caller points it.
+#
+# ovs-ofctl is the exception that keeps its grant: it talks to a per-bridge
+# <bridge>.mgmt socket created by ovs-vswitchd when the bridge appears, including
+# bridges spinifex creates at runtime, so it cannot be group-owned up front.
+
+# spinifex-vpcd has no rules at all. Its ip/iptables/sysctl/arping work is done
+# under the CAP_NET_ADMIN and CAP_NET_RAW its unit grants ambiently, which the
+# kernel passes to each child on exec. Those grants were also root-equivalent:
+# `sudo ip netns exec <ns> /bin/sh` is a root shell.
+
+# Spinifex daemon: tap devices and OpenFlow rules. Its unit holds no
+# CAP_NET_ADMIN, so unlike vpcd it cannot drop these. ovs-ofctl installs the
+# per-tap IMDS datapath flows on br-imds; the sysctl helper sets the
 # per-endpoint rp_filter/accept_local the asymmetric reply path needs.
 spinifex-daemon ALL=(root) NOPASSWD: /sbin/ip, /usr/sbin/ip
-spinifex-daemon ALL=(root) NOPASSWD: /usr/bin/ovs-vsctl, /usr/bin/ovs-appctl, /usr/bin/ovs-ofctl
-spinifex-daemon ALL=(root) NOPASSWD: /usr/sbin/sysctl -qw net.ipv4.conf.*
-spinifex-daemon ALL=(root) NOPASSWD: /usr/sbin/dhcpcd
-spinifex-daemon ALL=(root) NOPASSWD: /usr/bin/systemctl is-active openvswitch-ipsec.service
-spinifex-daemon ALL=(root) NOPASSWD: /usr/bin/ovn-nbctl set NB_Global . ipsec=true
+spinifex-daemon ALL=(root) NOPASSWD: /usr/bin/ovs-ofctl
+SUDOERS
 
-# Spinifex VPC daemon: OVN and OVS read/write, OVN controller status check and DHCP
-spinifex-vpcd ALL=(root) NOPASSWD: /usr/sbin/dhcpcd
-spinifex-vpcd ALL=(root) NOPASSWD: /usr/bin/ovs-vsctl, /usr/bin/ovs-appctl
-spinifex-vpcd ALL=(root) NOPASSWD: /usr/bin/ovn-nbctl, /usr/bin/ovn-sbctl, /usr/bin/ovn-appctl
-spinifex-vpcd ALL=(root) NOPASSWD: /usr/bin/systemctl is-active --quiet ovn-controller
-spinifex-vpcd ALL=(root) NOPASSWD: /sbin/ip, /usr/sbin/ip
+    # Separate append so the prose above can stay in a quoted heredoc: it carries
+    # backticks that an expanding one would run as command substitution.
+    $SUDO tee -a /etc/sudoers.d/spinifex-network > /dev/null << SUDOERS
+spinifex-daemon ALL=(root) NOPASSWD: ${ENDPOINT_SYSCTL_HELPER}
 SUDOERS
     $SUDO chmod 0440 /etc/sudoers.d/spinifex-network
     $SUDO visudo -cf /etc/sudoers.d/spinifex-network || fatal "Invalid sudoers syntax in spinifex-network"
-    info "Scoped sudoers rules installed for spinifex-daemon and spinifex-vpcd"
+    info "Scoped sudoers rules installed for spinifex-daemon (spinifex-vpcd needs none)"
 }
 
 # --- Install apt dependencies ---
@@ -209,6 +293,18 @@ SUDOERS
 # scripts/iso-builder/build/packages.list in the mulga repo. When you add,
 # remove, or change a runtime package here, review that file too — drift means
 # the ISO and `curl | bash` paths install different software.
+#
+# Hoisted out of the apt-get call so scripts/lint-apt-packages.sh can resolve the
+# same list against each supported suite. The arch-specific qemu package is
+# added by install_apt_deps from detect_arch.
+APT_RUNTIME_PACKAGES="nbdkit
+qemu-utils gdisk ovmf qemu-efi-aarch64 less
+libvirt-daemon-system libvirt-clients
+pciutils
+jq curl iproute2 netcat-openbsd wget unzip xz-utils file
+ovn-central ovn-host openvswitch-switch openvswitch-ipsec strongswan-charon dhcpcd-base
+chrony"
+
 install_apt_deps() {
     stage "installing apt dependencies"
     if [ "${INSTALL_SPINIFEX_SKIP_APT}" = "1" ]; then
@@ -217,17 +313,21 @@ install_apt_deps() {
         info "Installing system dependencies..."
         $SUDO apt-get update -qq
 
+        # Unquoted on purpose: both variables are whitespace-separated package lists.
+        # shellcheck disable=SC2086
         DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq \
-            nbdkit \
-            $QEMU_PACKAGES qemu-utils gdisk qemu-kvm ovmf qemu-efi-aarch64 less \
-            libvirt-daemon-system libvirt-clients \
-            pciutils \
-            jq curl iproute2 netcat-openbsd wget unzip xz-utils file \
-            ovn-central ovn-host openvswitch-switch openvswitch-ipsec strongswan-charon dhcpcd-base \
-            chrony \
+            $QEMU_PACKAGES $APT_RUNTIME_PACKAGES \
             > /dev/null
 
         info "System dependencies installed"
+
+        # Only on a machine that already boots from ZFS. Pulling zfsutils-linux
+        # in unconditionally would drag zfs-dkms onto every dev box and rebuild
+        # the module on each kernel upgrade for no benefit.
+        if [ "$(findmnt -no FSTYPE /)" = "zfs" ] && ! command -v zpool >/dev/null 2>&1; then
+            info "ZFS root detected, installing zfsutils-linux..."
+            DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq zfsutils-linux > /dev/null
+        fi
     fi
 
     # Mask the standalone dhcpcd.service auto-enabled on Debian Trixie when
@@ -375,14 +475,16 @@ create_directories() {
     $SUDO chmod 0750 /var/lib/spinifex
     $SUDO chown "root:$SPINIFEX_GROUP" /var/lib/spinifex
 
-    # Symlink so services that expect BaseDir/config/ can find /etc/spinifex/
-    if [ ! -e /var/lib/spinifex/config ]; then
-        $SUDO ln -s /etc/spinifex /var/lib/spinifex/config
+    # Symlink so services that expect BaseDir/config/ can find /etc/spinifex/.
+    # -n so a re-run replaces the link rather than creating one inside the
+    # directory it already points at.
+    if $SUDO test ! -e /var/lib/spinifex/config; then
+        $SUDO ln -sfn /etc/spinifex /var/lib/spinifex/config
     fi
 
     # Symlink so services that write logs to BaseDir/logs/ use /var/log/spinifex/
-    if [ ! -e /var/lib/spinifex/logs ]; then
-        $SUDO ln -s /var/log/spinifex /var/lib/spinifex/logs
+    if $SUDO test ! -e /var/lib/spinifex/logs; then
+        $SUDO ln -sfn /var/log/spinifex /var/lib/spinifex/logs
     fi
 
     $SUDO mkdir -p /var/log/spinifex
@@ -416,6 +518,12 @@ TMPEOF
     $SUDO chown "spinifex-storage:$SPINIFEX_GROUP" /etc/spinifex/predastore
     $SUDO chmod 0750 /etc/spinifex/predastore
 
+    # Northstar holds northstar.toml (bucket-scoped S3 creds, written 0600 by
+    # `spx admin init`); fix_file_ownership reassigns it to spinifex-northstar.
+    $SUDO mkdir -p /etc/spinifex/northstar
+    $SUDO chown "spinifex-northstar:$SPINIFEX_GROUP" /etc/spinifex/northstar
+    $SUDO chmod 0750 /etc/spinifex/northstar
+
     $SUDO mkdir -p /etc/spinifex/awsgw
     $SUDO chown "spinifex-gw:$SPINIFEX_GROUP" /etc/spinifex/awsgw
     $SUDO chmod 0750 /etc/spinifex/awsgw
@@ -441,6 +549,10 @@ TMPEOF
     $SUDO chown "spinifex-storage:$SPINIFEX_GROUP" /var/lib/spinifex/predastore
     $SUDO chmod 0700 /var/lib/spinifex/predastore
 
+    $SUDO mkdir -p /var/lib/spinifex/northstar
+    $SUDO chown "spinifex-northstar:$SPINIFEX_GROUP" /var/lib/spinifex/northstar
+    $SUDO chmod 0700 /var/lib/spinifex/northstar
+
     $SUDO mkdir -p /var/lib/spinifex/viperblock
     $SUDO chown "spinifex-viperblock:$SPINIFEX_GROUP" /var/lib/spinifex/viperblock
     $SUDO chmod 0700 /var/lib/spinifex/viperblock
@@ -453,9 +565,18 @@ TMPEOF
     $SUDO chown "spinifex-gw:$SPINIFEX_GROUP" /var/lib/spinifex/awsgw
     $SUDO chmod 0700 /var/lib/spinifex/awsgw
 
-    # Symlink so awsgw's {BaseDir}/config/ paths resolve to /etc/spinifex/
-    if [ ! -e /var/lib/spinifex/awsgw/config ]; then
-        $SUDO ln -s /etc/spinifex /var/lib/spinifex/awsgw/config
+    $SUDO mkdir -p /var/lib/spinifex/spinifex-ui
+    $SUDO chown "spinifex-ui:$SPINIFEX_GROUP" /var/lib/spinifex/spinifex-ui
+    $SUDO chmod 0700 /var/lib/spinifex/spinifex-ui
+
+    # Symlink so awsgw's {BaseDir}/config/ paths resolve to /etc/spinifex/.
+    # The test runs under $SUDO because the parent is 0700 spinifex-gw: an
+    # unprivileged -e cannot stat through it and always reports "missing", so
+    # every re-run reached the ln below. That ln then resolved through the
+    # existing link and tried to create /etc/spinifex/spinifex, which
+    # CreateServiceDirectories already owns — failing the whole install.
+    if $SUDO test ! -e /var/lib/spinifex/awsgw/config; then
+        $SUDO ln -sfn /etc/spinifex /var/lib/spinifex/awsgw/config
     fi
 
     # Service helper scripts (root-owned, group-executable by all service users)
@@ -512,6 +633,7 @@ fix_file_ownership() {
     for entry in \
         nats:spinifex-nats \
         predastore:spinifex-storage \
+        northstar:spinifex-northstar \
         spinifex:spinifex-daemon \
         viperblock:spinifex-viperblock \
         vpcd:spinifex-vpcd \
@@ -531,6 +653,10 @@ fix_file_ownership() {
     if [ -d /etc/spinifex/predastore ]; then
         $SUDO chown -R "spinifex-storage:$SPINIFEX_GROUP" /etc/spinifex/predastore \
             || fatal "Failed to set ownership on /etc/spinifex/predastore"
+    fi
+    if [ -d /etc/spinifex/northstar ]; then
+        $SUDO chown -R "spinifex-northstar:$SPINIFEX_GROUP" /etc/spinifex/northstar \
+            || fatal "Failed to set ownership on /etc/spinifex/northstar"
     fi
     if [ -d /etc/spinifex/awsgw ]; then
         $SUDO chown -R "spinifex-gw:$SPINIFEX_GROUP" /etc/spinifex/awsgw \
@@ -633,6 +759,10 @@ EOF
     fi
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable spinifex.target
+    # The unit file alone does not self-activate (WantedBy=timers.target only
+    # takes effect once enabled) — without this the JetStream ENOSPC-latch
+    # watchdog is inert and a full disk requires a manual restart forever.
+    $SUDO systemctl enable --now spinifex-nats-watchdog.timer
     info "Systemd units installed and enabled (per-service users)"
 }
 
@@ -730,7 +860,7 @@ print_summary() {
     echo ""
 }
 
-# --- Configure host swap (mulga-siv-251) ---
+# --- Configure host swap ---
 # Provisions an 8G swapfile and lowers vm.swappiness so spinifex.slice
 # (MemorySwapMax=100%) has a backing device for graceful degradation under
 # memory pressure. Reverses the historical swap=0 assumption. Idempotent.
@@ -841,4 +971,8 @@ main() {
     fi
 }
 
-main "$@"
+# Guarded so the package lint can source this file for APT_RUNTIME_PACKAGES
+# without running the installer.
+if [ "${INSTALL_SPINIFEX_LIB_ONLY:-0}" != "1" ]; then
+    main "$@"
+fi

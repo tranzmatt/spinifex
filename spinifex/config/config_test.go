@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -218,7 +219,7 @@ region = "ap-southeast-2"
 accesskey = "AK"
 secretkey = "SK"
 base_dir = "/data"
-node_id = 1
+host_id = 1
 
 [nodes.n1.awsgw]
 host = "0.0.0.0:9999"
@@ -241,7 +242,7 @@ expected_nodes = 3
 	assert.Equal(t, "mybucket", n.Predastore.Bucket)
 	assert.Equal(t, "AK", n.Predastore.AccessKey)
 	assert.Equal(t, "/data", n.Predastore.BaseDir)
-	assert.Equal(t, 1, n.Predastore.NodeID)
+	assert.Equal(t, 1, n.Predastore.HostID)
 	assert.Equal(t, "0.0.0.0:9999", n.AWSGW.Host)
 	assert.True(t, n.AWSGW.Debug)
 	assert.Equal(t, 3, n.AWSGW.ExpectedNodes)
@@ -312,7 +313,7 @@ func TestNodeBaseDir_HappyPath(t *testing.T) {
 
 func TestNodeBaseDir_NilConfig(t *testing.T) {
 	var cc *ClusterConfig
-	assert.Equal(t, "", cc.NodeBaseDir())
+	assert.Empty(t, cc.NodeBaseDir())
 }
 
 func TestNodeBaseDir_EmptyNode(t *testing.T) {
@@ -322,7 +323,7 @@ func TestNodeBaseDir_EmptyNode(t *testing.T) {
 			"node1": {BaseDir: "/data/node1"},
 		},
 	}
-	assert.Equal(t, "", cc.NodeBaseDir())
+	assert.Empty(t, cc.NodeBaseDir())
 }
 
 func TestNodeBaseDir_NodeNotInMap(t *testing.T) {
@@ -332,7 +333,7 @@ func TestNodeBaseDir_NodeNotInMap(t *testing.T) {
 			"node1": {BaseDir: "/data/node1"},
 		},
 	}
-	assert.Equal(t, "", cc.NodeBaseDir())
+	assert.Empty(t, cc.NodeBaseDir())
 }
 
 func TestNodeBaseDir_EmptyBaseDir(t *testing.T) {
@@ -342,7 +343,7 @@ func TestNodeBaseDir_EmptyBaseDir(t *testing.T) {
 			"node1": {BaseDir: ""},
 		},
 	}
-	assert.Equal(t, "", cc.NodeBaseDir())
+	assert.Empty(t, cc.NodeBaseDir())
 }
 
 // Tests for NetworkConfig (external pools)
@@ -782,4 +783,164 @@ shardwal = true
 	n := cfg.Nodes["n1"]
 	require.NotNil(t, n.Viperblock.ShardWAL)
 	assert.True(t, *n.Viperblock.ShardWAL)
+}
+
+func TestLoadConfig_ViperblockGCEnabled_DefaultNil(t *testing.T) {
+	resetViper(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spinifex.toml")
+
+	toml := `
+node = "n1"
+
+[nodes.n1]
+region = "us-east-1"
+`
+	require.NoError(t, os.WriteFile(path, []byte(toml), 0600))
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+
+	n := cfg.Nodes["n1"]
+	assert.Nil(t, n.Viperblock.GCEnabled, "GCEnabled should be nil when not configured (defaults to false in service)")
+}
+
+func TestLoadConfig_ViperblockGCEnabled_True(t *testing.T) {
+	resetViper(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spinifex.toml")
+
+	toml := `
+node = "n1"
+
+[nodes.n1]
+region = "us-east-1"
+
+[nodes.n1.viperblock]
+gc_enabled = true
+`
+	require.NoError(t, os.WriteFile(path, []byte(toml), 0600))
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+
+	n := cfg.Nodes["n1"]
+	require.NotNil(t, n.Viperblock.GCEnabled, "GCEnabled should be set when explicitly configured")
+	assert.True(t, *n.Viperblock.GCEnabled)
+}
+
+func TestParseEndpoints(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"empty", "", nil},
+		{"single", "tcp:127.0.0.1:6641", []string{"tcp:127.0.0.1:6641"}},
+		{"cluster", "tcp:ip1:6641,tcp:ip2:6641,tcp:ip3:6641",
+			[]string{"tcp:ip1:6641", "tcp:ip2:6641", "tcp:ip3:6641"}},
+		{"whitespace and trailing comma", " tcp:ip1:6641 , tcp:ip2:6641 ,",
+			[]string{"tcp:ip1:6641", "tcp:ip2:6641"}},
+		{"only commas", ",,", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, ParseEndpoints(tc.in))
+		})
+	}
+}
+
+func TestLoadConfig_NATExemptCIDRs(t *testing.T) {
+	base := `
+node = "n1"
+
+[network]
+external_mode = %q
+nat_exempt_cidrs = [%s]
+
+[nodes.n1]
+region = "us-east-1"
+
+[nodes.n1.vpcd]
+ovn_nb_addr = "tcp:127.0.0.1:6641"
+`
+	write := func(t *testing.T, mode, cidrs string) string {
+		t.Helper()
+		resetViper(t)
+		path := filepath.Join(t.TempDir(), "spinifex.toml")
+		require.NoError(t, os.WriteFile(path, fmt.Appendf(nil, base, mode, cidrs), 0600))
+		return path
+	}
+
+	t.Run("valid in nat mode", func(t *testing.T) {
+		cfg, err := LoadConfig(write(t, "nat", `"192.168.1.0/24", "172.16.0.0/12"`))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"192.168.1.0/24", "172.16.0.0/12"}, cfg.Network.NATExemptCIDRs)
+	})
+
+	t.Run("rejected outside nat mode", func(t *testing.T) {
+		_, err := LoadConfig(write(t, "pool", `"192.168.1.0/24"`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "nat_exempt_cidrs")
+	})
+
+	t.Run("invalid CIDR rejected", func(t *testing.T) {
+		_, err := LoadConfig(write(t, "nat", `"not-a-cidr"`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not-a-cidr")
+	})
+}
+
+func TestLoadConfig_DHCPMAC(t *testing.T) {
+	base := `
+node = "n1"
+
+[network]
+external_mode = "pool"
+
+[[network.external_pools]]
+name = "wan"
+source = %q
+%s
+%s
+
+[nodes.n1]
+region = "us-east-1"
+
+[nodes.n1.vpcd]
+ovn_nb_addr = "tcp:127.0.0.1:6641"
+`
+	write := func(t *testing.T, source, bindBridge, dhcpMAC string) string {
+		t.Helper()
+		resetViper(t)
+		path := filepath.Join(t.TempDir(), "spinifex.toml")
+		bb := ""
+		if bindBridge != "" {
+			bb = fmt.Sprintf("bind_bridge = %q", bindBridge)
+		}
+		dm := ""
+		if dhcpMAC != "" {
+			dm = fmt.Sprintf("dhcp_mac = %q", dhcpMAC)
+		}
+		require.NoError(t, os.WriteFile(path, fmt.Appendf(nil, base, source, bb, dm), 0600))
+		return path
+	}
+
+	t.Run("interface on dhcp pool", func(t *testing.T) {
+		cfg, err := LoadConfig(write(t, "dhcp", "wlan0", "interface"))
+		require.NoError(t, err)
+		assert.Equal(t, "interface", cfg.Network.ExternalPools[0].DHCPMAC)
+	})
+
+	t.Run("unknown value rejected", func(t *testing.T) {
+		_, err := LoadConfig(write(t, "dhcp", "wlan0", "random"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "dhcp_mac")
+	})
+
+	t.Run("rejected on static pool", func(t *testing.T) {
+		_, err := LoadConfig(write(t, "static", "", "interface"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `dhcp_mac is only valid with source="dhcp"`)
+	})
 }

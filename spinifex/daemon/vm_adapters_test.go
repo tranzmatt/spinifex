@@ -1,15 +1,23 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/mulgadc/spinifex/spinifex/gpu"
+	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
 	"github.com/mulgadc/spinifex/spinifex/tags"
+	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/vm"
+	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,7 +39,7 @@ func newHookTestDaemon(t *testing.T) (*Daemon, *nats.Conn) {
 	return d, nc
 }
 
-func TestOnInstanceUpHook_RegistersBothPerInstanceTopics(t *testing.T) {
+func TestOnInstanceUpHook_RegistersAllPerInstanceTopics(t *testing.T) {
 	d, _ := newHookTestDaemon(t)
 	instance := &vm.VM{ID: "i-up-basic"}
 
@@ -44,6 +52,10 @@ func TestOnInstanceUpHook_RegistersBothPerInstanceTopics(t *testing.T) {
 	consoleSub, ok := d.natsSubscriptions[instance.ID+".console"]
 	require.True(t, ok, "console subscription must be registered under <id>.console key")
 	assert.Equal(t, "ec2.i-up-basic.GetConsoleOutput", consoleSub.Subject)
+
+	passwordSub, ok := d.natsSubscriptions[instance.ID+".password"]
+	require.True(t, ok, "password subscription must be registered under <id>.password key")
+	assert.Equal(t, "ec2.i-up-basic.GetPasswordData", passwordSub.Subject)
 }
 
 func TestOnInstanceUpHook_ReArmsSystemTerminateForELBv2(t *testing.T) {
@@ -60,7 +72,7 @@ func TestOnInstanceUpHook_ReArmsSystemTerminateForELBv2(t *testing.T) {
 	assert.Equal(t, "system.TerminateInstance.i-up-sys", sub.Subject)
 }
 
-// TestOnInstanceUpHook_ReArmsSystemTerminateForEKS locks mulga-siv-295.10: an EKS
+// TestOnInstanceUpHook_ReArmsSystemTerminateForEKS locks the contract: an EKS
 // K3s control-plane VM placed on the coordinator's own node (local launch, no
 // remote-launch handler) must still bind system.TerminateInstance.{id} via the
 // OnInstanceUp funnel — otherwise a cluster-wide teardown invoked on another node
@@ -108,23 +120,30 @@ func TestOnInstanceUpHook_ReplacesExistingSubsOnDoubleUp(t *testing.T) {
 	require.NoError(t, d.onInstanceUpHook()(instance))
 	first := d.natsSubscriptions[instance.ID]
 	firstConsole := d.natsSubscriptions[instance.ID+".console"]
+	firstPassword := d.natsSubscriptions[instance.ID+".password"]
 	require.NotNil(t, first)
 	require.NotNil(t, firstConsole)
+	require.NotNil(t, firstPassword)
 
 	require.NoError(t, d.onInstanceUpHook()(instance))
 	second := d.natsSubscriptions[instance.ID]
 	secondConsole := d.natsSubscriptions[instance.ID+".console"]
+	secondPassword := d.natsSubscriptions[instance.ID+".password"]
 	require.NotNil(t, second)
 	require.NotNil(t, secondConsole)
+	require.NotNil(t, secondPassword)
 
 	// Second call must have unsubscribed the originals (so they're no longer
 	// receiving on the topic) and replaced the map entries with fresh subs.
 	assert.False(t, first.IsValid(), "first command sub should be unsubscribed")
 	assert.False(t, firstConsole.IsValid(), "first console sub should be unsubscribed")
+	assert.False(t, firstPassword.IsValid(), "first password sub should be unsubscribed")
 	assert.True(t, second.IsValid(), "second command sub should be live")
 	assert.True(t, secondConsole.IsValid(), "second console sub should be live")
+	assert.True(t, secondPassword.IsValid(), "second password sub should be live")
 	assert.NotSame(t, first, second, "command sub map entry must be replaced")
 	assert.NotSame(t, firstConsole, secondConsole, "console sub map entry must be replaced")
+	assert.NotSame(t, firstPassword, secondPassword, "password sub map entry must be replaced")
 }
 
 func TestOnInstanceDownHook_UnsubscribesAndDeletes(t *testing.T) {
@@ -134,17 +153,22 @@ func TestOnInstanceDownHook_UnsubscribesAndDeletes(t *testing.T) {
 	require.NoError(t, d.onInstanceUpHook()(instance))
 	cmdSub := d.natsSubscriptions[instance.ID]
 	consoleSub := d.natsSubscriptions[instance.ID+".console"]
+	passwordSub := d.natsSubscriptions[instance.ID+".password"]
 	require.NotNil(t, cmdSub)
 	require.NotNil(t, consoleSub)
+	require.NotNil(t, passwordSub)
 
 	d.onInstanceDownHook()(instance.ID)
 
 	_, cmdPresent := d.natsSubscriptions[instance.ID]
 	_, consolePresent := d.natsSubscriptions[instance.ID+".console"]
+	_, passwordPresent := d.natsSubscriptions[instance.ID+".password"]
 	assert.False(t, cmdPresent, "command sub must be deleted from map")
 	assert.False(t, consolePresent, "console sub must be deleted from map")
+	assert.False(t, passwordPresent, "password sub must be deleted from map")
 	assert.False(t, cmdSub.IsValid(), "command sub must be unsubscribed")
 	assert.False(t, consoleSub.IsValid(), "console sub must be unsubscribed")
+	assert.False(t, passwordSub.IsValid(), "password sub must be unsubscribed")
 }
 
 func TestOnInstanceDownHook_NoOpWhenAbsent(t *testing.T) {
@@ -199,13 +223,14 @@ func TestOnInstanceDownHook_OnlyRemovesTargetedInstance(t *testing.T) {
 
 	require.NoError(t, d.onInstanceUpHook()(keep))
 	require.NoError(t, d.onInstanceUpHook()(drop))
-	require.Len(t, d.natsSubscriptions, 4)
+	require.Len(t, d.natsSubscriptions, 6)
 
 	d.onInstanceDownHook()(drop.ID)
 
-	assert.Len(t, d.natsSubscriptions, 2)
+	assert.Len(t, d.natsSubscriptions, 3)
 	assert.NotNil(t, d.natsSubscriptions[keep.ID])
 	assert.NotNil(t, d.natsSubscriptions[keep.ID+".console"])
+	assert.NotNil(t, d.natsSubscriptions[keep.ID+".password"])
 	_, dropPresent := d.natsSubscriptions[drop.ID]
 	assert.False(t, dropPresent)
 }
@@ -354,6 +379,17 @@ func TestReleaseGPU_ManagerError_LogsWarning(t *testing.T) {
 	a.ReleaseGPU(instance)
 }
 
+// --- RemoveFromSpotRequest ---
+
+// RemoveFromSpotRequest is a no-op when the spot instance service is not
+// configured. The service-present path is just a delegation to the spot
+// service's CloseForInstance, which is covered by the service's own tests.
+func TestRemoveFromSpotRequest_NoService_NoOp(t *testing.T) {
+	d := &Daemon{}
+	a := newInstanceCleanerAdapter(d)
+	require.NoError(t, a.RemoveFromSpotRequest(&vm.VM{ID: "i-x", AccountID: "111111111111"}))
+}
+
 // TestBuildVMManagerDeps_WiresBeforeInstanceRelaunch guards the single line
 // in buildVMManagerDeps that routes the recovery hook to
 // refreshSystemInstanceState. Dropping it would surface only in cell-18.
@@ -370,4 +406,178 @@ func TestBuildVMManagerDeps_WiresBeforeInstanceRelaunch(t *testing.T) {
 	require.NoError(t, deps.Hooks.BeforeInstanceRelaunch(&vm.VM{ID: "i-noop", ManagedBy: ""}))
 	require.Error(t, deps.Hooks.BeforeInstanceRelaunch(&vm.VM{ID: "i-svc", ManagedBy: tags.ManagedByELBv2}),
 		"ELBv2 VM with nil elbv2Service must error rather than silently no-op")
+}
+
+// --- DetachAndDeleteENI: post-launch attach enumeration ---
+
+// TestInstanceCleanerAdapter_DetachAndDeleteENI_ReleasesPostLaunchAttach locks
+// in the terminate-time read path: DetachAndDeleteENI must enumerate the
+// spinifex-vpc-enis KV by InstanceId rather than trusting the launch-time
+// instance.ENIId scalar alone. handleAttachNetworkInterface (the real
+// post-launch/hot-plug attach path) only ever mutates the KV record, never
+// vm.VM — so without the enumeration this ENI would survive terminate and
+// pin its SG/subnet/VPC behind DependencyViolation, exactly as observed on
+// env19.
+func TestInstanceCleanerAdapter_DetachAndDeleteENI_ReleasesPostLaunchAttach(t *testing.T) {
+	f := newENIHotPlugFixture(t)
+	f.vmInst.AccountID = testAccountID
+
+	// Attach via the KV only — instance.ENIId is deliberately left unset,
+	// mirroring a hot-plug attach that never touches vm.VM.
+	_, err := f.daemon.vpcService.AttachENI(testAccountID, f.eniID, f.vmInst.ID, 1)
+	require.NoError(t, err)
+	require.Empty(t, f.vmInst.ENIId, "precondition: launch-time scalar must stay unset")
+
+	cleaner := newInstanceCleanerAdapter(f.daemon)
+	require.NoError(t, cleaner.DetachAndDeleteENI(f.vmInst))
+
+	_, err = f.daemon.vpcService.GetENIRecord(testAccountID, f.eniID)
+	require.Error(t, err, "the ENI record must be released even though instance.ENIId was never set")
+	assert.True(t, awserrors.IsErrorCode(err, awserrors.ErrorInvalidNetworkInterfaceIDNotFound))
+}
+
+// TestInstanceCleanerAdapter_DetachAndDeleteENI_DeleteOnTerminationFalseDetachesOnly
+// proves the sweep honours DeleteOnTermination=false: the ENI is detached
+// (freed for reattachment) but not deleted, matching AWS semantics.
+func TestInstanceCleanerAdapter_DetachAndDeleteENI_DeleteOnTerminationFalseDetachesOnly(t *testing.T) {
+	f := newENIHotPlugFixture(t)
+	f.vmInst.AccountID = testAccountID
+
+	_, err := f.daemon.vpcService.AttachENI(testAccountID, f.eniID, f.vmInst.ID, 1)
+	require.NoError(t, err)
+	require.NoError(t, f.daemon.vpcService.UpdateENI(testAccountID, f.eniID, func(r *handlers_ec2_vpc.ENIRecord) {
+		r.DeleteOnTermination = aws.Bool(false)
+	}))
+
+	cleaner := newInstanceCleanerAdapter(f.daemon)
+	require.NoError(t, cleaner.DetachAndDeleteENI(f.vmInst))
+
+	rec, err := f.daemon.vpcService.GetENIRecord(testAccountID, f.eniID)
+	require.NoError(t, err, "DeleteOnTermination=false must detach, not delete")
+	assert.Equal(t, "available", rec.Status)
+	assert.Empty(t, rec.InstanceId)
+}
+
+// TestInstanceCleanerAdapter_DetachAndDeleteENI_PrimaryENIReleased covers the
+// launch-time instance.ENIId path (as opposed to the KV enumeration sweep):
+// a still-attached primary ENI must be detached and force-deleted so it
+// converges to NotFound.
+func TestInstanceCleanerAdapter_DetachAndDeleteENI_PrimaryENIReleased(t *testing.T) {
+	f := newENIHotPlugFixture(t)
+	f.vmInst.AccountID = testAccountID
+	f.vmInst.ENIId = f.eniID
+
+	_, err := f.daemon.vpcService.AttachENI(testAccountID, f.eniID, f.vmInst.ID, 0)
+	require.NoError(t, err)
+
+	cleaner := newInstanceCleanerAdapter(f.daemon)
+	require.NoError(t, cleaner.DetachAndDeleteENI(f.vmInst))
+
+	_, err = f.daemon.vpcService.GetENIRecord(testAccountID, f.eniID)
+	require.Error(t, err, "the primary ENI must be deleted")
+	assert.True(t, awserrors.IsErrorCode(err, awserrors.ErrorInvalidNetworkInterfaceIDNotFound))
+}
+
+// TestInstanceCleanerAdapter_DetachAndDeleteENI_PrimaryENIDetachFailureContinues
+// proves a failed detach on the primary ENI does not abort the delete: DetachENI
+// on an ENI ID absent from the KV (e.g. already reaped) fails, but
+// ForceDeleteInstanceENI tolerates NotFound, so terminate still converges.
+func TestInstanceCleanerAdapter_DetachAndDeleteENI_PrimaryENIDetachFailureContinues(t *testing.T) {
+	f := newENIHotPlugFixture(t)
+	f.vmInst.AccountID = testAccountID
+	f.vmInst.ENIId = "eni-never-existed"
+
+	cleaner := newInstanceCleanerAdapter(f.daemon)
+	require.NoError(t, cleaner.DetachAndDeleteENI(f.vmInst),
+		"a failed detach on a missing primary ENI must not fail terminate")
+}
+
+// TestInstanceCleanerAdapter_DetachAndDeleteENI_MultipleAttachedENIsReleased locks
+// in the fix's core scenario: several post-launch-attached ENIs on one instance
+// are all swept, each honouring its own DeleteOnTermination value.
+func TestInstanceCleanerAdapter_DetachAndDeleteENI_MultipleAttachedENIsReleased(t *testing.T) {
+	f := newENIHotPlugFixture(t)
+	f.vmInst.AccountID = testAccountID
+
+	eniOut2, err := f.daemon.vpcService.CreateNetworkInterface(context.Background(), &ec2.CreateNetworkInterfaceInput{
+		SubnetId: aws.String(f.subnetID),
+	}, testAccountID)
+	require.NoError(t, err)
+	eniID2 := *eniOut2.NetworkInterface.NetworkInterfaceId
+
+	// eniID keeps the fixture's default DeleteOnTermination=true (deleted);
+	// eniID2 is explicitly false (detached only).
+	_, err = f.daemon.vpcService.AttachENI(testAccountID, f.eniID, f.vmInst.ID, 1)
+	require.NoError(t, err)
+	_, err = f.daemon.vpcService.AttachENI(testAccountID, eniID2, f.vmInst.ID, 2)
+	require.NoError(t, err)
+	require.NoError(t, f.daemon.vpcService.UpdateENI(testAccountID, eniID2, func(r *handlers_ec2_vpc.ENIRecord) {
+		r.DeleteOnTermination = aws.Bool(false)
+	}))
+
+	cleaner := newInstanceCleanerAdapter(f.daemon)
+	require.NoError(t, cleaner.DetachAndDeleteENI(f.vmInst))
+
+	_, err = f.daemon.vpcService.GetENIRecord(testAccountID, f.eniID)
+	require.Error(t, err, "DeleteOnTermination=true ENI must be deleted")
+
+	rec2, err := f.daemon.vpcService.GetENIRecord(testAccountID, eniID2)
+	require.NoError(t, err, "DeleteOnTermination=false ENI must survive, detached")
+	assert.Equal(t, "available", rec2.Status)
+}
+
+// TestInstanceCleanerAdapter_DetachAndDeleteENI_AbsentPrimaryDoesNotLogFalseSuccess
+// proves the false-success log is gone: a primary ENI that DetachAndDeleteENI
+// finds already absent must be logged as absent, never as "Deleted ENI on
+// termination" — that log used to fire unconditionally on a nil error, even
+// when the force path's stale-NotFound tolerance meant nothing was deleted.
+func TestInstanceCleanerAdapter_DetachAndDeleteENI_AbsentPrimaryDoesNotLogFalseSuccess(t *testing.T) {
+	f := newENIHotPlugFixture(t)
+	f.vmInst.AccountID = testAccountID
+	f.vmInst.ENIId = "eni-never-existed"
+
+	buf := captureSlogForTest(t)
+	cleaner := newInstanceCleanerAdapter(f.daemon)
+	require.NoError(t, cleaner.DetachAndDeleteENI(f.vmInst))
+
+	assert.NotContains(t, buf.String(), "Deleted ENI on termination",
+		"an already-absent ENI must never be logged as deleted")
+	assert.Contains(t, buf.String(), "ENI already absent on termination")
+}
+
+// TestInstanceCleanerAdapter_ReleaseAttachedENIs_ListInstanceENIsErrorTolerated
+// exercises the enumeration error branch: the connection backing vpcService's
+// KV is closed before terminate runs, so ListInstanceENIs fails with a real
+// connection error. The sweep must log and return rather than panic or
+// propagate the error as the primary terminate failure.
+func TestInstanceCleanerAdapter_ReleaseAttachedENIs_ListInstanceENIsErrorTolerated(t *testing.T) {
+	daemon := createTestDaemon(t, sharedNATSURL)
+
+	ns, err := server.NewServer(&server.Options{
+		Host:      "127.0.0.1",
+		Port:      -1,
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+		NoLog:     true,
+		NoSigs:    true,
+	})
+	require.NoError(t, err)
+	go ns.Start()
+	require.True(t, ns.ReadyForConnections(5*time.Second))
+	t.Cleanup(func() { ns.Shutdown() })
+
+	nc, err := nats.Connect(ns.ClientURL())
+	require.NoError(t, err)
+	testutil.StubVpcdSGResponder(t, nc)
+
+	vpcSvc, err := handlers_ec2_vpc.NewVPCServiceImplWithNATS(t.Context(), daemon.config, nc)
+	require.NoError(t, err)
+	daemon.vpcService = vpcSvc
+	nc.Close()
+
+	cleaner := newInstanceCleanerAdapter(daemon)
+	instance := &vm.VM{ID: "i-kv-down", AccountID: testAccountID}
+
+	require.NoError(t, cleaner.DetachAndDeleteENI(instance),
+		"an enumeration failure must not surface as a terminate error")
 }

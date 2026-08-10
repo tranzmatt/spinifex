@@ -5,10 +5,12 @@ package lbagent
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -22,8 +24,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mulgadc/predastore/auth"
+	"github.com/mulgadc/spinifex/internal/gwsign"
 	"github.com/mulgadc/spinifex/internal/tlsconfig"
+	"github.com/mulgadc/spinifex/spinifex/awserrors"
 )
 
 const (
@@ -42,6 +45,15 @@ const (
 
 	// pollInterval is how often the agent sends a heartbeat.
 	pollInterval = 5 * time.Second
+
+	// registrationGrace bounds how long startup heartbeat failures are logged
+	// below ERROR. A freshly launched LB races its own record's replication to
+	// the gateway node that fields the first heartbeat, so early failures
+	// (LoadBalancerNotFound, IMDS credentials not yet warm) are expected and
+	// self-heal within a few ticks. Past this window with no success — the
+	// fingerprint of a genuinely network-blackholed agent — failures escalate
+	// to ERROR so the serial-console telemetry still surfaces them.
+	registrationGrace = 60 * time.Second
 )
 
 // Data-plane engine names (duplicated from handlers/elbv2 to avoid an import cycle).
@@ -60,14 +72,19 @@ type Agent struct {
 	certDir    string // dir for TLS cert PEM files; defaults to CertDir (overridable in tests)
 	socketPath string // HAProxy stats socket
 
-	accessKey string
-	secretKey string
-	client    *http.Client
+	signer *gwsign.Signer
+	client *http.Client
 
 	localConfigHash string
 	engine          string         // data-plane engine of the last applied config
 	healthTargets   []HealthTarget // active probe targets (nginx/NLB only)
 	stopCh          chan struct{}
+
+	// startedAt anchors the registration grace window; firstHeartbeatOK
+	// records whether any heartbeat has ever succeeded. Both are touched only
+	// from the single poll goroutine (Start -> tick), so they need no lock.
+	startedAt        time.Time
+	firstHeartbeatOK bool
 
 	// For testing: override the reload functions (HAProxy / nginx).
 	reloadFn      func(configPath, pidPath string) error
@@ -86,11 +103,21 @@ func New(lbID, gatewayURL, accessKey, secretKey, region string) (*Agent, error) 
 	if gatewayURL == "" {
 		return nil, fmt.Errorf("gatewayURL is required")
 	}
-	if accessKey == "" || secretKey == "" {
-		return nil, fmt.Errorf("access key and secret key are required")
-	}
 	if region == "" {
 		return nil, fmt.Errorf("region is required")
+	}
+
+	// Static keys (when present in user-data) sign as-is; otherwise fall back to
+	// the IMDS instance-role credentials served in-VM, which rotate.
+	var signer *gwsign.Signer
+	if accessKey != "" && secretKey != "" {
+		signer = gwsign.NewStatic(accessKey, secretKey)
+	} else {
+		s, err := gwsign.NewIMDS(context.Background(), region)
+		if err != nil {
+			return nil, fmt.Errorf("init IMDS signer: %w", err)
+		}
+		signer = s
 	}
 
 	// Use system CA trust store (deployment CA provisioned via fw_cfg on the microvm).
@@ -114,10 +141,10 @@ func New(lbID, gatewayURL, accessKey, secretKey, region string) (*Agent, error) 
 		pidPath:       DefaultPIDPath,
 		certDir:       CertDir,
 		socketPath:    fmt.Sprintf("/tmp/spinifex-haproxy/%s.sock", lbID),
-		accessKey:     accessKey,
-		secretKey:     secretKey,
+		signer:        signer,
 		client:        client,
 		stopCh:        make(chan struct{}),
+		startedAt:     time.Now(),
 		reloadFn:      reloadHAProxy,
 		reloadNginxFn: reloadNginx,
 		statsFn:       queryHAProxyStats,
@@ -157,6 +184,15 @@ func (a *Agent) Stop() {
 
 // tick runs one heartbeat cycle: send health, check config hash, fetch if changed.
 func (a *Agent) tick() {
+	// A stopped agent must never heartbeat again, even if Start's select
+	// races a pending ticker tick against a just-closed stopCh — the whole
+	// point of stopping on a deleted LB is zero further noise.
+	select {
+	case <-a.stopCh:
+		return
+	default:
+	}
+
 	// nginx (NLB) has no per-server stats socket — the agent actively probes
 	// the delivered health targets instead of reading HAProxy stats.
 	var servers []ServerStatus
@@ -175,9 +211,36 @@ func (a *Agent) tick() {
 		// Include the dial target so the serial console disambiguates a
 		// transport failure (never reached AWSGW — "send request: dial ...")
 		// from an HTTP-level rejection ("gateway returned NNN: ...").
+		//
+		// Before the first successful heartbeat, and only within the grace
+		// window, a failure is an expected startup race (record not yet
+		// replicated, credentials not yet warm) and logs at INFO. Past the
+		// window, or once any heartbeat has succeeded, a failure is real and
+		// logs at ERROR so the console telemetry still catches a blackhole.
+		if !a.firstHeartbeatOK && time.Since(a.startedAt) < registrationGrace {
+			slog.Info("Heartbeat pending during startup", "err", err,
+				"gateway", a.gatewayURL, "elapsed", time.Since(a.startedAt).Round(time.Second))
+			return
+		}
+
+		// LoadBalancerNotFound is a positive response from the gateway (the
+		// store round-tripped and confirmed no record), not a connectivity
+		// failure — distinct from a dial error, timeout, or 5xx, all of which
+		// leave the LB's existence unknown and must keep retrying. Past the
+		// startup grace window it can no longer be the record's own
+		// replication race, so it means the LB was deleted: stop heartbeating
+		// it rather than retrying forever.
+		var gwErr *gatewayError
+		if errors.As(err, &gwErr) && gwErr.code == awserrors.ErrorELBv2LoadBalancerNotFound {
+			slog.Info("Load balancer no longer exists, stopping agent", "lbId", a.lbID, "gateway", a.gatewayURL)
+			a.Stop()
+			return
+		}
+
 		slog.Error("Heartbeat failed", "err", err, "gateway", a.gatewayURL, "region", a.region)
 		return
 	}
+	a.firstHeartbeatOK = true
 
 	slog.Debug("Heartbeat OK", "status", resp.Status, "configHash", resp.ConfigHash)
 
@@ -291,6 +354,16 @@ func (a *Agent) fetchAndApplyConfig() error {
 		return fmt.Errorf("reload %s: %w", engine, err)
 	}
 
+	// Only after a successful reload: until then the engine is still serving the
+	// previous config, which references the files being removed. A delivered PEM
+	// carries a private key, so undelivered ones left in place strand key
+	// material on disk for every certificate ever detached from a listener.
+	if err := a.pruneCertFiles(certDir, resp.CertFiles); err != nil {
+		// Not fatal — the config is live and correct, and a failed prune leaves a
+		// stale file rather than breaking traffic.
+		slog.Error("Failed to prune stale TLS certs", "certDir", certDir, "err", err)
+	}
+
 	a.engine = engine
 	a.healthTargets = resp.HealthTargets
 	a.localConfigHash = resp.ConfigHash
@@ -309,7 +382,7 @@ func (a *Agent) signedPost(params url.Values) ([]byte, error) {
 
 	sum := sha256.Sum256([]byte(body))
 	payloadHash := hex.EncodeToString(sum[:])
-	if err := auth.SignReq(req, a.accessKey, a.secretKey, payloadHash, "elasticloadbalancing", a.region); err != nil {
+	if err := a.signer.Sign(req, payloadHash, "elasticloadbalancing", a.region); err != nil {
 		return nil, fmt.Errorf("sign request: %w", err)
 	}
 
@@ -325,10 +398,41 @@ func (a *Agent) signedPost(params url.Values) ([]byte, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("gateway returned %d: %s", resp.StatusCode, string(respBody))
+		return nil, &gatewayError{statusCode: resp.StatusCode, code: parseAWSErrorCode(respBody), body: string(respBody)}
 	}
 
 	return respBody, nil
+}
+
+// gatewayError wraps a non-200 gateway response, carrying the parsed AWS
+// error code (if any) alongside the raw status/body so callers can
+// distinguish a specific, unambiguous rejection (e.g. LoadBalancerNotFound)
+// from a generic or ambiguous one.
+type gatewayError struct {
+	statusCode int
+	code       string
+	body       string
+}
+
+func (e *gatewayError) Error() string {
+	return fmt.Sprintf("gateway returned %d: %s", e.statusCode, e.body)
+}
+
+// awsErrorEnvelope is the minimal shape of the query-protocol error response
+// needed to recover the AWS error <Code> (e.g. "LoadBalancerNotFound").
+type awsErrorEnvelope struct {
+	XMLName xml.Name `xml:"ErrorResponse"`
+	Code    string   `xml:"Error>Code"`
+}
+
+// parseAWSErrorCode extracts the AWS error <Code> from a gateway error body.
+// Returns "" if the body does not parse as the expected envelope.
+func parseAWSErrorCode(body []byte) string {
+	var env awsErrorEnvelope
+	if err := xml.Unmarshal(body, &env); err != nil {
+		return ""
+	}
+	return env.Code
 }
 
 // writeCertFiles writes each delivered TLS PEM to its path (0600) under certDir.
@@ -352,6 +456,37 @@ func (a *Agent) writeCertFiles(certDir string, certs []certFile) error {
 			return fmt.Errorf("write cert %q: %w", clean, err)
 		}
 		slog.Info("Wrote TLS cert", "path", clean, "bytes", len(c.PEM))
+	}
+	return nil
+}
+
+// pruneCertFiles removes .pem files under certDir that are not in the delivered
+// set. An LB VM hosts exactly one load balancer, so every PEM there belongs to
+// this agent and anything undelivered is stale. Scoped to .pem so it cannot
+// touch an engine's own files, and to certDir's immediate entries so it cannot
+// follow a path out.
+func (a *Agent) pruneCertFiles(certDir string, certs []certFile) error {
+	entries, err := os.ReadDir(certDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read cert dir: %w", err)
+	}
+
+	keep := make(map[string]bool, len(certs))
+	for _, c := range certs {
+		keep[filepath.Base(filepath.Clean(c.Path))] = true
+	}
+
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".pem" || keep[e.Name()] {
+			continue
+		}
+		if err := os.Remove(filepath.Join(certDir, e.Name())); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale cert %q: %w", e.Name(), err)
+		}
+		slog.Info("Removed stale TLS cert", "path", filepath.Join(certDir, e.Name()))
 	}
 	return nil
 }

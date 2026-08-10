@@ -539,8 +539,8 @@ func TestIsMIGType(t *testing.T) {
 func TestMIGProfileFromType(t *testing.T) {
 	assert.Equal(t, "1g.10gb", MIGProfileFromType("mig.1g.10gb"))
 	assert.Equal(t, "7g.80gb", MIGProfileFromType("mig.7g.80gb"))
-	assert.Equal(t, "", MIGProfileFromType("t3.micro"))
-	assert.Equal(t, "", MIGProfileFromType(""))
+	assert.Empty(t, MIGProfileFromType("t3.micro"))
+	assert.Empty(t, MIGProfileFromType(""))
 }
 
 func TestGenerateMIGTypes(t *testing.T) {
@@ -555,8 +555,8 @@ func TestGenerateMIGTypes(t *testing.T) {
 	mig1g, ok := types["mig.1g.10gb"]
 	require.True(t, ok)
 	assert.Equal(t, "mig.1g.10gb", *mig1g.InstanceType)
-	assert.Equal(t, int64(0), *mig1g.VCpuInfo.DefaultVCpus)
-	assert.Equal(t, int64(0), *mig1g.MemoryInfo.SizeInMiB)
+	assert.Equal(t, int64(4), *mig1g.VCpuInfo.DefaultVCpus)
+	assert.Equal(t, int64(32*1024), *mig1g.MemoryInfo.SizeInMiB)
 	require.NotNil(t, mig1g.GpuInfo)
 	require.Len(t, mig1g.GpuInfo.Gpus, 1)
 	assert.Equal(t, "NVIDIA", *mig1g.GpuInfo.Gpus[0].Manufacturer)

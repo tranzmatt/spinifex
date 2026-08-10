@@ -1,13 +1,15 @@
 package handlers_eks
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // ClusterStatus is the persisted cluster lifecycle state; values match the AWS EKS status enum.
@@ -44,6 +46,10 @@ type ClusterMeta struct {
 	// EndpointIP is the NLB front-end IP (external-pool for public, VPC IP for private).
 	// The apiserver serving cert SANs this IP for TLS verification.
 	EndpointIP string `json:"endpointIp,omitempty"`
+	// EndpointDNSName is the account-qualified apiserver DNS name
+	// ({cluster}.{accountID}.{region}.eks.{baseDomain}) registered with northstar → EndpointIP.
+	// It is published as Endpoint and SANed on the apiserver cert. Empty otherwise.
+	EndpointDNSName string `json:"endpointDnsName,omitempty"`
 	// PrivateEndpointIP is the customer-VPC (Set A) IP of the ENI threaded onto the
 	// cluster NLB's LB VM when EndpointPrivateAccess is on. In-VPC workers + kubectl
 	// reach the control plane here on :443 (no public hairpin / NAT GW). SANed on
@@ -72,12 +78,19 @@ type ClusterMeta struct {
 	ControlPlaneNodes []ControlPlaneNode `json:"controlPlaneNodes,omitempty"`
 	// ControlPlaneSpreadGroup is the spread placement-group name; "" for single-CP.
 	ControlPlaneSpreadGroup string `json:"controlPlaneSpreadGroup,omitempty"`
+	// ControlPlaneTemplate is the create-time K3sServerInput the reconciler
+	// replays to provision a replacement CP member that joins the surviving etcd
+	// quorum. Per-node fields (TargetNodeID/ServerURL/KonnServerCount) and rotating
+	// creds (AccessKey/SecretKey/IamInstanceProfileArn) are cleared at persist and
+	// re-derived at provision. Nil for clusters created before member-count reconcile.
+	ControlPlaneTemplate *K3sServerInput `json:"controlPlaneTemplate,omitempty"`
 	// EgressEIPAllocationID / EgressEIPPublicIP track the hidden-pool SNAT address
 	// for CP VM egress (image pulls). Released on DeleteCluster.
 	EgressEIPAllocationID string    `json:"egressEipAllocationId,omitempty"`
 	EgressEIPPublicIP     string    `json:"egressEipPublicIp,omitempty"`
 	NLBArn                string    `json:"nlbArn,omitempty"`
 	NLBTargetGroupArn     string    `json:"nlbTargetGroupArn,omitempty"`
+	KonnTargetGroupArn    string    `json:"konnTargetGroupArn,omitempty"`
 	CreatedAt             time.Time `json:"createdAt"`
 	// DeletingSince stamps when the cluster entered DELETING. The teardown
 	// backstop reaper waits out a healthy synchronous DeleteCluster (min-age)
@@ -85,6 +98,24 @@ type ClusterMeta struct {
 	// teardown, never one still in progress. No omitempty: encoding/json never
 	// treats a time.Time as empty.
 	DeletingSince time.Time `json:"deletingSince"`
+	// DeleteReapAttempts counts backstop-reaper re-drive attempts against this
+	// DELETING cluster since DeletingSince. Drives the reaper's exponential
+	// backoff and the terminal give-up after maxDeleteReapAttempts.
+	DeleteReapAttempts int `json:"deleteReapAttempts,omitempty"`
+	// LastDeleteReapAttempt stamps the most recent backstop-reaper re-drive, so
+	// backoff grows from the last attempt rather than from DeletingSince.
+	// No omitempty: encoding/json never treats a time.Time as empty.
+	LastDeleteReapAttempt time.Time `json:"lastDeleteReapAttempt"`
+	// DeleteReapExhausted marks a DELETING cluster whose backstop reaper gave up
+	// after maxDeleteReapAttempts. Status stays DELETING — its infra remains
+	// tracked and billable pending operator intervention — only the automatic
+	// re-drive stops.
+	DeleteReapExhausted bool `json:"deleteReapExhausted,omitempty"`
+	// LastDeleteReapError is the error string from the most recent failed
+	// backstop-reaper re-drive, so an operator sees why teardown is stuck
+	// instead of just that it is. Set on every failed attempt, not only on
+	// exhaustion, and cleared once a re-drive succeeds.
+	LastDeleteReapError string `json:"lastDeleteReapError,omitempty"`
 	// HealthIssue is the last health failure reason ("" = healthy).
 	// DescribeCluster surfaces it as a ClusterHealth issue.
 	HealthIssue string `json:"healthIssue,omitempty"`
@@ -92,6 +123,12 @@ type ClusterMeta struct {
 	LastHealthProbe time.Time `json:"lastHealthProbe"`
 	// NodeCount is the node total from the CP's last NATS state report.
 	NodeCount int `json:"nodeCount,omitempty"`
+	// NodegroupNodeCounts is the per-nodegroup Ready count from the CP's last NATS
+	// state report, keyed by the eks.amazonaws.com/nodegroup node label value.
+	// waitWorkersReady gates a nodegroup's ACTIVE transition on ITS OWN entry here,
+	// never the cluster-wide NodeCount total — otherwise one nodegroup's Ready
+	// workers could mask another nodegroup whose own workers never registered.
+	NodegroupNodeCounts map[string]int `json:"nodegroupNodeCounts,omitempty"`
 	// Tags are the create-time resource tags, stored verbatim so DescribeCluster
 	// echoes them back. Without the round-trip a stock terraform-aws provider
 	// reconciling default_tags sees perpetual drift and issues TagResource on
@@ -134,7 +171,7 @@ var ErrClusterNotFound = errors.New("eks: cluster not found")
 const maxClusterStateCASRetries = 5
 
 // PutClusterMeta writes the meta record unconditionally.
-func PutClusterMeta(kv nats.KeyValue, meta *ClusterMeta) error {
+func PutClusterMeta(ctx context.Context, kv jetstream.KeyValue, meta *ClusterMeta) error {
 	if meta == nil {
 		return errors.New("eks: PutClusterMeta nil meta")
 	}
@@ -145,7 +182,7 @@ func PutClusterMeta(kv nats.KeyValue, meta *ClusterMeta) error {
 	if err != nil {
 		return fmt.Errorf("marshal cluster meta %s: %w", meta.Name, err)
 	}
-	if _, err := kv.Put(ClusterMetaKey(meta.Name), data); err != nil {
+	if _, err := kv.Put(ctx, ClusterMetaKey(meta.Name), data); err != nil {
 		return fmt.Errorf("kv put %s: %w", ClusterMetaKey(meta.Name), err)
 	}
 	return nil
@@ -153,13 +190,13 @@ func PutClusterMeta(kv nats.KeyValue, meta *ClusterMeta) error {
 
 // GetClusterMeta reads the meta record. Returns ErrClusterNotFound if the
 // key is absent.
-func GetClusterMeta(kv nats.KeyValue, name string) (*ClusterMeta, error) {
+func GetClusterMeta(ctx context.Context, kv jetstream.KeyValue, name string) (*ClusterMeta, error) {
 	if name == "" {
 		return nil, errors.New("eks: GetClusterMeta empty name")
 	}
-	entry, err := kv.Get(ClusterMetaKey(name))
+	entry, err := kv.Get(ctx, ClusterMetaKey(name))
 	if err != nil {
-		if errors.Is(err, nats.ErrKeyNotFound) {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			return nil, ErrClusterNotFound
 		}
 		return nil, fmt.Errorf("kv get %s: %w", ClusterMetaKey(name), err)
@@ -174,14 +211,14 @@ func GetClusterMeta(kv nats.KeyValue, name string) (*ClusterMeta, error) {
 // casUpdateMeta does a revision-checked read-modify-write of the cluster meta.
 // mutate returns true when a field changed. Retries on CAS conflict up to
 // maxClusterStateCASRetries. Returns ErrClusterNotFound if deleted concurrently.
-func casUpdateMeta(kv nats.KeyValue, name string, mutate func(*ClusterMeta) bool) error {
+func casUpdateMeta(ctx context.Context, kv jetstream.KeyValue, name string, mutate func(*ClusterMeta) bool) error {
 	if name == "" {
 		return errors.New("eks: casUpdateMeta empty name")
 	}
 	for range maxClusterStateCASRetries {
-		entry, err := kv.Get(ClusterMetaKey(name))
+		entry, err := kv.Get(ctx, ClusterMetaKey(name))
 		if err != nil {
-			if errors.Is(err, nats.ErrKeyNotFound) {
+			if errors.Is(err, jetstream.ErrKeyNotFound) {
 				return ErrClusterNotFound
 			}
 			return fmt.Errorf("kv get %s: %w", ClusterMetaKey(name), err)
@@ -197,11 +234,11 @@ func casUpdateMeta(kv nats.KeyValue, name string, mutate func(*ClusterMeta) bool
 		if err != nil {
 			return fmt.Errorf("marshal cluster meta %s: %w", name, err)
 		}
-		_, err = kv.Update(ClusterMetaKey(name), data, entry.Revision())
+		_, err = kv.Update(ctx, ClusterMetaKey(name), data, entry.Revision())
 		if err == nil {
 			return nil
 		}
-		if errors.Is(err, nats.ErrKeyExists) {
+		if errors.Is(err, jetstream.ErrKeyExists) {
 			continue
 		}
 		return fmt.Errorf("kv update %s: %w", ClusterMetaKey(name), err)
@@ -210,11 +247,11 @@ func casUpdateMeta(kv nats.KeyValue, name string, mutate func(*ClusterMeta) bool
 }
 
 // SetClusterStatus does a CAS update of meta.Status. Returns ErrClusterNotFound if deleted concurrently.
-func SetClusterStatus(kv nats.KeyValue, name string, status ClusterStatus) error {
+func SetClusterStatus(ctx context.Context, kv jetstream.KeyValue, name string, status ClusterStatus) error {
 	if name == "" {
 		return errors.New("eks: SetClusterStatus empty name")
 	}
-	return casUpdateMeta(kv, name, func(m *ClusterMeta) bool {
+	return casUpdateMeta(ctx, kv, name, func(m *ClusterMeta) bool {
 		if m.Status == status {
 			return false
 		}
@@ -228,11 +265,11 @@ func SetClusterStatus(kv nats.KeyValue, name string, status ClusterStatus) error
 
 // MarkClusterFailed transitions the cluster to FAILED with a reason, but only
 // from CREATING — so a late error cannot clobber a concurrent delete or an active cluster.
-func MarkClusterFailed(kv nats.KeyValue, name, reason string) error {
+func MarkClusterFailed(ctx context.Context, kv jetstream.KeyValue, name, reason string) error {
 	if name == "" {
 		return errors.New("eks: MarkClusterFailed empty name")
 	}
-	return casUpdateMeta(kv, name, func(m *ClusterMeta) bool {
+	return casUpdateMeta(ctx, kv, name, func(m *ClusterMeta) bool {
 		if m.Status != ClusterStatusCreating {
 			return false
 		}
@@ -242,16 +279,70 @@ func MarkClusterFailed(kv nats.KeyValue, name, reason string) error {
 	})
 }
 
+// maxDeleteReapAttempts caps automatic backstop re-drives of a wedged DELETING
+// cluster. A teardown that still fails after this many attempts is failing for
+// a reason retries will not fix (e.g. an unretriable DependencyViolation), so
+// further re-drives would only keep hammering AWS/OVN forever.
+const maxDeleteReapAttempts = 6
+
+// RecordDeleteReapAttempt increments the backstop reaper's attempt counter and
+// stamps LastDeleteReapAttempt, returning the updated count. Called immediately
+// before each re-drive so a crash mid-purge still counts the attempt on restart.
+func RecordDeleteReapAttempt(ctx context.Context, kv jetstream.KeyValue, name string) (int, error) {
+	if name == "" {
+		return 0, errors.New("eks: RecordDeleteReapAttempt empty name")
+	}
+	var attempts int
+	err := casUpdateMeta(ctx, kv, name, func(m *ClusterMeta) bool {
+		m.DeleteReapAttempts++
+		m.LastDeleteReapAttempt = time.Now().UTC()
+		attempts = m.DeleteReapAttempts
+		return true
+	})
+	return attempts, err
+}
+
+// RecordDeleteReapFailure persists the error from a failed backstop re-drive
+// onto ClusterMeta, so an operator inspecting a wedged DELETING cluster sees
+// why teardown keeps failing instead of just that it is. Called on every
+// failed attempt, not only on eventual exhaustion.
+func RecordDeleteReapFailure(ctx context.Context, kv jetstream.KeyValue, name string, purgeErr error) error {
+	if name == "" {
+		return errors.New("eks: RecordDeleteReapFailure empty name")
+	}
+	return casUpdateMeta(ctx, kv, name, func(m *ClusterMeta) bool {
+		m.LastDeleteReapError = purgeErr.Error()
+		return true
+	})
+}
+
+// MarkDeleteReapExhausted flags a DELETING cluster whose backstop reaper has
+// given up after maxDeleteReapAttempts. Status stays DELETING — a cluster with
+// un-torn-down infra must stay DELETING so its resources remain tracked and
+// billable — only the automatic re-drive stops; an operator must intervene.
+func MarkDeleteReapExhausted(ctx context.Context, kv jetstream.KeyValue, name string) error {
+	if name == "" {
+		return errors.New("eks: MarkDeleteReapExhausted empty name")
+	}
+	return casUpdateMeta(ctx, kv, name, func(m *ClusterMeta) bool {
+		if m.Status != ClusterStatusDeleting || m.DeleteReapExhausted {
+			return false
+		}
+		m.DeleteReapExhausted = true
+		return true
+	})
+}
+
 // SetClusterCertificateAuthority does a CAS update of meta.CertificateAuthorityB64.
 // Called by the bootstrap subscriber when the K3s VM publishes its CA.
-func SetClusterCertificateAuthority(kv nats.KeyValue, name, caB64 string) error {
+func SetClusterCertificateAuthority(ctx context.Context, kv jetstream.KeyValue, name, caB64 string) error {
 	if name == "" {
 		return errors.New("eks: SetClusterCertificateAuthority empty name")
 	}
 	if caB64 == "" {
 		return errors.New("eks: SetClusterCertificateAuthority empty CA")
 	}
-	return casUpdateMeta(kv, name, func(m *ClusterMeta) bool {
+	return casUpdateMeta(ctx, kv, name, func(m *ClusterMeta) bool {
 		if m.CertificateAuthorityB64 == caB64 {
 			return false
 		}
@@ -262,11 +353,11 @@ func SetClusterCertificateAuthority(kv nats.KeyValue, name, caB64 string) error 
 
 // SetClusterHealth records the latest health outcome; issue="" means healthy.
 // Only writes on a state change, stamping LastHealthProbe at the transition.
-func SetClusterHealth(kv nats.KeyValue, name, issue string) error {
+func SetClusterHealth(ctx context.Context, kv jetstream.KeyValue, name, issue string) error {
 	if name == "" {
 		return errors.New("eks: SetClusterHealth empty name")
 	}
-	return casUpdateMeta(kv, name, func(m *ClusterMeta) bool {
+	return casUpdateMeta(ctx, kv, name, func(m *ClusterMeta) bool {
 		if m.HealthIssue == issue {
 			return false
 		}
@@ -276,33 +367,96 @@ func SetClusterHealth(kv nats.KeyValue, name, issue string) error {
 	})
 }
 
-// SetClusterHealthState records health + node count. LastHealthProbe is stamped
-// on any change; no KV write when both are unchanged.
-func SetClusterHealthState(kv nats.KeyValue, name, issue string, nodeCount int) error {
+// SetClusterHealthState records health + node count (cluster-wide and, when the
+// CP state report carries it, per-nodegroup). LastHealthProbe is stamped on any
+// change; no KV write when nothing changed. nodegroupReady may be nil (older
+// AMI / no report yet), in which case the persisted per-nodegroup counts are
+// left untouched.
+func SetClusterHealthState(ctx context.Context, kv jetstream.KeyValue, name, issue string, nodeCount int, nodegroupReady map[string]int) error {
 	if name == "" {
 		return errors.New("eks: SetClusterHealthState empty name")
 	}
-	return casUpdateMeta(kv, name, func(m *ClusterMeta) bool {
-		if m.HealthIssue == issue && m.NodeCount == nodeCount {
+	return casUpdateMeta(ctx, kv, name, func(m *ClusterMeta) bool {
+		changed := m.HealthIssue != issue || m.NodeCount != nodeCount
+		if nodegroupReady != nil && !maps.Equal(m.NodegroupNodeCounts, nodegroupReady) {
+			changed = true
+		}
+		if !changed {
 			return false
 		}
 		m.HealthIssue = issue
 		m.NodeCount = nodeCount
+		if nodegroupReady != nil {
+			m.NodegroupNodeCounts = nodegroupReady
+		}
 		m.LastHealthProbe = time.Now().UTC()
+		return true
+	})
+}
+
+// ClearClusterManagedCPVPC clears meta.ManagedCPVPC once the managed CP VPC's
+// EC2 teardown has converged (including converging from an already-gone VPC).
+// purgeClusterInfra calls it immediately after a successful DeleteClusterCPVPC
+// so a re-drive of a wedged DELETING — with some unrelated step still failing —
+// never retries EC2/OVN calls against a stale VpcId, which is what turns a
+// single DependencyViolation into a permanent teardown loop. No-op if already
+// cleared. Returns ErrClusterNotFound if the cluster was deleted concurrently.
+func ClearClusterManagedCPVPC(ctx context.Context, kv jetstream.KeyValue, name string) error {
+	if name == "" {
+		return errors.New("eks: ClearClusterManagedCPVPC empty name")
+	}
+	return casUpdateMeta(ctx, kv, name, func(m *ClusterMeta) bool {
+		if m.ManagedCPVPC == nil {
+			return false
+		}
+		m.ManagedCPVPC = nil
+		return true
+	})
+}
+
+// SwapControlPlaneMember atomically replaces a lost control-plane member
+// (deadInstanceID) with a freshly provisioned one in meta.ControlPlaneNodes and
+// refreshes the scalar [0] mirrors if the primary changed. A no-op (no error)
+// when the dead member is already gone from the list — a concurrent swap already
+// won. Returns ErrClusterNotFound if the cluster was deleted concurrently.
+func SwapControlPlaneMember(ctx context.Context, kv jetstream.KeyValue, name, deadInstanceID string, replacement ControlPlaneNode) error {
+	if name == "" {
+		return errors.New("eks: SwapControlPlaneMember empty name")
+	}
+	if replacement.InstanceID == "" {
+		return errors.New("eks: SwapControlPlaneMember empty replacement instance id")
+	}
+	return casUpdateMeta(ctx, kv, name, func(m *ClusterMeta) bool {
+		idx := -1
+		for i, n := range m.ControlPlaneNodes {
+			if n.InstanceID == deadInstanceID {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
+			return false
+		}
+		m.ControlPlaneNodes[idx] = replacement
+		primary := m.ControlPlaneNodes[0]
+		m.ControlPlaneInstanceID = primary.InstanceID
+		m.ControlPlaneENIID = primary.ENIID
+		m.ControlPlaneENIIP = primary.ENIIP
+		m.ControlPlaneMgmtIP = primary.MgmtIP
 		return true
 	})
 }
 
 // DeleteClusterPrefix removes every KV key under clusters/{name}/.
 // Returns the first error but continues sweeping.
-func DeleteClusterPrefix(kv nats.KeyValue, name string) error {
+func DeleteClusterPrefix(ctx context.Context, kv jetstream.KeyValue, name string) error {
 	if name == "" {
 		return errors.New("eks: DeleteClusterPrefix empty name")
 	}
 	prefix := fmt.Sprintf("clusters/%s/", name)
-	keys, err := kv.Keys()
+	keys, err := kv.Keys(ctx)
 	if err != nil {
-		if errors.Is(err, nats.ErrNoKeysFound) {
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
 			return nil
 		}
 		return fmt.Errorf("kv keys: %w", err)
@@ -312,7 +466,7 @@ func DeleteClusterPrefix(kv nats.KeyValue, name string) error {
 		if !strings.HasPrefix(k, prefix) {
 			continue
 		}
-		if err := kv.Delete(k); err != nil && firstErr == nil {
+		if err := kv.Delete(ctx, k); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("kv delete %s: %w", k, err)
 		}
 	}

@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,9 +29,14 @@ type RemoveImageOpts struct {
 }
 
 // RemoveImageResult summarises what was deleted from object storage.
+//
+// BytesDeleted is the logical size of the deleted objects, not physical disk
+// space: predastore reclaims a deleted object's bytes asynchronously via
+// background compaction, so this count can be freed well after the call
+// returns, or briefly not at all if compaction is stalled.
 type RemoveImageResult struct {
 	ObjectsDeleted int
-	BytesFreed     int64
+	BytesDeleted   int64
 }
 
 // Dependents lists every resource that transitively backs an admin-imported
@@ -258,7 +264,7 @@ func RemoveSystemImage(store objectstore.ObjectStore, bucket string, opts Remove
 			return nil, fmt.Errorf("delete config: %w", err)
 		}
 		result.ObjectsDeleted += n
-		result.BytesFreed += b
+		result.BytesDeleted += b
 	}
 
 	// Step 2: drop the rest of ami-<id>/ (chunks, WAL, checkpoints).
@@ -267,7 +273,7 @@ func RemoveSystemImage(store objectstore.ObjectStore, bucket string, opts Remove
 		return nil, fmt.Errorf("delete ami prefix: %w", err)
 	}
 	result.ObjectsDeleted += n
-	result.BytesFreed += b
+	result.BytesDeleted += b
 
 	// Step 3: drop snap-<amiID>/ (the viperblock-internal snap checkpoint).
 	n, b, err = deletePrefix(store, bucket, SnapPrefix(opts.ImageID)+"/")
@@ -275,12 +281,12 @@ func RemoveSystemImage(store objectstore.ObjectStore, bucket string, opts Remove
 		return nil, fmt.Errorf("delete snap prefix: %w", err)
 	}
 	result.ObjectsDeleted += n
-	result.BytesFreed += b
+	result.BytesDeleted += b
 
 	slog.Info("RemoveSystemImage completed",
 		"imageId", opts.ImageID,
 		"objectsDeleted", result.ObjectsDeleted,
-		"bytesFreed", result.BytesFreed,
+		"bytesDeleted", result.BytesDeleted,
 		"force", opts.Force,
 	)
 	return result, nil
@@ -303,7 +309,7 @@ func (e *DependentError) Error() string {
 // admin tooling doesn't require an ImageServiceImpl (which carries NATS).
 func readAMIConfig(store objectstore.ObjectStore, bucket, imageID string) (viperblock.AMIMetadata, error) {
 	key := imageID + "/config.json"
-	res, err := store.GetObject(&s3.GetObjectInput{
+	res, err := store.GetObject(context.Background(), &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})
@@ -319,7 +325,7 @@ func readAMIConfig(store objectstore.ObjectStore, bucket, imageID string) (viper
 
 	var state viperblock.VBState
 	if err := json.Unmarshal(viperblock.StateBody(body), &state); err != nil {
-		return viperblock.AMIMetadata{}, fmt.Errorf("%w: %s: %v", handlers_ec2_image.ErrCorruptAMIConfig, key, err)
+		return viperblock.AMIMetadata{}, fmt.Errorf("%w: %s: %w", handlers_ec2_image.ErrCorruptAMIConfig, key, err)
 	}
 	return state.VolumeConfig.AMIMetadata, nil
 }
@@ -335,7 +341,7 @@ type volumeConfigWrapper struct {
 
 func readVolumeConfig(store objectstore.ObjectStore, bucket, volumeID string) (*viperblock.VolumeConfig, error) {
 	key := volumeID + "/config.json"
-	res, err := store.GetObject(&s3.GetObjectInput{
+	res, err := store.GetObject(context.Background(), &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})
@@ -351,7 +357,7 @@ func readVolumeConfig(store objectstore.ObjectStore, bucket, volumeID string) (*
 
 	var w volumeConfigWrapper
 	if err := json.Unmarshal(viperblock.StateBody(body), &w); err != nil {
-		return nil, fmt.Errorf("%w: %s: %v", errCorruptVolumeConfig, key, err)
+		return nil, fmt.Errorf("%w: %s: %w", errCorruptVolumeConfig, key, err)
 	}
 	return &w.VolumeConfig, nil
 }
@@ -362,7 +368,7 @@ func listCommonPrefixes(store objectstore.ObjectStore, bucket string) ([]string,
 	seen := map[string]bool{}
 	var token *string
 	for {
-		out, err := store.ListObjectsV2(&s3.ListObjectsV2Input{
+		out, err := store.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
 			Bucket:            aws.String(bucket),
 			Delimiter:         aws.String("/"),
 			ContinuationToken: token,
@@ -395,7 +401,7 @@ func sumPrefix(store objectstore.ObjectStore, bucket, prefix string) (int, int64
 	var bytes int64
 	var token *string
 	for {
-		out, err := store.ListObjectsV2(&s3.ListObjectsV2Input{
+		out, err := store.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
 			Bucket:            aws.String(bucket),
 			Prefix:            aws.String(prefix),
 			ContinuationToken: token,
@@ -425,7 +431,7 @@ func deletePrefix(store objectstore.ObjectStore, bucket, prefix string) (int, in
 	var bytes int64
 	var token *string
 	for {
-		out, err := store.ListObjectsV2(&s3.ListObjectsV2Input{
+		out, err := store.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
 			Bucket:            aws.String(bucket),
 			Prefix:            aws.String(prefix),
 			ContinuationToken: token,
@@ -437,7 +443,7 @@ func deletePrefix(store objectstore.ObjectStore, bucket, prefix string) (int, in
 			if obj.Key == nil {
 				continue
 			}
-			if _, err := store.DeleteObject(&s3.DeleteObjectInput{
+			if _, err := store.DeleteObject(context.Background(), &s3.DeleteObjectInput{
 				Bucket: aws.String(bucket),
 				Key:    obj.Key,
 			}); err != nil {

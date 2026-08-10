@@ -2,6 +2,7 @@ package vpcd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -27,14 +28,17 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/network/topology"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // Bridge mode selects how the WAN NIC reaches the OVS bridge.
 // Direct: WAN NIC added to OVS (distributed NAT, not safe on mgmt NIC).
 // Veth: veth pair links a Linux bridge to OVS (requires centralized NAT).
+// NAT: no WAN NIC bridged; transit veth + host masquerade (routed NAT).
 const (
 	BridgeModeDirect = "direct"
 	BridgeModeVeth   = "veth"
+	BridgeModeNAT    = "nat"
 	// OvnExternalBridge is the OVS bridge targeted by ovn-bridge-mappings for the "external" localnet.
 	OvnExternalBridge = "br-ext"
 )
@@ -61,18 +65,19 @@ var waitForFlowsHV = func() error {
 	return nil
 }
 
-// sudoCommand wraps exec.Command with sudo when not root; OVS/OVN commands require elevated privileges.
-func sudoCommand(name string, args ...string) *exec.Cmd {
-	if os.Getuid() == 0 {
-		return exec.Command(name, args...)
-	}
-	return exec.Command("sudo", append([]string{name}, args...)...)
-}
+// sudoCommand is utils.SudoCommand, which escalates only what genuinely needs
+// it. Every caller here is an OVS/OVN socket client, so none of them escalate;
+// a local copy that always sudoed silently bypassed that policy and broke the
+// flows-ready barrier once the grants were removed.
+var sudoCommand = utils.SudoCommand
 
 var serviceName = "vpcd"
 
 // Compile-time check: host.GatewayClaimProber implements reconcile.GatewayClaimVerifier.
 var _ reconcile.GatewayClaimVerifier = (*host.GatewayClaimProber)(nil)
+
+// Compile-time check: host.GatewayClaimProber implements subscribers.MACBindingFlusher.
+var _ subscribers.MACBindingFlusher = (*host.GatewayClaimProber)(nil)
 
 // BootstrapVPC holds the default VPC IDs from spinifex.toml used to seed OVN topology on first boot.
 type BootstrapVPC struct {
@@ -100,10 +105,10 @@ type Config struct {
 	BaseDir string
 	// Debug enables debug logging.
 	Debug bool
-	// ExternalMode is "pool" or "" (disabled).
+	// ExternalMode is "pool", "nat" (routed, outbound-only), or "" (disabled).
 	ExternalMode string
 	// ExternalPools holds the cluster-wide external IP pool configs.
-	ExternalPools []ExternalPoolConfig
+	ExternalPools []external.ExternalPoolConfig
 	// Bootstrap holds the default VPC config from spinifex.toml for first-boot reconciliation.
 	Bootstrap *BootstrapVPC
 	// ExternalInterface is the WAN NIC name (e.g., "enp0s3"). Used by
@@ -117,23 +122,22 @@ type Config struct {
 	// to scope its IntentState scan to local-AZ KV records; new VPC records
 	// are stamped with this value at create time.
 	AZ string
-}
-
-// ExternalPoolConfig mirrors config.ExternalPool for vpcd's internal use.
-type ExternalPoolConfig struct {
-	Name            string
-	Source          string // "static" (default) or "dhcp"
-	BindBridge      string // Linux bridge for DHCP DORA (source=dhcp only)
-	RangeStart      string
-	RangeEnd        string
-	Gateway         string
-	GatewayIP       string
-	PrefixLen       int
-	DNSServers      []string
-	Region          string
-	AZ              string
-	GwLrpRangeStart string // Sub-range for OVN gateway LRP IPs in centralized NAT mode.
-	GwLrpRangeEnd   string
+	// NorthstarBaseDomain is the cluster's authoritative base domain (northstar
+	// default_domain, e.g. "spx3.net"). IMDS uses it to serve public-hostname.
+	// Empty disables the public-hostname metadata key.
+	NorthstarBaseDomain string
+	// NorthstarInternalDomain is the cluster's private AWS-parity domain (northstar
+	// internal_domain, default "compute.internal"). IMDS serves it as local-hostname
+	// so the guest's own name matches the record the DNS writer publishes.
+	NorthstarInternalDomain string
+	// ResolverNameservers are the WAN IPs of cluster nodes running northstar,
+	// used as the per-tap DNS shim's forward targets. When set, DHCP advertises
+	// the link-local VPC DNS address (169.254.169.253) instead of the upstream
+	// pool DNS.
+	ResolverNameservers []string
+	// NATExemptCIDRs are extra destinations that skip routed-mode SNAT,
+	// appended to the transit /24 in the spinifex_nat_exempt set. nat mode only.
+	NATExemptCIDRs []string
 }
 
 // Service implements the Spinifex service interface for vpcd.
@@ -197,9 +201,11 @@ var checkBrInt = func() error {
 	return nil
 }
 
-// checkOVNController verifies ovn-controller is running. Tries legacy socket path, then OVN 22.03+ path, then systemctl.
+// checkOVNController verifies ovn-controller is running. ovn-appctl resolves a
+// bare target against /var/run/ovn where the socket and pidfile live; ovs-appctl
+// looks in /var/run/openvswitch and only ever logged a missing pidfile.
 var checkOVNController = func() error {
-	if sudoCommand("ovs-appctl", "-t", "ovn-controller", "version").Run() == nil {
+	if sudoCommand("ovn-appctl", "-t", "ovn-controller", "version").Run() == nil {
 		return nil
 	}
 	if matches, _ := filepath.Glob("/var/run/ovn/ovn-controller.*.ctl"); len(matches) > 0 {
@@ -221,7 +227,8 @@ var localSystemID = func() (string, error) {
 	out, err := sudoCommand("ovs-vsctl", "get", "open_vswitch", ".", "external-ids:system-id").Output()
 	if err != nil {
 		var stderr string
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			stderr = strings.TrimSpace(string(exitErr.Stderr))
 		}
 		return "", fmt.Errorf("ovs-vsctl get system-id: %s: %w", stderr, err)
@@ -248,7 +255,8 @@ var discoverChassis = func(sbAddr string) ([]string, error) {
 	out, err := sudoCommand("ovn-sbctl", args...).Output()
 	if err != nil {
 		var stderr string
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			stderr = strings.TrimSpace(string(exitErr.Stderr))
 		}
 		return nil, fmt.Errorf("ovn-sbctl list Chassis: %s: %w", stderr, err)
@@ -325,10 +333,16 @@ var externalCIDRFromBridge = func(bridge string) (netip.Prefix, error) {
 	return netip.Prefix{}, fmt.Errorf("no IPv4 address on %q", bridge)
 }
 
+// externalCIDRRetryDelay is the poll interval between resolve attempts; tests shorten it.
+var externalCIDRRetryDelay = 500 * time.Millisecond
+
+// externalCIDRResolveTimeout bounds startup resolution of the WAN bridge CIDR; tests shorten it.
+var externalCIDRResolveTimeout = 30 * time.Second
+
 // resolveExternalCIDR blocks until the WAN bridge has an IPv4 address or timeout elapses.
 // Guards the boot race where vpcd starts before systemd-networkd or netplan assigns the uplink address.
 func resolveExternalCIDR(ctx context.Context, bridge string, timeout time.Duration) (netip.Prefix, error) {
-	const retryDelay = 500 * time.Millisecond
+	retryDelay := externalCIDRRetryDelay
 	deadline := time.Now().Add(timeout)
 	attempt := 0
 	for {
@@ -360,7 +374,7 @@ func ensureExternalCIDRReady(ctx context.Context, externalMode, bridge string) e
 	if externalMode == "" {
 		return nil
 	}
-	cidr, err := resolveExternalCIDR(ctx, bridge, 30*time.Second)
+	cidr, err := resolveExternalCIDR(ctx, bridge, externalCIDRResolveTimeout)
 	if err != nil {
 		slog.Error("vpcd: external CIDR resolution failed", "bridge", bridge, "err", err)
 		return err
@@ -408,6 +422,22 @@ func launchService(cfg *Config) error {
 		return err
 	}
 
+	if bridgeMode == BridgeModeNAT {
+		// Re-ensure kernel egress rules on every start so they survive reboots
+		// and firewall flushes without iptables-persistent.
+		if err := host.EnsureNATEgressRules(ctx, host.NewExecRunner()); err != nil {
+			slog.Error("vpcd: NAT egress rule install failed", "err", err)
+			return err
+		}
+		if cfg.ExternalMode == "nat" && len(cfg.ExternalPools) == 0 {
+			slog.Warn("vpcd: nat mode with no external pool; synthesizing default transit pool",
+				"name", host.NATTransitPoolName, "gateway", host.NATTransitGatewayIP)
+			cfg.ExternalPools = append(cfg.ExternalPools, external.ExternalPoolConfig{
+				Name: host.NATTransitPoolName, Gateway: host.NATTransitGatewayIP, PrefixLen: 24,
+			})
+		}
+	}
+
 	if err := ensureExternalCIDRReady(ctx, cfg.ExternalMode, wanBridge); err != nil {
 		return err
 	}
@@ -426,35 +456,42 @@ func launchService(cfg *Config) error {
 	slog.Info("vpcd: gateway chassis discovered", "chassis", chassisNames)
 
 	uplinkMode := host.UplinkModePhysical
-	if bridgeMode == BridgeModeVeth {
+	switch bridgeMode {
+	case BridgeModeVeth:
 		uplinkMode = host.UplinkModeVeth
+	case BridgeModeNAT:
+		uplinkMode = host.UplinkModeRouted
 	}
 	natMode := policy.NATModeFromUplinkMode(uplinkMode)
 
 	var topoOpts []topology.Option
-	if dns := pickDNSServer(cfg.ExternalPools); dns != "" {
+	if dns := resolverDNSServer(cfg); dns != "" {
 		topoOpts = append(topoOpts, topology.WithDNSServer(func() string { return dns }))
 	}
 	topoMgr := topology.NewLiveManager(liveClient, topoOpts...)
 
+	igwPool, publicPool := selectExternalPools(cfg.ExternalMode, cfg.ExternalPools)
+
 	sgMgr := policy.NewSecurityGroupManager(liveClient)
-	natMgr, err := policy.NewNATManager(liveClient, natMode,
+	natOpts := []policy.Option{
 		policy.WithFlowsBarrier(waitForFlowsHV),
 		policy.WithNeighFlusher(neighFlusher(wanBridge)),
 		policy.WithNeighPrimer(neighPrimer(wanBridge)),
-	)
+	}
+	if natMode == policy.NATModeRouted {
+		natOpts = append(natOpts, policy.WithSNATExemptSet(policy.NATExemptSetName,
+			append([]string{host.NATTransitCIDR}, cfg.NATExemptCIDRs...)))
+	}
+	if natMode == policy.NATModeRouted && publicPool != nil {
+		natOpts = append(natOpts, policy.WithHostEIPBinder(hostEIPBinder(publicPool)))
+	}
+	natMgr, err := policy.NewNATManager(liveClient, natMode, natOpts...)
 	if err != nil {
 		return fmt.Errorf("construct NAT manager: %w", err)
 	}
 	routeMgr := policy.NewRouteManager(liveClient)
 
-	var igwPool *external.ExternalPoolConfig
-	if cfg.ExternalMode != "" && len(cfg.ExternalPools) > 0 {
-		p := externalPoolConfigToShared(cfg.ExternalPools[0])
-		igwPool = &p
-	}
-
-	js, err := nc.JetStream()
+	js, err := jetstream.New(nc)
 	if err != nil {
 		return fmt.Errorf("get JetStream context: %w", err)
 	}
@@ -476,12 +513,16 @@ func launchService(cfg *Config) error {
 		return live, nil
 	}
 	imdsSvc, err := handlers_imds.NewIMDSServiceImpl(
+		ctx,
 		nc,
 		handlers_imds.NewNATSSTSAssumer(nc),
 		handlers_imds.NewNATSProfileLookup(nc),
 		handlers_imds.NewNATSPublicKeyLookup(nc),
 		max(len(chassisNames), 1),
 		listTaps,
+		cfg.NorthstarBaseDomain,
+		cfg.NorthstarInternalDomain,
+		cfg.ResolverNameservers,
 	)
 	if err != nil {
 		return fmt.Errorf("construct IMDS service: %w", err)
@@ -505,19 +546,75 @@ func launchService(cfg *Config) error {
 		}
 	}()
 
+	// Host ingress plumbing only exists in routed-NAT mode; other modes keep
+	// nil hooks so the IGW manager never touches host routes.
+	var routedIngress *external.RoutedIngressHooks
+	if bridgeMode == BridgeModeNAT {
+		ingressRunner := host.NewExecRunner()
+		// Duplicate VPC CIDRs (every account's default VPC is 172.31.0.0/16)
+		// collide on the single host route table: the bootstrap VPC always
+		// wins; other VPCs only install when the CIDR is free and only remove
+		// a route their own gateway IP holds.
+		preferredVPC := ""
+		if cfg.Bootstrap != nil {
+			preferredVPC = cfg.Bootstrap.VpcId
+		}
+		routedIngress = &external.RoutedIngressHooks{
+			Ensure: func(ctx context.Context, vpcID, vpcCIDR, gwLrpIP string) error {
+				if vpcID != preferredVPC {
+					holder, err := host.VPCIngressRouteVia(ctx, ingressRunner, vpcCIDR)
+					if err == nil && holder != "" && holder != gwLrpIP {
+						slog.Warn("vpcd: host ingress route conflict, keeping existing holder",
+							"vpc_id", vpcID, "vpc_cidr", vpcCIDR, "holder_gw", holder, "skipped_gw", gwLrpIP)
+						return nil
+					}
+				}
+				return host.EnsureVPCIngressRoute(ctx, ingressRunner, vpcCIDR, gwLrpIP)
+			},
+			Remove: func(ctx context.Context, vpcID, vpcCIDR, gwLrpIP string) error {
+				if gwLrpIP != "" {
+					holder, err := host.VPCIngressRouteVia(ctx, ingressRunner, vpcCIDR)
+					if err == nil && holder != "" && holder != gwLrpIP {
+						slog.Info("vpcd: leaving host ingress route held by another VPC",
+							"vpc_id", vpcID, "vpc_cidr", vpcCIDR, "holder_gw", holder)
+						return nil
+					}
+				}
+				return host.RemoveVPCIngressRoute(ctx, ingressRunner, vpcCIDR)
+			},
+		}
+	}
+
 	gwAllocator := pickGatewayAllocator(igwPool, liveClient, dhcpMgr)
 	igwMgr, err := external.NewIGWManager(external.IGWManagerConfig{
-		OVN:          liveClient,
-		Routes:       routeMgr,
-		NAT:          natMgr,
-		Pool:         igwPool,
-		Allocator:    gwAllocator,
-		Chassis:      chassisNames,
-		NATMode:      natMode,
-		FlowsBarrier: waitForFlowsHV,
+		OVN:           liveClient,
+		Routes:        routeMgr,
+		NAT:           natMgr,
+		Pool:          igwPool,
+		Allocator:     gwAllocator,
+		Chassis:       chassisNames,
+		NATMode:       natMode,
+		FlowsBarrier:  waitForFlowsHV,
+		RoutedIngress: routedIngress,
+		NexthopSeed: func(ctx context.Context, lrpName, nexthopIP string) error {
+			return host.SeedNexthopMAC(ctx, host.NewExecRunner(), lrpName, nexthopIP)
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("construct IGW manager: %w", err)
+	}
+	// The lease loop can land on a different address after a NAK or an expiry.
+	// Registered here rather than at manager construction because the IGW
+	// manager that owns the gateway datapath does not exist until now.
+	if dhcpMgr != nil {
+		dhcpMgr.SetIPChangeHook(leaseIPChangeHook(igwMgr, nc))
+		// Nothing else returns an address whose resource was deleted out from
+		// under its lease, so the sweep runs for the life of the daemon.
+		dhcpMgr.SetLeaseOwner(&leaseOwnerResolver{nc: nc, igwMgr: igwMgr})
+		go runLeaseReaper(ctx, dhcpMgr, leaseReapInterval, leaseReapStartDelay)
+		// Leases and gateway ports can already disagree by the time this vpcd
+		// starts, and no lease event will ever fire to correct them.
+		reconcileGatewayLeases(ctx, dhcpMgr, igwMgr)
 	}
 	eipMgr, err := external.NewEIPManager(natMgr, waitForFlowsHV)
 	if err != nil {
@@ -531,7 +628,7 @@ func launchService(cfg *Config) error {
 	// Elect one vpcd for startup reconcile; without this, concurrent Get-then-Create on Logical_Router
 	// produces duplicate rows that ovn-nbctl rejects. Runtime events still fan out via queue groups.
 	holder, _ := os.Hostname()
-	releaseLeader, isLeader := reconcile.AcquireLeader(nc, reconcile.KVBucketVPCDReconcile, holder)
+	releaseLeader, isLeader := reconcile.AcquireLeader(ctx, nc, reconcile.KVBucketVPCDReconcile, holder)
 
 	subscriber, err := subscribers.New(subscribers.Config{
 		Topology: topoMgr,
@@ -539,6 +636,7 @@ func launchService(cfg *Config) error {
 		EIP:      eipMgr,
 		NATGW:    natgwMgr,
 		IGW:      igwMgr,
+		MAC:      host.NewGatewayClaimProber(cfg.OVNSBAddr),
 	})
 	if err != nil {
 		return fmt.Errorf("construct subscriber: %w", err)
@@ -565,7 +663,12 @@ func launchService(cfg *Config) error {
 		NodeHostname: holder,
 		Chassis:      chassisNames,
 		GatewayClaim: host.NewGatewayClaimProber(cfg.OVNSBAddr),
-		DNSServer:    pickDNSServer(cfg.ExternalPools),
+		DNSServer:    resolverDNSServer(cfg),
+		// Re-read intent at prune time so a guest launched during a long apply
+		// phase is not mistaken for an orphan and its dnat_and_snat swept.
+		FreshIntent: func(ctx context.Context) (reconcile.IntentState, error) {
+			return reconcile.LoadIntentFromKV(ctx, js, cfg.AZ)
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("construct reconciler: %w", err)
@@ -593,6 +696,12 @@ func launchService(cfg *Config) error {
 		close(loopDone)
 	}()
 
+	// Per-host ovn-controller wedge watchdog. Not leader-gated: a stale-SB wedge is
+	// local to this chassis and usually strikes a non-leader placement host, so the
+	// recovery must run on every node. Backstops the bring-up settle pass for runtime
+	// SB re-bootstraps (snapshot install / compaction) with no deploy in flight.
+	go runOVNControllerWatchdog(loopCtx, newOVNWatchdog(host.NewGatewayClaimProber(cfg.OVNSBAddr)))
+
 	slog.Info("vpcd service started, waiting for VPC lifecycle events",
 		"subscriptions", len(subs))
 
@@ -606,9 +715,20 @@ func launchService(cfg *Config) error {
 	return nil
 }
 
+// resolverDNSServer returns the OVN dhcp_options dns_server advertised to
+// instances. With northstar configured, guests get the link-local VPC DNS
+// address served by the per-tap shim (which forwards to ResolverNameservers);
+// absent northstar it falls back to the upstream pool DNS.
+func resolverDNSServer(cfg *Config) string {
+	if len(cfg.ResolverNameservers) > 0 {
+		return handlers_imds.VPCDNSServerIP
+	}
+	return pickDNSServer(cfg.ExternalPools)
+}
+
 // pickDNSServer returns the OVN dhcp_options dns_server from the first unscoped pool with DNS servers.
 // Empty falls back to topology.NewLiveManager's default.
-func pickDNSServer(pools []ExternalPoolConfig) string {
+func pickDNSServer(pools []external.ExternalPoolConfig) string {
 	for _, p := range pools {
 		if p.Region == "" && p.AZ == "" && len(p.DNSServers) > 0 {
 			return "{" + strings.Join(p.DNSServers, ", ") + "}"
@@ -619,7 +739,7 @@ func pickDNSServer(pools []ExternalPoolConfig) string {
 
 // startDHCPManagerIfNeeded starts the per-AZ DHCP Manager when any pool has Source="dhcp".
 // Returns (nil, nil, nil) when not needed.
-func startDHCPManagerIfNeeded(ctx context.Context, nc *nats.Conn, js nats.JetStreamContext, cfg *Config) (*dhcp.Manager, []*nats.Subscription, error) {
+func startDHCPManagerIfNeeded(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, cfg *Config) (*dhcp.Manager, []*nats.Subscription, error) {
 	if cfg == nil || cfg.ExternalMode == "" {
 		return nil, nil, nil
 	}
@@ -634,13 +754,17 @@ func startDHCPManagerIfNeeded(ctx context.Context, nc *nats.Conn, js nats.JetStr
 		return nil, nil, nil
 	}
 
-	store, err := dhcp.NewStore(js, cfg.AZ)
+	store, err := dhcp.NewStore(ctx, js, cfg.AZ)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create dhcp lease store: %w", err)
 	}
+	// Labels option 12 with this host so the upstream lease table groups by the
+	// node that took each lease.
+	nodeName, _ := os.Hostname()
 	mgr, err := dhcp.NewManager(dhcp.ManagerConfig{
-		Client: dhcp.NewNClient4(0),
-		Store:  store,
+		Client:   dhcp.NewNClient4(0),
+		Store:    store,
+		NodeName: nodeName,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("create dhcp manager: %w", err)
@@ -657,6 +781,76 @@ func startDHCPManagerIfNeeded(ctx context.Context, nc *nats.Conn, js nats.JetStr
 	return mgr, subs, nil
 }
 
+// leaseRecordRebindTimeout bounds the daemon-side record reconcile. Larger than
+// the daemon's own budget so its error text wins over a deadline from here.
+const leaseRecordRebindTimeout = 75 * time.Second
+
+// leaseIPChangeHook rebinds whatever was bound to a lease's old address after it
+// moved. Gateway-LRP leases are internal transit plumbing vpcd owns outright, so
+// they are rebound in-process. EIP and ENI-public addresses are API-visible and
+// their records live daemon-side, so those go over TopicLeaseChanged.
+func leaseIPChangeHook(igwMgr external.IGWManager, nc *nats.Conn) dhcp.IPChangeHook {
+	return func(ctx context.Context, e dhcp.Entry, oldIP net.IP) error {
+		if e.Lease == nil {
+			return errors.New("lease ip change: nil lease")
+		}
+		if e.Purpose == dhcp.PurposeGatewayLRP {
+			if e.VPCID == "" {
+				return fmt.Errorf("gw-lrp lease %s carries no vpc_id; cannot rebind", e.Lease.ClientID)
+			}
+			prefixLen, _ := e.Lease.SubnetMask.Size()
+			return igwMgr.RebindGatewayIP(ctx, e.VPCID, e.Lease.IP.String(), prefixLen)
+		}
+		return requestLeaseRecordRebind(ctx, nc, e, oldIP)
+	}
+}
+
+// requestLeaseRecordRebind asks the daemon to move the resource record naming
+// the old address. The old address is already released, so a failed or
+// unanswered request means an API-visible record advertises an address nothing
+// holds — it is returned so the manager logs it against the lease.
+func requestLeaseRecordRebind(ctx context.Context, nc *nats.Conn, e dhcp.Entry, oldIP net.IP) error {
+	if nc == nil {
+		return fmt.Errorf("no NATS connection to rebind %q lease %s (%s -> %s)",
+			e.Purpose, e.Lease.ClientID, oldIP, e.Lease.IP)
+	}
+	payload, err := json.Marshal(dhcp.LeaseChangedRequest{
+		ClientID: e.Lease.ClientID,
+		Purpose:  e.Purpose,
+		PoolName: e.PoolName,
+		VPCID:    e.VPCID,
+		OldIP:    ipString(oldIP),
+		NewIP:    ipString(e.Lease.IP),
+	})
+	if err != nil {
+		return fmt.Errorf("marshal lease-changed request for %s: %w", e.Lease.ClientID, err)
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, leaseRecordRebindTimeout)
+	defer cancel()
+	msg, err := nc.RequestWithContext(reqCtx, dhcp.TopicLeaseChanged, payload)
+	if err != nil {
+		return fmt.Errorf("request rebind of %q lease %s (%s -> %s): %w",
+			e.Purpose, e.Lease.ClientID, oldIP, e.Lease.IP, err)
+	}
+	var reply dhcp.LeaseChangedReply
+	if err := json.Unmarshal(msg.Data, &reply); err != nil {
+		return fmt.Errorf("decode rebind reply for %s: %w", e.Lease.ClientID, err)
+	}
+	if reply.Error != "" {
+		return fmt.Errorf("rebind of %q lease %s rejected: %s", e.Purpose, e.Lease.ClientID, reply.Error)
+	}
+	return nil
+}
+
+// ipString renders an IP for the wire, tolerating nil.
+func ipString(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+
 // pickGatewayAllocator returns a DHCPGatewayLRPAllocator for DHCP-sourced pools; otherwise StaticRangeAllocator.
 func pickGatewayAllocator(pool *external.ExternalPoolConfig, ovnClient ovn.Client, mgr *dhcp.Manager) external.GatewayIPAllocator {
 	if pool.IsDHCP() && mgr != nil {
@@ -665,32 +859,57 @@ func pickGatewayAllocator(pool *external.ExternalPoolConfig, ovnClient ovn.Clien
 	return external.NewStaticRangeAllocator(ovnClient)
 }
 
-// externalPoolConfigToShared translates vpcd's ExternalPoolConfig into the network/external shared type.
-func externalPoolConfigToShared(p ExternalPoolConfig) external.ExternalPoolConfig {
-	return external.ExternalPoolConfig{
-		Name:            p.Name,
-		Source:          p.Source,
-		BindBridge:      p.BindBridge,
-		RangeStart:      p.RangeStart,
-		RangeEnd:        p.RangeEnd,
-		Gateway:         p.Gateway,
-		GatewayIP:       p.GatewayIP,
-		PrefixLen:       p.PrefixLen,
-		DNSServers:      p.DNSServers,
-		Region:          p.Region,
-		AZ:              p.AZ,
-		GwLrpRangeStart: p.GwLrpRangeStart,
-		GwLrpRangeEnd:   p.GwLrpRangeEnd,
-	}
-}
-
-// resolveBridgeConfig picks bridge mode (auto-detecting when unset) and always uses "br-wan" as the WAN bridge.
+// resolveBridgeConfig picks bridge mode (auto-detecting when unset) and the WAN
+// bridge: "br-wan" for bridged modes, the transit veth host end for nat mode.
 func resolveBridgeConfig(cfgBridgeMode, externalIface string) (string, string) {
 	bridgeMode := cfgBridgeMode
 	if bridgeMode == "" && externalIface != "" {
 		bridgeMode = detectBridgeMode(externalIface)
 	}
+	if bridgeMode == BridgeModeNAT {
+		return bridgeMode, host.NATTransitHostEnd
+	}
 	return bridgeMode, "br-wan"
+}
+
+// selectExternalPools splits configured pools by role. In nat mode the IGW
+// gateway-LRP allocator draws from the transit pool (matched by name, never
+// by index); any other pool carries public EIPs delivered via host plumbing.
+// Other modes keep the first pool for the IGW and have no public split.
+func selectExternalPools(externalMode string, pools []external.ExternalPoolConfig) (igwPool, publicPool *external.ExternalPoolConfig) {
+	for i := range pools {
+		p := pools[i]
+		if externalMode == "nat" && p.Name != host.NATTransitPoolName {
+			if publicPool == nil {
+				publicPool = &p
+			}
+			continue
+		}
+		if igwPool == nil {
+			igwPool = &p
+		}
+	}
+	return igwPool, publicPool
+}
+
+// hostEIPBinder builds the routed-mode host plumbing hooks for EIPs on the
+// public pool: /32 route into OVN plus proxy-ARP on the uplink. Static pools
+// locate the uplink via the pool gateway; dhcp pools via their bind bridge.
+func hostEIPBinder(pool *external.ExternalPoolConfig) policy.HostEIPBinder {
+	runner := host.NewExecRunner()
+	gateway, uplinkHint := pool.Gateway, pool.BindBridge
+	return policy.HostEIPBinder{
+		Bind: func(eip policy.EIPSpec, gwLrpIP string) error {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return host.EnsureEIPIngress(ctx, runner, eip.ExternalIP, gwLrpIP, gateway, uplinkHint)
+		},
+		Unbind: func(externalIP string) error {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return host.RemoveEIPIngress(ctx, runner, externalIP, gateway, uplinkHint)
+		},
+	}
 }
 
 // neighFlusher builds the ARP-flush hook for AddEIP/DeleteEIP so recycled IPs re-resolve L2 immediately.
@@ -724,9 +943,14 @@ var ifaceExists = func(name string) bool {
 	return exec.Command("ip", "link", "show", name).Run() == nil
 }
 
-// detectBridgeMode infers bridge mode: veth when veth-wan-ovs exists, direct otherwise.
+// detectBridgeMode infers bridge mode: nat when spx-nat-ovs exists, veth when
+// veth-wan-ovs exists, direct otherwise.
 // Each branch logs at Info/Warn so `journalctl | grep bridge` shows the full detection trail.
 func detectBridgeMode(externalIface string) string {
+	if ifaceExists(host.NATTransitOVSEnd) {
+		slog.Info("vpcd: detected routed-NAT transit veth", "mode", BridgeModeNAT)
+		return BridgeModeNAT
+	}
 	if ifaceExists("veth-wan-ovs") {
 		slog.Info("vpcd: detected veth pair linking Linux bridge to OVS", "mode", BridgeModeVeth)
 		return BridgeModeVeth
@@ -743,7 +967,8 @@ var portToBr = func(port string) (string, error) {
 	out, err := sudoCommand("ovs-vsctl", "port-to-br", port).Output()
 	if err != nil {
 		var stderr string
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			stderr = strings.TrimSpace(string(exitErr.Stderr))
 		}
 		return "", fmt.Errorf("ovs-vsctl port-to-br %s: %s: %w", port, stderr, err)
@@ -802,8 +1027,23 @@ func verifyBridgeMode(mode, externalIface, wanBridge string) error {
 				master, wanBridge)
 		}
 		return nil
+	case BridgeModeNAT:
+		br, err := portToBr(host.NATTransitOVSEnd)
+		if err != nil {
+			return fmt.Errorf("vpcd: nat bridge mode: %s not on OVS — run setup-ovn.sh --nat-uplink: %w",
+				host.NATTransitOVSEnd, err)
+		}
+		if br != OvnExternalBridge {
+			return fmt.Errorf("vpcd: nat bridge mode: %s is on OVS bridge %q, expected %q",
+				host.NATTransitOVSEnd, br, OvnExternalBridge)
+		}
+		if !ifaceExists(host.NATTransitHostEnd) {
+			return fmt.Errorf("vpcd: nat bridge mode: %s link missing — run setup-ovn.sh --nat-uplink",
+				host.NATTransitHostEnd)
+		}
+		return nil
 	default:
-		return fmt.Errorf("vpcd: unknown bridge_mode %q — supported values: %q, %q",
-			mode, BridgeModeDirect, BridgeModeVeth)
+		return fmt.Errorf("vpcd: unknown bridge_mode %q — supported values: %q, %q, %q",
+			mode, BridgeModeDirect, BridgeModeVeth, BridgeModeNAT)
 	}
 }

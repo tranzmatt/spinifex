@@ -1,6 +1,7 @@
 package handlers_elbv2
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/elbv2"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
+	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,7 +51,7 @@ func TestBuildLBAgentEnv(t *testing.T) {
 		region:          "ap-southeast-2",
 	}
 	// With no mgmt bridge, the lb-agent falls back to the WAN GatewayURL.
-	env := svc.buildLBAgentEnv("lb-abc123")
+	env := svc.buildLBAgentEnv("lb-abc123", true)
 
 	lines := strings.Split(strings.TrimRight(env, "\n"), "\n")
 	kvs := make(map[string]string, len(lines))
@@ -66,6 +68,23 @@ func TestBuildLBAgentEnv(t *testing.T) {
 	assert.Equal(t, "ap-southeast-2", kvs["LB_REGION"])
 }
 
+// TestBuildLBAgentEnv_IMDSModeOmitsKeys verifies that when a profile is attached
+// (staticCreds=false) the static keys are dropped so the lb-agent signs with
+// IMDS instance-role credentials via the SDK chain.
+func TestBuildLBAgentEnv_IMDSModeOmitsKeys(t *testing.T) {
+	svc := &ELBv2ServiceImpl{
+		GatewayURL:      "https://10.0.0.1:9999",
+		SystemAccessKey: "AKIAIOSFODNN7EXAMPLE",
+		SystemSecretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+		region:          "ap-southeast-2",
+	}
+	env := svc.buildLBAgentEnv("lb-abc123", false)
+	assert.NotContains(t, env, "LB_ACCESS_KEY")
+	assert.NotContains(t, env, "LB_SECRET_KEY")
+	assert.Contains(t, env, "LB_LB_ID=lb-abc123\n")
+	assert.Contains(t, env, "LB_REGION=ap-southeast-2\n")
+}
+
 // TestBuildLBAgentEnv_UsesMgmtGateway verifies every lb-agent (customer or
 // system) heartbeats over the on-link mgmt-bridge URL, not the WAN GatewayURL,
 // so the control-plane heartbeat survives a reboot that strands the data plane.
@@ -77,12 +96,12 @@ func TestBuildLBAgentEnv_UsesMgmtGateway(t *testing.T) {
 		SystemSecretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
 		region:          "ap-southeast-2",
 	}
-	env := svc.buildLBAgentEnv("lb-abc123")
+	env := svc.buildLBAgentEnv("lb-abc123", true)
 	assert.Contains(t, env, "LB_GATEWAY_URL=https://192.168.50.1:9999\n")
 
 	// With no mgmt bridge, the lb-agent falls back to the WAN URL.
 	svc.MgmtBridgeIP = ""
-	env = svc.buildLBAgentEnv("lb-abc123")
+	env = svc.buildLBAgentEnv("lb-abc123", true)
 	assert.Contains(t, env, "LB_GATEWAY_URL=https://10.0.0.1:9999\n")
 }
 
@@ -90,13 +109,13 @@ func TestBuildLBAgentEnv_UsesMgmtGateway(t *testing.T) {
 func TestSubnetCIDRForIP(t *testing.T) {
 	assert.Equal(t, "10.0.1.5/24", subnetCIDRForIP("10.0.1.5", "10.0.1.0/24"))
 	assert.Equal(t, "172.16.2.10/20", subnetCIDRForIP("172.16.2.10", "172.16.0.0/20"))
-	assert.Equal(t, "", subnetCIDRForIP("10.0.1.5", "bad-cidr"))
+	assert.Empty(t, subnetCIDRForIP("10.0.1.5", "bad-cidr"))
 }
 
 func TestSubnetGatewayIP(t *testing.T) {
 	assert.Equal(t, "10.0.1.1", subnetGatewayIP("10.0.1.0/24"))
 	assert.Equal(t, "172.16.0.1", subnetGatewayIP("172.16.0.0/20"))
-	assert.Equal(t, "", subnetGatewayIP("not-a-cidr"))
+	assert.Empty(t, subnetGatewayIP("not-a-cidr"))
 }
 
 // setupMicrovmTestService creates an ELBv2 service wired to a real VPC
@@ -106,7 +125,7 @@ func setupMicrovmTestService(t *testing.T) (*ELBv2ServiceImpl, *handlers_ec2_vpc
 	_, nc, _ := testutil.StartTestJetStream(t)
 	testutil.StubVpcdSGResponder(t, nc)
 
-	vpcSvc, err := handlers_ec2_vpc.NewVPCServiceImplWithNATS(nil, nc)
+	vpcSvc, err := handlers_ec2_vpc.NewVPCServiceImplWithNATS(t.Context(), nil, nc)
 	require.NoError(t, err)
 
 	cfg := &config.Config{
@@ -114,7 +133,9 @@ func setupMicrovmTestService(t *testing.T) (*ELBv2ServiceImpl, *handlers_ec2_vpc
 			DevNetworking: true,
 		},
 	}
-	elbv2Svc, err := NewELBv2ServiceImplWithNATS(cfg, nc)
+	masterKey, err := handlers_iam.GenerateMasterKey()
+	require.NoError(t, err)
+	elbv2Svc, err := NewELBv2ServiceImplWithNATS(cfg, nc, masterKey)
 	require.NoError(t, err)
 	elbv2Svc.VPCService = vpcSvc
 	elbv2Svc.GatewayURL = "https://10.20.0.5:9999"
@@ -123,13 +144,13 @@ func setupMicrovmTestService(t *testing.T) (*ELBv2ServiceImpl, *handlers_ec2_vpc
 	elbv2Svc.region = "us-east-1"
 	elbv2Svc.CACert = "-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----\n"
 
-	vpcOut, err := vpcSvc.CreateVpc(&ec2.CreateVpcInput{
+	vpcOut, err := vpcSvc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.0/16"),
 	}, testAccountID)
 	require.NoError(t, err)
 	vpcID := *vpcOut.Vpc.VpcId
 
-	subnetOut, err := vpcSvc.CreateSubnet(&ec2.CreateSubnetInput{
+	subnetOut, err := vpcSvc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:            aws.String(vpcID),
 		CidrBlock:        aws.String("10.0.1.0/24"),
 		AvailabilityZone: aws.String("us-east-1a"),
@@ -153,7 +174,7 @@ func TestCreateLoadBalancer_DeliversCACert(t *testing.T) {
 	}
 	svc.InstanceLauncher = mock
 
-	_, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	_, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("mv-alb"),
 		Subnets: []*string{aws.String(subnetID)},
 	}, testAccountID)
@@ -175,7 +196,7 @@ func TestCreateLoadBalancer_Microvm_LBAgentEnv(t *testing.T) {
 	}
 	svc.InstanceLauncher = mock
 
-	_, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	_, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("env-alb"),
 		Subnets: []*string{aws.String(subnetID)},
 	}, testAccountID)
@@ -203,7 +224,7 @@ func TestCreateLoadBalancer_Microvm_NICs(t *testing.T) {
 	}
 	svc.InstanceLauncher = mock
 
-	_, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+	_, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{
 		Name:    aws.String("nic-alb"),
 		Subnets: []*string{aws.String(subnetID)},
 	}, testAccountID)

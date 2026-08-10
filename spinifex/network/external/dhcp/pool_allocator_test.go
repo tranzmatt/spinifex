@@ -43,13 +43,13 @@ func TestDHCPPoolAllocatorAllocateAndRelease(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "192.0.2.100", addr.String())
 
-	entry, err := store.Get("eipalloc-1")
+	entry, err := store.Get(t.Context(), "eipalloc-1")
 	require.NoError(t, err)
 	assert.Equal(t, dhcp.PurposeEIP, entry.Purpose)
 	assert.Equal(t, "wan", entry.PoolName)
 
 	require.NoError(t, allocator.Release(context.Background(), "wan", addr, ""))
-	_, err = store.Get("eipalloc-1")
+	_, err = store.Get(t.Context(), "eipalloc-1")
 	assert.Error(t, err)
 	assert.Equal(t, 1, fake.ReleaseCount())
 }
@@ -71,7 +71,7 @@ func TestDHCPPoolAllocatorClientIDPrecedence(t *testing.T) {
 	for _, tc := range cases {
 		_, err := allocator.Allocate(context.Background(), tc.req)
 		require.NoError(t, err, "case %+v", tc.req)
-		entry, err := store.Get(tc.clientID)
+		entry, err := store.Get(t.Context(), tc.clientID)
 		require.NoError(t, err, "client id %q not persisted", tc.clientID)
 		assert.Equal(t, tc.purpose, entry.Purpose)
 	}
@@ -107,12 +107,17 @@ func TestDHCPPoolAllocatorRejectsPoolMismatch(t *testing.T) {
 	assert.Contains(t, err.Error(), "pool mismatch")
 }
 
-func TestDHCPPoolAllocatorReleaseUnknownIPIsNoop(t *testing.T) {
+// An untracked IP must not report success. Answering SUCCESS with nothing sent
+// upstream is what let stranded leases accumulate unnoticed; every caller of
+// Release logs and continues, so surfacing the error costs no teardown progress.
+func TestDHCPPoolAllocatorReleaseUnknownIPErrors(t *testing.T) {
 	fake := dhcp.NewFake()
 	pool := external.ExternalPoolConfig{Name: "wan", Source: external.SourceDHCP, BindBridge: "br-wan"}
 	allocator, _ := newPoolAllocator(t, fake, pool)
 
 	addr := netip.MustParseAddr("198.51.100.99")
-	assert.NoError(t, allocator.Release(context.Background(), "wan", addr, ""))
+	err := allocator.Release(context.Background(), "wan", addr, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no tracked lease for ip 198.51.100.99")
 	assert.Equal(t, 0, fake.ReleaseCount())
 }

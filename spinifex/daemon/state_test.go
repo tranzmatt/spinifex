@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -25,6 +27,9 @@ func createDaemonWithJetStream(t *testing.T) *Daemon {
 	_, nc, _ := testutil.StartTestJetStream(t)
 
 	tmpDir := t.TempDir()
+	// Restore's orphan reconciliation reads pidfiles from the runtime dir;
+	// sandbox it so tests never touch this box's real /run/spinifex.
+	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
 
 	clusterCfg := &config.ClusterConfig{
 		Node:  "node-1",
@@ -357,7 +362,7 @@ func TestRun_AbortedByConcurrentTerminate(t *testing.T) {
 			}
 			daemon.vmMgr.Insert(instance)
 
-			err := daemon.vmMgr.Run(instance)
+			err := daemon.vmMgr.Run(t.Context(), instance)
 			require.NoError(t, err, "expected nil for non-launchable status %s", status)
 			assert.Equal(t, status, instance.Status, "status must not change")
 		})
@@ -741,7 +746,7 @@ func TestRestoreInstances_RunningResetsLaunchTime(t *testing.T) {
 	// LaunchTime should be reset to approximately now, not the stale 30min-ago time
 	assert.True(t, instance.Instance.LaunchTime.After(before) || instance.Instance.LaunchTime.Equal(before),
 		"LaunchTime should be reset to now, got %v (stale was %v)", *instance.Instance.LaunchTime, staleTime)
-	assert.True(t, time.Since(*instance.Instance.LaunchTime) < vm.PendingWatchdogTimeout,
+	assert.Less(t, time.Since(*instance.Instance.LaunchTime), vm.PendingWatchdogTimeout,
 		"LaunchTime should be within watchdog timeout window")
 }
 
@@ -922,6 +927,35 @@ func TestStatePersistence_RoundTrip(t *testing.T) {
 	assert.Equal(t, original.Attributes.StopInstance, loaded.Attributes.StopInstance)
 }
 
+// TestWriteState_LocalFailureStillWritesKV guards against a launch-window data
+// loss: before the fix, WriteState returned the instant the local file write
+// failed, so the independent JetStream KV write was never attempted. A crash
+// right after would leave a live VM with no durable record anywhere. The local
+// write is forced to fail deterministically (a regular file blocking the state
+// dir) rather than relying on a real disk fault, which is not reproducible here.
+func TestWriteState_LocalFailureStillWritesKV(t *testing.T) {
+	daemon := createDaemonWithJetStream(t)
+
+	obs := &fakeKVObserver{}
+	daemon.jsManager.SetSyncObserver(obs)
+
+	daemon.vmMgr.Insert(&vm.VM{ID: "i-localfault", Status: vm.StateRunning, InstanceType: "t3.micro"})
+
+	// Block the local state directory with a regular file so WriteLocalStateBytes's
+	// MkdirAll fails deterministically, without needing root or a real disk fault.
+	blocker := filepath.Join(daemon.config.DataDir, DefaultLocalStateDir)
+	require.NoError(t, os.WriteFile(blocker, []byte("not a directory"), 0o600))
+
+	err := daemon.WriteState()
+	require.Error(t, err, "WriteState must still surface the local write failure")
+
+	successes, failures := obs.snapshot()
+	assert.Empty(t, failures)
+	assert.Len(t, successes, 1, "KV write must be attempted even when the local write fails")
+	assert.Equal(t, uint64(0), daemon.Revision(),
+		"revision tracks local persistence and must not advance on a local failure")
+}
+
 // TestRestoreInstances_StoppedInstanceMigratedToSharedKV verifies that after
 // a daemon restart, a stopped instance is migrated to shared KV and can be
 // retrieved by the ec2.start handler.
@@ -1025,7 +1059,7 @@ func TestPendingWatchdog_MarksStuckInstanceFailed(t *testing.T) {
 	stuckBefore, _ := daemon.vmMgr.Get("i-stuck")
 	require.NotNil(t, stuckBefore)
 	for _, instance := range stuck {
-		daemon.vmMgr.MarkFailed(instance, "launch_timeout")
+		daemon.vmMgr.MarkFailed(context.Background(), instance, "launch_timeout")
 	}
 
 	// MarkFailed sets the StateReason synchronously, then runs the cleanup
@@ -1123,7 +1157,7 @@ func TestMarkInstanceFailed_AlreadyShuttingDown(t *testing.T) {
 	daemon.vmMgr.Insert(instance)
 
 	// Should be a no-op — instance is already being cleaned up
-	daemon.vmMgr.MarkFailed(instance, "test_reason")
+	daemon.vmMgr.MarkFailed(context.Background(), instance, "test_reason")
 
 	// Status should not change
 	assert.Equal(t, vm.StateShuttingDown, instance.Status)
@@ -1139,7 +1173,7 @@ func TestMarkInstanceFailed_AlreadyTerminated(t *testing.T) {
 	}
 	daemon.vmMgr.Insert(instance)
 
-	daemon.vmMgr.MarkFailed(instance, "test_reason")
+	daemon.vmMgr.MarkFailed(context.Background(), instance, "test_reason")
 
 	// Status should not change
 	assert.Equal(t, vm.StateTerminated, instance.Status)

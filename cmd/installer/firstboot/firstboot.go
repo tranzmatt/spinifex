@@ -1,20 +1,3 @@
-/*
-Copyright © 2026 Mulga Defense Corporation
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
-
-You should have received a copy of the GNU Affero General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
-*/
-
 // Package firstboot writes the oneshot systemd service and configuration that
 // completes Spinifex provisioning on the first real boot after installation.
 package firstboot
@@ -31,14 +14,23 @@ import (
 // Config holds the values the firstboot service needs to configure the node.
 type Config struct {
 	Hostname string
-	// EncapIP is the Geneve tunnel IP for OVN. Set to the LAN bridge IP when a
-	// dedicated LAN NIC is present, otherwise the WAN bridge IP. Empty when DHCP
-	// is used — setup-ovn.sh auto-detects the IP from the default route in that case.
+	// EncapIP is the Geneve tunnel IP for OVN, taken from the vpc plane after
+	// collapsing (vpc <- lan <- wan). Empty when that plane uses DHCP —
+	// setup-ovn.sh auto-detects the IP from the default route in that case.
 	EncapIP string
-	// ClusterRole is "init" or "join".
-	ClusterRole string
-	// JoinAddr is host:port of the primary node, only used when ClusterRole is "join".
-	JoinAddr string
+	// LANIP is the internal cluster address, taken from the lan plane after
+	// collapsing. Passed as --bind and --cluster-bind so predastore replication,
+	// the NATS mesh and OVN control traffic stay off the public interface.
+	// Empty leaves the 0.0.0.0 wildcard default, which is correct for a
+	// single-NIC node where lan folds onto wan.
+	LANIP string
+	// WANIP is the public address, taken from the wan plane. Passed as
+	// --advertise so northstar's :53 listener, the awsgw registry host and the
+	// dial target recorded for off-host clients stay on the public interface.
+	// Without it a concrete --bind is echoed back as the advertise address,
+	// which would move all three onto the internal plane. Empty when wan uses
+	// DHCP, leaving spx to auto-detect from the default route.
+	WANIP string
 	// Email is the operator email collected by the TUI or SPINIFEX_EMAIL on
 	// the headless path. Passed to `spx admin init --email=<value>` when set;
 	// omitted entirely when empty.
@@ -91,6 +83,31 @@ func writeScript(root string, cfg Config) error {
 		setupOVN += fmt.Sprintf(" --encap-ip=%s", cfg.EncapIP)
 	}
 
+	// Pre-start OVS and OVN central so their databases are initialised before
+	// setup-ovn.sh runs. On physical hardware, first-boot DB initialisation takes
+	// longer than setup-ovn.sh's internal 15-second timeout allows. Starting them
+	// here and waiting until the NB DB is ready means setup-ovn.sh sees a live DB
+	// the moment it starts — no races, no timeout failures.
+	ovnPrestart := `systemctl start openvswitch-switch
+systemctl start ovn-central
+echo "Waiting for OVN NB DB to initialise..."
+for _i in $(seq 1 120); do
+    if ovn-nbctl --timeout=2 get-connection >/dev/null 2>&1; then
+        echo "OVN NB DB ready (${_i}s)"
+        break
+    fi
+    sleep 1
+done`
+
+	// When a provisioning controller owns formation (SkipFormation) it also owns
+	// the clustered OVN bring-up via setup-ovn.sh's RAFT flags. firstboot must
+	// not start a standalone ovn-central here: the single-node .db it would leave
+	// blocks ovn-ctl's create/join (which require a clean DB). Defer both.
+	if cfg.SkipFormation {
+		ovnPrestart = `echo "[firstboot] OVN bring-up deferred to provisioning controller"`
+		setupOVN = `echo "[firstboot] setup-ovn deferred to provisioning controller"`
+	}
+
 	callbackBlock := ""
 	if cfg.InstallCallback != "" {
 		callbackBlock = fmt.Sprintf(
@@ -123,21 +140,7 @@ fi
 # Set hostname
 hostnamectl set-hostname %s
 
-# Pre-start OVS and OVN central so their databases are initialised before
-# setup-ovn.sh runs. On physical hardware, first-boot DB initialisation takes
-# longer than setup-ovn.sh's internal 15-second timeout allows. Starting them
-# here and waiting until the NB DB is ready means setup-ovn.sh sees a live DB
-# the moment it starts — no races, no timeout failures.
-systemctl start openvswitch-switch
-systemctl start ovn-central
-echo "Waiting for OVN NB DB to initialise..."
-for _i in $(seq 1 120); do
-    if ovn-nbctl --timeout=2 get-connection >/dev/null 2>&1; then
-        echo "OVN NB DB ready (${_i}s)"
-        break
-    fi
-    sleep 1
-done
+%s
 
 # Create default nameservers if DHCP server returns blank
 printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolvconf/resolv.conf.d/base
@@ -203,6 +206,9 @@ fi
 
 # Enable services to start, on reboot
 systemctl enable spinifex.target spinifex-banner.service
+# WantedBy=timers.target only self-activates once enabled — without this the
+# JetStream ENOSPC-latch watchdog never runs and a full disk needs a manual restart.
+systemctl enable --now spinifex-nats-watchdog.timer
 
 # Mark complete only after every step above has succeeded. Until this point,
 # any failure (set -e) leaves the marker absent and the next reboot retries
@@ -229,7 +235,7 @@ if grep -q 'external_mode.*pool' /etc/spinifex/spinifex.toml 2>/dev/null; then
         echo "[firstboot] warning: br-ext not up after 30s — external networking may be delayed"
     fi
 fi
-`, cfg.Hostname, setupOVN, clusterCmd, callbackBlock)
+`, cfg.Hostname, ovnPrestart, setupOVN, clusterCmd, callbackBlock)
 
 	path := filepath.Join(root, "usr/local/bin/spinifex-firstboot.sh")
 	return os.WriteFile(path, []byte(script), 0o755)
@@ -250,13 +256,66 @@ func buildClusterCmd(cfg Config) string {
 	if cfg.GPUPassthrough {
 		gpuFlag = " --gpu-passthrough"
 	}
-	switch cfg.ClusterRole {
-	case "join":
-		return fmt.Sprintf("spx admin join --node %s --host %s%s", cfg.Hostname, cfg.JoinAddr, emailFlag)
-	default:
-		return fmt.Sprintf("spx admin init --node %s --nodes 1%s%s", cfg.Hostname, emailFlag, gpuFlag)
+	// Without these the node takes the 0.0.0.0 wildcard default and every
+	// internal service resolves onto the auto-detected WAN address, which is
+	// exactly what the three-plane model exists to prevent.
+	bindFlags := ""
+	if cfg.LANIP != "" {
+		bindFlags = fmt.Sprintf(" --bind %s --cluster-bind %s", cfg.LANIP, cfg.LANIP)
 	}
+	// --advertise must be explicit whenever --bind is: spx echoes a concrete
+	// bind address straight back as the advertise address and never reaches its
+	// WAN auto-detection, which would silently publish the internal plane as
+	// this node's public dial target.
+	preamble := ""
+	switch {
+	case bindFlags == "":
+		// Nothing pinned, so spx auto-detects both and a guessed advertise
+		// address would only get in the way.
+	case cfg.WANIP != "":
+		bindFlags += " --advertise " + cfg.WANIP
+	default:
+		// A DHCP wan has no address at install time, but it does by the time
+		// firstboot runs, so read it off the bridge instead of shipping the
+		// bind address as the public one.
+		preamble = wanAdvertisePreamble
+		bindFlags += ` $SPX_ADVERTISE`
+	}
+
+	// Always a single-node cluster. The installer cannot form a multi-node one:
+	// cluster membership decides the OVN database topology and the join token
+	// only exists once the primary has booted, so neither is knowable while the
+	// nodes are still being installed. Multi-node is a post-install conversion,
+	// documented in the multi-node install guide.
+	cmd := fmt.Sprintf("spx admin init --node %s --nodes 1%s%s%s", cfg.Hostname, bindFlags, emailFlag, gpuFlag)
+	return preamble + cmd
 }
+
+// wanAdvertisePreamble resolves the wan plane's DHCP lease into $SPX_ADVERTISE
+// just before formation. br-wan is always the wan bridge — that plane is the one
+// role that cannot fold — so its address is the node's public identity.
+//
+// Falling through with SPX_ADVERTISE empty is deliberate: no lease means there
+// is no public address to advertise yet, and spx echoing the bind address is
+// still better than formation failing outright.
+const wanAdvertisePreamble = `# The wan plane leases its address, so it is only knowable at boot. Without this
+# spx would echo --bind back as the advertise address and publish the internal
+# plane as this node's public dial target.
+SPX_ADVERTISE=""
+echo "[firstboot] waiting for the wan plane to acquire an address..."
+for _i in $(seq 1 60); do
+    _wan_ip=$(ip -4 -o addr show br-wan scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    if [ -n "$_wan_ip" ]; then
+        SPX_ADVERTISE=" --advertise $_wan_ip"
+        echo "[firstboot] wan address $_wan_ip (${_i}s)"
+        break
+    fi
+    sleep 1
+done
+if [ -z "$SPX_ADVERTISE" ]; then
+    echo "[firstboot] warning: br-wan has no address after 60s — this node will advertise its bind address"
+fi
+`
 
 // shellEscapeSingle wraps s in single quotes with any embedded single
 // quotes escaped. Minimal — we only need this because the email value is

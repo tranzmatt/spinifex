@@ -2,11 +2,6 @@ package utils
 
 import (
 	"testing"
-
-	"github.com/mulgadc/spinifex/spinifex/testutil"
-	"github.com/nats-io/nats.go"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestAccountKey(t *testing.T) {
@@ -58,68 +53,4 @@ func TestGlobalAccountID(t *testing.T) {
 	if !IsAccountID(GlobalAccountID) {
 		t.Error("GlobalAccountID should be a valid account ID")
 	}
-}
-
-// startJSNATSServer starts an embedded JetStream-enabled NATS server for testing.
-func startJSNATSServer(t *testing.T) (*nats.Conn, nats.JetStreamContext) {
-	t.Helper()
-	_, nc, js := testutil.StartTestJetStream(t)
-	return nc, js
-}
-
-// TestVersionStateMachine covers unset→0, first write, idempotent same write, upgrade, and no-downgrade.
-// One bucket is reused so each step runs against the prior state — the only way to catch unconditional-overwrite regressions.
-func TestVersionStateMachine(t *testing.T) {
-	_, js := startJSNATSServer(t)
-	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "test-version-fsm"})
-	require.NoError(t, err)
-
-	// Unset → 0.
-	v, err := ReadVersion(kv)
-	require.NoError(t, err)
-	assert.Equal(t, 0, v, "ReadVersion on unset bucket")
-
-	steps := []struct {
-		name  string
-		write int
-		want  int // expected ReadVersion after the write
-	}{
-		{"first write persists", 1, 1},
-		{"same version is no-op", 1, 1},
-		{"higher version upgrades", 2, 2},
-		{"lower version is no-op (no downgrade)", 1, 2},
-		{"larger jump upgrades", 5, 5},
-	}
-	for _, step := range steps {
-		t.Run(step.name, func(t *testing.T) {
-			require.NoError(t, WriteVersion(kv, step.write))
-			v, err := ReadVersion(kv)
-			require.NoError(t, err)
-			assert.Equal(t, step.want, v)
-		})
-	}
-
-	// Round-trip the raw KV value to confirm the encoding is what readers
-	// outside this package would expect.
-	entry, err := kv.Get(VersionKey)
-	require.NoError(t, err)
-	assert.Equal(t, "5", string(entry.Value()))
-}
-
-func TestDeleteKVBucketIfExists(t *testing.T) {
-	_, js := startJSNATSServer(t)
-
-	// Missing bucket is a no-op.
-	require.NoError(t, DeleteKVBucketIfExists(js, "ghost-bucket"))
-
-	// Existing bucket gets deleted.
-	_, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "doomed-bucket"})
-	require.NoError(t, err)
-	require.NoError(t, DeleteKVBucketIfExists(js, "doomed-bucket"))
-
-	_, err = js.KeyValue("doomed-bucket")
-	require.Error(t, err, "bucket should be gone")
-
-	// Calling again on the now-missing bucket is still a no-op (idempotent).
-	require.NoError(t, DeleteKVBucketIfExists(js, "doomed-bucket"))
 }

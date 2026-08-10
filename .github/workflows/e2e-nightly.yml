@@ -11,12 +11,20 @@ on:
 
 permissions:
   contents: read
+  # actions: read lets the "Resolve CI job id" step below look up this job's
+  # numeric id via the Actions API — github.job is only the YAML key, no
+  # context exposes the id itself.
+  actions: read
 
 # Scheduled runs are loaded from the default branch (main), so the schedule
 # trigger must stay in sync on main for cron to fire.
 env:
   GIT_BRANCH: ${{ github.event_name == 'schedule' && 'dev' || github.ref_name }}
-  UBUNTU_GOLD_IMAGE: /mnt/disk1/gold-images/spinifex-image-builder-ubuntu-24.04.qcow2
+  UBUNTU_GOLD_IMAGE: /mnt/disk1/gold-images/spinifex-image-builder-ubuntu-26.04.qcow2
+  # OTLP export to the central Elastic sink (wattle). Repo variable overrides;
+  # empty string disables telemetry entirely.
+  SPINIFEX_OTLP_ENDPOINT: ${{ vars.SPINIFEX_OTLP_ENDPOINT || 'http://192.168.1.13:8200' }}
+  SPINIFEX_OTEL_ATTRS: ci.run_id=${{ github.run_id }},ci.workflow=${{ github.workflow }}
 
 jobs:
   matrix:
@@ -28,20 +36,25 @@ jobs:
       matrix:
         include:
           - { cell: 1,  install: binary, topo: single,     net: dhcp,   host: debian-13,    arch: x86_64, runner: ci-single, extra: "" }
-          - { cell: 2,  install: binary, topo: single,     net: static, host: ubuntu-24.04, arch: x86_64, runner: ci-single, extra: "" }
-          - { cell: 3,  install: binary, topo: single,     net: dhcp,   host: ubuntu-24.04, arch: x86_64, runner: ci-single, extra: "" }
+          - { cell: 2,  install: binary, topo: single,     net: static, host: ubuntu-26.04, arch: x86_64, runner: ci-single, extra: "" }
+          - { cell: 3,  install: binary, topo: single,     net: dhcp,   host: ubuntu-26.04, arch: x86_64, runner: ci-single, extra: "" }
           - { cell: 8,  install: binary, topo: real-multi, net: dhcp,   host: debian-13,    arch: x86_64, runner: ci-multi,  extra: "" }
-          - { cell: 9,  install: binary, topo: real-multi, net: static, host: ubuntu-24.04, arch: x86_64, runner: ci-multi,  extra: "" }
-          - { cell: 10, install: binary, topo: real-multi, net: dhcp,   host: ubuntu-24.04, arch: x86_64, runner: ci-multi,  extra: "" }
+          - { cell: 9,  install: binary, topo: real-multi, net: static, host: ubuntu-26.04, arch: x86_64, runner: ci-multi,  extra: "" }
+          - { cell: 10, install: binary, topo: real-multi, net: dhcp,   host: ubuntu-26.04, arch: x86_64, runner: ci-multi,  extra: "" }
           - { cell: 17, install: binary, topo: single,     net: static, host: debian-13,    arch: x86_64, runner: ci-pseudo, extra: "tofu-examples" }
           - { cell: 18, install: binary, topo: single,     net: static, host: debian-13,    arch: x86_64, runner: ci-single, extra: "reboot-single" }
           - { cell: 19, install: binary, topo: single,     net: nat,    host: debian-13,    arch: x86_64, runner: ci-single, extra: "nat-single" }
 
     runs-on: [ self-hosted, "${{ matrix.runner }}" ]
-    timeout-minutes: 35
+    timeout-minutes: ${{ matrix.extra == 'tofu-examples' && 45 || 35 }}
     env:
       TOFU_LOG: /tmp/e2e-nightly-cell-${{ matrix.cell }}-${{ github.run_id }}.log
       ARTIFACT_DIR: /tmp/spinifex-e2e-nightly-cell-${{ matrix.cell }}-${{ github.run_id }}
+      # Job-level env wins over the workflow-level default above, so telemetry
+      # from this cell carries ci.cell/ci.matrix. Nine cells run under one
+      # run id and every cell names its hosts node1/node2/node3, so without
+      # this every cell's telemetry collapses into one unattributable bucket.
+      SPINIFEX_OTEL_ATTRS: ci.run_id=${{ github.run_id }},ci.workflow=${{ github.workflow }},ci.cell=${{ matrix.cell }},ci.matrix=${{ matrix.topo }}/${{ matrix.net }}/${{ matrix.host }}
 
     steps:
       # blank or scheduled run = full matrix.
@@ -88,6 +101,16 @@ jobs:
         with:
           path: spinifex
 
+      # Nine cells share one run id and every cell names its hosts
+      # node1/node2/node3, so ci.cell above separates them and ci.job_id here
+      # links each cell's telemetry to the job log that produced it. Runs
+      # before Bootstrap bakes SPINIFEX_OTEL_ATTRS into the VM's telemetry.env.
+      - name: Resolve CI job id
+        if: steps.gate.outputs.selected == 'true'
+        uses: ./spinifex/.github/actions/otel-job-id
+        with:
+          job-name: "cell-${{ matrix.cell }} (${{ matrix.topo }}/${{ matrix.net }}/${{ matrix.host }}${{ matrix.extra && format('/{0}', matrix.extra) || '' }})"
+
       - name: Build Install Artifacts
         if: steps.gate.outputs.selected == 'true'
         working-directory: mulga/scripts/tofu-cluster
@@ -105,10 +128,13 @@ jobs:
         run: |
           export TF_VAR_git_branch="${GIT_BRANCH}"
 
+          # Match the family, not a pinned version: an exact match silently stops
+          # overriding the image when the matrix bumps release, dropping the cell
+          # back onto the debian gold.
           TOFU_VAR_ARGS=""
-          if [ "$MATRIX_HOST" = "ubuntu-24.04" ]; then
-            TOFU_VAR_ARGS="-var=host_image_override=${UBUNTU_GOLD_IMAGE}"
-          fi
+          case "$MATRIX_HOST" in
+            ubuntu-*) TOFU_VAR_ARGS="-var=host_image_override=${UBUNTU_GOLD_IMAGE}" ;;
+          esac
 
           tofu init -input=false >> "$TOFU_LOG" 2>&1
           tofu workspace select -or-create "${SPINIFEX_CI_ENV}" >> "$TOFU_LOG" 2>&1
@@ -143,13 +169,20 @@ jobs:
         if: steps.gate.outputs.selected == 'true' && matrix.topo == 'single' && matrix.extra == ''
         working-directory: mulga/scripts/tofu-cluster
         run: |
+          set -euo pipefail
+          # Nightly runs a documented subset of the single-node set; the assert
+          # fails the cell if that subset ever names a suite this topology
+          # cannot fully exercise.
+          . "${GITHUB_WORKSPACE}/spinifex/.github/scripts/suite-sets.sh"
+          e2e_suites_assert_subset "e2e-nightly single" "${E2E_SUITES_NIGHTLY_SINGLE}" "${E2E_SUITES_SINGLE}"
+
           INVENTORY=$(tofu output -json inventory)
           WAN_IP=$(echo "$INVENTORY" | jq -r '.nodes[0].wan_ip')
           SSH_KEY=$(echo "$INVENTORY" | jq -r '.ssh_key_path')
           SSH_KEY="${SSH_KEY/#\~/$HOME}"
           ssh -tt -o StrictHostKeyChecking=no -i "$SSH_KEY" tf-user@${WAN_IP} \
             "set -u; mkdir -p '${ARTIFACT_DIR}'; cd \$HOME/e2e-tests/_bin; FAIL=0; \
-             for SUITE in single cert lb; do \
+             for SUITE in ${E2E_SUITES_NIGHTLY_SINGLE}; do \
                echo \"::group::suite \$SUITE\"; \
                date -u +%Y-%m-%dT%H:%M:%SZ > '${ARTIFACT_DIR}/test-'\$SUITE'.start'; \
                GITHUB_ACTIONS=true FORCE_COLOR=1 SPINIFEX_E2E=1 SPINIFEX_MODE=single \
@@ -186,6 +219,11 @@ jobs:
         if: steps.gate.outputs.selected == 'true' && matrix.topo == 'real-multi'
         working-directory: mulga/scripts/tofu-cluster
         run: |
+          set -euo pipefail
+          # See the single-node step: same subset guard, multi-node set.
+          . "${GITHUB_WORKSPACE}/spinifex/.github/scripts/suite-sets.sh"
+          e2e_suites_assert_subset "e2e-nightly multi" "${E2E_SUITES_NIGHTLY_MULTI}" "${E2E_SUITES_MULTI}"
+
           INVENTORY=$(tofu output -json inventory)
           NODE1_IP=$(echo "$INVENTORY" | jq -r '.nodes[0].wan_ip')
           SSH_KEY=$(echo "$INVENTORY" | jq -r '.ssh_key_path')
@@ -200,7 +238,7 @@ jobs:
 
           ssh -tt -o StrictHostKeyChecking=no -i "$SSH_KEY" tf-user@${NODE1_IP} \
             "set -u; mkdir -p '${ARTIFACT_DIR}'; cd \$HOME/e2e-tests/_bin; FAIL=0; \
-             for SUITE in multinode cert lb; do \
+             for SUITE in ${E2E_SUITES_NIGHTLY_MULTI}; do \
                echo \"::group::suite \$SUITE\"; \
                date -u +%Y-%m-%dT%H:%M:%SZ > '${ARTIFACT_DIR}/test-'\$SUITE'.start'; \
                GITHUB_ACTIONS=true FORCE_COLOR=1 SPINIFEX_E2E=1 SPINIFEX_MODE=multinode \
@@ -212,6 +250,18 @@ jobs:
                rc=\${PIPESTATUS[0]}; echo \"::endgroup::\"; \
                if [ \$rc -ne 0 ]; then echo \"\$SUITE: FAILED\" >> '${ARTIFACT_DIR}/suite-status.txt'; FAIL=1; fi; \
              done; exit \$FAIL"
+
+      - name: Import RDS PostgreSQL AMI
+        if: steps.gate.outputs.selected == 'true' && matrix.extra == 'tofu-examples'
+        working-directory: mulga/scripts/tofu-cluster
+        run: |
+          set -euo pipefail
+          INVENTORY=$(tofu output -json inventory)
+          WAN_IP=$(echo "$INVENTORY" | jq -r '.nodes[0].wan_ip')
+          SSH_KEY=$(echo "$INVENTORY" | jq -r '.ssh_key_path')
+          SSH_KEY="${SSH_KEY/#\~/$HOME}"
+          ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" tf-user@${WAN_IP} \
+            "spx admin images import --name spinifex-rds-postgres"
 
       - name: Run Tofu Workbooks
         if: steps.gate.outputs.selected == 'true' && matrix.extra == 'tofu-examples'
@@ -335,13 +385,25 @@ jobs:
         env:
           MATRIX_HOST: ${{ matrix.host }}
         run: |
+          # Must mirror the Provision step's override, or destroy runs against a
+          # different image path than apply did.
           TOFU_VAR_ARGS=""
-          if [ "$MATRIX_HOST" = "ubuntu-24.04" ]; then
-            TOFU_VAR_ARGS="-var=host_image_override=${UBUNTU_GOLD_IMAGE}"
-          fi
+          case "$MATRIX_HOST" in
+            ubuntu-*) TOFU_VAR_ARGS="-var=host_image_override=${UBUNTU_GOLD_IMAGE}" ;;
+          esac
           tofu workspace select -or-create "${SPINIFEX_CI_ENV}" >> "$TOFU_LOG" 2>&1
+          timeout 120 ./flush-telemetry.sh "${SPINIFEX_CI_ENV}" >> "$TOFU_LOG" 2>&1 || true
           tofu destroy -var-file=envs/${SPINIFEX_CI_ENV}.tfvars ${TOFU_VAR_ARGS} -auto-approve -input=false >> "$TOFU_LOG" 2>&1
           ./scrub-env.sh "${SPINIFEX_CI_ENV}" >> "$TOFU_LOG" 2>&1 || true
+
+      - name: Upload tofu log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tofu-log-cell-${{ matrix.cell }}-${{ github.run_id }}
+          path: ${{ env.TOFU_LOG }}
+          if-no-files-found: ignore
+          retention-days: 14
 
   # Bare-metal single-node suite. Doesn't fit the tofu matrix shape, so it
   # runs as a sibling job via the reusable e2e-baremetal workflow. Gated like a
@@ -359,4 +421,8 @@ jobs:
     uses: ./.github/workflows/e2e-baremetal.yml
     with:
       ref: ${{ github.event_name == 'schedule' && 'dev' || github.ref_name }}
+      # A reusable-workflow call gets none of this workflow's context (env:
+      # above, matrix.cell) for free — cell-20 needs its own attrs string.
+      # There's no matrix leg here, just the one fixed baremetal cell.
+      otel-attrs: ci.run_id=${{ github.run_id }},ci.workflow=${{ github.workflow }},ci.cell=20,ci.matrix=baremetal/pxe/real-hw
     secrets: inherit

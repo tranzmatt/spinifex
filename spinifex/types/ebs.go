@@ -24,13 +24,13 @@ type EBSRequest struct {
 	HotplugPort int `json:"HotplugPort,omitempty"`
 }
 
-// NBDTransport defines the transport type for NBD connections
+// NBDTransport defines the transport type for NBD connections.
 type NBDTransport string
 
 const (
-	// NBDTransportSocket uses Unix domain sockets (faster, local only)
+	// NBDTransportSocket uses Unix domain sockets (faster, local only).
 	NBDTransportSocket NBDTransport = "socket"
-	// NBDTransportTCP uses TCP connections (required for remote/DPU scenarios)
+	// NBDTransportTCP uses TCP connections (required for remote/DPU scenarios).
 	NBDTransportTCP NBDTransport = "tcp"
 )
 
@@ -44,6 +44,10 @@ type EBSUnMountResponse struct {
 	Volume  string `json:"Volume"`
 	Mounted bool   `json:"Mounted"`
 	Error   string `json:"Error"`
+	// NotFound signals the volume was already unmounted and sealed (a retry
+	// after a request that timed out client-side but completed server-side).
+	// The caller treats this as a successful, idempotent seal.
+	NotFound bool `json:"NotFound"`
 }
 
 type EBSSyncRequest struct {
@@ -64,17 +68,6 @@ type EBSDeleteResponse struct {
 	Volume  string `json:"Volume"`
 	Success bool   `json:"Success"`
 	Error   string `json:"Error"`
-}
-
-type EBSSnapshotRequest struct {
-	Volume     string `json:"Volume"`
-	SnapshotID string `json:"SnapshotID"`
-}
-
-type EBSSnapshotResponse struct {
-	SnapshotID string `json:"SnapshotID"`
-	Success    bool   `json:"Success"`
-	Error      string `json:"Error"`
 }
 
 // EBSConfigUpdateRequest carries a control-plane VolumeConfig update for an

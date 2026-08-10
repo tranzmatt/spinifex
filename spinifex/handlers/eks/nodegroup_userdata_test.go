@@ -82,3 +82,70 @@ func TestBuildAgentUserData_NoGatewayIPUsesHostnameEndpoint(t *testing.T) {
 		t.Errorf("expected hostname:port tls config key when GatewayIP is empty\n%s", got)
 	}
 }
+
+func baseTestInput() agentUserDataInput {
+	return agentUserDataInput{
+		ClusterName:   "alpha",
+		NodegroupName: "ng-1",
+		ServerURL:     "https://10.0.0.1:443",
+		JoinToken:     "jointoken",
+		NodeName:      "alpha-ng-1-abcd1234",
+		Region:        "ap-southeast-2",
+		AccountID:     "123456789012",
+		RegistryHost:  "123456789012.dkr.ecr.ap-southeast-2.spinifex.internal",
+	}
+}
+
+func TestBuildAgentUserData_GPUEnabledSignalsNodegroupAndGPU(t *testing.T) {
+	in := baseTestInput()
+	in.GPUEnabled = true
+	in.GPUVendor = "nvidia"
+
+	got := buildAgentUserData(in)
+
+	// buildAgentUserData writes NO node-label/node-taint config drop-in:
+	// mulga-eks-provider-id.sh is the single node-label writer (k3s replaces,
+	// not merges, node-label across config.yaml.d files). The worker signals its
+	// nodegroup + GPU role via agent.env; the AMI script folds the labels + taint
+	// into the one node-label list it already writes for the topology labels.
+	if strings.Contains(got, "config.yaml.d/10-nodegroup.yaml") {
+		t.Errorf("must not write a nodegroup node-label drop-in, got:\n%s", got)
+	}
+	if strings.Contains(got, "node-label:") || strings.Contains(got, "node-taint:") {
+		t.Errorf("user-data must not carry any node-label/node-taint drop-in, got:\n%s", got)
+	}
+	if !strings.Contains(got, "SPINIFEX_NODEGROUP=ng-1") {
+		t.Errorf("expected SPINIFEX_NODEGROUP in agent.env, got:\n%s", got)
+	}
+	if !strings.Contains(got, "SPINIFEX_GPU_NODE=true") {
+		t.Errorf("expected SPINIFEX_GPU_NODE=true in agent.env for a GPU nodegroup, got:\n%s", got)
+	}
+	if strings.Contains(got, "K3S_NODE_LABEL") {
+		t.Errorf("label must not ride the no-op K3S_NODE_LABEL env, got:\n%s", got)
+	}
+}
+
+func TestBuildAgentUserData_NonGPUSignalsNodegroupOnly(t *testing.T) {
+	in := baseTestInput()
+
+	got := buildAgentUserData(in)
+
+	if strings.Contains(got, "nvidia.com/gpu") {
+		t.Errorf("non-GPU nodegroup user-data must not reference nvidia.com/gpu, got:\n%s", got)
+	}
+	if strings.Contains(got, "SPINIFEX_GPU_NODE") {
+		t.Errorf("non-GPU nodegroup must not set SPINIFEX_GPU_NODE, got:\n%s", got)
+	}
+	if strings.Contains(got, "node-label:") || strings.Contains(got, "node-taint:") {
+		t.Errorf("user-data must not carry any node-label/node-taint drop-in, got:\n%s", got)
+	}
+	// The worker signals its nodegroup via agent.env; mulga-eks-provider-id.sh
+	// turns it into the eks.amazonaws.com/nodegroup label that gates the
+	// nodegroup reaching ACTIVE (waitWorkersReady buckets Ready nodes by it).
+	if !strings.Contains(got, "SPINIFEX_NODEGROUP=ng-1") {
+		t.Errorf("expected SPINIFEX_NODEGROUP in agent.env, got:\n%s", got)
+	}
+	if strings.Contains(got, "K3S_NODE_LABEL") {
+		t.Errorf("nodegroup label must not ride the no-op K3S_NODE_LABEL env, got:\n%s", got)
+	}
+}

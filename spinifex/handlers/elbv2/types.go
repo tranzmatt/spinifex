@@ -6,35 +6,38 @@ import (
 )
 
 const (
-	// LoadBalancer types
+	// LoadBalancer types.
 	LoadBalancerTypeApplication = "application"
 	LoadBalancerTypeNetwork     = "network"
 
-	// LoadBalancer schemes
+	// maxLBSecurityGroups is the AWS cap on security groups per load balancer.
+	maxLBSecurityGroups = 5
+
+	// LoadBalancer schemes.
 	SchemeInternetFacing = "internet-facing"
 	SchemeInternal       = "internal"
 
-	// LoadBalancer states
+	// LoadBalancer states.
 	StateProvisioning = "provisioning"
 	StateActive       = "active"
 	StateFailed       = "failed"
 
-	// Target group target types (v1 supports instance and ip)
+	// Target group target types (v1 supports instance and ip).
 	TargetTypeInstance = "instance"
 	TargetTypeIP       = "ip"
 
-	// Target health states
+	// Target health states.
 	TargetHealthInitial   = "initial"
 	TargetHealthHealthy   = "healthy"
 	TargetHealthUnhealthy = "unhealthy"
 	TargetHealthDraining  = "draining"
 	TargetHealthUnused    = "unused"
 
-	// Listener protocols (ALB)
+	// Listener protocols (ALB).
 	ProtocolHTTP  = "HTTP"
 	ProtocolHTTPS = "HTTPS"
 
-	// Listener protocols (NLB)
+	// Listener protocols (NLB).
 	ProtocolTCP    = "TCP"
 	ProtocolUDP    = "UDP"
 	ProtocolTLS    = "TLS"
@@ -57,12 +60,12 @@ const (
 	// not specify an SslPolicy.
 	DefaultSslPolicy = "ELBSecurityPolicy-2016-08"
 
-	// Listener action types
+	// Listener action types.
 	ActionTypeForward       = "forward"
 	ActionTypeFixedResponse = "fixed-response"
 	ActionTypeRedirect      = "redirect"
 
-	// Rule condition fields
+	// Rule condition fields.
 	RuleFieldHostHeader        = "host-header"
 	RuleFieldPathPattern       = "path-pattern"
 	RuleFieldHTTPHeader        = "http-header"
@@ -82,7 +85,7 @@ const (
 	MaxConditionValueLen  = 128
 	MaxHTTPHeaderNameLen  = 40
 
-	// Default health check values (ALB)
+	// Default health check values (ALB).
 	DefaultHealthCheckInterval           = 30
 	DefaultHealthCheckTimeout            = 5
 	DefaultHealthyThreshold              = 5
@@ -93,7 +96,7 @@ const (
 	DefaultHealthCheckMatcher            = "200"
 	DefaultTargetDeregistrationDelaySecs = 300
 
-	// Default health check values (NLB)
+	// Default health check values (NLB).
 	DefaultNLBHealthCheckInterval = 30
 	DefaultNLBHealthCheckTimeout  = 10
 	DefaultNLBHealthyThreshold    = 3
@@ -101,24 +104,28 @@ const (
 	DefaultNLBHealthCheckProtocol = ProtocolTCP
 	DefaultNLBHealthCheckPort     = "traffic-port"
 
-	// IP address type
+	// IP address type.
 	IPAddressTypeIPv4 = "ipv4"
 )
 
 // LoadBalancerRecord represents a stored load balancer (ALB or NLB).
 type LoadBalancerRecord struct {
-	LoadBalancerArn string   `json:"load_balancer_arn"`
-	LoadBalancerID  string   `json:"load_balancer_id"` // Short ID (hex suffix)
-	DNSName         string   `json:"dns_name"`
-	Name            string   `json:"name"`
-	Scheme          string   `json:"scheme"` // "internet-facing" or "internal"
-	Type            string   `json:"type"`   // Always "application"
-	State           string   `json:"state"`  // "provisioning", "active", "failed"
-	VpcId           string   `json:"vpc_id"`
-	SecurityGroups  []string `json:"security_groups"`
-	// NLBManagedSGID is the managed SG minted for NLBs (customer SGs are rejected).
-	// Attached to every LB ENI; listener-port ingress is authorized on it.
-	// Not surfaced by DescribeLoadBalancers.
+	LoadBalancerArn string `json:"load_balancer_arn"`
+	LoadBalancerID  string `json:"load_balancer_id"` // Short ID (hex suffix)
+	DNSName         string `json:"dns_name"`
+	Name            string `json:"name"`
+	Scheme          string `json:"scheme"` // "internet-facing" or "internal"
+	Type            string `json:"type"`   // Always "application"
+	State           string `json:"state"`  // "provisioning", "active", "failed"
+	// StateReason explains a failed state; surfaced as State.Reason so API
+	// consumers see why provisioning gave up (e.g. sys.micro capacity exhausted).
+	StateReason    string   `json:"state_reason,omitempty"`
+	VpcId          string   `json:"vpc_id"`
+	SecurityGroups []string `json:"security_groups"`
+	// NLBManagedSGID is the managed SG minted for an NLB created without customer
+	// SGs; attached to every LB ENI with listener-port ingress authorized on it.
+	// Empty when the NLB was created with customer SGs (which replace it). Not
+	// surfaced by DescribeLoadBalancers.
 	NLBManagedSGID string `json:"nlb_managed_sg_id,omitempty"`
 	// NLBIngressCIDRs overrides the scheme-based default client CIDRs that
 	// listener ports are opened to on NLBManagedSGID. Empty ⇒ default
@@ -391,5 +398,9 @@ var (
 		"load_balancing.cross_zone.enabled":     "use_load_balancer_configuration",
 		"load_balancing.algorithm.type":         "round_robin",
 		"slow_start.duration_seconds":           "0",
+		// NLB target-group default. The AWS Load Balancer Controller always
+		// writes this on NLB target groups (e.g. ingress-nginx); without it as a
+		// known key the modify is rejected and LBC loops on the Service forever.
+		"proxy_protocol_v2.enabled": "false",
 	}
 )

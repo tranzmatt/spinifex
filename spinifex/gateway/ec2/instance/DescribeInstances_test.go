@@ -1,6 +1,7 @@
 package gateway_ec2_instance
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -39,7 +40,7 @@ func TestDescribeInstances_SingleNode(t *testing.T) {
 	require.NoError(t, err)
 
 	input := &ec2.DescribeInstancesInput{}
-	output, err := DescribeInstances(input, nc, 1, "123456789012")
+	output, err := DescribeInstances(context.Background(), input, nc, 1, "123456789012")
 
 	require.NoError(t, err)
 	require.NotNil(t, output)
@@ -90,7 +91,7 @@ func TestDescribeInstances_MultipleNodes(t *testing.T) {
 	nc2.Flush()
 
 	input := &ec2.DescribeInstancesInput{}
-	output, err := DescribeInstances(input, nc, 2, "123456789012")
+	output, err := DescribeInstances(context.Background(), input, nc, 2, "123456789012")
 
 	require.NoError(t, err)
 	require.NotNil(t, output)
@@ -101,7 +102,7 @@ func TestDescribeInstances_NoSubscribers(t *testing.T) {
 	_, nc := startTestNATSServer(t)
 
 	input := &ec2.DescribeInstancesInput{}
-	output, err := DescribeInstances(input, nc, 0, "123456789012")
+	output, err := DescribeInstances(context.Background(), input, nc, 0, "123456789012")
 
 	// No subscribers means timeout — function returns empty reservations, no error
 	require.NoError(t, err)
@@ -118,7 +119,7 @@ func TestDescribeInstances_NodeReturnsError(t *testing.T) {
 	})
 
 	input := &ec2.DescribeInstancesInput{}
-	output, err := DescribeInstances(input, nc, 1, "123456789012")
+	output, err := DescribeInstances(context.Background(), input, nc, 1, "123456789012")
 
 	// Error responses from nodes are logged but don't fail the overall call
 	require.NoError(t, err)
@@ -156,7 +157,7 @@ func TestDescribeInstances_MixedResponses(t *testing.T) {
 	nc2.Flush()
 
 	input := &ec2.DescribeInstancesInput{}
-	output, err := DescribeInstances(input, nc, 2, "123456789012")
+	output, err := DescribeInstances(context.Background(), input, nc, 2, "123456789012")
 
 	require.NoError(t, err)
 	require.NotNil(t, output)
@@ -173,7 +174,7 @@ func TestDescribeInstances_MalformedJSON(t *testing.T) {
 	})
 
 	input := &ec2.DescribeInstancesInput{}
-	output, err := DescribeInstances(input, nc, 1, "123456789012")
+	output, err := DescribeInstances(context.Background(), input, nc, 1, "123456789012")
 
 	// Malformed JSON from a node is skipped, not fatal
 	require.NoError(t, err)
@@ -192,7 +193,7 @@ func TestDescribeInstances_EmptyReservations(t *testing.T) {
 	})
 
 	input := &ec2.DescribeInstancesInput{}
-	output, err := DescribeInstances(input, nc, 1, "123456789012")
+	output, err := DescribeInstances(context.Background(), input, nc, 1, "123456789012")
 
 	require.NoError(t, err)
 	require.NotNil(t, output)
@@ -214,7 +215,7 @@ func TestDescribeInstances_TimeoutCollection(t *testing.T) {
 	})
 
 	input := &ec2.DescribeInstancesInput{}
-	output, err := DescribeInstances(input, nc, 0, "123456789012") // 0 = timeout-based collection
+	output, err := DescribeInstances(context.Background(), input, nc, 0, "123456789012") // 0 = timeout-based collection
 
 	require.NoError(t, err)
 	require.NotNil(t, output)
@@ -235,7 +236,7 @@ func TestDescribeInstances_EarlyExitWithExpectedNodes(t *testing.T) {
 
 	input := &ec2.DescribeInstancesInput{}
 	start := time.Now()
-	output, err := DescribeInstances(input, nc, 1, "123456789012")
+	output, err := DescribeInstances(context.Background(), input, nc, 1, "123456789012")
 	duration := time.Since(start)
 
 	require.NoError(t, err)
@@ -243,6 +244,156 @@ func TestDescribeInstances_EarlyExitWithExpectedNodes(t *testing.T) {
 	assert.Len(t, output.Reservations, 1)
 	// Should exit early, well before the 3-second timeout
 	assert.Less(t, duration, 2*time.Second)
+}
+
+// subscribeEmptyInstanceBuckets makes the stopped/terminated KV bucket
+// queries in gatherInstances succeed with no instances, so a fan-out that
+// resolves fully still isn't marked incomplete just because the buckets have
+// nothing to say.
+func subscribeEmptyInstanceBuckets(t *testing.T, nc *nats.Conn) {
+	t.Helper()
+	for _, topic := range []string{"ec2.DescribeStoppedInstances", "ec2.DescribeTerminatedInstances"} {
+		_, err := nc.Subscribe(topic, func(msg *nats.Msg) {
+			data, _ := json.Marshal(&ec2.DescribeInstancesOutput{Reservations: []*ec2.Reservation{}})
+			msg.Respond(data)
+		})
+		require.NoError(t, err)
+	}
+	nc.Flush()
+}
+
+// TestDescribeInstancesChecked_ExplicitIDNotFound_CompleteSweep covers the
+// The primary criterion: naming a nonexistent instance ID with a
+// fully-answered fan-out returns InvalidInstanceID.NotFound instead of a
+// silent empty list.
+func TestDescribeInstancesChecked_ExplicitIDNotFound_CompleteSweep(t *testing.T) {
+	_, nc := startTestNATSServer(t)
+	subscribeEmptyInstanceBuckets(t, nc)
+
+	_, err := nc.Subscribe("ec2.DescribeInstances", func(msg *nats.Msg) {
+		data, _ := json.Marshal(&ec2.DescribeInstancesOutput{
+			Reservations: []*ec2.Reservation{
+				{
+					ReservationId: aws.String("r-1"),
+					Instances:     []*ec2.Instance{{InstanceId: aws.String("i-real")}},
+				},
+			},
+		})
+		msg.Respond(data)
+	})
+	require.NoError(t, err)
+	nc.Flush()
+
+	input := &ec2.DescribeInstancesInput{InstanceIds: []*string{aws.String("i-doesnotexist0000000")}}
+	_, err = DescribeInstancesChecked(context.Background(), input, nc, 1, "123456789012")
+
+	require.Error(t, err)
+	assert.Equal(t, awserrors.ErrorInvalidInstanceIDNotFound, err.Error())
+}
+
+// TestDescribeInstances_ExplicitIDNotFound_StaysSilent guards the internal
+// callers (IMDS lookup, RDS instance-state resolver, EKS control-plane
+// reconciler) that call the plain DescribeInstances and rely on "not found"
+// meaning an empty list, not an error. Only DescribeInstancesChecked — used
+// solely by the gateway's customer-facing action — may assert NotFound.
+func TestDescribeInstances_ExplicitIDNotFound_StaysSilent(t *testing.T) {
+	_, nc := startTestNATSServer(t)
+	subscribeEmptyInstanceBuckets(t, nc)
+
+	// Mirrors a real node: it filters by the requested InstanceIds itself, so
+	// a query for an ID it doesn't hold gets an empty reservations list back.
+	_, err := nc.Subscribe("ec2.DescribeInstances", func(msg *nats.Msg) {
+		data, _ := json.Marshal(&ec2.DescribeInstancesOutput{Reservations: []*ec2.Reservation{}})
+		msg.Respond(data)
+	})
+	require.NoError(t, err)
+	nc.Flush()
+
+	input := &ec2.DescribeInstancesInput{InstanceIds: []*string{aws.String("i-doesnotexist0000000")}}
+	output, err := DescribeInstances(context.Background(), input, nc, 1, "123456789012")
+
+	require.NoError(t, err)
+	require.NotNil(t, output)
+	assert.Empty(t, output.Reservations)
+}
+
+// TestDescribeInstancesChecked_ExplicitIDFound_CompleteSweep is the positive
+// counterpart: the same complete sweep, but the requested ID is present, so
+// no error is raised.
+func TestDescribeInstancesChecked_ExplicitIDFound_CompleteSweep(t *testing.T) {
+	_, nc := startTestNATSServer(t)
+	subscribeEmptyInstanceBuckets(t, nc)
+
+	_, err := nc.Subscribe("ec2.DescribeInstances", func(msg *nats.Msg) {
+		data, _ := json.Marshal(&ec2.DescribeInstancesOutput{
+			Reservations: []*ec2.Reservation{
+				{
+					ReservationId: aws.String("r-1"),
+					Instances:     []*ec2.Instance{{InstanceId: aws.String("i-real")}},
+				},
+			},
+		})
+		msg.Respond(data)
+	})
+	require.NoError(t, err)
+	nc.Flush()
+
+	input := &ec2.DescribeInstancesInput{InstanceIds: []*string{aws.String("i-real")}}
+	output, err := DescribeInstancesChecked(context.Background(), input, nc, 1, "123456789012")
+
+	require.NoError(t, err)
+	require.Len(t, output.Reservations, 1)
+}
+
+// TestDescribeInstancesChecked_FilterOnlyNoMatch_ReturnsEmptyNotNotFound
+// covers the second criterion: a --filters query that matches nothing
+// must still return rc=0 with an empty list, never NotFound (no instance IDs
+// were named).
+func TestDescribeInstancesChecked_FilterOnlyNoMatch_ReturnsEmptyNotNotFound(t *testing.T) {
+	_, nc := startTestNATSServer(t)
+	subscribeEmptyInstanceBuckets(t, nc)
+
+	_, err := nc.Subscribe("ec2.DescribeInstances", func(msg *nats.Msg) {
+		data, _ := json.Marshal(&ec2.DescribeInstancesOutput{Reservations: []*ec2.Reservation{}})
+		msg.Respond(data)
+	})
+	require.NoError(t, err)
+	nc.Flush()
+
+	input := &ec2.DescribeInstancesInput{
+		Filters: []*ec2.Filter{{Name: aws.String("tag:nope"), Values: []*string{aws.String("nothing")}}},
+	}
+	output, err := DescribeInstancesChecked(context.Background(), input, nc, 1, "123456789012")
+
+	require.NoError(t, err)
+	require.NotNil(t, output)
+	assert.Empty(t, output.Reservations)
+}
+
+// TestDescribeInstancesChecked_ExplicitIDNotFound_NodeTimeout verifies the
+// subtle third criterion: a node timing out during the fan-out must not
+// produce a false NotFound. Only one of two expected nodes answers, so the
+// sweep is provably incomplete and the naive found-set check must be
+// suppressed.
+func TestDescribeInstancesChecked_ExplicitIDNotFound_NodeTimeout(t *testing.T) {
+	_, nc := startTestNATSServer(t)
+	subscribeEmptyInstanceBuckets(t, nc)
+
+	// Only one of the two expected nodes has a subscriber; the second never
+	// answers, so the fan-out hits its 3s deadline with sum.TimedOut=true.
+	_, err := nc.Subscribe("ec2.DescribeInstances", func(msg *nats.Msg) {
+		data, _ := json.Marshal(&ec2.DescribeInstancesOutput{Reservations: []*ec2.Reservation{}})
+		msg.Respond(data)
+	})
+	require.NoError(t, err)
+	nc.Flush()
+
+	input := &ec2.DescribeInstancesInput{InstanceIds: []*string{aws.String("i-on-the-slow-node")}}
+	output, err := DescribeInstancesChecked(context.Background(), input, nc, 2, "123456789012")
+
+	require.NoError(t, err, "an incomplete sweep must never assert a false NotFound")
+	require.NotNil(t, output)
+	assert.Empty(t, output.Reservations)
 }
 
 func TestDescribeInstances_ClosedConnection(t *testing.T) {
@@ -253,7 +404,7 @@ func TestDescribeInstances_ClosedConnection(t *testing.T) {
 	closedNC.Close()
 
 	input := &ec2.DescribeInstancesInput{}
-	_, err = DescribeInstances(input, closedNC, 1, "123456789012")
+	_, err = DescribeInstances(context.Background(), input, closedNC, 1, "123456789012")
 
 	require.Error(t, err)
 }

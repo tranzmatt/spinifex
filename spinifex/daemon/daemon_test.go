@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -41,6 +42,7 @@ import (
 	handlers_ec2_placementgroup "github.com/mulgadc/spinifex/spinifex/handlers/ec2/placementgroup"
 	handlers_ec2_routetable "github.com/mulgadc/spinifex/spinifex/handlers/ec2/routetable"
 	handlers_ec2_snapshot "github.com/mulgadc/spinifex/spinifex/handlers/ec2/snapshot"
+	handlers_ec2_spotinstance "github.com/mulgadc/spinifex/spinifex/handlers/ec2/spotinstance"
 	handlers_ec2_volume "github.com/mulgadc/spinifex/spinifex/handlers/ec2/volume"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
 	handlers_elbv2 "github.com/mulgadc/spinifex/spinifex/handlers/elbv2"
@@ -50,7 +52,9 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/spinifex/spinifex/vm"
+	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -77,7 +81,7 @@ func drainAndClose(t *testing.T, nc *nats.Conn) {
 	}
 }
 
-// createTestDaemon creates a test daemon instance with minimal configuration
+// createTestDaemon creates a test daemon instance with minimal configuration.
 func createTestDaemon(t *testing.T, natsURL string) *Daemon {
 	// Create a temporary directory for test data
 	tmpDir := t.TempDir()
@@ -118,7 +122,8 @@ func createTestDaemon(t *testing.T, natsURL string) *Daemon {
 	require.NoError(t, err, "Failed to connect to NATS")
 
 	daemon.natsConn = nc
-	daemon.detachDelay = 0 // Skip sleep in tests
+	daemon.detachDelay = 0          // Skip sleep in tests
+	daemon.deviceDeletedTimeout = 0 // Skip DEVICE_DELETED wait in tests
 
 	// Initialize services (needed for handler tests).
 	// jsManager is nil here; pass a nil literal to keep the StoppedInstanceStore
@@ -132,10 +137,11 @@ func createTestDaemon(t *testing.T, natsURL string) *Daemon {
 	// AttachVolume / DetachVolume manager methods enough plumbing to drive
 	// ebs.mount/unmount over NATS using the test's connection.
 	daemon.vmMgr.SetDeps(vm.Deps{
-		NodeID:             daemon.node,
-		VolumeMounter:      newVolumeMounterAdapter(daemon.natsConn, daemon.node, daemon.volumeService),
-		VolumeStateUpdater: daemon.volumeService,
-		DetachDelay:        daemon.detachDelay,
+		NodeID:               daemon.node,
+		VolumeMounter:        newVolumeMounterAdapter(daemon.natsConn, daemon.node, daemon.volumeService),
+		VolumeStateUpdater:   daemon.volumeService,
+		DetachDelay:          daemon.detachDelay,
+		DeviceDeletedTimeout: daemon.deviceDeletedTimeout,
 	})
 
 	t.Cleanup(func() {
@@ -147,7 +153,7 @@ func createTestDaemon(t *testing.T, natsURL string) *Daemon {
 	return daemon
 }
 
-// getTestInstanceType returns a valid instance type for testing based on the system's CPU
+// getTestInstanceType returns a valid instance type for testing based on the system's CPU.
 func getTestInstanceType(t *testing.T) string {
 	t.Helper()
 	rm, err := NewResourceManager(nil, nil, nil)
@@ -170,7 +176,7 @@ func getTestInstanceType(t *testing.T) string {
 func seedTestAMI(t *testing.T, store *objectstore.MemoryObjectStore, bucket, imageID string) {
 	t.Helper()
 	amiConfig := `{"VolumeConfig":{"AMIMetadata":{"ImageID":"` + imageID + `","Name":"test"}}}`
-	_, err := store.PutObject(&awss3.PutObjectInput{
+	_, err := store.PutObject(t.Context(), &awss3.PutObjectInput{
 		Bucket:      aws.String(bucket),
 		Key:         aws.String(imageID + "/config.json"),
 		Body:        strings.NewReader(amiConfig),
@@ -179,13 +185,13 @@ func seedTestAMI(t *testing.T, store *objectstore.MemoryObjectStore, bucket, ima
 	require.NoError(t, err)
 }
 
-// TestResourceManager tests resource manager functionality
+// TestResourceManager tests resource manager functionality.
 func TestResourceManager(t *testing.T) {
 	rm, err := NewResourceManager(nil, nil, nil)
 	require.NoError(t, err)
 
 	require.NotNil(t, rm)
-	assert.Greater(t, rm.hostVCPU, 0)
+	assert.Positive(t, rm.hostVCPU)
 	assert.Greater(t, rm.hostMemGB, float64(0))
 
 	// Test allocation using the first available instance type (dynamic based on CPU)
@@ -244,7 +250,7 @@ func TestResourceManager(t *testing.T) {
 
 		// Test requesting more than available
 		maxPossible := rm.canAllocate(microType, 1000)
-		assert.Greater(t, maxPossible, 0, "Should be able to allocate at least 1")
+		assert.Positive(t, maxPossible, "Should be able to allocate at least 1")
 		assert.LessOrEqual(t, maxPossible, 1000, "Should not exceed requested count")
 
 		// Test requesting exactly 1
@@ -264,7 +270,7 @@ func TestResourceManager(t *testing.T) {
 	})
 }
 
-// TestGetInstanceTypeInfos tests the GetInstanceTypeInfos method
+// TestGetInstanceTypeInfos tests the GetInstanceTypeInfos method.
 func TestGetInstanceTypeInfos(t *testing.T) {
 	rm, err := NewResourceManager(nil, nil, nil)
 	require.NoError(t, err)
@@ -273,7 +279,7 @@ func TestGetInstanceTypeInfos(t *testing.T) {
 
 	require.NotEmpty(t, infos, "Should return at least one instance type")
 	// With generation-specific families, minimum is 7 (unknown/burstable-only) up to 31 (current-gen)
-	assert.True(t, len(infos) >= 7,
+	assert.GreaterOrEqual(t, len(infos), 7,
 		"Should have at least 7 instance types, got %d", len(infos))
 
 	// Verify structure of returned instance type info
@@ -292,7 +298,7 @@ func TestGetInstanceTypeInfos(t *testing.T) {
 	}
 }
 
-// TestGetAvailableInstanceTypeInfos_ResourceFiltering tests that instance types are filtered by available resources
+// TestGetAvailableInstanceTypeInfos_ResourceFiltering tests that instance types are filtered by available resources.
 func TestGetAvailableInstanceTypeInfos_ResourceFiltering(t *testing.T) {
 	rm, err := NewResourceManager(nil, nil, nil)
 	require.NoError(t, err)
@@ -310,7 +316,7 @@ func TestGetAvailableInstanceTypeInfos_ResourceFiltering(t *testing.T) {
 	// be filtered out.
 	assert.LessOrEqual(t, len(initialAvailable), len(allTypes),
 		"Available types should be <= total types")
-	assert.Greater(t, len(initialAvailable), 0, "Should have at least one available type")
+	assert.NotEmpty(t, initialAvailable, "Should have at least one available type")
 
 	// Verify all initially available types fit within schedulable resources.
 	schedulableVCPU := rm.hostVCPU - rm.reservedVCPU
@@ -370,18 +376,18 @@ func TestGetAvailableInstanceTypeInfos_ResourceFiltering(t *testing.T) {
 	// Deallocate and verify we get the same available types as before
 	rm.deallocate(nanoType)
 	afterDeallocation := rm.GetAvailableInstanceTypeInfos(false)
-	assert.Equal(t, len(initialAvailable), len(afterDeallocation),
+	assert.Len(t, afterDeallocation, len(initialAvailable),
 		"Should have same available types after deallocation")
 }
 
-// TestHandleEC2DescribeInstanceTypes tests the DescribeInstanceTypes handler
+// TestHandleEC2DescribeInstanceTypes tests the DescribeInstanceTypes handler.
 func TestHandleEC2DescribeInstanceTypes(t *testing.T) {
 	natsURL := sharedNATSURL
 
 	daemon := createTestDaemon(t, natsURL)
 
 	// Subscribe to DescribeInstanceTypes (no queue group for fan-out)
-	sub, err := daemon.natsConn.Subscribe("ec2.DescribeInstanceTypes", daemon.handleEC2DescribeInstanceTypes)
+	sub, err := daemon.natsConn.Subscribe("ec2.DescribeInstanceTypes", handleNATSRequest(daemon.instanceService.DescribeInstanceTypes))
 	require.NoError(t, err, "Failed to subscribe to ec2.DescribeInstanceTypes")
 	defer sub.Unsubscribe()
 
@@ -400,7 +406,7 @@ func TestHandleEC2DescribeInstanceTypes(t *testing.T) {
 		require.NoError(t, err, "Should unmarshal response")
 
 		require.NotNil(t, output.InstanceTypes, "InstanceTypes should not be nil")
-		assert.Greater(t, len(output.InstanceTypes), 0, "Should return at least one instance type")
+		assert.NotEmpty(t, output.InstanceTypes, "Should return at least one instance type")
 
 		// Verify CPU architecture is correct
 		expectedArch := "x86_64"
@@ -458,7 +464,7 @@ func TestHandleEC2DescribeInstanceTypes(t *testing.T) {
 		}
 
 		// Verify counts match (all available types should be returned)
-		assert.Equal(t, len(expectedTypes), len(output.InstanceTypes),
+		assert.Len(t, output.InstanceTypes, len(expectedTypes),
 			"Returned instance types count should match available types count")
 
 		t.Logf("Verified %d instance types match expected list", len(output.InstanceTypes))
@@ -524,7 +530,7 @@ func TestHandleEC2DescribeInstanceTypes(t *testing.T) {
 		err = json.Unmarshal(reply.Data, &afterAllocationOutput)
 		require.NoError(t, err)
 
-		assert.Equal(t, initialCount, len(afterAllocationOutput.InstanceTypes),
+		assert.Len(t, afterAllocationOutput.InstanceTypes, initialCount,
 			"no-filter response must list the same supported types before and after allocation")
 
 		afterTypes := make(map[string]bool)
@@ -657,7 +663,7 @@ func TestHandleEC2DescribeInstanceTypes(t *testing.T) {
 				expectedSlots++
 			}
 		}
-		assert.Equal(t, expectedSlots, len(output.InstanceTypes),
+		assert.Len(t, output.InstanceTypes, expectedSlots,
 			"Should have %d slots for types fitting 2 vCPU / 16GB", expectedSlots)
 
 		// Now increase capacity to test duplicate slots
@@ -691,7 +697,7 @@ func TestHandleEC2DescribeInstanceTypes(t *testing.T) {
 	})
 }
 
-// TestDaemon_BootAllocation verifies that resources are correctly reconstructed on startup
+// TestDaemon_BootAllocation verifies that resources are correctly reconstructed on startup.
 func TestDaemon_BootAllocation(t *testing.T) {
 	natsURL := sharedJSNATSURL
 
@@ -744,7 +750,7 @@ func TestDaemon_BootAllocation(t *testing.T) {
 
 	// Pre-populate the local state file with test state. Post-1a, LoadState
 	// reads from the local file (KV is best-effort cache only).
-	err = WriteLocalState(daemon.localStatePath(), vms)
+	err = writeLocalState(daemon.localStatePath(), vms)
 	require.NoError(t, err)
 
 	// Manually trigger the LoadState and allocation logic normally found in Start()
@@ -771,7 +777,7 @@ func TestDaemon_BootAllocation(t *testing.T) {
 	assert.Equal(t, expectedMem, daemon.resourceMgr.allocatedMem)
 }
 
-// TestCanAllocate_CountEdgeCases tests edge cases for canAllocate with count parameter
+// TestCanAllocate_CountEdgeCases tests edge cases for canAllocate with count parameter.
 func TestCanAllocate_CountEdgeCases(t *testing.T) {
 	t.Run("MinCount_equals_MaxCount", func(t *testing.T) {
 		rm, err := NewResourceManager(nil, nil, nil)
@@ -958,7 +964,7 @@ func TestAllocate_NoOvercommitUnderContention(t *testing.T) {
 	// Size the pool on the full per-instance charge (guest -m + nbdkit, RG-6),
 	// not bare guest -m, so capacityFor slots still fit exactly after RG-6.
 	memGB := float64(rm.instanceMemChargeMiB(microType)) / 1024.0
-	require.Greater(t, vCPUs, 0, "micro type must report vCPU count")
+	require.Positive(t, vCPUs, "micro type must report vCPU count")
 	require.Greater(t, memGB, float64(0), "micro type must report memory")
 
 	const capacityFor = 8 // slots
@@ -1015,198 +1021,7 @@ func TestAllocate_NoOvercommitUnderContention(t *testing.T) {
 	assert.InDelta(t, memGB*float64(capacityFor), finalMem, 0.001, "allocated memory must not exceed schedulable pool")
 }
 
-// TestDescribeInstances_ReservationGrouping tests that instances are grouped by reservation ID
-func TestDescribeInstances_ReservationGrouping(t *testing.T) {
-	natsURL := sharedNATSURL
-
-	daemon := createTestDaemon(t, natsURL)
-
-	// Create instances with shared reservation (simulating --count 3)
-	reservation1 := &ec2.Reservation{}
-	reservation1.SetReservationId("r-shared-001")
-	reservation1.SetOwnerId("123456789012")
-
-	// Add 3 instances with same reservation ID
-	for i := 1; i <= 3; i++ {
-		instanceID := fmt.Sprintf("i-group1-%03d", i)
-		ec2Instance := &ec2.Instance{}
-		ec2Instance.SetInstanceId(instanceID)
-		ec2Instance.SetInstanceType("t3.micro")
-
-		daemon.vmMgr.Insert(&vm.VM{
-			ID:          instanceID,
-			Status:      vm.StateRunning,
-			AccountID:   testAccountID,
-			Reservation: reservation1,
-			Instance:    ec2Instance,
-		})
-	}
-
-	// Create another reservation with 2 instances
-	reservation2 := &ec2.Reservation{}
-	reservation2.SetReservationId("r-shared-002")
-	reservation2.SetOwnerId("123456789012")
-
-	for i := 1; i <= 2; i++ {
-		instanceID := fmt.Sprintf("i-group2-%03d", i)
-		ec2Instance := &ec2.Instance{}
-		ec2Instance.SetInstanceId(instanceID)
-		ec2Instance.SetInstanceType("t3.small")
-
-		daemon.vmMgr.Insert(&vm.VM{
-			ID:          instanceID,
-			Status:      vm.StateRunning,
-			AccountID:   testAccountID,
-			Reservation: reservation2,
-			Instance:    ec2Instance,
-		})
-	}
-
-	// Create a single-instance reservation
-	reservation3 := &ec2.Reservation{}
-	reservation3.SetReservationId("r-single-003")
-	reservation3.SetOwnerId("123456789012")
-
-	ec2Instance := &ec2.Instance{}
-	ec2Instance.SetInstanceId("i-single-001")
-	ec2Instance.SetInstanceType("t3.large")
-
-	daemon.vmMgr.Insert(&vm.VM{
-		ID:          "i-single-001",
-		Status:      vm.StateStopped,
-		AccountID:   testAccountID,
-		Reservation: reservation3,
-		Instance:    ec2Instance,
-	})
-
-	// Subscribe to handle DescribeInstances
-	sub, err := daemon.natsConn.Subscribe("ec2.DescribeInstances", daemon.handleEC2DescribeInstances)
-	require.NoError(t, err)
-	defer sub.Unsubscribe()
-
-	t.Run("GroupsInstancesByReservationID", func(t *testing.T) {
-		input := &ec2.DescribeInstancesInput{}
-		inputJSON, _ := json.Marshal(input)
-
-		resp, err := natsRequest(daemon.natsConn, "ec2.DescribeInstances", inputJSON, 5*time.Second)
-		require.NoError(t, err)
-
-		var output ec2.DescribeInstancesOutput
-		err = json.Unmarshal(resp.Data, &output)
-		require.NoError(t, err)
-
-		// Should have exactly 3 reservations
-		assert.Len(t, output.Reservations, 3, "Should have 3 reservations")
-
-		// Build a map of reservation ID -> instance count
-		resMap := make(map[string]int)
-		for _, res := range output.Reservations {
-			resID := *res.ReservationId
-			resMap[resID] = len(res.Instances)
-			t.Logf("Reservation %s has %d instances", resID, len(res.Instances))
-		}
-
-		assert.Equal(t, 3, resMap["r-shared-001"], "r-shared-001 should have 3 instances")
-		assert.Equal(t, 2, resMap["r-shared-002"], "r-shared-002 should have 2 instances")
-		assert.Equal(t, 1, resMap["r-single-003"], "r-single-003 should have 1 instance")
-	})
-
-	t.Run("FilterByInstanceID_PreservesReservation", func(t *testing.T) {
-		// Request only one instance from a multi-instance reservation
-		input := &ec2.DescribeInstancesInput{
-			InstanceIds: []*string{aws.String("i-group1-001")},
-		}
-		inputJSON, _ := json.Marshal(input)
-
-		resp, err := natsRequest(daemon.natsConn, "ec2.DescribeInstances", inputJSON, 5*time.Second)
-		require.NoError(t, err)
-
-		var output ec2.DescribeInstancesOutput
-		err = json.Unmarshal(resp.Data, &output)
-		require.NoError(t, err)
-
-		// Should have 1 reservation with 1 instance
-		require.Len(t, output.Reservations, 1)
-		assert.Equal(t, "r-shared-001", *output.Reservations[0].ReservationId)
-		assert.Len(t, output.Reservations[0].Instances, 1)
-		assert.Equal(t, "i-group1-001", *output.Reservations[0].Instances[0].InstanceId)
-	})
-
-	t.Run("FilterMultipleInstances_SameReservation", func(t *testing.T) {
-		// Request 2 instances from the same reservation
-		input := &ec2.DescribeInstancesInput{
-			InstanceIds: []*string{
-				aws.String("i-group1-001"),
-				aws.String("i-group1-003"),
-			},
-		}
-		inputJSON, _ := json.Marshal(input)
-
-		resp, err := natsRequest(daemon.natsConn, "ec2.DescribeInstances", inputJSON, 5*time.Second)
-		require.NoError(t, err)
-
-		var output ec2.DescribeInstancesOutput
-		err = json.Unmarshal(resp.Data, &output)
-		require.NoError(t, err)
-
-		// Should have 1 reservation with 2 instances
-		require.Len(t, output.Reservations, 1)
-		assert.Equal(t, "r-shared-001", *output.Reservations[0].ReservationId)
-		assert.Len(t, output.Reservations[0].Instances, 2)
-	})
-
-	t.Run("FilterMultipleInstances_DifferentReservations", func(t *testing.T) {
-		// Request instances from different reservations
-		input := &ec2.DescribeInstancesInput{
-			InstanceIds: []*string{
-				aws.String("i-group1-001"),
-				aws.String("i-group2-001"),
-				aws.String("i-single-001"),
-			},
-		}
-		inputJSON, _ := json.Marshal(input)
-
-		resp, err := natsRequest(daemon.natsConn, "ec2.DescribeInstances", inputJSON, 5*time.Second)
-		require.NoError(t, err)
-
-		var output ec2.DescribeInstancesOutput
-		err = json.Unmarshal(resp.Data, &output)
-		require.NoError(t, err)
-
-		// Should have 3 reservations, each with 1 instance
-		assert.Len(t, output.Reservations, 3)
-		for _, res := range output.Reservations {
-			assert.Len(t, res.Instances, 1, "Each reservation should have 1 instance when filtered")
-		}
-	})
-
-	t.Run("InstanceStates_AreCorrect", func(t *testing.T) {
-		input := &ec2.DescribeInstancesInput{}
-		inputJSON, _ := json.Marshal(input)
-
-		resp, err := natsRequest(daemon.natsConn, "ec2.DescribeInstances", inputJSON, 5*time.Second)
-		require.NoError(t, err)
-
-		var output ec2.DescribeInstancesOutput
-		err = json.Unmarshal(resp.Data, &output)
-		require.NoError(t, err)
-
-		// Find the stopped instance and verify its state
-		for _, res := range output.Reservations {
-			for _, inst := range res.Instances {
-				if *inst.InstanceId == "i-single-001" {
-					assert.Equal(t, int64(80), *inst.State.Code, "Stopped instance should have code 80")
-					assert.Equal(t, "stopped", *inst.State.Name)
-				} else {
-					assert.Equal(t, int64(16), *inst.State.Code, "Running instance should have code 16")
-					assert.Equal(t, "running", *inst.State.Name)
-				}
-			}
-		}
-	})
-}
-
-// TestRunInstances_CountValidation tests MinCount/MaxCount validation scenarios
+// TestRunInstances_CountValidation tests MinCount/MaxCount validation scenarios.
 func TestRunInstances_CountValidation(t *testing.T) {
 	natsURL := sharedNATSURL
 	instanceType := getTestInstanceType(t)
@@ -1327,9 +1142,9 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		}
 
 		// Each fittable type gets 2 subscriptions: queue group + node-specific
-		assert.Equal(t, fittableTypes*2, len(rm.instanceSubs),
+		assert.Len(t, rm.instanceSubs, fittableTypes*2,
 			"should subscribe to all instance types that fit (queue + node-specific)")
-		assert.Greater(t, len(rm.instanceSubs), 0,
+		assert.NotEmpty(t, rm.instanceSubs,
 			"should subscribe to at least some instance types")
 
 		// Verify topics follow the expected pattern
@@ -1350,7 +1165,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		initialCount := len(rm.instanceSubs)
-		require.Greater(t, initialCount, 0)
+		require.Positive(t, initialCount)
 
 		// Allocate all resources so nothing fits
 		rm.mu.Lock()
@@ -1367,7 +1182,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		queueSubs, nodeSubs := countSubsBySuffix(rm.instanceSubs, ".test-node")
 		assert.Equal(t, 0, queueSubs,
 			"queue subscriptions should drop when the node is full")
-		assert.Greater(t, nodeSubs, 0,
+		assert.Positive(t, nodeSubs,
 			"node-targeted subscriptions persist regardless of capacity")
 	})
 
@@ -1391,7 +1206,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		rm.updateInstanceSubscriptions()
 		queueSubs, nodeSubs := countSubsBySuffix(rm.instanceSubs, ".test-node")
 		assert.Equal(t, 0, queueSubs, "queue subscriptions drop when the node is full")
-		assert.Greater(t, nodeSubs, 0, "node-targeted subscriptions persist when full")
+		assert.Positive(t, nodeSubs, "node-targeted subscriptions persist when full")
 
 		// Free all resources
 		rm.mu.Lock()
@@ -1400,7 +1215,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		rm.mu.Unlock()
 		rm.updateInstanceSubscriptions()
 
-		assert.Equal(t, expectedCount, len(rm.instanceSubs),
+		assert.Len(t, rm.instanceSubs, expectedCount,
 			"should resubscribe to all types when resources are freed")
 	})
 
@@ -1423,7 +1238,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		rm.updateInstanceSubscriptions()
 
 		// Count subscribed types — should be less than total but more than zero
-		assert.Greater(t, len(rm.instanceSubs), 0,
+		assert.NotEmpty(t, rm.instanceSubs,
 			"should still be subscribed to small instance types")
 		assert.Less(t, len(rm.instanceSubs), len(rm.instanceTypes)*2,
 			"should not be subscribed to large instance types")
@@ -1445,7 +1260,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		initialCount := len(rm.instanceSubs)
-		require.Greater(t, initialCount, 0)
+		require.Positive(t, initialCount)
 
 		// Find a .micro type that fits (2 vCPU, 1 GB — always fits)
 		var microType *ec2.InstanceTypeInfo
@@ -1464,7 +1279,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 			require.NoError(t, err)
 			allocated++
 		}
-		require.Greater(t, allocated, 0)
+		require.Positive(t, allocated)
 
 		// Should have fewer subscriptions now (or zero)
 		assert.Less(t, len(rm.instanceSubs), initialCount,
@@ -1474,7 +1289,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		for range allocated {
 			rm.deallocate(microType)
 		}
-		assert.Equal(t, initialCount, len(rm.instanceSubs),
+		assert.Len(t, rm.instanceSubs, initialCount,
 			"deallocating should restore all subscriptions")
 	})
 
@@ -1554,7 +1369,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 	})
 }
 
-// TestResourceManager_ConcurrentAccess tests thread safety of resource manager
+// TestResourceManager_ConcurrentAccess tests thread safety of resource manager.
 func TestResourceManager_ConcurrentAccess(t *testing.T) {
 	rm, err := NewResourceManager(nil, nil, nil)
 	require.NoError(t, err)
@@ -1735,7 +1550,327 @@ func TestInstanceCleanerAdapter_DeleteVolumes_DeleteOnTermination_False(t *testi
 	assert.False(t, ebsDeletedVolumes["vol-keep"], "Root volume with DeleteOnTermination=false should NOT be deleted")
 }
 
-// TestHandleEC2Events_AttachVolume tests the attach-volume handler in handleEC2Events
+// TestInstanceCleanerAdapter_DeleteVolumes_BootVolumeDeletedAfterAttachmentClear
+// locks the running-instance terminate path: a Boot,
+// DeleteOnTermination root volume left attached (terminateCleanup's
+// shutdownAndUnmount runs Unmount, which deliberately never clears a Boot
+// volume's AttachedInstance) previously hit DeleteVolume's in-use guard
+// directly. DeleteVolumes must now call DeleteVolumeOnTerminate, which clears
+// the stale attachment first, so the delete actually succeeds.
+func TestInstanceCleanerAdapter_DeleteVolumes_BootVolumeDeletedAfterAttachmentClear(t *testing.T) {
+	daemon, store := createFullTestDaemonWithStore(t, sharedNATSURL)
+
+	// DeleteVolume's snapshot-reference guard requires a non-nil snapshotKV;
+	// wire a JetStream-backed one (no snapshot refs recorded) so the delete
+	// reaches the S3 cleanup step instead of failing closed on a nil KV.
+	jsConn, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	t.Cleanup(func() { jsConn.Close() })
+	js, err := jetstream.New(jsConn)
+	require.NoError(t, err)
+	snapKV, err := js.CreateKeyValue(t.Context(), jetstream.KeyValueConfig{
+		Bucket: "snap-kv-" + strings.ReplaceAll(t.Name(), "/", "-"),
+	})
+	require.NoError(t, err)
+	daemon.volumeService = handlers_ec2_volume.NewVolumeServiceImplWithStore(daemon.config, store, daemon.natsConn, snapKV)
+
+	volumeID := "vol-root-attached"
+	seedVolumeConfig(t, store, volumeID, viperblock.VolumeMetadata{
+		VolumeID:         volumeID,
+		TenantID:         testAccountID,
+		SizeGiB:          10,
+		State:            "available",
+		AttachedInstance: "i-test-boot-delete", // stale: never cleared by Stop/shutdownAndUnmount's Boot carve-out
+	})
+
+	instance := &vm.VM{
+		ID:        "i-test-boot-delete",
+		AccountID: testAccountID,
+		EBSRequests: types.EBSRequests{
+			Requests: []types.EBSRequest{
+				{Name: volumeID, Boot: true, DeleteOnTermination: true},
+			},
+		},
+	}
+
+	cleaner := newInstanceCleanerAdapter(daemon)
+	err = cleaner.DeleteVolumes(instance)
+	require.NoError(t, err, "the still-attached boot volume must be deleted, not rejected as VolumeInUse")
+
+	_, err = daemon.volumeService.GetVolumeConfig(volumeID)
+	require.Error(t, err, "the volume must actually be deleted")
+	assert.Contains(t, err.Error(), awserrors.ErrorInvalidVolumeNotFound)
+}
+
+// TestInstanceCleanerAdapter_DeleteVolumes_NonDoTBootVolumeDetachedNotDeleted
+// locks the running-path half of the terminate-implies-detach fix for a
+// DeleteOnTermination=false root volume: shutdownAndUnmount's Unmount
+// (daemon/vm_adapters.go) deliberately never clears a Boot volume's
+// attachment, so without this it would strand attached to the now-terminated
+// instance forever. Terminate must still detach it (AWS semantics: it
+// survives as available, it just isn't deleted).
+func TestInstanceCleanerAdapter_DeleteVolumes_NonDoTBootVolumeDetachedNotDeleted(t *testing.T) {
+	daemon, store := createFullTestDaemonWithStore(t, sharedNATSURL)
+
+	volumeID := "vol-root-nondot-attached"
+	seedVolumeConfig(t, store, volumeID, viperblock.VolumeMetadata{
+		VolumeID:         volumeID,
+		TenantID:         testAccountID,
+		SizeGiB:          10,
+		State:            "available",
+		AttachedInstance: "i-test-boot-detach", // stale: never cleared by Unmount's Boot carve-out
+	})
+
+	instance := &vm.VM{
+		ID:        "i-test-boot-detach",
+		AccountID: testAccountID,
+		EBSRequests: types.EBSRequests{
+			Requests: []types.EBSRequest{
+				{Name: volumeID, Boot: true, DeleteOnTermination: false},
+			},
+		},
+	}
+
+	cleaner := newInstanceCleanerAdapter(daemon)
+	err := cleaner.DeleteVolumes(instance)
+	require.NoError(t, err)
+
+	cfg, err := daemon.volumeService.GetVolumeConfig(volumeID)
+	require.NoError(t, err, "a DeleteOnTermination=false volume must survive terminate")
+	assert.Equal(t, "available", cfg.VolumeMetadata.State)
+	assert.Empty(t, cfg.VolumeMetadata.AttachedInstance, "terminate must still detach it")
+}
+
+// TestInstanceCleanerAdapter_DeleteVolumes_NonBootNonDoTVolumeDetachedNotDeleted
+// mirrors the Boot-volume case above for a non-Boot, DeleteOnTermination=false
+// data volume: terminate must still detach it (AWS semantics: it survives as
+// available, it just isn't deleted). Unlike a Boot volume, a non-Boot volume
+// was previously assumed to already be detached by shutdownAndUnmount's
+// Unmount, but Unmount only clears the attachment when its unmount seal
+// succeeds and is skipped entirely on the stuck-terminate force-complete
+// path, so that assumption left it stranded attached.
+func TestInstanceCleanerAdapter_DeleteVolumes_NonBootNonDoTVolumeDetachedNotDeleted(t *testing.T) {
+	daemon, store := createFullTestDaemonWithStore(t, sharedNATSURL)
+
+	volumeID := "vol-data-nondot-attached"
+	seedVolumeConfig(t, store, volumeID, viperblock.VolumeMetadata{
+		VolumeID:         volumeID,
+		TenantID:         testAccountID,
+		SizeGiB:          10,
+		State:            "in-use",
+		AttachedInstance: "i-test-data-detach", // stale: Unmount's seal failed or never ran
+	})
+
+	instance := &vm.VM{
+		ID:        "i-test-data-detach",
+		AccountID: testAccountID,
+		EBSRequests: types.EBSRequests{
+			Requests: []types.EBSRequest{
+				{Name: volumeID, Boot: false, DeleteOnTermination: false},
+			},
+		},
+	}
+
+	cleaner := newInstanceCleanerAdapter(daemon)
+	err := cleaner.DeleteVolumes(instance)
+	require.NoError(t, err)
+
+	cfg, err := daemon.volumeService.GetVolumeConfig(volumeID)
+	require.NoError(t, err, "a DeleteOnTermination=false volume must survive terminate")
+	assert.Equal(t, "available", cfg.VolumeMetadata.State)
+	assert.Empty(t, cfg.VolumeMetadata.AttachedInstance, "terminate must still detach it")
+}
+
+// TestTerminatedTeardownReaper_SelfHealsFailedVolumeTeardown proves the
+// go-forward self-heal: a stopped-terminate that stamped
+// Teardown[volumes]=failed on a transient error (deleteInstanceVolumes,
+// handlers/ec2/instance/service_impl.go) is retried by
+// TerminatedTeardownReaper.Sweep (vm/teardown_reaper.go) through the real
+// instanceCleanerAdapter, which stage 1 rerouted through
+// DeleteVolumeOnTerminate. The retry clears the stale attachment, the delete
+// now succeeds, and the mark flips to done — without abandoning the record.
+func TestTerminatedTeardownReaper_SelfHealsFailedVolumeTeardown(t *testing.T) {
+	daemon, store := createFullTestDaemonWithStore(t, sharedJSNATSURL)
+
+	// A real terminated-instance KV, so Sweep can list/update/(not yet)purge
+	// the record exactly as production does.
+	jsManager, err := NewJetStreamManager(daemon.natsConn, 1)
+	require.NoError(t, err)
+	require.NoError(t, jsManager.InitTerminatedInstanceBucket())
+	daemon.stateStore = newStateStoreAdapter(jsManager)
+
+	// DeleteVolume's snapshot-reference guard requires a non-nil snapshotKV.
+	js, err := jetstream.New(daemon.natsConn)
+	require.NoError(t, err)
+	snapKV, err := js.CreateKeyValue(t.Context(), jetstream.KeyValueConfig{
+		Bucket: "snap-kv-" + strings.ReplaceAll(t.Name(), "/", "-"),
+	})
+	require.NoError(t, err)
+	daemon.volumeService = handlers_ec2_volume.NewVolumeServiceImplWithStore(daemon.config, store, daemon.natsConn, snapKV)
+
+	volumeID := "vol-root-self-heal"
+	instanceID := "i-self-heal"
+	seedVolumeConfig(t, store, volumeID, viperblock.VolumeMetadata{
+		VolumeID:         volumeID,
+		TenantID:         testAccountID,
+		SizeGiB:          10,
+		State:            "available",
+		AttachedInstance: instanceID, // stale, left by the earlier failed terminate
+	})
+
+	instance := &vm.VM{
+		ID:           instanceID,
+		AccountID:    testAccountID,
+		Status:       vm.StateTerminated,
+		LastNode:     daemon.node,
+		TerminatedAt: time.Now(), // inside the visibility window: Sweep must not purge yet
+		Teardown: map[string]string{
+			vm.TeardownVolumes: string(vm.TeardownFailed),
+		},
+		EBSRequests: types.EBSRequests{
+			Requests: []types.EBSRequest{
+				{Name: volumeID, Boot: true, DeleteOnTermination: true},
+			},
+		},
+	}
+	require.NoError(t, daemon.stateStore.WriteTerminatedInstance(instance.ID, instance))
+
+	reaper := vm.NewManagerWithDeps(vm.Deps{
+		NodeID:          daemon.node,
+		StateStore:      daemon.stateStore,
+		InstanceCleaner: newInstanceCleanerAdapter(daemon),
+	}).NewTerminatedTeardownReaper()
+
+	_, err = reaper.Sweep(context.Background())
+	require.NoError(t, err)
+
+	_, err = daemon.volumeService.GetVolumeConfig(volumeID)
+	require.Error(t, err, "the retried delete must actually remove the volume")
+	assert.Contains(t, err.Error(), awserrors.ErrorInvalidVolumeNotFound)
+
+	remaining, err := daemon.stateStore.ListTerminatedInstances()
+	require.NoError(t, err)
+	require.Len(t, remaining, 1, "still within the visibility window: not purged yet")
+	assert.Equal(t, string(vm.TeardownDone), remaining[0].Teardown[vm.TeardownVolumes],
+		"a retry that now succeeds must flip the mark from failed to done")
+}
+
+// TestTerminatedTeardownReaper_SelfHealsFailedVolumeDetach mirrors the
+// self-heal test above for a non-Boot, DeleteOnTermination=false volume: a
+// terminate that stamped Teardown[volumes]=failed on a transient detach
+// error is retried by TerminatedTeardownReaper.Sweep through the real
+// instanceCleanerAdapter. The retry must clear the stale attachment so the
+// volume converges to available/detached instead of staying stranded
+// in-use with no automatic path back — the "no both-calls-fail" recovery
+// requirement.
+func TestTerminatedTeardownReaper_SelfHealsFailedVolumeDetach(t *testing.T) {
+	daemon, store := createFullTestDaemonWithStore(t, sharedNATSURL)
+
+	fakeStore := newFakeStateStore()
+	daemon.stateStore = fakeStore
+
+	volumeID := "vol-data-self-heal"
+	instanceID := "i-self-heal-detach"
+	seedVolumeConfig(t, store, volumeID, viperblock.VolumeMetadata{
+		VolumeID:         volumeID,
+		TenantID:         testAccountID,
+		SizeGiB:          10,
+		State:            "in-use",
+		AttachedInstance: instanceID, // stale, left by the earlier failed terminate
+	})
+
+	instance := &vm.VM{
+		ID:           instanceID,
+		AccountID:    testAccountID,
+		Status:       vm.StateTerminated,
+		LastNode:     daemon.node,
+		TerminatedAt: time.Now(), // inside the visibility window: Sweep must not purge yet
+		Teardown: map[string]string{
+			vm.TeardownVolumes: string(vm.TeardownFailed),
+		},
+		EBSRequests: types.EBSRequests{
+			Requests: []types.EBSRequest{
+				{Name: volumeID, Boot: false, DeleteOnTermination: false},
+			},
+		},
+	}
+	require.NoError(t, fakeStore.WriteTerminatedInstance(instance.ID, instance))
+
+	reaper := vm.NewManagerWithDeps(vm.Deps{
+		NodeID:          daemon.node,
+		StateStore:      fakeStore,
+		InstanceCleaner: newInstanceCleanerAdapter(daemon),
+	}).NewTerminatedTeardownReaper()
+
+	_, err := reaper.Sweep(context.Background())
+	require.NoError(t, err)
+
+	cfg, err := daemon.volumeService.GetVolumeConfig(volumeID)
+	require.NoError(t, err, "the volume must survive: DeleteOnTermination=false")
+	assert.Equal(t, "available", cfg.VolumeMetadata.State)
+	assert.Empty(t, cfg.VolumeMetadata.AttachedInstance, "the retry must clear the stale attachment")
+
+	remaining, err := fakeStore.ListTerminatedInstances()
+	require.NoError(t, err)
+	require.Len(t, remaining, 1, "still within the visibility window: not purged yet")
+	assert.Equal(t, string(vm.TeardownDone), remaining[0].Teardown[vm.TeardownVolumes],
+		"a retry that now succeeds must flip the mark from failed to done")
+}
+
+// TestStuckTerminateReaper_DetachesNonDoTVolumeWithoutUnmount proves the
+// stuck-terminate force-complete path (the second live-reproduced case)
+// detaches a non-Boot, DeleteOnTermination=false volume even though
+// shutdownAndUnmount's Unmount never ran: forceFinalizeStuckTerminate kills
+// the wedged QEMU and calls the cleaner directly, skipping Unmount entirely.
+// Before the fix, DeleteVolumes relied on Unmount to have already cleared a
+// non-Boot volume's attachment, so this path left it attached and, once the
+// instance record was gone, unrecoverable via either detach-volume or
+// delete-volume.
+func TestStuckTerminateReaper_DetachesNonDoTVolumeWithoutUnmount(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	daemon, store := createFullTestDaemonWithStore(t, sharedNATSURL)
+
+	const instanceID = "i-wedged-terminate"
+	volumeID := "vol-data-wedged"
+	seedVolumeConfig(t, store, volumeID, viperblock.VolumeMetadata{
+		VolumeID:         volumeID,
+		TenantID:         testAccountID,
+		SizeGiB:          10,
+		State:            "in-use",
+		AttachedInstance: instanceID, // never cleared: Unmount never ran on this path
+	})
+
+	fakeStore := newFakeStateStore()
+	mgr := vm.NewManagerWithDeps(vm.Deps{
+		NodeID:          daemon.node,
+		StateStore:      fakeStore,
+		InstanceCleaner: newInstanceCleanerAdapter(daemon),
+	})
+
+	mgr.InsertIfAbsent(&vm.VM{
+		ID:             instanceID,
+		AccountID:      testAccountID,
+		Status:         vm.StateShuttingDown,
+		ShuttingDownAt: time.Now().Add(-15 * time.Minute), // past the stuck-terminate backstop timeout
+		EBSRequests: types.EBSRequests{
+			Requests: []types.EBSRequest{
+				{Name: volumeID, Boot: false, DeleteOnTermination: false},
+			},
+		},
+	})
+
+	reaped, err := mgr.NewStuckTerminateReaper().Sweep(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, reaped, "the wedged terminate must be force-completed")
+
+	cfg, err := daemon.volumeService.GetVolumeConfig(volumeID)
+	require.NoError(t, err)
+	assert.Equal(t, "available", cfg.VolumeMetadata.State,
+		"the force-complete path must still detach a non-Boot DeleteOnTermination=false volume")
+	assert.Empty(t, cfg.VolumeMetadata.AttachedInstance)
+}
+
+// TestHandleEC2Events_AttachVolume tests the attach-volume handler in handleEC2Events.
 func TestHandleEC2Events_AttachVolume(t *testing.T) {
 	natsURL := sharedNATSURL
 
@@ -1837,7 +1972,7 @@ func TestHandleEC2Events_AttachVolume(t *testing.T) {
 	})
 }
 
-// TestHandleEC2Events_DetachVolume tests the detach-volume handler in handleEC2Events
+// TestHandleEC2Events_DetachVolume tests the detach-volume handler in handleEC2Events.
 func TestHandleEC2Events_DetachVolume(t *testing.T) {
 	natsURL := sharedNATSURL
 
@@ -2264,7 +2399,7 @@ func TestDetachVolume_SuccessPath(t *testing.T) {
 	assert.Equal(t, "vol-root", *instance.Instance.BlockDeviceMappings[0].Ebs.VolumeId)
 }
 
-// TestDetachVolume_ForceFlag tests that force=true continues past device_del failure
+// TestDetachVolume_ForceFlag tests that force=true continues past device_del failure.
 func TestDetachVolume_ForceFlag(t *testing.T) {
 	natsURL := sharedNATSURL
 
@@ -2490,7 +2625,7 @@ func TestDetachVolume_BlockdevDelFailure(t *testing.T) {
 	assert.True(t, bdmFound, "Volume must remain in BlockDeviceMappings when blockdev-del fails")
 }
 
-// TestDetachVolume_SuccessWithDeviceMatch tests detach with correct --device cross-check
+// TestDetachVolume_SuccessWithDeviceMatch tests detach with correct --device cross-check.
 func TestDetachVolume_SuccessWithDeviceMatch(t *testing.T) {
 	natsURL := sharedNATSURL
 
@@ -2796,7 +2931,7 @@ func TestDaemon_WriteState_NilJSManager(t *testing.T) {
 
 func TestDaemon_LoadState_NilJSManager(t *testing.T) {
 	tmpDir := t.TempDir()
-	require.NoError(t, WriteLocalState(LocalStatePath(tmpDir), map[string]*vm.VM{
+	require.NoError(t, writeLocalState(LocalStatePath(tmpDir), map[string]*vm.VM{
 		"i-seed": {ID: "i-seed"},
 	}))
 
@@ -2983,16 +3118,47 @@ func TestGetAvailableInstanceTypeInfos_GPUType_ShowCapacity(t *testing.T) {
 	assert.Equal(t, 2, count12xl, "4 GPUs → 2 slots for g7e.12xlarge")
 }
 
-// canAllocate for GPU types returns count without CPU/memory gating.
-func TestCanAllocate_GPUType_BypassesCPUMemory(t *testing.T) {
+// canAllocate for GPU types is gated by CPU/memory like any other instance
+// type. The whole-GPU early return used to
+// bypass this check entirely, letting a launch proceed on a host with no
+// memory headroom.
+func TestCanAllocate_GPUType_GatedByCPUMemory(t *testing.T) {
 	rm := &ResourceManager{
 		hostVCPU:      4,   // deliberately tiny
 		hostMemGB:     8.0, // deliberately tiny
 		instanceTypes: map[string]*ec2.InstanceTypeInfo{},
+		gpuManager:    gpu.NewManager([]gpu.GPUDevice{makeGPUDevice()}),
 	}
 	gpuType := makeGPUInstanceType("g7e.4xlarge", 16, 128*1024)
-	assert.Equal(t, 1, rm.canAllocate(gpuType, 1),
-		"GPU type must be allocatable even when CPU/memory would normally block it")
+	assert.Equal(t, 0, rm.canAllocate(gpuType, 1),
+		"GPU type must be blocked by cpu/mem exhaustion like any other instance type")
+}
+
+// canAllocate for GPU types succeeds once both cpu/mem headroom and a free
+// GPU slot exist.
+func TestCanAllocate_GPUType_SucceedsWithRoomAndSlot(t *testing.T) {
+	rm := &ResourceManager{
+		hostVCPU:      32,
+		hostMemGB:     256.0,
+		instanceTypes: map[string]*ec2.InstanceTypeInfo{},
+		gpuManager:    gpu.NewManager([]gpu.GPUDevice{makeGPUDevice()}),
+	}
+	gpuType := makeGPUInstanceType("g7e.4xlarge", 16, 128*1024)
+	assert.Equal(t, 1, rm.canAllocate(gpuType, 1))
+}
+
+// canAllocate for GPU types is refused up front when the GPU pool has no
+// free slot, even with abundant cpu/mem headroom.
+func TestCanAllocate_GPUType_RefusedWhenGPUPoolExhausted(t *testing.T) {
+	rm := &ResourceManager{
+		hostVCPU:      32,
+		hostMemGB:     256.0,
+		instanceTypes: map[string]*ec2.InstanceTypeInfo{},
+		gpuManager:    gpu.NewManager(nil),
+	}
+	gpuType := makeGPUInstanceType("g7e.4xlarge", 16, 128*1024)
+	assert.Equal(t, 0, rm.canAllocate(gpuType, 1),
+		"no GPU in the pool must refuse admission regardless of cpu/mem headroom")
 }
 
 // --- GetSupportedInstanceTypeInfos ---
@@ -3274,6 +3440,48 @@ func TestVolumeMounterAdapter_Unmount_SealFailureSkipsAvailable(t *testing.T) {
 		"a successful seal must still transition the volume to available")
 }
 
+// TestVolumeMounterAdapter_Unmount_NotFoundFlipsToAvailable verifies the
+// timeout-then-completed-seal retry path: an ebs.unmount response reporting
+// NotFound (the seal already completed on a prior, client-timed-out request)
+// must still flip a non-boot data volume to available, while the boot/EFI
+// gate stays intact.
+func TestVolumeMounterAdapter_Unmount_NotFoundFlipsToAvailable(t *testing.T) {
+	daemon := createTestDaemon(t, sharedNATSURL)
+	volState := &recordingVolState{}
+	adapter := newVolumeMounterAdapter(daemon.natsConn, daemon.node, volState)
+
+	sub, err := daemon.natsConn.Subscribe(adapter.topic("unmount"), func(msg *nats.Msg) {
+		var req types.EBSRequest
+		json.Unmarshal(msg.Data, &req)
+		resp := types.EBSUnMountResponse{
+			Volume:   req.Name,
+			NotFound: true,
+			Error:    fmt.Sprintf("Volume %s not found", req.Name),
+		}
+		data, _ := json.Marshal(resp)
+		msg.Respond(data)
+	})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	inst := &vm.VM{
+		ID: "i-unmount-retry",
+		EBSRequests: types.EBSRequests{
+			Requests: []types.EBSRequest{
+				{Name: "vol-boot-retry", Boot: true, EFI: false},
+				{Name: "vol-data-retry", Boot: false, EFI: false},
+			},
+		},
+	}
+	require.NoError(t, adapter.Unmount(inst))
+
+	calls := volState.snapshot()
+	assert.Contains(t, calls, "vol-data-retry:available",
+		"a NotFound response (already-completed seal) must still flip a non-boot data volume to available")
+	assert.NotContains(t, calls, "vol-boot-retry:available",
+		"a boot volume must stay attached even when the seal retry reports NotFound")
+}
+
 // TestUnmountResponseError covers the shared seal-result parser used by both the
 // gated DetachVolume path (unmountOne) and the tolerated teardown path (Unmount).
 func TestUnmountResponseError(t *testing.T) {
@@ -3291,6 +3499,11 @@ func TestUnmountResponseError(t *testing.T) {
 	})
 	t.Run("malformed payload propagates", func(t *testing.T) {
 		require.Error(t, unmountResponseError([]byte("not json")))
+	})
+	t.Run("not found treated as idempotent success", func(t *testing.T) {
+		data, _ := json.Marshal(types.EBSUnMountResponse{Volume: "v", NotFound: true, Error: "Volume v not found"})
+		require.NoError(t, unmountResponseError(data),
+			"a NotFound response means the seal already completed on a prior request; a timeout-then-retry must not be treated as a failure")
 	})
 }
 
@@ -3436,40 +3649,6 @@ func TestVolumeMounterAdapter_Mount_RollbackFailurePropagates(t *testing.T) {
 		"rollback failure must be surfaced, not silently logged")
 	assert.Contains(t, err.Error(), "rollback unmount failed",
 		"underlying unmount error must be wrapped in")
-}
-
-// TestDescribeInstances_InvalidInstanceIDMalformed verifies that DescribeInstances
-// returns InvalidInstanceID.Malformed when given instance IDs without the i- prefix.
-func TestDescribeInstances_InvalidInstanceIDMalformed(t *testing.T) {
-	natsURL := sharedNATSURL
-	daemon := createTestDaemon(t, natsURL)
-
-	sub, err := daemon.natsConn.Subscribe("ec2.DescribeInstances", daemon.handleEC2DescribeInstances)
-	require.NoError(t, err)
-	defer sub.Unsubscribe()
-
-	t.Run("MalformedInstanceID", func(t *testing.T) {
-		input := &ec2.DescribeInstancesInput{
-			InstanceIds: []*string{aws.String("bad-instance-id")},
-		}
-		inputJSON, _ := json.Marshal(input)
-
-		resp, err := natsRequest(daemon.natsConn, "ec2.DescribeInstances", inputJSON, 5*time.Second)
-		require.NoError(t, err)
-		assert.Contains(t, string(resp.Data), "InvalidInstanceID.Malformed")
-	})
-
-	t.Run("ValidInstanceIDPassesValidation", func(t *testing.T) {
-		input := &ec2.DescribeInstancesInput{
-			InstanceIds: []*string{aws.String("i-nonexistent")},
-		}
-		inputJSON, _ := json.Marshal(input)
-
-		resp, err := natsRequest(daemon.natsConn, "ec2.DescribeInstances", inputJSON, 5*time.Second)
-		require.NoError(t, err)
-		// Should not contain a malformed error — returns empty results instead
-		assert.NotContains(t, string(resp.Data), "InvalidInstanceID.Malformed")
-	})
 }
 
 // TestStopTerminate_IncorrectInstanceState verifies that stopping an already-stopped
@@ -3936,6 +4115,57 @@ func TestResolveGPUModel_OverrideCustomisesConsumerGPU(t *testing.T) {
 	assert.Equal(t, int64(12288), m.MemoryMiB)
 }
 
+// TestApplyGPUModelOverrides_SetsDeviceMemory pins that a GPUModelOverride
+// reaches the raw device passed into gpu.NewManager, not just the advertised
+// instance type, so admission checks that read Device.MemoryMiB directly
+// (e.g. Bedrock capacity) see the override too.
+func TestApplyGPUModelOverrides_SetsDeviceMemory(t *testing.T) {
+	devices := []gpu.GPUDevice{
+		{VendorID: "10de", DeviceID: "25b0", PCIAddress: "0000:03:00.0", MemoryMiB: 0},
+		{VendorID: "10de", DeviceID: "2236", PCIAddress: "0000:04:00.0", MemoryMiB: 23028},
+	}
+	overrides := []config.GPUModelOverride{
+		{VendorID: "10de", DeviceID: "25b0", Name: "RTX A1000", MemoryMiB: 8188},
+	}
+	applyGPUModelOverrides(devices, overrides)
+	assert.Equal(t, int64(8188), devices[0].MemoryMiB, "overridden device should carry the corrected VRAM")
+	assert.Equal(t, int64(23028), devices[1].MemoryMiB, "device with no matching override is untouched")
+}
+
+// TestApplyGPUModelOverrides_ZeroMemoryDoesNotWipe covers an override set for
+// a non-VRAM reason: memory_mib is absent, so it decodes to 0, and applying
+// that would erase discovered VRAM and fail admission on a device that is fine.
+func TestApplyGPUModelOverrides_ZeroMemoryDoesNotWipe(t *testing.T) {
+	devices := []gpu.GPUDevice{
+		{VendorID: "10de", DeviceID: "25b0", PCIAddress: "0000:03:00.0", MemoryMiB: 8188},
+	}
+	overrides := []config.GPUModelOverride{
+		{VendorID: "10de", DeviceID: "25b0", XVGAOff: true},
+	}
+	applyGPUModelOverrides(devices, overrides)
+	assert.Equal(t, int64(8188), devices[0].MemoryMiB, "override without memory_mib must leave discovered VRAM intact")
+}
+
+// TestBuildGPUPool_OverrideReachesManagerSnapshot exercises the full path:
+// buildGPUPool must apply GPUModelOverrides.MemoryMiB to the device before
+// constructing the gpu.Manager, so Manager.Snapshot (what checkCapacity
+// reads) reports the overridden VRAM rather than the raw discovered value.
+func TestBuildGPUPool_OverrideReachesManagerSnapshot(t *testing.T) {
+	devices := []gpu.GPUDevice{
+		{VendorID: "10de", DeviceID: "25b0", PCIAddress: "0000:03:00.0", MemoryMiB: 0},
+	}
+	cfg := config.DaemonConfig{
+		GPUModelOverrides: []config.GPUModelOverride{
+			{VendorID: "10de", DeviceID: "25b0", Name: "RTX A1000", MemoryMiB: 8188},
+		},
+	}
+	mgr, _, _ := buildGPUPool(devices, cfg)
+	require.NotNil(t, mgr)
+	snapshot := mgr.Snapshot()
+	require.Len(t, snapshot, 1)
+	assert.Equal(t, int64(8188), snapshot[0].Device.MemoryMiB)
+}
+
 // --- initServiceWithRetry ---
 
 // stubInitRetrySleep replaces the package-level sleep seam with a recorder
@@ -4223,12 +4453,12 @@ func TestReloadGPUTypes_CallsUpdateInstanceSubscriptions(t *testing.T) {
 
 	rm.reloadGPUTypes([]instancetypes.GPUModel{instancetypes.NVIDIAt4}, nil, gpuMgr)
 	subsAfter := len(rm.instanceSubs)
-	require.Greater(t, subsAfter, 0, "subscriptions added after reload — updateInstanceSubscriptions ran")
+	require.Positive(t, subsAfter, "subscriptions added after reload — updateInstanceSubscriptions ran")
 
 	// Each g4dn size produces both queue and node-specific topics; record the
 	// count so we can prove a second call does not double-subscribe.
 	rm.reloadGPUTypes([]instancetypes.GPUModel{instancetypes.NVIDIAt4}, nil, gpuMgr)
-	assert.Equal(t, subsAfter, len(rm.instanceSubs),
+	assert.Len(t, rm.instanceSubs, subsAfter,
 		"second reload with identical models must not double-subscribe — proves idempotent invocation")
 }
 
@@ -4251,6 +4481,7 @@ func TestAssertNoClusterServicesInitialised_PerField(t *testing.T) {
 		{name: "eigwService", set: func(d *Daemon) { d.eigwService = &handlers_ec2_eigw.EgressOnlyIGWServiceImpl{} }, wantMsg: "eigwService"},
 		{name: "igwService", set: func(d *Daemon) { d.igwService = &handlers_ec2_igw.IGWServiceImpl{} }, wantMsg: "igwService"},
 		{name: "placementGroupService", set: func(d *Daemon) { d.placementGroupService = &handlers_ec2_placementgroup.PlacementGroupServiceImpl{} }, wantMsg: "placementGroupService"},
+		{name: "spotInstanceService", set: func(d *Daemon) { d.spotInstanceService = &handlers_ec2_spotinstance.SpotInstanceServiceImpl{} }, wantMsg: "spotInstanceService"},
 		{name: "vpcService", set: func(d *Daemon) { d.vpcService = &handlers_ec2_vpc.VPCServiceImpl{} }, wantMsg: "vpcService"},
 		{name: "routeTableService", set: func(d *Daemon) { d.routeTableService = &handlers_ec2_routetable.RouteTableServiceImpl{} }, wantMsg: "routeTableService"},
 		{name: "natGatewayService", set: func(d *Daemon) { d.natGatewayService = &handlers_ec2_natgw.NatGatewayServiceImpl{} }, wantMsg: "natGatewayService"},

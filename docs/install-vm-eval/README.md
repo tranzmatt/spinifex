@@ -97,8 +97,8 @@ iface br-wan inet dhcp
 
 Walkthrough of changes:
 
-* Adds eno3 into the bridge
-* eno3 becomes a slave interface
+* Adds enp0s1 into the bridge
+* enp0s1 becomes a slave interface
 * All traffic goes through br-wan
 * Spinifex EC2 (VMs) in a public subnet, obtain an IP address from the WAN upstream
 
@@ -173,7 +173,6 @@ curl -fsSL https://install.mulgadc.com | bash
 [INFO]   /usr/local/share/spinifex/setup-ovn.sh
 [INFO] Creating directories...
 [INFO] Generated /etc/spinifex/systemd.env
-[INFO]   /var/lib/spinifex/predastore-start.sh
 [INFO]   /var/lib/spinifex/wait-for-nats.sh
 [INFO] Fixing file ownership for privilege separation...
 [INFO] File ownership updated

@@ -1,6 +1,7 @@
 package gateway_eks
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	handlers_eks "github.com/mulgadc/spinifex/spinifex/handlers/eks"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -25,7 +27,7 @@ func TestWebhookTokenReview_Rejects(t *testing.T) {
 	_, nc := testutil.StartTestNATS(t)
 
 	// nil conn → ServerInternal
-	_, err := WebhookTokenReview(nil, "alpha", []byte(`{"accountId":"1","token":"t"}`))
+	_, err := WebhookTokenReview(context.Background(), nil, "alpha", []byte(`{"accountId":"1","token":"t"}`))
 	require.Error(t, err)
 	assert.Equal(t, awserrors.ErrorServerInternal, err.Error())
 
@@ -39,7 +41,7 @@ func TestWebhookTokenReview_Rejects(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := WebhookTokenReview(nc, tc.cluster, []byte(tc.body))
+			_, err := WebhookTokenReview(context.Background(), nc, tc.cluster, []byte(tc.body))
 			require.Error(t, err)
 			assert.Equal(t, tc.want, err.Error())
 		})
@@ -49,15 +51,17 @@ func TestWebhookTokenReview_Rejects(t *testing.T) {
 // A genuine infra fault (account bucket absent) maps to ServerInternal.
 func TestWebhookTokenReview_InfraFaultIsServerInternal(t *testing.T) {
 	_, nc, _ := testutil.StartTestJetStream(t)
-	_, err := WebhookTokenReview(nc, "alpha", []byte(`{"accountId":"111122223333","token":"`+validToken("https://sts/?x=1")+`"}`))
+	_, err := WebhookTokenReview(context.Background(), nc, "alpha", []byte(`{"accountId":"111122223333","token":"`+validToken("https://sts/?x=1")+`"}`))
 	require.Error(t, err)
 	assert.Equal(t, awserrors.ErrorServerInternal, err.Error())
 }
 
 func TestWebhookTokenReview_ResolvesIdentity(t *testing.T) {
-	_, nc, js := testutil.StartTestJetStream(t)
-	kv := testutil.SeedKV(t, js, handlers_eks.AccountBucketName("111122223333"), nil)
-	require.NoError(t, handlers_eks.PutAccessEntryRecord(kv, &handlers_eks.AccessEntryRecord{
+	_, nc, _ := testutil.StartTestJetStream(t)
+	js := testutil.NewJetStream(t, nc)
+	kv, err := js.CreateKeyValue(t.Context(), jetstream.KeyValueConfig{Bucket: handlers_eks.AccountBucketName("111122223333")})
+	require.NoError(t, err)
+	require.NoError(t, handlers_eks.PutAccessEntryRecord(t.Context(), kv, &handlers_eks.AccessEntryRecord{
 		ClusterName:        "alpha",
 		PrincipalARN:       testARN,
 		KubernetesUsername: testARN,
@@ -77,7 +81,7 @@ func TestWebhookTokenReview_ResolvesIdentity(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = sub.Unsubscribe() })
 
-	out, err := WebhookTokenReview(nc, "alpha", []byte(`{"accountId":"111122223333","token":"`+validToken("https://sts/?Action=GetCallerIdentity")+`"}`))
+	out, err := WebhookTokenReview(context.Background(), nc, "alpha", []byte(`{"accountId":"111122223333","token":"`+validToken("https://sts/?Action=GetCallerIdentity")+`"}`))
 	require.NoError(t, err)
 	require.NotNil(t, out)
 	assert.True(t, out.Authenticated)

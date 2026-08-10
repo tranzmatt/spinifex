@@ -20,13 +20,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/private/protocol/xml/xmlutil"
 	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
-	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/pterm/pterm"
 )
 
@@ -72,6 +68,89 @@ func GenerateXMLPayload(locationName string, payload any) any {
 	return v.Interface()
 }
 
+// NormalizeXMLOutput returns a copy of output with every nil slice field
+// (recursively) replaced by a non-nil empty slice, since aws-sdk-go's
+// xmlutil.BuildXML omits a nil slice's container element entirely but
+// renders an empty one for a non-nil empty slice, unlike real AWS.
+func NormalizeXMLOutput(output any) any {
+	v := reflect.ValueOf(output)
+	if !v.IsValid() {
+		return output
+	}
+	// Work on an addressable copy: callers pass struct values, and reflection
+	// can only Set fields through an addressable Value.
+	ptr := reflect.New(v.Type())
+	ptr.Elem().Set(v)
+	normalizeNilSlices(ptr.Elem())
+	return ptr.Elem().Interface()
+}
+
+// normalizeNilSlices walks v in place, turning nil slice fields into empty
+// ones and recursing into structs, pointers, and existing slice elements.
+func normalizeNilSlices(v reflect.Value) {
+	switch v.Kind() {
+	case reflect.Pointer:
+		if !v.IsNil() {
+			normalizeNilSlices(v.Elem())
+		}
+	case reflect.Struct:
+		for _, field := range v.Fields() {
+			switch field.Kind() {
+			case reflect.Slice:
+				if field.IsNil() {
+					if field.CanSet() {
+						field.Set(reflect.MakeSlice(field.Type(), 0, 0))
+					}
+				} else {
+					for j := 0; j < field.Len(); j++ {
+						normalizeNilSlices(field.Index(j))
+					}
+				}
+			case reflect.Pointer, reflect.Struct:
+				normalizeNilSlices(field)
+			}
+		}
+	}
+}
+
+// WithRequestID returns a copy of payload's structure with a synthetic
+// RequestId field prepended, since the SDK's generated output structs never
+// carry one. payload must be a struct or pointer to struct; anything else is
+// returned unchanged.
+func WithRequestID(payload any, requestID string) any {
+	pv := reflect.ValueOf(payload)
+	for pv.Kind() == reflect.Pointer {
+		pv = pv.Elem()
+	}
+	if pv.Kind() != reflect.Struct {
+		return payload
+	}
+	pt := pv.Type()
+
+	fields := []reflect.StructField{
+		{
+			Name: "RequestId",
+			Type: reflect.TypeFor[string](),
+			Tag:  reflect.StructTag(`locationName:"requestId" type:"string"`),
+		},
+	}
+	for f := range pt.Fields() {
+		if f.PkgPath == "" { // skip unexported marker fields (e.g. "_")
+			fields = append(fields, f)
+		}
+	}
+
+	composite := reflect.New(reflect.StructOf(fields)).Elem()
+	composite.FieldByName("RequestId").SetString(requestID)
+	for i := 0; i < pt.NumField(); i++ {
+		if f := pt.Field(i); f.PkgPath == "" {
+			composite.FieldByName(f.Name).Set(pv.Field(i))
+		}
+	}
+
+	return composite.Interface()
+}
+
 // GenerateIAMXMLPayload wraps IAM output in the <ActionResponse><ActionResult>...</ActionResult></ActionResponse> structure.
 func GenerateIAMXMLPayload(action string, payload any) any {
 	resultName := action + "Result"
@@ -101,8 +180,19 @@ func GenerateIAMXMLPayload(action string, payload any) any {
 
 // GenerateErrorPayload serializes an ec2.ResponseError with the given code as JSON.
 func GenerateErrorPayload(code string) (jsonResponse []byte) {
+	return GenerateErrorPayloadWithMessage(code, "")
+}
+
+// GenerateErrorPayloadWithMessage serializes an ec2.ResponseError carrying both
+// the sanitized code and the original error message, so the client can surface
+// the actionable reason instead of a bare code. Message is omitted when empty
+// or identical to the code.
+func GenerateErrorPayloadWithMessage(code, message string) (jsonResponse []byte) {
 	var responseError ec2.ResponseError
 	responseError.Code = aws.String(code)
+	if message != "" && message != code {
+		responseError.Message = aws.String(message)
+	}
 	jsonResponse, err := json.Marshal(responseError)
 	if err != nil {
 		slog.Error("GenerateErrorPayload could not marshal JSON payload", "err", err)
@@ -160,18 +250,6 @@ func ValidateKeyPairName(name string) error {
 	return nil
 }
 
-func CreateS3Client(cfg *config.Config) *s3.S3 {
-	sess := session.Must(session.NewSession(&aws.Config{
-		Region:           aws.String(cfg.Predastore.Region),
-		Endpoint:         aws.String(fmt.Sprintf("https://%s", cfg.Predastore.Host)),
-		Credentials:      credentials.NewStaticCredentials(cfg.Predastore.AccessKey, cfg.Predastore.SecretKey, ""),
-		S3ForcePathStyle: aws.Bool(true),
-		DisableSSL:       aws.Bool(false),
-	}))
-
-	return s3.New(sess)
-}
-
 func DownloadFileWithProgress(url string, name string, filename string, timeout time.Duration) (err error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	if timeout > 0 {
@@ -187,12 +265,12 @@ func DownloadFileWithProgress(url string, name string, filename string, timeout 
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return fmt.Errorf("request error: %v", err)
+		return fmt.Errorf("request error: %w", err)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("http error: %v", err)
+		return fmt.Errorf("http error: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
@@ -201,26 +279,34 @@ func DownloadFileWithProgress(url string, name string, filename string, timeout 
 
 	f, err := os.Create(filename)
 	if err != nil {
-		return fmt.Errorf("file create error: %v", err)
+		return fmt.Errorf("file create error: %w", err)
 	}
 	defer f.Close()
 
 	cl := resp.ContentLength
 
 	if cl > 0 {
-		bar, _ := pterm.DefaultProgressbar.
-			WithTitle(fmt.Sprintf("Downloading %s", name)).
-			WithTotal(int(cl)).
-			Start()
+		total := SafeInt64ToUint64(cl)
+		bar, update := NewByteProgressBar(fmt.Sprintf("Downloading %s", name), total)
 
+		// io.Copy writes ~32 KiB per TeeReader call, so gate rendering on
+		// integer-percentage change to cap the bar at ≤101 renders instead of
+		// re-rendering tens of thousands of times.
+		var current uint64
+		lastPct := -1
 		reader := io.TeeReader(resp.Body, progressWriter(func(n int) {
-			bar.Add(n)
+			current += SafeIntToUint64(n)
+			pct := SafeUint64ToInt(current * 100 / total)
+			if pct > lastPct {
+				lastPct = pct
+				update(current)
+			}
 		}))
 
 		_, err = io.Copy(f, reader)
 		_, _ = bar.Stop()
 		if err != nil {
-			return fmt.Errorf("copy error: %v", err)
+			return fmt.Errorf("copy error: %w", err)
 		}
 		return err
 	} else {
@@ -236,7 +322,7 @@ func DownloadFileWithProgress(url string, name string, filename string, timeout 
 		_ = spin.Stop()
 
 		if err != nil {
-			return fmt.Errorf("copy error: %v", err)
+			return fmt.Errorf("copy error: %w", err)
 		}
 	}
 
@@ -249,6 +335,35 @@ type progressWriter func(n int)
 func (pw progressWriter) Write(p []byte) (int, error) {
 	pw(len(p))
 	return len(p), nil
+}
+
+// NewByteProgressBar starts a pterm progress bar that renders human-readable
+// sizes in its title instead of raw byte counts, and returns an update func
+// that performs one render per call. Callers must invoke update at a throttled
+// cadence (integer-percentage change) — the render itself is expensive, so an
+// unthrottled per-write call regresses throughput.
+//
+// pterm's elapsed-time display normally spawns a background goroutine that
+// re-renders every second with no lock, tearing the line against our own
+// low-frequency renders. Starting with it off means no timer is spawned; the
+// flag is then set on the returned bar so pterm still appends its "| 9s"
+// suffix, now emitted only on our (single) renders.
+func NewByteProgressBar(title string, total uint64) (*pterm.ProgressbarPrinter, func(current uint64)) {
+	totalHuman := HumanBytes(total)
+	bar, _ := pterm.DefaultProgressbar.
+		WithTitle(title).
+		WithTotal(SafeUint64ToInt(total)).
+		WithShowCount(false).       // hide raw ints; the size goes in the title
+		WithShowElapsedTime(false). // suppress the async re-render (see above)
+		Start()
+	bar.ShowElapsedTime = true // keep pterm's elapsed, rendered only by us
+
+	update := func(current uint64) {
+		bar.Current = SafeUint64ToInt(current) // drives fill + percentage
+		// UpdateTitle performs the single render for this step.
+		bar.UpdateTitle(fmt.Sprintf("%s — %s / %s", title, HumanBytes(current), totalHuman))
+	}
+	return bar, update
 }
 
 // HumanBytes formats a byte count using IEC binary suffixes (KiB, MiB, ...).

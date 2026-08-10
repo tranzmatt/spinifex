@@ -1,6 +1,7 @@
 package gateway_ec2_tags
 
 import (
+	"context"
 	"errors"
 
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -9,7 +10,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// ValidateCreateTagsInput validates the input parameters for CreateTags
+// ValidateCreateTagsInput validates the input parameters for CreateTags.
 func ValidateCreateTagsInput(input *ec2.CreateTagsInput) error {
 	if input == nil {
 		return errors.New(awserrors.ErrorInvalidParameterValue)
@@ -32,8 +33,8 @@ func ValidateCreateTagsInput(input *ec2.CreateTagsInput) error {
 	return nil
 }
 
-// CreateTags handles the EC2 CreateTags API call
-func CreateTags(input *ec2.CreateTagsInput, natsConn *nats.Conn, accountID string) (ec2.CreateTagsOutput, error) {
+// CreateTags handles the EC2 CreateTags API call.
+func CreateTags(ctx context.Context, input *ec2.CreateTagsInput, natsConn *nats.Conn, accountID string) (ec2.CreateTagsOutput, error) {
 	var output ec2.CreateTagsOutput
 
 	if err := ValidateCreateTagsInput(input); err != nil {
@@ -41,7 +42,7 @@ func CreateTags(input *ec2.CreateTagsInput, natsConn *nats.Conn, accountID strin
 	}
 
 	svc := handlers_ec2_tags.NewNATSTagsService(natsConn)
-	result, err := svc.CreateTags(input, accountID)
+	result, err := svc.CreateTags(ctx, input, accountID)
 	if err != nil {
 		return output, err
 	}

@@ -6,7 +6,7 @@
 // Usage (must run as root — needs AF_PACKET):
 //
 //	sudo dhcptest --iface=br-wan
-//	sudo dhcptest --iface=br-wan --mac=02:00:00:7c:b7:b9 --promisc
+//	sudo dhcptest --iface=br-wan --mac=02:54:df:71:22:5c --promisc
 //	sudo dhcptest --iface=br-wan --spinifex-id=gateway-wan1
 package main
 
@@ -14,7 +14,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -23,6 +23,7 @@ import (
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv4/nclient4"
+	"github.com/mulgadc/spinifex/spinifex/network/external/dhcp"
 )
 
 func main() {
@@ -36,6 +37,7 @@ func main() {
 	timeout := flag.Duration("timeout", 10*time.Second, "Per-attempt DHCP timeout")
 	retries := flag.Int("retries", 3, "Number of DORA attempts before giving up")
 	verbose := flag.Bool("verbose", false, "Print full DHCP packet contents")
+	broadcast := flag.Bool("broadcast", false, "Set the BOOTP broadcast flag, as vpcd's Acquire path does, so replies come back to ff:ff:ff:ff:ff:ff rather than unicast to the bridge MAC")
 	flag.Parse()
 
 	// Resolve the hardware address to use.
@@ -44,20 +46,25 @@ func main() {
 
 	switch {
 	case *spinifexID != "":
-		hwAddr, err = net.ParseMAC(generateMAC(*spinifexID))
+		// vpcd's own derivation, so the probe leases under the MAC the daemon
+		// would have used for this id.
+		hwAddr, err = dhcp.DeriveMAC(*spinifexID)
 		if err != nil {
-			log.Fatalf("generateMAC(%q): %v", *spinifexID, err)
+			slog.Error("Could not derive MAC", "spinifex-id", *spinifexID, "error", err)
+			os.Exit(1)
 		}
 		fmt.Printf("spinifex virtual MAC for %q: %s\n", *spinifexID, hwAddr)
 	case *macStr != "":
 		hwAddr, err = net.ParseMAC(*macStr)
 		if err != nil {
-			log.Fatalf("parse --mac %q: %v", *macStr, err)
+			slog.Error("Could not parse --mac", "mac", *macStr, "error", err)
+			os.Exit(1)
 		}
 	default:
 		hwAddr, err = ifaceMAC(*iface)
 		if err != nil {
-			log.Fatalf("get MAC for %s: %v", *iface, err)
+			slog.Error("Could not get MAC for interface", "iface", *iface, "error", err)
+			os.Exit(1)
 		}
 		fmt.Printf("using real interface MAC: %s\n", hwAddr)
 	}
@@ -83,7 +90,7 @@ func main() {
 
 	if *promisc {
 		if err := setPromisc(*iface, true); err != nil {
-			log.Printf("WARNING: failed to set promisc on %s: %v", *iface, err)
+			slog.Warn("Failed to set promisc on interface", "iface", *iface, "error", err)
 		} else {
 			fmt.Printf("set %s promisc ON\n\n", *iface)
 		}
@@ -96,25 +103,21 @@ func main() {
 		nclient4.WithRetry(*retries),
 	}
 	if *verbose {
-		opts = append(opts, nclient4.WithLogger(nclient4.ShortSummaryLogger{Printfer: log.New(os.Stderr, "[nclient4] ", 0)}))
+		opts = append(opts, nclient4.WithLogger(nclient4.ShortSummaryLogger{Printfer: slogPrintfer{}}))
 	}
 
 	client, err := nclient4.New(*iface, opts...)
 	if err != nil {
-		log.Fatalf("nclient4.New(%s): %v", *iface, err)
+		slog.Error("Could not create nclient4 client", "iface", *iface, "error", err)
+		os.Exit(1)
 	}
 	defer client.Close()
 
-	// Identity modifiers — client-id / hostname / vendor-class for upstream lease tagging.
-	var mods []dhcpv4.Modifier
-	if cid != "" {
-		mods = append(mods, dhcpv4.WithOption(dhcpv4.OptClientIdentifier([]byte(cid))))
-	}
-	if *hostname != "" {
-		mods = append(mods, dhcpv4.WithOption(dhcpv4.OptHostName(*hostname)))
-	}
-	if *vendorClass != "" {
-		mods = append(mods, dhcpv4.WithOption(dhcpv4.OptClassIdentifier(*vendorClass)))
+	// Identity modifiers — client-id / hostname / vendor-class for upstream lease
+	// tagging. Built by the vpcd code path so the probe cannot drift from it.
+	mods := dhcp.IdentityModifiers(cid, *hostname, *vendorClass, hwAddr)
+	if *broadcast {
+		mods = append(mods, dhcpv4.WithBroadcast(true))
 	}
 
 	fmt.Println("Sending DHCP Discover...")
@@ -141,14 +144,12 @@ func main() {
 	}
 }
 
-// generateMAC is the same deterministic hash used by vpcd's topology.go.
-// It produces a locally-administered MAC (02:00:00:xx:xx:xx) from a resource ID.
-func generateMAC(resourceID string) string {
-	h := uint32(0)
-	for _, c := range resourceID {
-		h = h*31 + uint32(c)
-	}
-	return fmt.Sprintf("02:00:00:%02x:%02x:%02x", (h>>16)&0xff, (h>>8)&0xff, h&0xff)
+// slogPrintfer adapts nclient4's Printfer to slog. nclient4 only emits through
+// it under --verbose, so the packet summaries log at info level to stay visible.
+type slogPrintfer struct{}
+
+func (slogPrintfer) Printf(format string, v ...any) {
+	slog.Info(fmt.Sprintf(format, v...), "component", "nclient4")
 }
 
 func ifaceMAC(name string) (net.HardwareAddr, error) {

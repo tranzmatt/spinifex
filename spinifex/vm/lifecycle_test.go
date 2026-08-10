@@ -7,9 +7,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/mulgadc/spinifex/spinifex/gpu"
 	"github.com/mulgadc/spinifex/spinifex/qmp"
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/stretchr/testify/assert"
@@ -111,7 +113,12 @@ func TestBuildDrives(t *testing.T) {
 		wantDrives    []Drive
 		wantIOThreads []IOThread
 		wantDevices   []Device
-		wantErr       string
+		wantBlockdevs []Blockdev
+		// wantHotplugPorts, when non-nil, asserts requests[i].HotplugPort
+		// after the call — pinning both the "already recorded, left alone"
+		// and "unset, allocated and written back" behaviours.
+		wantHotplugPorts []int
+		wantErr          string
 	}{
 		{
 			name: "boot volume",
@@ -120,7 +127,7 @@ func TestBuildDrives(t *testing.T) {
 			},
 			cpuCount: 4,
 			wantDrives: []Drive{
-				{File: "nbd:unix:/tmp/boot.sock", Format: "raw", If: "none", Media: "disk", ID: "os", Cache: "none"},
+				{File: "nbd:unix:/tmp/boot.sock", Format: "raw", If: "none", Media: "disk", ID: "os", Cache: "none", Werror: "report", Rerror: "report"},
 			},
 			wantIOThreads: []IOThread{{ID: "ioth-os"}},
 			wantDevices: []Device{
@@ -154,20 +161,95 @@ func TestBuildDrives(t *testing.T) {
 			wantErr:  "NBDURI not set for volume vol-efi-bad",
 		},
 		{
-			name: "mixed boot + EFI",
+			name: "data volume with a recorded HotplugPort keeps it and emits a named blockdev+device",
+			requests: []types.EBSRequest{
+				{Name: "vol-data-a", NBDURI: "nbd:unix:/tmp/data-a.sock", HotplugPort: 3},
+			},
+			cpuCount:      2,
+			wantIOThreads: []IOThread{{ID: "ioth-vol-data-a"}},
+			wantBlockdevs: []Blockdev{
+				{Value: "driver=nbd,node-name=nbd-vol-data-a,server.type=unix,server.path=/tmp/data-a.sock,export="},
+			},
+			wantDevices: []Device{
+				{Value: "virtio-blk-pci,id=vdisk-vol-data-a,drive=nbd-vol-data-a,iothread=ioth-vol-data-a,serial=voldataa,bus=hotplug-ebs3,werror=report,rerror=report"},
+			},
+			wantHotplugPorts: []int{3},
+		},
+		{
+			name: "data volume with HotplugPort unset gets the lowest free port allocated and written back",
+			requests: []types.EBSRequest{
+				{Name: "vol-data-b", NBDURI: "nbd:unix:/tmp/data-b.sock"},
+			},
+			cpuCount:      2,
+			wantIOThreads: []IOThread{{ID: "ioth-vol-data-b"}},
+			wantBlockdevs: []Blockdev{
+				{Value: "driver=nbd,node-name=nbd-vol-data-b,server.type=unix,server.path=/tmp/data-b.sock,export="},
+			},
+			wantDevices: []Device{
+				{Value: "virtio-blk-pci,id=vdisk-vol-data-b,drive=nbd-vol-data-b,iothread=ioth-vol-data-b,serial=voldatab,bus=hotplug-ebs1,werror=report,rerror=report"},
+			},
+			wantHotplugPorts: []int{1},
+		},
+		{
+			name: "two data volumes with HotplugPort unset in one call get distinct ports",
+			requests: []types.EBSRequest{
+				{Name: "vol-data-c", NBDURI: "nbd:unix:/tmp/data-c.sock"},
+				{Name: "vol-data-d", NBDURI: "nbd:unix:/tmp/data-d.sock"},
+			},
+			cpuCount: 2,
+			wantIOThreads: []IOThread{
+				{ID: "ioth-vol-data-c"},
+				{ID: "ioth-vol-data-d"},
+			},
+			wantBlockdevs: []Blockdev{
+				{Value: "driver=nbd,node-name=nbd-vol-data-c,server.type=unix,server.path=/tmp/data-c.sock,export="},
+				{Value: "driver=nbd,node-name=nbd-vol-data-d,server.type=unix,server.path=/tmp/data-d.sock,export="},
+			},
+			wantDevices: []Device{
+				{Value: "virtio-blk-pci,id=vdisk-vol-data-c,drive=nbd-vol-data-c,iothread=ioth-vol-data-c,serial=voldatac,bus=hotplug-ebs1,werror=report,rerror=report"},
+				{Value: "virtio-blk-pci,id=vdisk-vol-data-d,drive=nbd-vol-data-d,iothread=ioth-vol-data-d,serial=voldatad,bus=hotplug-ebs2,werror=report,rerror=report"},
+			},
+			wantHotplugPorts: []int{1, 2},
+		},
+		{
+			name: "data volume errors when the hot-plug port pool is exhausted",
+			requests: func() []types.EBSRequest {
+				reqs := make([]types.EBSRequest, 0, EBSHotPlugSlotCount+1)
+				for i := 1; i <= EBSHotPlugSlotCount; i++ {
+					reqs = append(reqs, types.EBSRequest{
+						Name: fmt.Sprintf("vol-filler-%d", i), NBDURI: "nbd:unix:/tmp/filler.sock", HotplugPort: i,
+					})
+				}
+				reqs = append(reqs, types.EBSRequest{Name: "vol-overflow", NBDURI: "nbd:unix:/tmp/overflow.sock"})
+				return reqs
+			}(),
+			cpuCount: 2,
+			wantErr:  "no free EBS hot-plug port for volume vol-overflow",
+		},
+		{
+			name: "mixed boot + EFI + data: boot and EFI stay byte-identical to the legacy shape",
 			requests: []types.EBSRequest{
 				{Name: "vol-boot", NBDURI: "nbd:unix:/tmp/boot.sock", Boot: true},
 				{Name: "vol-efi", NBDURI: "nbd:unix:/tmp/efi.sock", EFI: true},
+				{Name: "vol-data-a", NBDURI: "nbd:unix:/tmp/data-a.sock", HotplugPort: 3},
 			},
 			cpuCount: 4,
 			wantDrives: []Drive{
-				{File: "nbd:unix:/tmp/boot.sock", Format: "raw", If: "none", Media: "disk", ID: "os", Cache: "none"},
+				{File: "nbd:unix:/tmp/boot.sock", Format: "raw", If: "none", Media: "disk", ID: "os", Cache: "none", Werror: "report", Rerror: "report"},
 				{File: "nbd:unix:/tmp/efi.sock", Format: "raw", If: "pflash", Unit: 1},
 			},
-			wantIOThreads: []IOThread{{ID: "ioth-os"}},
+			wantIOThreads: []IOThread{
+				{ID: "ioth-os"},
+				{ID: "ioth-vol-data-a"},
+			},
+			wantBlockdevs: []Blockdev{
+				{Value: "driver=nbd,node-name=nbd-vol-data-a,server.type=unix,server.path=/tmp/data-a.sock,export="},
+			},
 			wantDevices: []Device{
 				{Value: "virtio-blk-pci,drive=os,iothread=ioth-os,num-queues=4,bootindex=1"},
+				{Value: "virtio-blk-pci,id=vdisk-vol-data-a,drive=nbd-vol-data-a,iothread=ioth-vol-data-a,serial=voldataa,bus=hotplug-ebs3,werror=report,rerror=report"},
 			},
+			wantHotplugPorts: []int{0, 0, 3},
 		},
 		{
 			name:     "empty requests",
@@ -182,7 +264,7 @@ func TestBuildDrives(t *testing.T) {
 			if machineType == "" {
 				machineType = "q35"
 			}
-			drives, iothreads, devices, err := buildDrives(tt.requests, tt.cpuCount, machineType)
+			cfg, err := buildDrives(tt.requests, tt.cpuCount, machineType)
 
 			if tt.wantErr != "" {
 				require.Error(t, err)
@@ -191,9 +273,18 @@ func TestBuildDrives(t *testing.T) {
 			}
 
 			require.NoError(t, err)
-			assert.Equal(t, tt.wantDrives, drives)
-			assert.Equal(t, tt.wantIOThreads, iothreads)
-			assert.Equal(t, tt.wantDevices, devices)
+			assert.Equal(t, tt.wantDrives, cfg.Drives)
+			assert.Equal(t, tt.wantIOThreads, cfg.IOThreads)
+			assert.Equal(t, tt.wantDevices, cfg.Devices)
+			assert.Equal(t, tt.wantBlockdevs, cfg.Blockdevs)
+
+			if tt.wantHotplugPorts != nil {
+				require.Len(t, tt.requests, len(tt.wantHotplugPorts))
+				for i, want := range tt.wantHotplugPorts {
+					assert.Equal(t, want, tt.requests[i].HotplugPort,
+						"request %d (%s) HotplugPort", i, tt.requests[i].Name)
+				}
+			}
 		})
 	}
 }
@@ -233,7 +324,7 @@ func TestGenerateMgmtMAC_Stable(t *testing.T) {
 
 func TestStartReturnsErrorWhenInstanceUnknown(t *testing.T) {
 	m := NewManager()
-	err := m.Start("i-missing")
+	err := m.Start(t.Context(), "i-missing")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "i-missing")
 }
@@ -281,7 +372,7 @@ func TestRun_LaunchStillValid_FirstCheck(t *testing.T) {
 			instance := &VM{ID: "i-" + string(status), Status: status}
 			m.Insert(instance)
 
-			err := m.Run(instance)
+			err := m.Run(t.Context(), instance)
 
 			require.NoError(t, err)
 			assert.Empty(t, mounter.mounted, "Mount must not be called when launch is aborted by first race check")
@@ -305,7 +396,7 @@ func TestRun_LaunchStillValid_SecondCheck(t *testing.T) {
 		m.UpdateState(v.ID, func(vv *VM) { vv.Status = StateShuttingDown })
 	}
 
-	err := m.Run(instance)
+	err := m.Run(t.Context(), instance)
 
 	require.NoError(t, err, "Run must return nil when concurrent terminate flips status during Mount")
 	assert.Equal(t, []string{"i-flip"}, mounter.mounted, "Mount must run exactly once before the second race check")
@@ -324,12 +415,47 @@ func TestRun_VolumeMounterError_Propagates(t *testing.T) {
 	instance := &VM{ID: "i-mount-fail", Status: StatePending}
 	m.Insert(instance)
 
-	err := m.Run(instance)
+	err := m.Run(t.Context(), instance)
 
 	require.ErrorIs(t, err, sentinel)
 	assert.Equal(t, []string{"i-mount-fail"}, mounter.mounted)
 	assert.Equal(t, 0, *upCalls)
 	assert.Equal(t, StatePending, m.Status(instance), "status must be unchanged on Mount failure")
+}
+
+// TestRun_VolumeStateFailureRollsBackBeforeQEMU verifies launch does not expose
+// a writer when authoritative attachment state cannot be persisted.
+func TestRun_VolumeStateFailureRollsBackBeforeQEMU(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	stateErr := errors.New("predastore unavailable")
+	mounter := &fakeVolumeMounter{}
+	stateUpdater := &fakeVolumeStateUpdater{err: stateErr}
+	m := NewManagerWithDeps(Deps{
+		VolumeMounter:      mounter,
+		VolumeStateUpdater: stateUpdater,
+	})
+	instance := &VM{
+		ID:     "i-state-fail",
+		Status: StatePending,
+		EBSRequests: types.EBSRequests{Requests: []types.EBSRequest{{
+			Name: "vol-1", DeviceName: "/dev/sda1", Boot: true,
+		}}},
+	}
+	m.Insert(instance)
+
+	err := m.Run(t.Context(), instance)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, stateErr)
+	assert.Equal(t, []string{instance.ID}, mounter.mounted)
+	assert.Equal(t, []string{instance.ID}, mounter.unmounted,
+		"failed attachment-state persistence must roll back mounted volumes")
+	calls := stateUpdater.snapshot()
+	require.Len(t, calls, 1)
+	assert.Equal(t, "in-use", calls[0].State)
+	assert.Equal(t, instance.ID, calls[0].InstanceID)
+	assert.NoFileExists(t, filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), instance.ID+".pid"),
+		"startQEMU must not run after attachment-state persistence fails")
 }
 
 // TestRun_AlreadyRunningPID_ReturnsError covers the live-PID guard
@@ -345,7 +471,7 @@ func TestRun_AlreadyRunningPID_ReturnsError(t *testing.T) {
 	pidFile := filepath.Join(pidDir, instance.ID+".pid")
 	require.NoError(t, os.WriteFile(pidFile, fmt.Appendf(nil, "%d", os.Getpid()), 0o600))
 
-	err := m.Run(instance)
+	err := m.Run(t.Context(), instance)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "already running")
@@ -366,7 +492,7 @@ func TestStart_DispatchesThroughLaunch(t *testing.T) {
 	instance := &VM{ID: "i-start-dispatch", Status: StateStopped}
 	m.Insert(instance)
 
-	err := m.Start(instance.ID)
+	err := m.Start(t.Context(), instance.ID)
 
 	require.ErrorIs(t, err, sentinel, "Start must dispatch through launch and surface Mount errors")
 	assert.Equal(t, []string{"i-start-dispatch"}, mounter.mounted)
@@ -380,7 +506,7 @@ func TestStart_AbortedByConcurrentTerminate(t *testing.T) {
 	instance := &VM{ID: "i-start-abort", Status: StateShuttingDown}
 	m.Insert(instance)
 
-	err := m.Start(instance.ID)
+	err := m.Start(t.Context(), instance.ID)
 
 	require.NoError(t, err)
 	assert.Empty(t, mounter.mounted)
@@ -389,7 +515,7 @@ func TestStart_AbortedByConcurrentTerminate(t *testing.T) {
 
 // TestLaunchStillValid_Allowlist locks in the launchStillValid allowlist
 // across every defined InstanceState plus the zero value. The parent
-// plan flagged: "a regression in the allowlist would silently break the
+// A regression in the allowlist would silently break the
 // start-stopped path" — e.g. dropping StateStopped would make
 // StartInstances on a stopped VM no-op without surfacing an error.
 func TestLaunchStillValid_Allowlist(t *testing.T) {
@@ -456,13 +582,17 @@ func startBrokenQMPListener(t *testing.T) (string, func()) {
 }
 
 // TestAttachQMP_DialFailure_NoHeartbeatLeak covers the regression the
-// parent plan flagged: a swap that started qmpHeartbeat before checking
+// A swap that started qmpHeartbeat before checking
 // the factory error would leak one goroutine per failed reconnect. With
 // no listener at the configured socket, net.Dial fails inside
 // newQMPClientWithHandshake and AttachQMP must return without spawning
 // the heartbeat or mutating instance.QMPClient.
 func TestAttachQMP_DialFailure_NoHeartbeatLeak(t *testing.T) {
 	defer goleak.VerifyNone(t)
+
+	orig := qmpSocketWaitTimeout
+	qmpSocketWaitTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { qmpSocketWaitTimeout = orig })
 
 	m := NewManager()
 	instance := &VM{
@@ -817,6 +947,31 @@ func TestStartQEMU_DirectBoot_MgmtTapError(t *testing.T) {
 	assert.Equal(t, "br-mgmt", plumber.setupCalls[0].Bridge)
 }
 
+// TestStartQEMU_DiskBoot_MgmtTapCreated verifies the disk-boot/restart path
+// pre-creates the mgmt tap via SetupTap (owned by the daemon euid) before
+// handing it to QEMU, mirroring the direct-boot branch. Without this the
+// non-root daemon (no CAP_NET_ADMIN) cannot attach /dev/net/tun, breaking every
+// stopped-instance restart including EKS control-plane recovery.
+func TestStartQEMU_DiskBoot_MgmtTapCreated(t *testing.T) {
+	// No primary ENI → dev user-mode net; MgmtMAC set → enters disk-boot mgmt block.
+	plumber := &fakeNetworkPlumber{setupErr: errors.New("mgmt tap failed")}
+	m := directBootManager(t, plumber)
+
+	instance := &VM{
+		ID:           "i-disk-mgmt",
+		InstanceType: "t3.nano",
+		MgmtMAC:      "02:aa:bb:cc:dd:ee",
+	}
+
+	err := m.startQEMU(instance)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mgmt tap")
+	require.Len(t, plumber.setupCalls, 1)
+	assert.Equal(t, MgmtTapName("i-disk-mgmt"), plumber.setupCalls[0].Name)
+	assert.Equal(t, "br-mgmt", plumber.setupCalls[0].Bridge)
+}
+
 // TestStartQEMU_DirectBoot_NoENI_NoMgmt_InstanceTypeNotFound verifies that
 // startQEMU returns an error when the instance type is absent from the resolver,
 // exercising the early-return before any DirectBoot config is written.
@@ -867,6 +1022,8 @@ var _ NetworkPlumber = (*scriptedNetworkPlumber)(nil)
 func TestStartupTimeouts(t *testing.T) {
 	assert.Equal(t, 5*time.Second, qemuStartupTimeout)
 	assert.Equal(t, 5*time.Second, nbdReadyTimeout)
+	assert.Equal(t, 3*time.Second, qmpSocketWaitTimeout,
+		"production QMP socket wait default must stay 3s outside tests")
 }
 
 // TestRG4_GuestOOMTier asserts the RG-4 OOM ladder: a customer guest QEMU
@@ -952,13 +1109,13 @@ func TestSendQMPCommand_ReconnectsWedgedClient(t *testing.T) {
 	// Simulate the wedge: mark Dead as a timed-out decode would.
 	client.Dead = true
 
-	resp, err := sendQMPCommand(client, qmp.QMPCommand{Execute: "query-status"}, "i-wedged")
+	resp, err := sendQMPCommand(t.Context(), client, qmp.QMPCommand{Execute: "query-status"}, "i-wedged")
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.False(t, client.Dead, "reconnect must clear Dead so later commands reuse the fresh stream")
 
 	// A second command must succeed over the reconnected stream.
-	_, err = sendQMPCommand(client, qmp.QMPCommand{Execute: "query-status"}, "i-wedged")
+	_, err = sendQMPCommand(t.Context(), client, qmp.QMPCommand{Execute: "query-status"}, "i-wedged")
 	require.NoError(t, err)
 }
 
@@ -976,7 +1133,251 @@ func TestSendQMPCommand_NoPathCannotReconnect(t *testing.T) {
 	client.Dead = true
 	client.Path = ""
 
-	_, err = sendQMPCommand(client, qmp.QMPCommand{Execute: "query-status"}, "i-nopath")
+	_, err = sendQMPCommand(t.Context(), client, qmp.QMPCommand{Execute: "query-status"}, "i-nopath")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no socket path")
+}
+
+// startSingleClientQMPListener models a real `-qmp unix:...,server,nowait`
+// QEMU monitor: single-threaded, serving exactly one connection at a time.
+// Unlike startWorkingQMPListener (which spawns a goroutine per accepted
+// connection and greets all of them concurrently, hiding the
+// reconnect-ordering bug), Accept is only called again once the current
+// connection's serve loop returns — so a second connection dialed while the
+// first is still open sits unaccepted (and ungreeted) in the kernel backlog,
+// exactly like a real single-client monitor, with no lock/goroutine race.
+func startSingleClientQMPListener(t *testing.T) (sockPath string, stop func()) {
+	t.Helper()
+	sockPath = filepath.Join(t.TempDir(), "qmp.sock")
+	ln, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			serveSingleClientQMPConn(conn)
+		}
+	}()
+
+	stopped := false
+	stop = func() {
+		if stopped {
+			return
+		}
+		stopped = true
+		_ = ln.Close()
+		<-done
+	}
+	t.Cleanup(stop)
+	return sockPath, stop
+}
+
+// serveSingleClientQMPConn greets conn, then echoes {"return":{}} for every
+// command line until the connection errors or closes. It blocks for the
+// life of the connection, which is what makes startSingleClientQMPListener's
+// accept loop strictly serial.
+func serveSingleClientQMPConn(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	greeting := `{"QMP":{"version":{"qemu":{"major":8,"minor":0}},"capabilities":[]}}` + "\n"
+	if _, err := conn.Write([]byte(greeting)); err != nil {
+		return
+	}
+	dec := json.NewDecoder(conn)
+	for {
+		var cmd map[string]any
+		if err := dec.Decode(&cmd); err != nil {
+			return
+		}
+		if _, err := conn.Write([]byte(`{"return":{}}` + "\n")); err != nil {
+			return
+		}
+	}
+}
+
+// TestSendQMPCommand_ReconnectsAgainstSingleClientServer is the regression
+// test for the reconnectQMP ordering bug against a real QEMU
+// `server,nowait` QMP monitor, only one client may hold a connection at a
+// time. A wedged client's reconnect must close its own stale connection
+// BEFORE dialing fresh, freeing the slot — dialing fresh first (the pre-fix
+// ordering) leaves the old connection occupying the only slot, so the new
+// dial gets no greeting and reconnect fails, leaving q.Dead permanently
+// true and every later attach/detach on the VM erroring.
+func TestSendQMPCommand_ReconnectsAgainstSingleClientServer(t *testing.T) {
+	sockPath, stop := startSingleClientQMPListener(t)
+	defer stop()
+
+	client, err := qmp.NewQMPClient(sockPath)
+	require.NoError(t, err)
+	defer func() { _ = client.Conn.Close() }()
+
+	// The old connection is still open (not yet closed) when Dead is set —
+	// exactly the state a wedged decode leaves behind, and exactly what the
+	// pre-fix bare-dial-before-close ordering could not recover from against
+	// a single-client monitor.
+	client.Dead = true
+
+	resp, err := sendQMPCommand(t.Context(), client, qmp.QMPCommand{Execute: "query-status"}, "i-single-client")
+	require.NoError(t, err, "reconnect must close the stale connection before redialing so the single-client monitor's slot is free")
+	require.NotNil(t, resp)
+	assert.False(t, client.Dead, "reconnect must clear Dead so later commands reuse the fresh stream")
+
+	_, err = sendQMPCommand(t.Context(), client, qmp.QMPCommand{Execute: "query-status"}, "i-single-client")
+	require.NoError(t, err, "a second command must succeed over the reconnected stream")
+}
+
+// TestQMPGreetingTimeout pins the VFIO scaling: a GPU passthrough guest must
+// pin all its RAM through the IOMMU before the monitor answers, so its greeting
+// deadline sits at the floor for a small guest and grows with RAM up to the cap;
+// a plain VM keeps the default.
+func TestQMPGreetingTimeout(t *testing.T) {
+	plain := &VM{}
+	assert.Equal(t, qmp.DefaultGreetingTimeout, qmpGreetingTimeout(plain),
+		"a plain VM keeps the default greeting deadline")
+
+	// A small GPU guest (<1 GiB scaling contribution) sits at the floor.
+	smallGPU := &VM{
+		GPUAttachments: []gpu.GPUAttachment{{PCIAddress: "0000:5e:00.0"}},
+		Config:         Config{Memory: 4096},
+	}
+	assert.Equal(t, qmpVFIOGreetingFloor, qmpGreetingTimeout(smallGPU),
+		"a small VFIO guest gets the floor greeting deadline")
+	assert.Greater(t, qmpVFIOGreetingFloor, qmp.DefaultGreetingTimeout,
+		"the VFIO floor must exceed the plain default")
+
+	// A large GPU guest scales above the floor: 64 GiB -> floor + 64*8s.
+	largeGPU := &VM{
+		GPUAttachments: []gpu.GPUAttachment{{PCIAddress: "0000:5e:00.0"}},
+		Config:         Config{Memory: 64 * 1024},
+	}
+	assert.Equal(t, qmpVFIOGreetingBase+64*qmpVFIOGreetingPerGiB, qmpGreetingTimeout(largeGPU),
+		"a large VFIO guest scales its deadline with RAM")
+
+	// An oversized guest is clamped to the cap, not left unbounded.
+	hugeGPU := &VM{
+		GPUAttachments: []gpu.GPUAttachment{{PCIAddress: "0000:5e:00.0"}},
+		Config:         Config{Memory: 1024 * 1024},
+	}
+	assert.Equal(t, qmpVFIOGreetingCap, qmpGreetingTimeout(hugeGPU),
+		"a huge VFIO guest is clamped to the cap")
+}
+
+// TestRemoveStaleQMPSocket covers the SIGKILL-leftover unlink: a stale socket
+// inode is removed, and a missing file is a no-op (not an error).
+func TestRemoveStaleQMPSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qmp-i-stale.sock")
+	require.NoError(t, os.WriteFile(path, nil, 0o600))
+
+	require.NoError(t, removeStaleQMPSocket(path))
+	_, statErr := os.Stat(path)
+	assert.True(t, os.IsNotExist(statErr), "stale socket inode must be unlinked")
+
+	require.NoError(t, removeStaleQMPSocket(path), "a missing socket is a no-op")
+}
+
+// TestIsTransientDialError pins which connect failures the QMP dial retries: a
+// listener-not-up-yet (refused), a socket briefly absent (enoent), or a peer
+// resetting mid-greeting (reset/broken pipe from a QEMU still initialising) are
+// transient; a clean decode/handshake failure is not — it means a settled
+// listener answered.
+func TestIsTransientDialError(t *testing.T) {
+	assert.True(t, isTransientDialError(syscall.ECONNREFUSED), "pre-listen/stale refuses connect")
+	assert.True(t, isTransientDialError(syscall.ENOENT), "socket absent between unlink and rebind")
+	assert.True(t, isTransientDialError(syscall.ECONNRESET), "fresh QEMU resets mid-greeting while initialising")
+	assert.True(t, isTransientDialError(syscall.EPIPE), "peer tears down the greeting connection")
+	assert.True(t, isTransientDialError(fmt.Errorf("waiting for QMP greeting: %w", syscall.ECONNRESET)),
+		"a wrapped connection-reset from the greeting read is still transient")
+	assert.False(t, isTransientDialError(fmt.Errorf("waiting for QMP greeting: eof")),
+		"a reached-listener handshake failure must not be retried")
+}
+
+// serveQMPConn writes the QMP greeting then echoes {"return":{}} for each command
+// line, modelling a live QEMU monitor closely enough for a handshake.
+func serveQMPConn(c net.Conn) {
+	defer func() { _ = c.Close() }()
+	greeting := `{"QMP":{"version":{"qemu":{"major":8,"minor":0}},"capabilities":[]}}` + "\n"
+	if _, err := c.Write([]byte(greeting)); err != nil {
+		return
+	}
+	dec := json.NewDecoder(c)
+	for {
+		var cmd map[string]any
+		if err := dec.Decode(&cmd); err != nil {
+			return
+		}
+		if _, err := c.Write([]byte(`{"return":{}}` + "\n")); err != nil {
+			return
+		}
+	}
+}
+
+// startDelayedQMPListener simulates a relaunched QEMU: after delay it unlinks any
+// stale inode at sockPath, binds, and serves. Until then a pre-seeded stale inode
+// refuses connects, forcing the dialer to retry. Returns a stop function.
+func startDelayedQMPListener(t *testing.T, sockPath string, delay time.Duration) func() {
+	t.Helper()
+	done := make(chan struct{})
+	lnCh := make(chan net.Listener, 1)
+	go func() {
+		defer close(done)
+		time.Sleep(delay)
+		_ = os.Remove(sockPath)
+		ln, err := net.Listen("unix", sockPath)
+		if err != nil {
+			lnCh <- nil
+			return
+		}
+		lnCh <- ln
+		for {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go serveQMPConn(conn)
+		}
+	}()
+	stopped := false
+	stop := func() {
+		if stopped {
+			return
+		}
+		stopped = true
+		if ln := <-lnCh; ln != nil {
+			_ = ln.Close()
+		}
+		<-done
+	}
+	t.Cleanup(stop)
+	return stop
+}
+
+// TestNewQMPClientWithHandshake_RetriesTransientConnect is the mgo6c regression:
+// a stale socket inode from a SIGKILLed predecessor refuses the first connect,
+// and the relaunched QEMU only listens after a short delay. The dial must retry
+// past the refused window rather than fail the whole restart.
+func TestNewQMPClientWithHandshake_RetriesTransientConnect(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	sockPath := filepath.Join(t.TempDir(), "qmp-i-retry.sock")
+
+	// Seed a stale inode with no listener — a single dial gets ECONNREFUSED.
+	stale, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	unixLn, ok := stale.(*net.UnixListener)
+	require.True(t, ok, "unix listener expected")
+	unixLn.SetUnlinkOnClose(false)
+	require.NoError(t, stale.Close())
+
+	stop := startDelayedQMPListener(t, sockPath, 150*time.Millisecond)
+	defer stop()
+
+	instance := &VM{ID: "i-retry", Config: Config{QMPSocket: sockPath}}
+	client, err := newQMPClientWithHandshake(t.Context(), instance)
+	require.NoError(t, err, "dial must retry past the refused window")
+	require.NotNil(t, client)
+	_ = client.Conn.Close()
 }

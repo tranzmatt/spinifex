@@ -1,8 +1,11 @@
 package handlers_eks
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -13,10 +16,131 @@ import (
 	handlers_ec2_placementgroup "github.com/mulgadc/spinifex/spinifex/handlers/ec2/placementgroup"
 	"github.com/mulgadc/spinifex/spinifex/handlers/sysinstance"
 	"github.com/mulgadc/spinifex/spinifex/instancetypes"
+	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/mulgadc/spinifex/spinifex/types"
+	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// serveNodeStatus replies to spinifex.node.status fan-outs with the given node
+// snapshots so the NATS host scheduler can be exercised end-to-end.
+func serveNodeStatus(t *testing.T, nc *nats.Conn, nodes []types.NodeStatusResponse) {
+	t.Helper()
+	sub, err := nc.Subscribe("spinifex.node.status", func(msg *nats.Msg) {
+		for _, n := range nodes {
+			data, _ := json.Marshal(n)
+			_ = nc.Publish(msg.Reply, data)
+		}
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+}
+
+// TestNATSHostScheduler_SchedulableHosts covers both fit paths: customer types
+// fit on advertised per-type Available; system types fit on raw headroom.
+func TestNATSHostScheduler_SchedulableHosts(t *testing.T) {
+	_, nc := testutil.StartTestNATS(t)
+	serveNodeStatus(t, nc, []types.NodeStatusResponse{
+		{
+			Node: "nodeA", TotalVCPU: 32, TotalMemGB: 128,
+			InstanceTypes: []types.InstanceTypeCap{{Name: "t3.medium", Available: 3}},
+		},
+		{
+			Node: "nodeB", TotalVCPU: 0, TotalMemGB: 0,
+			InstanceTypes: []types.InstanceTypeCap{{Name: "t3.medium", Available: 0}},
+		},
+	})
+	sched := NewNATSHostScheduler(nc)
+
+	// Customer type: only the node advertising free capacity is schedulable.
+	require.Equal(t, []string{"nodeA"}, sched.SchedulableHosts(context.Background(), "t3.medium"))
+
+	// System type: fit is decided by raw headroom, so the drained node drops out.
+	sysHosts := sched.SchedulableHosts(context.Background(), defaultK3sServerInstanceType)
+	sort.Strings(sysHosts)
+	require.Equal(t, []string{"nodeA"}, sysHosts)
+
+	// Unknown system type yields no hosts.
+	require.Empty(t, sched.SchedulableHosts(context.Background(), "sys.bogus"))
+}
+
+// TestSpreadHostsByAZ_DistinctAZs covers the common case: with at least as many
+// AZs as hosts, round-robin visits every AZ once before repeating any of them,
+// so a prefix of the result spans distinct AZs.
+func TestSpreadHostsByAZ_DistinctAZs(t *testing.T) {
+	hosts := []azHost{
+		{node: "node-1", az: "az-a"},
+		{node: "node-2", az: "az-b"},
+		{node: "node-3", az: "az-a"},
+		{node: "node-4", az: "az-c"},
+	}
+	out := spreadHostsByAZ(hosts)
+	require.Len(t, out, 4)
+
+	// First 3 picks (one per AZ) must land on 3 distinct AZs.
+	azOf := map[string]string{"node-1": "az-a", "node-2": "az-b", "node-3": "az-a", "node-4": "az-c"}
+	seen := make(map[string]bool)
+	for _, n := range out[:3] {
+		seen[azOf[n]] = true
+	}
+	assert.Len(t, seen, 3, "first 3 hosts should span 3 distinct AZs, got %v", out[:3])
+	// Every host still appears exactly once; nothing is dropped.
+	assert.ElementsMatch(t, []string{"node-1", "node-2", "node-3", "node-4"}, out)
+}
+
+// TestSpreadHostsByAZ_FewerAZsThanHosts documents the degradation: with 2 AZs
+// for a 3-way spread, every host is still returned and the first 2 picks land
+// in distinct AZs, the third necessarily repeating one.
+func TestSpreadHostsByAZ_FewerAZsThanHosts(t *testing.T) {
+	hosts := []azHost{
+		{node: "node-1", az: "az-a"},
+		{node: "node-2", az: "az-a"},
+		{node: "node-3", az: "az-b"},
+	}
+	out := spreadHostsByAZ(hosts)
+	require.Len(t, out, 3, "degraded spread must still place every host")
+	assert.ElementsMatch(t, []string{"node-1", "node-2", "node-3"}, out)
+
+	azOf := map[string]string{"node-1": "az-a", "node-2": "az-a", "node-3": "az-b"}
+	assert.NotEqual(t, azOf[out[0]], azOf[out[1]], "first 2 picks should still land in distinct AZs")
+}
+
+// TestSpreadHostsByAZ_UniformAZDegradesToNodeOrder covers real deployments where
+// every node reports the same AZ (or none at all): interleaving collapses to a
+// single bucket, so the original arrival order is preserved and nothing breaks.
+func TestSpreadHostsByAZ_UniformAZDegradesToNodeOrder(t *testing.T) {
+	hosts := []azHost{
+		{node: "node-1", az: "ap-southeast-2a"},
+		{node: "node-2", az: "ap-southeast-2a"},
+		{node: "node-3", az: "ap-southeast-2a"},
+	}
+	assert.Equal(t, []string{"node-1", "node-2", "node-3"}, spreadHostsByAZ(hosts))
+}
+
+// TestNATSHostScheduler_SchedulableHosts_SpreadsByAZ exercises the fan-out path
+// end-to-end: node.status responses carrying distinct AZs must come back
+// ordered so the first haControlPlaneCount hosts span distinct AZs.
+func TestNATSHostScheduler_SchedulableHosts_SpreadsByAZ(t *testing.T) {
+	_, nc := testutil.StartTestNATS(t)
+	serveNodeStatus(t, nc, []types.NodeStatusResponse{
+		{Node: "node-1", AZ: "az-a", InstanceTypes: []types.InstanceTypeCap{{Name: "t3.medium", Available: 1}}},
+		{Node: "node-2", AZ: "az-a", InstanceTypes: []types.InstanceTypeCap{{Name: "t3.medium", Available: 1}}},
+		{Node: "node-3", AZ: "az-b", InstanceTypes: []types.InstanceTypeCap{{Name: "t3.medium", Available: 1}}},
+		{Node: "node-4", AZ: "az-c", InstanceTypes: []types.InstanceTypeCap{{Name: "t3.medium", Available: 1}}},
+	})
+	sched := NewNATSHostScheduler(nc)
+
+	hosts := sched.SchedulableHosts(context.Background(), "t3.medium")
+	require.Len(t, hosts, 4)
+
+	azOf := map[string]string{"node-1": "az-a", "node-2": "az-a", "node-3": "az-b", "node-4": "az-c"}
+	seen := make(map[string]bool)
+	for _, n := range hosts[:3] {
+		seen[azOf[n]] = true
+	}
+	assert.Len(t, seen, 3, "first 3 schedulable hosts should span 3 distinct AZs, got %v", hosts[:3])
+}
 
 // --- HA control-plane orchestrator test doubles ---
 
@@ -32,9 +156,9 @@ type fakeHostScheduler struct {
 
 var _ HostScheduler = (*fakeHostScheduler)(nil)
 
-func (f *fakeHostScheduler) SchedulableHosts(string) []string { return f.hosts }
+func (f *fakeHostScheduler) SchedulableHosts(context.Context, string) []string { return f.hosts }
 
-func (f *fakeHostScheduler) InstanceHosts(ids []string) map[string]string {
+func (f *fakeHostScheduler) InstanceHosts(_ context.Context, ids []string) map[string]string {
 	out := make(map[string]string)
 	for _, id := range ids {
 		if f.notVisible[id] {
@@ -58,7 +182,7 @@ type seqK3sVPC struct {
 
 var _ k3sVPCProvisioner = (*seqK3sVPC)(nil)
 
-func (v *seqK3sVPC) CreateNetworkInterface(in *ec2.CreateNetworkInterfaceInput, _ string) (*ec2.CreateNetworkInterfaceOutput, error) {
+func (v *seqK3sVPC) CreateNetworkInterface(_ context.Context, in *ec2.CreateNetworkInterfaceInput, _ string) (*ec2.CreateNetworkInterfaceOutput, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.n++
@@ -69,18 +193,18 @@ func (v *seqK3sVPC) CreateNetworkInterface(in *ec2.CreateNetworkInterfaceInput, 
 	}}, nil
 }
 
-func (v *seqK3sVPC) DeleteNetworkInterface(in *ec2.DeleteNetworkInterfaceInput, _ string) (*ec2.DeleteNetworkInterfaceOutput, error) {
+func (v *seqK3sVPC) DeleteNetworkInterface(_ context.Context, in *ec2.DeleteNetworkInterfaceInput, _ string) (*ec2.DeleteNetworkInterfaceOutput, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.deleted = append(v.deleted, aws.StringValue(in.NetworkInterfaceId))
 	return &ec2.DeleteNetworkInterfaceOutput{}, nil
 }
 
-func (v *seqK3sVPC) DescribeNetworkInterfaces(*ec2.DescribeNetworkInterfacesInput, string) (*ec2.DescribeNetworkInterfacesOutput, error) {
+func (v *seqK3sVPC) DescribeNetworkInterfaces(context.Context, *ec2.DescribeNetworkInterfacesInput, string) (*ec2.DescribeNetworkInterfacesOutput, error) {
 	return &ec2.DescribeNetworkInterfacesOutput{}, nil
 }
 
-func (v *seqK3sVPC) DetachENI(_, _ string) error { return nil }
+func (v *seqK3sVPC) DetachENI(_ context.Context, _, _ string) error { return nil }
 
 // seqK3sInst returns instance ID "i-<nodeID>" so launches map deterministically
 // back to their target host. failNodes makes a node's launch return an error.
@@ -144,7 +268,7 @@ type fakePlacer struct {
 
 var _ controlPlanePlacer = (*fakePlacer)(nil)
 
-func (p *fakePlacer) CreatePlacementGroup(in *ec2.CreatePlacementGroupInput, _ string) (*ec2.CreatePlacementGroupOutput, error) {
+func (p *fakePlacer) CreatePlacementGroup(_ context.Context, in *ec2.CreatePlacementGroupInput, _ string) (*ec2.CreatePlacementGroupOutput, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.createGroups = append(p.createGroups, aws.StringValue(in.GroupName))
@@ -154,14 +278,14 @@ func (p *fakePlacer) CreatePlacementGroup(in *ec2.CreatePlacementGroupInput, _ s
 	return &ec2.CreatePlacementGroupOutput{}, nil
 }
 
-func (p *fakePlacer) DeletePlacementGroup(in *ec2.DeletePlacementGroupInput, _ string) (*ec2.DeletePlacementGroupOutput, error) {
+func (p *fakePlacer) DeletePlacementGroup(_ context.Context, in *ec2.DeletePlacementGroupInput, _ string) (*ec2.DeletePlacementGroupOutput, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.deleteGroups = append(p.deleteGroups, aws.StringValue(in.GroupName))
 	return &ec2.DeletePlacementGroupOutput{}, nil
 }
 
-func (p *fakePlacer) ReserveSpreadNodes(in *handlers_ec2_placementgroup.ReserveSpreadNodesInput, _ string) (*handlers_ec2_placementgroup.ReserveSpreadNodesOutput, error) {
+func (p *fakePlacer) ReserveSpreadNodes(_ context.Context, in *handlers_ec2_placementgroup.ReserveSpreadNodesInput, _ string) (*handlers_ec2_placementgroup.ReserveSpreadNodesOutput, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.reserveInputs = append(p.reserveInputs, in)
@@ -176,14 +300,14 @@ func (p *fakePlacer) ReserveSpreadNodes(in *handlers_ec2_placementgroup.ReserveS
 	return &handlers_ec2_placementgroup.ReserveSpreadNodesOutput{ReservedNodes: reserved}, nil
 }
 
-func (p *fakePlacer) ReleaseSpreadNodes(in *handlers_ec2_placementgroup.ReleaseSpreadNodesInput, _ string) (*handlers_ec2_placementgroup.ReleaseSpreadNodesOutput, error) {
+func (p *fakePlacer) ReleaseSpreadNodes(_ context.Context, in *handlers_ec2_placementgroup.ReleaseSpreadNodesInput, _ string) (*handlers_ec2_placementgroup.ReleaseSpreadNodesOutput, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.releaseInputs = append(p.releaseInputs, in)
 	return &handlers_ec2_placementgroup.ReleaseSpreadNodesOutput{}, nil
 }
 
-func (p *fakePlacer) FinalizeSpreadInstances(in *handlers_ec2_placementgroup.FinalizeSpreadInstancesInput, _ string) (*handlers_ec2_placementgroup.FinalizeSpreadInstancesOutput, error) {
+func (p *fakePlacer) FinalizeSpreadInstances(_ context.Context, in *handlers_ec2_placementgroup.FinalizeSpreadInstancesInput, _ string) (*handlers_ec2_placementgroup.FinalizeSpreadInstancesOutput, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.finalizeInputs = append(p.finalizeInputs, in)
@@ -193,7 +317,7 @@ func (p *fakePlacer) FinalizeSpreadInstances(in *handlers_ec2_placementgroup.Fin
 	return &handlers_ec2_placementgroup.FinalizeSpreadInstancesOutput{}, nil
 }
 
-func (p *fakePlacer) RemoveInstance(in *handlers_ec2_placementgroup.RemoveInstanceInput, _ string) (*handlers_ec2_placementgroup.RemoveInstanceOutput, error) {
+func (p *fakePlacer) RemoveInstance(_ context.Context, in *handlers_ec2_placementgroup.RemoveInstanceInput, _ string) (*handlers_ec2_placementgroup.RemoveInstanceOutput, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.removeInputs = append(p.removeInputs, in)
@@ -209,10 +333,10 @@ type seqK3sAMI struct {
 
 var _ k3sAMIResolver = (*seqK3sAMI)(nil)
 
-func (a *seqK3sAMI) DescribeImages(in *ec2.DescribeImagesInput, accountID string) (*ec2.DescribeImagesOutput, error) {
+func (a *seqK3sAMI) DescribeImages(_ context.Context, in *ec2.DescribeImagesInput, accountID string) (*ec2.DescribeImagesOutput, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.inner.DescribeImages(in, accountID)
+	return a.inner.DescribeImages(context.Background(), in, accountID)
 }
 
 func newPlacerService(sched HostScheduler, placer controlPlanePlacer, vpc k3sVPCProvisioner, inst k3sInstanceLauncher) *EKSServiceImpl {
@@ -242,7 +366,7 @@ func TestPlaceControlPlane_SpreadHappyPath(t *testing.T) {
 	inst := &seqK3sInst{}
 	svc := newPlacerService(sched, placer, vpc, inst)
 
-	nodes, group, err := svc.placeControlPlane(testHAAccountID, "alpha", validK3sInput())
+	nodes, group, err := svc.placeControlPlane(context.Background(), testHAAccountID, "alpha", validK3sInput())
 	require.NoError(t, err)
 	assert.Equal(t, "eks-cp-"+testHAAccountID+"-alpha", group)
 	require.Len(t, nodes, 3)
@@ -269,6 +393,35 @@ func TestPlaceControlPlane_SpreadHappyPath(t *testing.T) {
 	assert.Empty(t, inst.terminated)
 }
 
+// TestPlaceControlPlane_SpreadPrefersDistinctAZs runs placeControlPlane against
+// the real NATS-backed HostScheduler with 4 nodes across 3 AZs, and a placer
+// reserving what it is offered first, as ReserveSpreadNodes does.
+func TestPlaceControlPlane_SpreadPrefersDistinctAZs(t *testing.T) {
+	_, nc := testutil.StartTestNATS(t)
+	serveNodeStatus(t, nc, []types.NodeStatusResponse{
+		{Node: "node-a", AZ: "az-1", TotalVCPU: 32, TotalMemGB: 128},
+		{Node: "node-b", AZ: "az-1", TotalVCPU: 32, TotalMemGB: 128},
+		{Node: "node-c", AZ: "az-2", TotalVCPU: 32, TotalMemGB: 128},
+		{Node: "node-d", AZ: "az-3", TotalVCPU: 32, TotalMemGB: 128},
+	})
+	sched := NewNATSHostScheduler(nc)
+	placer := &fakePlacer{} // reserved unset: defaults to the first MaxCount EligibleNodes, like the real service.
+	vpc := &seqK3sVPC{}
+	inst := &seqK3sInst{}
+	svc := newPlacerService(sched, placer, vpc, inst)
+
+	nodes, _, err := svc.placeControlPlane(context.Background(), testHAAccountID, "alpha", validK3sInput())
+	require.NoError(t, err)
+	require.Len(t, nodes, 3)
+
+	azOf := map[string]string{"node-a": "az-1", "node-b": "az-1", "node-c": "az-2", "node-d": "az-3"}
+	seen := make(map[string]bool)
+	for _, n := range nodeIDs(nodes) {
+		seen[azOf[n]] = true
+	}
+	assert.Len(t, seen, 3, "the 3 control-plane members should land on 3 distinct AZs, got %v", nodeIDs(nodes))
+}
+
 func TestPlaceControlPlane_SpreadFirstInitsRestJoin(t *testing.T) {
 	sched := &fakeHostScheduler{hosts: []string{"node-a", "node-b", "node-c"}}
 	placer := &fakePlacer{reserved: []string{"node-a", "node-b", "node-c"}}
@@ -278,7 +431,7 @@ func TestPlaceControlPlane_SpreadFirstInitsRestJoin(t *testing.T) {
 
 	tmpl := validK3sInput()
 	tmpl.JoinToken = "sharedtok123"
-	_, _, err := svc.placeControlPlane(testHAAccountID, "alpha", tmpl)
+	_, _, err := svc.placeControlPlane(context.Background(), testHAAccountID, "alpha", tmpl)
 	require.NoError(t, err)
 
 	// node-a is reserved[0] → the first server: cluster-inits, no join URL.
@@ -305,10 +458,10 @@ func TestPlaceControlPlane_FirstServerFailureRollsBackNoJoins(t *testing.T) {
 	inst := &seqK3sInst{failNodes: map[string]bool{"node-a": true}}
 	svc := newPlacerService(sched, placer, &seqK3sVPC{}, inst)
 
-	nodes, group, err := svc.placeControlPlane(testHAAccountID, "alpha", validK3sInput())
+	nodes, group, err := svc.placeControlPlane(context.Background(), testHAAccountID, "alpha", validK3sInput())
 	require.Error(t, err)
 	assert.Nil(t, nodes)
-	assert.Equal(t, "", group)
+	assert.Empty(t, group)
 
 	// The first server never came up, so no join servers were launched and there
 	// is nothing to terminate; the reservation + group are still cleaned up.
@@ -326,11 +479,11 @@ func TestPlaceControlPlane_FallbackUnderThreeHosts(t *testing.T) {
 	inst := &seqK3sInst{}
 	svc := newPlacerService(sched, placer, &seqK3sVPC{}, inst)
 
-	nodes, group, err := svc.placeControlPlane(testHAAccountID, "alpha", validK3sInput())
+	nodes, group, err := svc.placeControlPlane(context.Background(), testHAAccountID, "alpha", validK3sInput())
 	require.NoError(t, err)
-	assert.Equal(t, "", group)
+	assert.Empty(t, group)
 	require.Len(t, nodes, 1)
-	assert.Equal(t, "", nodes[0].NodeID)
+	assert.Empty(t, nodes[0].NodeID)
 	assert.Equal(t, "i-local", nodes[0].InstanceID)
 
 	assert.Empty(t, placer.createGroups)
@@ -344,7 +497,7 @@ func TestPlaceControlPlane_BoundaryExactlyThree(t *testing.T) {
 	inst := &seqK3sInst{}
 	svc := newPlacerService(sched, placer, &seqK3sVPC{}, inst)
 
-	nodes, group, err := svc.placeControlPlane(testHAAccountID, "alpha", validK3sInput())
+	nodes, group, err := svc.placeControlPlane(context.Background(), testHAAccountID, "alpha", validK3sInput())
 	require.NoError(t, err)
 	assert.Equal(t, "eks-cp-"+testHAAccountID+"-alpha", group)
 	require.Len(t, nodes, 3)
@@ -358,10 +511,10 @@ func TestPlaceControlPlane_PartialLaunchRollsBack(t *testing.T) {
 	inst := &seqK3sInst{failNodes: map[string]bool{"node-c": true}}
 	svc := newPlacerService(sched, placer, &seqK3sVPC{}, inst)
 
-	nodes, group, err := svc.placeControlPlane(testHAAccountID, "alpha", validK3sInput())
+	nodes, group, err := svc.placeControlPlane(context.Background(), testHAAccountID, "alpha", validK3sInput())
 	require.Error(t, err)
 	assert.Nil(t, nodes)
-	assert.Equal(t, "", group)
+	assert.Empty(t, group)
 
 	assert.Len(t, inst.terminated, 2, "the two VMs that launched are terminated")
 	require.Len(t, placer.releaseInputs, 1)
@@ -376,11 +529,11 @@ func TestPlaceControlPlane_ReserveFailureFallsBackToSingle(t *testing.T) {
 	inst := &seqK3sInst{}
 	svc := newPlacerService(sched, placer, &seqK3sVPC{}, inst)
 
-	nodes, group, err := svc.placeControlPlane(testHAAccountID, "alpha", validK3sInput())
+	nodes, group, err := svc.placeControlPlane(context.Background(), testHAAccountID, "alpha", validK3sInput())
 	require.NoError(t, err)
-	assert.Equal(t, "", group)
+	assert.Empty(t, group)
 	require.Len(t, nodes, 1)
-	assert.Equal(t, "", nodes[0].NodeID)
+	assert.Empty(t, nodes[0].NodeID)
 
 	assert.Len(t, placer.createGroups, 1)
 	require.Len(t, placer.reserveInputs, 1)
@@ -397,10 +550,10 @@ func TestPlaceControlPlane_VerifyMismatchRollsBack(t *testing.T) {
 	inst := &seqK3sInst{}
 	svc := newPlacerService(sched, placer, &seqK3sVPC{}, inst)
 
-	nodes, group, err := svc.placeControlPlane(testHAAccountID, "alpha", validK3sInput())
+	nodes, group, err := svc.placeControlPlane(context.Background(), testHAAccountID, "alpha", validK3sInput())
 	require.Error(t, err)
 	assert.Nil(t, nodes)
-	assert.Equal(t, "", group)
+	assert.Empty(t, group)
 
 	assert.Len(t, inst.terminated, 3)
 	require.Len(t, placer.releaseInputs, 1)
@@ -417,7 +570,7 @@ func TestPlaceControlPlane_VerifyToleratesNotYetVisible(t *testing.T) {
 	inst := &seqK3sInst{}
 	svc := newPlacerService(sched, placer, &seqK3sVPC{}, inst)
 
-	nodes, group, err := svc.placeControlPlane(testHAAccountID, "alpha", validK3sInput())
+	nodes, group, err := svc.placeControlPlane(context.Background(), testHAAccountID, "alpha", validK3sInput())
 	require.NoError(t, err)
 	assert.Equal(t, "eks-cp-"+testHAAccountID+"-alpha", group)
 	require.Len(t, nodes, 3)
@@ -435,10 +588,10 @@ func TestPlaceControlPlane_FinalizeFailureRollsBack(t *testing.T) {
 	inst := &seqK3sInst{}
 	svc := newPlacerService(sched, placer, &seqK3sVPC{}, inst)
 
-	nodes, group, err := svc.placeControlPlane(testHAAccountID, "alpha", validK3sInput())
+	nodes, group, err := svc.placeControlPlane(context.Background(), testHAAccountID, "alpha", validK3sInput())
 	require.Error(t, err)
 	assert.Nil(t, nodes)
-	assert.Equal(t, "", group)
+	assert.Empty(t, group)
 
 	assert.Len(t, inst.terminated, 3)
 	require.Len(t, placer.finalizeInputs, 1)
@@ -479,13 +632,13 @@ func TestTeardownSpreadGroup(t *testing.T) {
 			{NodeID: "n3", InstanceID: "i-3"},
 		},
 	}
-	svc.teardownSpreadGroup(meta)
+	svc.teardownSpreadGroup(context.Background(), meta)
 	assert.Len(t, placer.removeInputs, 3)
 	assert.Equal(t, []string{meta.ControlPlaneSpreadGroup}, placer.deleteGroups)
 
 	noGroup := &fakePlacer{}
 	svc2 := &EKSServiceImpl{deps: EKSServiceDeps{PlacementGroup: noGroup}}
-	svc2.teardownSpreadGroup(&ClusterMeta{})
+	svc2.teardownSpreadGroup(context.Background(), &ClusterMeta{})
 	assert.Empty(t, noGroup.removeInputs)
 	assert.Empty(t, noGroup.deleteGroups)
 }
@@ -535,4 +688,76 @@ func TestSpecForSystemType_RejectsNonSystem(t *testing.T) {
 	assert.False(t, ok, "customer types are not system types")
 	_, _, ok = instancetypes.SpecForSystemType("sys.nonexistent")
 	assert.False(t, ok, "unknown system size has no spec")
+}
+
+func TestProvisionFreshControlPlane_ClusterInitNoJoin(t *testing.T) {
+	sched := &fakeHostScheduler{hosts: []string{"node-a", "node-b"}}
+	inst := &seqK3sInst{}
+	svc := newPlacerService(sched, &fakePlacer{}, &seqK3sVPC{}, inst)
+	// IAM is unwired here, so the launch re-derives static system creds from
+	// deps (as ProvisionReplacementCP/CreateCluster do).
+	svc.deps.SystemAccessKey = "AKIATEST"
+	svc.deps.SystemSecretKey = "secret"
+	tmpl := validK3sInput()
+
+	node, err := svc.ProvisionFreshControlPlane(context.Background(), FreshCPRequest{
+		ClusterName:  "alpha",
+		Template:     &tmpl,
+		ExcludeHosts: []string{"node-a"},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "node-b", node.NodeID, "placed on the one non-excluded host")
+	assert.Equal(t, "i-node-b", node.InstanceID)
+	assert.NotEmpty(t, node.ENIID, "fresh CP carries a fresh ENI")
+	ud := inst.userData["node-b"]
+	assert.Contains(t, ud, "cluster-init: true", "fresh CP seeds a new single-member etcd, not a join")
+	assert.NotContains(t, ud, "server: https://", "must not join a (nonexistent) survivor")
+	assert.Contains(t, ud, "EKS_ACCESS_KEY=AKIATEST", "re-derives system creds like ProvisionReplacementCP")
+	assert.Contains(t, ud, "SPINIFEX_PREDASTORE_AKID=AKIATEST", "re-derives predastore creds too")
+}
+
+func TestProvisionFreshControlPlane_NoFreeHostErrors(t *testing.T) {
+	// Two hosts, both excluded: genuinely nothing schedulable. A single
+	// excluded host is covered separately since that falls back to it
+	// (single-node topology).
+	sched := &fakeHostScheduler{hosts: []string{"node-a", "node-b"}}
+	svc := newPlacerService(sched, &fakePlacer{}, &seqK3sVPC{}, &seqK3sInst{})
+	svc.deps.SystemAccessKey = "AKIATEST"
+	svc.deps.SystemSecretKey = "secret"
+	tmpl := validK3sInput()
+
+	_, err := svc.ProvisionFreshControlPlane(context.Background(), FreshCPRequest{
+		ClusterName:  "alpha",
+		Template:     &tmpl,
+		ExcludeHosts: []string{"node-a", "node-b"},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no schedulable host")
+}
+
+func TestProvisionFreshControlPlane_SingleHostFallsBack(t *testing.T) {
+	// Single-node deployment: the only schedulable host is also the excluded
+	// (old CP) host. pickReplacementHost falls back to it rather than erroring.
+	sched := &fakeHostScheduler{hosts: []string{"node-a"}}
+	svc := newPlacerService(sched, &fakePlacer{}, &seqK3sVPC{}, &seqK3sInst{})
+	svc.deps.SystemAccessKey = "AKIATEST"
+	svc.deps.SystemSecretKey = "secret"
+	tmpl := validK3sInput()
+
+	node, err := svc.ProvisionFreshControlPlane(context.Background(), FreshCPRequest{
+		ClusterName:  "alpha",
+		Template:     &tmpl,
+		ExcludeHosts: []string{"node-a"},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "node-a", node.NodeID)
+}
+
+func TestProvisionFreshControlPlane_NilTemplateRejected(t *testing.T) {
+	svc := newPlacerService(&fakeHostScheduler{}, &fakePlacer{}, &seqK3sVPC{}, &seqK3sInst{})
+	_, err := svc.ProvisionFreshControlPlane(context.Background(), FreshCPRequest{ClusterName: "alpha"})
+	require.Error(t, err, "nil template rejected")
 }

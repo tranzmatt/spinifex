@@ -1,7 +1,10 @@
 package handlers_eks
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,10 +15,55 @@ import (
 	"github.com/aws/aws-sdk-go/service/eks"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
+	"github.com/mulgadc/spinifex/spinifex/tags"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// filteringK3sAMI applies its Filters against each image's tags, mirroring
+// AWS server-side tag filtering. fakeK3sAMI ignores Filters and returns every
+// image regardless, which cannot distinguish a GPU-tagged AMI from a plain one
+// when both are present — needed to verify the worker-launch path actually
+// threads the gpu-vendor filter through to DescribeImages.
+type filteringK3sAMI struct {
+	images []*ec2.Image
+}
+
+var _ k3sAMIResolver = (*filteringK3sAMI)(nil)
+
+func (f *filteringK3sAMI) DescribeImages(_ context.Context, input *ec2.DescribeImagesInput, _ string) (*ec2.DescribeImagesOutput, error) {
+	out := &ec2.DescribeImagesOutput{}
+	for _, img := range f.images {
+		if k3sImageMatchesFilters(img, input.Filters) {
+			out.Images = append(out.Images, img)
+		}
+	}
+	return out, nil
+}
+
+func k3sImageMatchesFilters(img *ec2.Image, filters []*ec2.Filter) bool {
+	tagVals := map[string]string{}
+	for _, t := range img.Tags {
+		tagVals[aws.StringValue(t.Key)] = aws.StringValue(t.Value)
+	}
+	for _, f := range filters {
+		name := aws.StringValue(f.Name)
+		const prefix = "tag:"
+		if len(name) <= len(prefix) || name[:len(prefix)] != prefix {
+			continue
+		}
+		val, ok := tagVals[name[len(prefix):]]
+		if !ok {
+			return false
+		}
+		matched := slices.Contains(aws.StringValueSlice(f.Values), val)
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
 
 // fakeWorkerLauncher records RunWorkerInstance / TerminateWorkerInstances calls
 // and hands back sequential instance IDs so tests can assert on the IDs a
@@ -24,11 +72,16 @@ import (
 type fakeWorkerLauncher struct {
 	mu             sync.Mutex
 	runCalls       []*ec2.RunInstancesInput
+	runNodes       []string
 	terminateCalls [][]string
 
 	nextID  int
 	runErr  error
 	termErr error
+	// failNextN makes the next N RunWorkerInstanceOnNode calls fail with runErr
+	// before subsequent calls succeed — simulates a transient launch failure
+	// (QMP timeout, host pressure) that clears on retry.
+	failNextN int
 }
 
 var _ WorkerLauncher = (*fakeWorkerLauncher)(nil)
@@ -37,10 +90,26 @@ func newFakeWorkerLauncher() *fakeWorkerLauncher {
 	return &fakeWorkerLauncher{}
 }
 
-func (f *fakeWorkerLauncher) RunWorkerInstance(input *ec2.RunInstancesInput, _ string) (*ec2.Reservation, error) {
+func (f *fakeWorkerLauncher) RunWorkerInstance(ctx context.Context, input *ec2.RunInstancesInput, accountID string) (*ec2.Reservation, error) {
+	return f.RunWorkerInstanceOnNode(ctx, "", input, accountID)
+}
+
+func (f *fakeWorkerLauncher) RunWorkerInstanceOnNode(_ context.Context, nodeID string, input *ec2.RunInstancesInput, _ string) (*ec2.Reservation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.runCalls = append(f.runCalls, input)
+	f.runNodes = append(f.runNodes, nodeID)
+	if f.failNextN > 0 {
+		f.failNextN--
+		err := f.runErr
+		if f.failNextN == 0 {
+			// Transient window exhausted: clear runErr so later calls succeed
+			// unless the test also wants a permanent failure (it wouldn't set
+			// failNextN in that case).
+			f.runErr = nil
+		}
+		return nil, err
+	}
 	if f.runErr != nil {
 		return nil, f.runErr
 	}
@@ -49,7 +118,7 @@ func (f *fakeWorkerLauncher) RunWorkerInstance(input *ec2.RunInstancesInput, _ s
 	return &ec2.Reservation{Instances: []*ec2.Instance{{InstanceId: aws.String(id)}}}, nil
 }
 
-func (f *fakeWorkerLauncher) TerminateWorkerInstances(ids []string, _ string) error {
+func (f *fakeWorkerLauncher) TerminateWorkerInstances(_ context.Context, ids []string, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.terminateCalls = append(f.terminateCalls, ids)
@@ -90,21 +159,22 @@ func seedActiveClusterWithToken(t *testing.T, f *eksServiceFixture, cluster stri
 			VpcId:     "vpc-aaa",
 		},
 	}
-	require.NoError(t, PutClusterMeta(f.kv, meta))
+	require.NoError(t, PutClusterMeta(t.Context(), f.kv, meta))
 
 	ct, err := handlers_iam.EncryptSecret("K10node-join-token::server:abc", bootstrapTestMasterKey)
 	require.NoError(t, err)
-	_, err = f.kv.Put(NodeTokenKey(cluster), []byte(ct))
+	_, err = f.kv.Put(t.Context(), NodeTokenKey(cluster), []byte(ct))
 	require.NoError(t, err)
 }
 
-// markWorkersReady simulates the cluster reconciler observing n Ready nodes from
-// the CP state report, so launchNodegroupInfra's Ready-gate (waitWorkersReady)
-// can resolve. Seed clusters start at NodeCount 0, so n is the create baseline
-// (0) plus the worker count the test expects Ready.
-func markWorkersReady(t *testing.T, f *eksServiceFixture, cluster string, n int) {
+// markWorkersReady simulates the cluster reconciler observing n Ready nodes,
+// scoped to nodegroup ng's eks.amazonaws.com/nodegroup label, from the CP state
+// report, so launchNodegroupInfra's Ready-gate (waitWorkersReady) can resolve.
+// Seed clusters start at NodeCount/NodegroupNodeCounts 0, so n is the create
+// baseline (0) plus the worker count the test expects Ready.
+func markWorkersReady(t *testing.T, f *eksServiceFixture, cluster, ng string, n int) {
 	t.Helper()
-	require.NoError(t, SetClusterHealthState(f.kv, cluster, "", n))
+	require.NoError(t, SetClusterHealthState(t.Context(), f.kv, cluster, "", n, map[string]int{ng: n}))
 }
 
 func createNGInput(cluster, ng string, desired int64) *eks.CreateNodegroupInput {
@@ -127,25 +197,25 @@ func TestReclaimOrphanedNodegroups_TerminatesStrandedWorkers(t *testing.T) {
 	seedActiveClusterWithToken(t, f, cluster)
 
 	// CREATING left behind by a crashed launcher, workers already recorded.
-	require.NoError(t, PutNodegroupRecord(f.kv, &NodegroupRecord{
+	require.NoError(t, PutNodegroupRecord(t.Context(), f.kv, &NodegroupRecord{
 		ClusterName: cluster, Name: "ng-stuck",
 		Status:      eks.NodegroupStatusCreating,
 		InstanceIDs: []string{"i-worker1", "i-worker2"},
 	}))
 	// CREATE_FAILED that still holds a partially-launched worker.
-	require.NoError(t, PutNodegroupRecord(f.kv, &NodegroupRecord{
+	require.NoError(t, PutNodegroupRecord(t.Context(), f.kv, &NodegroupRecord{
 		ClusterName: cluster, Name: "ng-failed",
 		Status:      eks.NodegroupStatusCreateFailed,
 		InstanceIDs: []string{"i-worker3"},
 	}))
 	// ACTIVE must be left untouched.
-	require.NoError(t, PutNodegroupRecord(f.kv, &NodegroupRecord{
+	require.NoError(t, PutNodegroupRecord(t.Context(), f.kv, &NodegroupRecord{
 		ClusterName: cluster, Name: "ng-active",
 		Status:      eks.NodegroupStatusActive,
 		InstanceIDs: []string{"i-worker9"},
 	}))
 
-	f.svc.reclaimOrphanedNodegroups(testAccountID, f.kv, cluster)
+	f.svc.reclaimOrphanedNodegroups(context.Background(), testAccountID, f.kv, cluster)
 
 	var terminated []string
 	for _, call := range f.worker.terminateCalls {
@@ -154,21 +224,22 @@ func TestReclaimOrphanedNodegroups_TerminatesStrandedWorkers(t *testing.T) {
 	assert.ElementsMatch(t, []string{"i-worker1", "i-worker2", "i-worker3"}, terminated)
 
 	for _, ng := range []string{"ng-stuck", "ng-failed"} {
-		got, err := GetNodegroupRecord(f.kv, cluster, ng)
+		got, err := GetNodegroupRecord(t.Context(), f.kv, cluster, ng)
 		require.NoError(t, err)
 		assert.Equal(t, eks.NodegroupStatusCreateFailed, got.Status, ng)
 		assert.Empty(t, got.InstanceIDs, ng)
 	}
 
-	got, err := GetNodegroupRecord(f.kv, cluster, "ng-active")
+	got, err := GetNodegroupRecord(t.Context(), f.kv, cluster, "ng-active")
 	require.NoError(t, err)
 	assert.Equal(t, eks.NodegroupStatusActive, got.Status)
 	assert.Equal(t, []string{"i-worker9"}, got.InstanceIDs)
 }
 
 func TestNodegroupRecord_CRUDRoundTrip(t *testing.T) {
-	_, _, js := testutil.StartTestJetStream(t)
-	kv, err := GetOrCreateAccountBucket(js, testAccountID)
+	_, nc, _ := testutil.StartTestJetStream(t)
+	js := testutil.NewJetStream(t, nc)
+	kv, err := GetOrCreateAccountBucket(t.Context(), js, testAccountID, 1)
 	require.NoError(t, err)
 
 	rec := &NodegroupRecord{
@@ -183,24 +254,24 @@ func TestNodegroupRecord_CRUDRoundTrip(t *testing.T) {
 		ScalingDesired: 2,
 		InstanceIDs:    []string{"i-1", "i-2"},
 	}
-	require.NoError(t, PutNodegroupRecord(kv, rec))
+	require.NoError(t, PutNodegroupRecord(t.Context(), kv, rec))
 
-	got, err := GetNodegroupRecord(kv, "c1", "ng1")
+	got, err := GetNodegroupRecord(t.Context(), kv, "c1", "ng1")
 	require.NoError(t, err)
 	assert.Equal(t, rec.InstanceIDs, got.InstanceIDs)
 	assert.Equal(t, int64(2), got.ScalingDesired)
 
-	list, err := ListNodegroupRecords(kv, "c1")
+	list, err := ListNodegroupRecords(t.Context(), kv, "c1")
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	assert.Equal(t, "ng1", list[0].Name)
 
-	require.NoError(t, DeleteNodegroupRecord(kv, "c1", "ng1"))
-	_, err = GetNodegroupRecord(kv, "c1", "ng1")
+	require.NoError(t, DeleteNodegroupRecord(t.Context(), kv, "c1", "ng1"))
+	_, err = GetNodegroupRecord(t.Context(), kv, "c1", "ng1")
 	assert.ErrorIs(t, err, ErrNodegroupNotFound)
 
 	// Delete of an absent record is idempotent.
-	require.NoError(t, DeleteNodegroupRecord(kv, "c1", "ng1"))
+	require.NoError(t, DeleteNodegroupRecord(t.Context(), kv, "c1", "ng1"))
 }
 
 func TestBuildAgentUserData_Shape(t *testing.T) {
@@ -217,7 +288,7 @@ func TestBuildAgentUserData_Shape(t *testing.T) {
 	assert.Contains(t, ud, "K3S_URL=https://10.254.0.9:443")
 	assert.Contains(t, ud, "K3S_TOKEN=K10secret::server:xyz")
 	assert.Contains(t, ud, "K3S_NODE_NAME=c1-ng1-abc123de")
-	assert.Contains(t, ud, "eks.amazonaws.com/nodegroup=ng1")
+	assert.Contains(t, ud, "SPINIFEX_NODEGROUP=ng1")
 	assert.Contains(t, ud, agentEnvPath)
 	// IMDS is served at the host tap, so no in-guest on-link route is emitted.
 	assert.NotContains(t, ud, "169.254.169.254")
@@ -229,7 +300,7 @@ func TestBuildAgentUserData_Shape(t *testing.T) {
 func TestEnsureNodegroupSGRules_AuthorizesExpectedRules(t *testing.T) {
 	sg := newFakeSGProvisioner()
 
-	require.NoError(t, EnsureNodegroupSGRules(sg, testAccountID, "c1", "sg-cp", "sg-ng"))
+	require.NoError(t, EnsureNodegroupSGRules(context.Background(), sg, testAccountID, "c1", "sg-cp", "sg-ng"))
 
 	require.Len(t, sg.authorizeCalls, 6)
 
@@ -254,7 +325,7 @@ func TestEnsureNodegroupSGRules_DuplicateRuleTolerated(t *testing.T) {
 	sg := newFakeSGProvisioner()
 	sg.authorizeErr = errors.New(awserrors.ErrorInvalidPermissionDuplicate)
 
-	require.NoError(t, EnsureNodegroupSGRules(sg, testAccountID, "c1", "sg-cp", "sg-ng"),
+	require.NoError(t, EnsureNodegroupSGRules(context.Background(), sg, testAccountID, "c1", "sg-cp", "sg-ng"),
 		"duplicate-rule error must be treated as success")
 }
 
@@ -262,7 +333,7 @@ func TestCreateNodegroup_HappyPath(t *testing.T) {
 	f := newEKSServiceFixture(t)
 	seedActiveClusterWithToken(t, f, "c1")
 
-	out, err := f.svc.CreateNodegroup(createNGInput("c1", "ng1", 2), testAccountID)
+	out, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 2), testAccountID)
 	require.NoError(t, err)
 	require.NotNil(t, out.Nodegroup)
 	// The create accepts the request as CREATING; worker launch runs async.
@@ -271,17 +342,17 @@ func TestCreateNodegroup_HappyPath(t *testing.T) {
 	assert.Contains(t, aws.StringValue(out.Nodegroup.NodegroupArn), ":nodegroup/c1/ng1/")
 
 	// Both workers register Ready → the Ready-gate lets the nodegroup go ACTIVE.
-	markWorkersReady(t, f, "c1", 2)
+	markWorkersReady(t, f, "c1", "ng1", 2)
 	f.svc.WaitLaunches()
 
 	// The async launch transitions the record to ACTIVE once workers run.
-	active, err := GetNodegroupRecord(f.kv, "c1", "ng1")
+	active, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng1")
 	require.NoError(t, err)
 	assert.Equal(t, eks.NodegroupStatusActive, active.Status)
 
 	// Two workers launched and tracked.
 	assert.Len(t, f.worker.runCalls, 2)
-	rec, err := GetNodegroupRecord(f.kv, "c1", "ng1")
+	rec, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng1")
 	require.NoError(t, err)
 	assert.Len(t, rec.InstanceIDs, 2)
 
@@ -300,8 +371,211 @@ func TestCreateNodegroup_HappyPath(t *testing.T) {
 	assert.NotEmpty(t, f.sg.authorizeCalls)
 
 	// Duplicate create → ResourceInUseException.
-	_, err = f.svc.CreateNodegroup(createNGInput("c1", "ng1", 2), testAccountID)
+	_, err = f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 2), testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceInUse)
+}
+
+// Omitting diskSize must fall back to the AWS default rather than 0. A 0 skips
+// the block device mapping entirely, which drops the worker onto the AMI's own
+// volume — sized to hold the image and nothing else.
+func TestCreateNodegroup_OmittedDiskSizeUsesAWSDefault(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	seedActiveClusterWithToken(t, f, "c1")
+
+	// createNGInput leaves DiskSize nil, which is the case being covered.
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 1), testAccountID)
+	require.NoError(t, err)
+
+	rec, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng1")
+	require.NoError(t, err)
+	assert.Equal(t, int64(defaultNodegroupDiskSizeGiB), rec.DiskSize)
+
+	markWorkersReady(t, f, "c1", "ng1", 1)
+	f.svc.WaitLaunches()
+
+	// The default has to reach the launch, not just the record.
+	require.Len(t, f.worker.runCalls, 1)
+	bdms := f.worker.runCalls[0].BlockDeviceMappings
+	require.Len(t, bdms, 1, "a defaulted diskSize must still produce a block device mapping")
+	assert.Equal(t, int64(defaultNodegroupDiskSizeGiB), aws.Int64Value(bdms[0].Ebs.VolumeSize))
+}
+
+// A GPU instance type must mark the record GPUEnabled with the matching
+// vendor, so the worker-launch path resolves the GPU node AMI instead of the
+// default eks-node AMI.
+func TestCreateNodegroup_GPUInstanceTypeSetsGPUFields(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	seedActiveClusterWithToken(t, f, "c1")
+
+	in := createNGInput("c1", "ng-gpu", 1)
+	in.InstanceTypes = aws.StringSlice([]string{"g5.xlarge"})
+
+	_, err := f.svc.CreateNodegroup(context.Background(), in, testAccountID)
+	require.NoError(t, err)
+
+	rec, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng-gpu")
+	require.NoError(t, err)
+	assert.True(t, rec.GPUEnabled)
+	assert.Equal(t, "nvidia", rec.GPUVendor)
+
+	markWorkersReady(t, f, "c1", "ng-gpu", 1)
+	f.svc.WaitLaunches()
+}
+
+// A GPU nodegroup create must auto-stage the nvidia-device-plugin addon so
+// GPU-tainted nodes get nvidia.com/gpu allocatable without a manual CreateAddon.
+func TestCreateNodegroup_GPUNodegroupStagesDevicePluginAddon(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	seedActiveClusterWithToken(t, f, "c1")
+
+	in := createNGInput("c1", "ng-gpu", 1)
+	in.InstanceTypes = aws.StringSlice([]string{"g5.xlarge"})
+
+	_, err := f.svc.CreateNodegroup(context.Background(), in, testAccountID)
+	require.NoError(t, err)
+
+	markWorkersReady(t, f, "c1", "ng-gpu", 1)
+	f.svc.WaitLaunches()
+
+	rec, err := GetAddonRecord(t.Context(), f.kv, "c1", nvidiaDevicePluginAddonName)
+	require.NoError(t, err, "nvidia-device-plugin must be staged for a GPU nodegroup")
+	assert.Equal(t, "0.17.4", rec.AddonVersion)
+}
+
+// A non-GPU nodegroup create must not stage nvidia-device-plugin — it stays
+// dormant on non-GPU clusters, and it isn't user-visible in the catalog.
+func TestCreateNodegroup_NonGPUNodegroupDoesNotStageDevicePluginAddon(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	seedActiveClusterWithToken(t, f, "c1")
+
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 1), testAccountID)
+	require.NoError(t, err)
+
+	markWorkersReady(t, f, "c1", "ng1", 1)
+	f.svc.WaitLaunches()
+
+	_, err = GetAddonRecord(t.Context(), f.kv, "c1", nvidiaDevicePluginAddonName)
+	require.ErrorIs(t, err, ErrAddonNotFound)
+}
+
+// A non-GPU instance type must leave the record's GPU fields unset, so the
+// worker-launch path keeps resolving the default eks-node AMI.
+func TestCreateNodegroup_NonGPUInstanceTypeClearsGPUFields(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	seedActiveClusterWithToken(t, f, "c1")
+
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 1), testAccountID)
+	require.NoError(t, err)
+
+	rec, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng1")
+	require.NoError(t, err)
+	assert.False(t, rec.GPUEnabled)
+	assert.Empty(t, rec.GPUVendor)
+
+	markWorkersReady(t, f, "c1", "ng1", 1)
+	f.svc.WaitLaunches()
+}
+
+// DescribeNodegroup must surface GPU-ness to API clients via amiType, the
+// real AWS field EKS uses to signal a GPU-flavored node AMI — even though the
+// caller requested the plain AL2_x86_64 default.
+func TestCreateNodegroup_GPUInstanceTypeExposesGPUAmiTypeInDescribe(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	seedActiveClusterWithToken(t, f, "c1")
+
+	in := createNGInput("c1", "ng-gpu", 1)
+	in.InstanceTypes = aws.StringSlice([]string{"g5.xlarge"})
+
+	_, err := f.svc.CreateNodegroup(context.Background(), in, testAccountID)
+	require.NoError(t, err)
+
+	out, err := f.svc.DescribeNodegroup(context.Background(), &eks.DescribeNodegroupInput{
+		ClusterName:   aws.String("c1"),
+		NodegroupName: aws.String("ng-gpu"),
+	}, testAccountID)
+	require.NoError(t, err)
+	assert.Equal(t, eks.AMITypesAl2X8664Gpu, aws.StringValue(out.Nodegroup.AmiType))
+
+	markWorkersReady(t, f, "c1", "ng-gpu", 1)
+	f.svc.WaitLaunches()
+}
+
+// A non-GPU nodegroup's DescribeNodegroup response must keep the plain amiType
+// so the UI does not mistake it for a GPU nodegroup.
+func TestCreateNodegroup_NonGPUInstanceTypeKeepsPlainAmiTypeInDescribe(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	seedActiveClusterWithToken(t, f, "c1")
+
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 1), testAccountID)
+	require.NoError(t, err)
+
+	out, err := f.svc.DescribeNodegroup(context.Background(), &eks.DescribeNodegroupInput{
+		ClusterName:   aws.String("c1"),
+		NodegroupName: aws.String("ng1"),
+	}, testAccountID)
+	require.NoError(t, err)
+	assert.Equal(t, eks.AMITypesAl2X8664, aws.StringValue(out.Nodegroup.AmiType))
+
+	markWorkersReady(t, f, "c1", "ng1", 1)
+	f.svc.WaitLaunches()
+}
+
+// End-to-end: a GPU nodegroup's worker launch must resolve the GPU-tagged AMI
+// over a coexisting plain eks-node AMI, not merely set the record's GPU fields.
+func TestCreateNodegroup_GPUWorkerLaunchUsesGPUAMI(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	seedActiveClusterWithToken(t, f, "c1")
+
+	f.svc.deps.Image = &filteringK3sAMI{images: []*ec2.Image{
+		{ImageId: aws.String("ami-eks-plain"), CreationDate: aws.String("2026-01-01T00:00:00.000Z"),
+			Tags: []*ec2.Tag{{Key: aws.String(tags.ManagedByKey), Value: aws.String(tags.ManagedByEKS)}}},
+		{ImageId: aws.String("ami-eks-gpu"), CreationDate: aws.String("2026-06-01T00:00:00.000Z"),
+			Tags: []*ec2.Tag{
+				{Key: aws.String(tags.ManagedByKey), Value: aws.String(tags.ManagedByEKS)},
+				{Key: aws.String(tags.GPUVendorKey), Value: aws.String(tags.GPUVendorNVIDIA)},
+			}},
+	}}
+
+	in := createNGInput("c1", "ng-gpu", 1)
+	in.InstanceTypes = aws.StringSlice([]string{"g5.xlarge"})
+	_, err := f.svc.CreateNodegroup(context.Background(), in, testAccountID)
+	require.NoError(t, err)
+
+	markWorkersReady(t, f, "c1", "ng-gpu", 1)
+	f.svc.WaitLaunches()
+
+	rec, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng-gpu")
+	require.NoError(t, err)
+	assert.Equal(t, eks.NodegroupStatusActive, rec.Status)
+
+	require.Len(t, f.worker.runCalls, 1)
+	assert.Equal(t, "ami-eks-gpu", aws.StringValue(f.worker.runCalls[0].ImageId))
+}
+
+// A GPU nodegroup with no matching GPU AMI must fail, never fall back to the
+// plain eks-node AMI (running a GPU workload on a driverless image is worse
+// than a clear failure).
+func TestCreateNodegroup_GPUWorkerLaunchNoGPUAMINoFallback(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	seedActiveClusterWithToken(t, f, "c1")
+
+	f.svc.deps.Image = &filteringK3sAMI{images: []*ec2.Image{
+		{ImageId: aws.String("ami-eks-plain"), CreationDate: aws.String("2026-01-01T00:00:00.000Z"),
+			Tags: []*ec2.Tag{{Key: aws.String(tags.ManagedByKey), Value: aws.String(tags.ManagedByEKS)}}},
+	}}
+
+	in := createNGInput("c1", "ng-gpu", 1)
+	in.InstanceTypes = aws.StringSlice([]string{"g5.xlarge"})
+	_, err := f.svc.CreateNodegroup(context.Background(), in, testAccountID)
+	require.NoError(t, err)
+
+	f.svc.WaitLaunches()
+
+	rec, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng-gpu")
+	require.NoError(t, err)
+	assert.Equal(t, eks.NodegroupStatusCreateFailed, rec.Status)
+	assert.Contains(t, rec.StatusReason, "resolve eks-node AMI")
+	assert.Empty(t, f.worker.runCalls, "no worker must launch on the driverless plain AMI")
 }
 
 // Workers that launch but never register Ready (no rise in the cluster's Ready-
@@ -311,17 +585,95 @@ func TestCreateNodegroup_WorkersNeverReady_CreateFailed(t *testing.T) {
 	f := newEKSServiceFixture(t)
 	seedActiveClusterWithToken(t, f, "c1")
 
-	_, err := f.svc.CreateNodegroup(createNGInput("c1", "ng1", 2), testAccountID)
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 2), testAccountID)
 	require.NoError(t, err)
 
 	// No markWorkersReady → NodeCount stays at the baseline; the Ready-gate times out.
 	f.svc.WaitLaunches()
 
-	rec, err := GetNodegroupRecord(f.kv, "c1", "ng1")
+	rec, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng1")
 	require.NoError(t, err)
 	assert.Equal(t, eks.NodegroupStatusCreateFailed, rec.Status)
 	assert.Contains(t, rec.StatusReason, "did not become Ready")
 	assert.Len(t, rec.InstanceIDs, 2, "launched workers retained for the reclaim path")
+}
+
+// The Ready-gate must be scoped to each nodegroup's OWN workers
+// (eks.amazonaws.com/nodegroup=<name>), never a cluster-wide tally: one
+// nodegroup's Ready nodes must never mask another nodegroup whose own workers
+// never registered. Regresses a bug where waitWorkersReady compared against the
+// global cluster Ready-node count, so ng-a's Ready worker could have falsely
+// satisfied ng-b's gate too.
+func TestCreateNodegroup_ReadyGateScopedPerNodegroupNotGlobal(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	seedActiveClusterWithToken(t, f, "c1")
+
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng-a", 1), testAccountID)
+	require.NoError(t, err)
+	_, err = f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng-b", 1), testAccountID)
+	require.NoError(t, err)
+
+	// Only ng-a's worker registers Ready; ng-b's worker never does. If the
+	// Ready-gate were still scoped globally, the cluster-wide count (1) would
+	// wrongly satisfy ng-b's gate too.
+	markWorkersReady(t, f, "c1", "ng-a", 1)
+	f.svc.WaitLaunches()
+
+	ngA, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng-a")
+	require.NoError(t, err)
+	assert.Equal(t, eks.NodegroupStatusActive, ngA.Status, "ng-a's own Ready worker must activate it")
+
+	ngB, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng-b")
+	require.NoError(t, err)
+	assert.Equal(t, eks.NodegroupStatusCreateFailed, ngB.Status,
+		"ng-b must not be marked ACTIVE by ng-a's Ready nodes — its own workers never registered")
+	assert.Contains(t, ngB.StatusReason, "did not become Ready")
+}
+
+// A worker launch that fails transiently (QMP timeout / host pressure) must be
+// retried, not abandon the nodegroup at its first failed RunInstances call —
+// the relaunch converges to desired capacity within the retry budget.
+func TestCreateNodegroup_RelaunchesOnWorkerLaunchFailure(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	seedActiveClusterWithToken(t, f, "c1")
+
+	// The first RunInstances call fails; the retry must relaunch the shortfall
+	// and succeed on its next attempt instead of leaving the nodegroup stuck.
+	f.worker.runErr = errors.New("qmp: timeout waiting for launch")
+	f.worker.failNextN = 1
+
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 1), testAccountID)
+	require.NoError(t, err)
+
+	markWorkersReady(t, f, "c1", "ng1", 1)
+	f.svc.WaitLaunches()
+
+	rec, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng1")
+	require.NoError(t, err)
+	assert.Equal(t, eks.NodegroupStatusActive, rec.Status,
+		"the retried launch must converge to ACTIVE, not CREATE_FAILED")
+	assert.Len(t, rec.InstanceIDs, 1)
+	assert.GreaterOrEqual(t, len(f.worker.runCalls), 2, "must have retried after the first failed launch")
+}
+
+// A worker launch that keeps failing must still terminate (CREATE_FAILED) once
+// the retry budget is exhausted — retrying must never hang the nodegroup
+// forever — while having genuinely retried at least once before giving up.
+func TestCreateNodegroup_WorkerLaunchFailureExhaustsRetryBudget(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	seedActiveClusterWithToken(t, f, "c1")
+
+	f.worker.runErr = errors.New("qmp: timeout waiting for launch")
+
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 1), testAccountID)
+	require.NoError(t, err)
+	f.svc.WaitLaunches()
+
+	rec, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng1")
+	require.NoError(t, err)
+	assert.Equal(t, eks.NodegroupStatusCreateFailed, rec.Status)
+	assert.Contains(t, rec.StatusReason, "worker launch shortfall after")
+	assert.Greater(t, len(f.worker.runCalls), 1, "must have retried at least once before giving up")
 }
 
 func TestCreateNodegroup_DiskSizePropagatesToBlockDeviceMapping(t *testing.T) {
@@ -330,10 +682,10 @@ func TestCreateNodegroup_DiskSizePropagatesToBlockDeviceMapping(t *testing.T) {
 
 	in := createNGInput("c1", "ng1", 1)
 	in.DiskSize = aws.Int64(30)
-	_, err := f.svc.CreateNodegroup(in, testAccountID)
+	_, err := f.svc.CreateNodegroup(context.Background(), in, testAccountID)
 	require.NoError(t, err)
 
-	markWorkersReady(t, f, "c1", 1)
+	markWorkersReady(t, f, "c1", "ng1", 1)
 	f.svc.WaitLaunches()
 
 	require.Len(t, f.worker.runCalls, 1)
@@ -343,60 +695,45 @@ func TestCreateNodegroup_DiskSizePropagatesToBlockDeviceMapping(t *testing.T) {
 	assert.Equal(t, int64(30), aws.Int64Value(bdm[0].Ebs.VolumeSize))
 }
 
-func TestCreateNodegroup_NoDiskSizeOmitsBlockDeviceMapping(t *testing.T) {
-	f := newEKSServiceFixture(t)
-	seedActiveClusterWithToken(t, f, "c1")
-
-	_, err := f.svc.CreateNodegroup(createNGInput("c1", "ng1", 1), testAccountID)
-	require.NoError(t, err)
-
-	markWorkersReady(t, f, "c1", 1)
-	f.svc.WaitLaunches()
-
-	require.Len(t, f.worker.runCalls, 1)
-	// No DiskSize requested → leave the launch path on its default sizing.
-	assert.Empty(t, f.worker.runCalls[0].BlockDeviceMappings)
-}
-
 func TestCreateNodegroup_ClusterNotActive(t *testing.T) {
 	f := newEKSServiceFixture(t)
-	require.NoError(t, PutClusterMeta(f.kv, &ClusterMeta{
+	require.NoError(t, PutClusterMeta(t.Context(), f.kv, &ClusterMeta{
 		Name:               "c1",
 		Status:             ClusterStatusCreating,
 		ControlPlaneENIIP:  "10.0.1.42",
 		ResourcesVpcConfig: &ClusterVpcConfig{VpcId: "vpc-aaa"},
 	}))
 
-	_, err := f.svc.CreateNodegroup(createNGInput("c1", "ng1", 1), testAccountID)
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 1), testAccountID)
 	require.EqualError(t, err, awserrors.ErrorInvalidRequest)
 }
 
 func TestCreateNodegroup_UnknownCluster(t *testing.T) {
 	f := newEKSServiceFixture(t)
-	_, err := f.svc.CreateNodegroup(createNGInput("ghost", "ng1", 1), testAccountID)
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("ghost", "ng1", 1), testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceNotFound)
 }
 
 func TestDescribeAndListNodegroups(t *testing.T) {
 	f := newEKSServiceFixture(t)
 	seedActiveClusterWithToken(t, f, "c1")
-	_, err := f.svc.CreateNodegroup(createNGInput("c1", "ng1", 1), testAccountID)
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 1), testAccountID)
 	require.NoError(t, err)
-	markWorkersReady(t, f, "c1", 1)
+	markWorkersReady(t, f, "c1", "ng1", 1)
 	f.svc.WaitLaunches()
 
-	desc, err := f.svc.DescribeNodegroup(&eks.DescribeNodegroupInput{
+	desc, err := f.svc.DescribeNodegroup(context.Background(), &eks.DescribeNodegroupInput{
 		ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1"),
 	}, testAccountID)
 	require.NoError(t, err)
 	assert.Equal(t, "ng1", aws.StringValue(desc.Nodegroup.NodegroupName))
 	assert.Equal(t, "c1", aws.StringValue(desc.Nodegroup.ClusterName))
 
-	list, err := f.svc.ListNodegroups(&eks.ListNodegroupsInput{ClusterName: aws.String("c1")}, testAccountID)
+	list, err := f.svc.ListNodegroups(context.Background(), &eks.ListNodegroupsInput{ClusterName: aws.String("c1")}, testAccountID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"ng1"}, aws.StringValueSlice(list.Nodegroups))
 
-	_, err = f.svc.DescribeNodegroup(&eks.DescribeNodegroupInput{
+	_, err = f.svc.DescribeNodegroup(context.Background(), &eks.DescribeNodegroupInput{
 		ClusterName: aws.String("c1"), NodegroupName: aws.String("ghost"),
 	}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceNotFound)
@@ -405,14 +742,14 @@ func TestDescribeAndListNodegroups(t *testing.T) {
 func TestUpdateNodegroupConfig_ScaleUpAndDown(t *testing.T) {
 	f := newEKSServiceFixture(t)
 	seedActiveClusterWithToken(t, f, "c1")
-	_, err := f.svc.CreateNodegroup(createNGInput("c1", "ng1", 1), testAccountID)
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 1), testAccountID)
 	require.NoError(t, err)
-	markWorkersReady(t, f, "c1", 1)
+	markWorkersReady(t, f, "c1", "ng1", 1)
 	f.svc.WaitLaunches()
 	require.Len(t, f.worker.runCalls, 1)
 
 	// Scale up 1 → 3: two new workers launched.
-	upOut, err := f.svc.UpdateNodegroupConfig(&eks.UpdateNodegroupConfigInput{
+	upOut, err := f.svc.UpdateNodegroupConfig(context.Background(), &eks.UpdateNodegroupConfigInput{
 		ClusterName:   aws.String("c1"),
 		NodegroupName: aws.String("ng1"),
 		ScalingConfig: &eks.NodegroupScalingConfig{DesiredSize: aws.Int64(3)},
@@ -420,12 +757,12 @@ func TestUpdateNodegroupConfig_ScaleUpAndDown(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, eks.UpdateStatusSuccessful, aws.StringValue(upOut.Update.Status))
 	assert.Len(t, f.worker.runCalls, 3)
-	rec, err := GetNodegroupRecord(f.kv, "c1", "ng1")
+	rec, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng1")
 	require.NoError(t, err)
 	assert.Len(t, rec.InstanceIDs, 3)
 
 	// Scale down 3 → 1: surplus (last two) terminated.
-	_, err = f.svc.UpdateNodegroupConfig(&eks.UpdateNodegroupConfigInput{
+	_, err = f.svc.UpdateNodegroupConfig(context.Background(), &eks.UpdateNodegroupConfigInput{
 		ClusterName:   aws.String("c1"),
 		NodegroupName: aws.String("ng1"),
 		ScalingConfig: &eks.NodegroupScalingConfig{DesiredSize: aws.Int64(1)},
@@ -433,7 +770,7 @@ func TestUpdateNodegroupConfig_ScaleUpAndDown(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, f.worker.terminateCalls, 1)
 	assert.Len(t, f.worker.terminateCalls[0], 2)
-	rec, err = GetNodegroupRecord(f.kv, "c1", "ng1")
+	rec, err = GetNodegroupRecord(t.Context(), f.kv, "c1", "ng1")
 	require.NoError(t, err)
 	assert.Len(t, rec.InstanceIDs, 1)
 }
@@ -445,9 +782,9 @@ func TestUpdateNodegroupConfig_ScaleUpAndDown(t *testing.T) {
 func TestUpdateNodegroupConfig_ConcurrentScaleUpConverges(t *testing.T) {
 	f := newEKSServiceFixture(t)
 	seedActiveClusterWithToken(t, f, "c1")
-	_, err := f.svc.CreateNodegroup(createNGInput("c1", "ng1", 1), testAccountID)
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 1), testAccountID)
 	require.NoError(t, err)
-	markWorkersReady(t, f, "c1", 1)
+	markWorkersReady(t, f, "c1", "ng1", 1)
 	f.svc.WaitLaunches()
 	require.Len(t, f.worker.runCalls, 1)
 
@@ -460,7 +797,7 @@ func TestUpdateNodegroupConfig_ConcurrentScaleUpConverges(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			<-start
-			_, errs[idx] = f.svc.UpdateNodegroupConfig(&eks.UpdateNodegroupConfigInput{
+			_, errs[idx] = f.svc.UpdateNodegroupConfig(context.Background(), &eks.UpdateNodegroupConfigInput{
 				ClusterName:   aws.String("c1"),
 				NodegroupName: aws.String("ng1"),
 				ScalingConfig: &eks.NodegroupScalingConfig{DesiredSize: aws.Int64(3)},
@@ -473,7 +810,7 @@ func TestUpdateNodegroupConfig_ConcurrentScaleUpConverges(t *testing.T) {
 		require.NoError(t, e)
 	}
 
-	rec, err := GetNodegroupRecord(f.kv, "c1", "ng1")
+	rec, err := GetNodegroupRecord(t.Context(), f.kv, "c1", "ng1")
 	require.NoError(t, err)
 	assert.Len(t, rec.InstanceIDs, 3, "record must converge to desired=3, not overshoot")
 
@@ -491,13 +828,13 @@ func TestUpdateNodegroupConfig_CapacityErrorSurfacesCode(t *testing.T) {
 	scaleUpWithRunErr := func(t *testing.T, runErr error) error {
 		f := newEKSServiceFixture(t)
 		seedActiveClusterWithToken(t, f, "c1")
-		_, err := f.svc.CreateNodegroup(createNGInput("c1", "ng1", 1), testAccountID)
+		_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 1), testAccountID)
 		require.NoError(t, err)
-		markWorkersReady(t, f, "c1", 1)
+		markWorkersReady(t, f, "c1", "ng1", 1)
 		f.svc.WaitLaunches()
 
 		f.worker.runErr = runErr
-		_, err = f.svc.UpdateNodegroupConfig(&eks.UpdateNodegroupConfigInput{
+		_, err = f.svc.UpdateNodegroupConfig(context.Background(), &eks.UpdateNodegroupConfigInput{
 			ClusterName:   aws.String("c1"),
 			NodegroupName: aws.String("ng1"),
 			ScalingConfig: &eks.NodegroupScalingConfig{DesiredSize: aws.Int64(3)},
@@ -511,6 +848,15 @@ func TestUpdateNodegroupConfig_CapacityErrorSurfacesCode(t *testing.T) {
 		assert.True(t, awserrors.HasErrorCode(err.Error()))
 	})
 
+	t.Run("wrapped capacity code preserved", func(t *testing.T) {
+		wrapped := fmt.Errorf("launch on node-1: %w", errors.New(awserrors.ErrorInsufficientInstanceCapacity))
+		err := scaleUpWithRunErr(t, wrapped)
+		require.EqualError(t, err, wrapped.Error())
+		code, ok := awserrors.ResolveErrorCode(err)
+		assert.True(t, ok)
+		assert.Equal(t, awserrors.ErrorInsufficientInstanceCapacity, code)
+	})
+
 	t.Run("opaque error wrapped", func(t *testing.T) {
 		err := scaleUpWithRunErr(t, errors.New("kvm: out of host memory"))
 		require.Error(t, err)
@@ -522,23 +868,23 @@ func TestUpdateNodegroupConfig_CapacityErrorSurfacesCode(t *testing.T) {
 func TestDeleteNodegroup_TerminatesAndIsIdempotent(t *testing.T) {
 	f := newEKSServiceFixture(t)
 	seedActiveClusterWithToken(t, f, "c1")
-	_, err := f.svc.CreateNodegroup(createNGInput("c1", "ng1", 2), testAccountID)
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 2), testAccountID)
 	require.NoError(t, err)
-	markWorkersReady(t, f, "c1", 2)
+	markWorkersReady(t, f, "c1", "ng1", 2)
 	f.svc.WaitLaunches()
 
-	_, err = f.svc.DeleteNodegroup(&eks.DeleteNodegroupInput{
+	_, err = f.svc.DeleteNodegroup(context.Background(), &eks.DeleteNodegroupInput{
 		ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1"),
 	}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, f.worker.terminateCalls, 1)
 	assert.Len(t, f.worker.terminateCalls[0], 2)
 
-	_, err = GetNodegroupRecord(f.kv, "c1", "ng1")
+	_, err = GetNodegroupRecord(t.Context(), f.kv, "c1", "ng1")
 	assert.ErrorIs(t, err, ErrNodegroupNotFound)
 
 	// Second delete → ResourceNotFoundException (record already gone).
-	_, err = f.svc.DeleteNodegroup(&eks.DeleteNodegroupInput{
+	_, err = f.svc.DeleteNodegroup(context.Background(), &eks.DeleteNodegroupInput{
 		ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1"),
 	}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceNotFound)
@@ -546,8 +892,65 @@ func TestDeleteNodegroup_TerminatesAndIsIdempotent(t *testing.T) {
 
 func TestUpdateNodegroupVersion_NotImplemented(t *testing.T) {
 	f := newEKSServiceFixture(t)
-	_, err := f.svc.UpdateNodegroupVersion(&eks.UpdateNodegroupVersionInput{
+	_, err := f.svc.UpdateNodegroupVersion(context.Background(), &eks.UpdateNodegroupVersionInput{
 		ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1"),
 	}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorNotImplemented)
+}
+
+// TestSelectWorkerHost_NoSchedulerOrCapacity returns "" so the caller falls back
+// to a local launch when no scheduler is wired or no host has free capacity.
+func TestSelectWorkerHost_NoSchedulerOrCapacity(t *testing.T) {
+	s := &EKSServiceImpl{deps: EKSServiceDeps{}}
+	require.Empty(t, s.selectWorkerHost(context.Background(), "t3.medium", nil))
+
+	s = &EKSServiceImpl{deps: EKSServiceDeps{Scheduler: &fakeHostScheduler{}}}
+	require.Empty(t, s.selectWorkerHost(context.Background(), "t3.medium", nil))
+}
+
+// mapHostScheduler is a HostScheduler stub with an explicit instance->host map,
+// so a test can give every worker a distinct ID (which the fakeHostScheduler's
+// "i-<node>" convention cannot, collapsing same-host workers).
+type mapHostScheduler struct {
+	hosts     []string
+	placement map[string]string
+}
+
+var _ HostScheduler = (*mapHostScheduler)(nil)
+
+func (m *mapHostScheduler) SchedulableHosts(context.Context, string) []string { return m.hosts }
+
+func (m *mapHostScheduler) InstanceHosts(_ context.Context, ids []string) map[string]string {
+	out := make(map[string]string, len(ids))
+	for _, id := range ids {
+		if h, ok := m.placement[id]; ok {
+			out[id] = h
+		}
+	}
+	return out
+}
+
+// TestSelectWorkerHost_SpreadsThenPacks confirms sequential single-worker
+// launches fan out one-per-host before doubling up, the fix for all workers
+// landing on a single node.
+func TestSelectWorkerHost_SpreadsThenPacks(t *testing.T) {
+	hosts := []string{"nodeA", "nodeB", "nodeC"}
+	sched := &mapHostScheduler{hosts: hosts, placement: map[string]string{}}
+	s := &EKSServiceImpl{deps: EKSServiceDeps{Scheduler: sched}}
+
+	placed := map[string]int{}
+	var workerIDs []string
+	for i := range 6 {
+		host := s.selectWorkerHost(context.Background(), "t3.medium", workerIDs)
+		require.Contains(t, hosts, host)
+		placed[host]++
+		id := "i-w" + strconv.Itoa(i)
+		sched.placement[id] = host
+		workerIDs = append(workerIDs, id)
+	}
+
+	// 6 workers across 3 hosts spread evenly: exactly 2 per host, none starved.
+	for _, h := range hosts {
+		require.Equal(t, 2, placed[h], "host %s should hold 2 of 6 workers", h)
+	}
 }

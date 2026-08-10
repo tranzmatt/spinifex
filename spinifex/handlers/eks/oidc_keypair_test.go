@@ -6,12 +6,12 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
 	"testing"
 
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,15 +27,15 @@ var testMasterKey = func() []byte {
 func TestGenerateClusterOIDCKeypair_PersistsJWKSAndEncryptedPrivateKey(t *testing.T) {
 	kv := newClusterStateTestKV(t)
 
-	_, jwksBytes, err := GenerateClusterOIDCKeypair(kv, "alpha", testMasterKey)
+	_, jwksBytes, err := GenerateClusterOIDCKeypair(t.Context(), kv, "alpha", testMasterKey)
 	require.NoError(t, err)
 	require.NotEmpty(t, jwksBytes)
 
-	jwksEntry, err := kv.Get(OIDCJWKSKey("alpha"))
+	jwksEntry, err := kv.Get(t.Context(), OIDCJWKSKey("alpha"))
 	require.NoError(t, err)
 	assert.Equal(t, jwksBytes, jwksEntry.Value())
 
-	keyEntry, err := kv.Get(OIDCSigningKeyKey("alpha"))
+	keyEntry, err := kv.Get(t.Context(), OIDCSigningKeyKey("alpha"))
 	require.NoError(t, err)
 	assert.NotEmpty(t, keyEntry.Value())
 	assert.NotContains(t, string(keyEntry.Value()), "BEGIN PRIVATE KEY",
@@ -47,7 +47,7 @@ func TestGenerateClusterOIDCKeypair_PersistsJWKSAndEncryptedPrivateKey(t *testin
 // public key and crash-loops on a private-key PEM.
 func TestPublicKeyPEMFromPrivate_RoundTrips(t *testing.T) {
 	kv := newClusterStateTestKV(t)
-	privPEM, _, err := GenerateClusterOIDCKeypair(kv, "alpha", testMasterKey)
+	privPEM, _, err := GenerateClusterOIDCKeypair(t.Context(), kv, "alpha", testMasterKey)
 	require.NoError(t, err)
 
 	pubPEM, err := PublicKeyPEMFromPrivate(privPEM)
@@ -62,7 +62,7 @@ func TestPublicKeyPEMFromPrivate_RoundTrips(t *testing.T) {
 	pubEC, ok := pub.(*ecdsa.PublicKey)
 	require.True(t, ok)
 
-	stored, err := LoadClusterOIDCPrivateKey(kv, "alpha", testMasterKey)
+	stored, err := LoadClusterOIDCPrivateKey(t.Context(), kv, "alpha", testMasterKey)
 	require.NoError(t, err)
 	assert.True(t, stored.PublicKey.Equal(pubEC), "derived public key must match the private key")
 }
@@ -80,7 +80,7 @@ func TestPublicKeyPEMFromPrivate_RejectsGarbage(t *testing.T) {
 func TestGenerateClusterOIDCKeypair_ReturnsPrivateKeyPEMMatchingStored(t *testing.T) {
 	kv := newClusterStateTestKV(t)
 
-	privPEM, _, err := GenerateClusterOIDCKeypair(kv, "alpha", testMasterKey)
+	privPEM, _, err := GenerateClusterOIDCKeypair(t.Context(), kv, "alpha", testMasterKey)
 	require.NoError(t, err)
 	require.Contains(t, privPEM, "BEGIN PRIVATE KEY", "returned PEM must be plaintext")
 
@@ -91,7 +91,7 @@ func TestGenerateClusterOIDCKeypair_ReturnsPrivateKeyPEMMatchingStored(t *testin
 	returnedEC, ok := returned.(*ecdsa.PrivateKey)
 	require.True(t, ok)
 
-	stored, err := LoadClusterOIDCPrivateKey(kv, "alpha", testMasterKey)
+	stored, err := LoadClusterOIDCPrivateKey(t.Context(), kv, "alpha", testMasterKey)
 	require.NoError(t, err)
 	assert.True(t, stored.Equal(returnedEC), "returned PEM must match the persisted key")
 }
@@ -99,7 +99,7 @@ func TestGenerateClusterOIDCKeypair_ReturnsPrivateKeyPEMMatchingStored(t *testin
 func TestGenerateClusterOIDCKeypair_JWKSShapeIsRFC7517EC_P256(t *testing.T) {
 	kv := newClusterStateTestKV(t)
 
-	_, jwksBytes, err := GenerateClusterOIDCKeypair(kv, "alpha", testMasterKey)
+	_, jwksBytes, err := GenerateClusterOIDCKeypair(t.Context(), kv, "alpha", testMasterKey)
 	require.NoError(t, err)
 
 	var doc oidcJWKS
@@ -124,9 +124,9 @@ func TestGenerateClusterOIDCKeypair_JWKSShapeIsRFC7517EC_P256(t *testing.T) {
 func TestGenerateClusterOIDCKeypair_TwoCallsProduceDistinctKeys(t *testing.T) {
 	kv := newClusterStateTestKV(t)
 
-	_, a, err := GenerateClusterOIDCKeypair(kv, "alpha", testMasterKey)
+	_, a, err := GenerateClusterOIDCKeypair(t.Context(), kv, "alpha", testMasterKey)
 	require.NoError(t, err)
-	_, b, err := GenerateClusterOIDCKeypair(kv, "beta", testMasterKey)
+	_, b, err := GenerateClusterOIDCKeypair(t.Context(), kv, "beta", testMasterKey)
 	require.NoError(t, err)
 	assert.NotEqual(t, a, b, "JWKS for distinct clusters must differ")
 }
@@ -134,19 +134,19 @@ func TestGenerateClusterOIDCKeypair_TwoCallsProduceDistinctKeys(t *testing.T) {
 func TestGenerateClusterOIDCKeypair_EmptyArgsRejected(t *testing.T) {
 	kv := newClusterStateTestKV(t)
 
-	_, _, err := GenerateClusterOIDCKeypair(kv, "", testMasterKey)
+	_, _, err := GenerateClusterOIDCKeypair(t.Context(), kv, "", testMasterKey)
 	require.Error(t, err)
-	_, _, err = GenerateClusterOIDCKeypair(kv, "alpha", nil)
+	_, _, err = GenerateClusterOIDCKeypair(t.Context(), kv, "alpha", nil)
 	require.Error(t, err)
 }
 
 func TestLoadClusterOIDCPrivateKey_RoundTripMatchesJWKSPublic(t *testing.T) {
 	kv := newClusterStateTestKV(t)
 
-	_, jwksBytes, err := GenerateClusterOIDCKeypair(kv, "alpha", testMasterKey)
+	_, jwksBytes, err := GenerateClusterOIDCKeypair(t.Context(), kv, "alpha", testMasterKey)
 	require.NoError(t, err)
 
-	priv, err := LoadClusterOIDCPrivateKey(kv, "alpha", testMasterKey)
+	priv, err := LoadClusterOIDCPrivateKey(t.Context(), kv, "alpha", testMasterKey)
 	require.NoError(t, err)
 	require.NotNil(t, priv)
 	assert.Equal(t, elliptic.P256(), priv.Curve)
@@ -160,50 +160,52 @@ func TestLoadClusterOIDCPrivateKey_RoundTripMatchesJWKSPublic(t *testing.T) {
 	yExpected, err := base64.RawURLEncoding.DecodeString(doc.Keys[0].Y)
 	require.NoError(t, err)
 
-	assert.Equal(t, padCoord(priv.X.Bytes()), xExpected)
-	assert.Equal(t, padCoord(priv.Y.Bytes()), yExpected)
+	point, err := priv.PublicKey.Bytes()
+	require.NoError(t, err)
+	assert.Equal(t, xExpected, point[1:1+p256CoordLen])
+	assert.Equal(t, yExpected, point[1+p256CoordLen:])
 }
 
 func TestLoadClusterOIDCPrivateKey_WrongMasterKeyFails(t *testing.T) {
 	kv := newClusterStateTestKV(t)
-	_, _, err := GenerateClusterOIDCKeypair(kv, "alpha", testMasterKey)
+	_, _, err := GenerateClusterOIDCKeypair(t.Context(), kv, "alpha", testMasterKey)
 	require.NoError(t, err)
 
 	other := make([]byte, 32)
 	other[0] = 0xff
-	_, err = LoadClusterOIDCPrivateKey(kv, "alpha", other)
+	_, err = LoadClusterOIDCPrivateKey(t.Context(), kv, "alpha", other)
 	require.Error(t, err)
 }
 
 func TestLoadClusterOIDCPrivateKey_MissingReturnsErrClusterNotFound(t *testing.T) {
 	kv := newClusterStateTestKV(t)
-	_, err := LoadClusterOIDCPrivateKey(kv, "ghost", testMasterKey)
+	_, err := LoadClusterOIDCPrivateKey(t.Context(), kv, "ghost", testMasterKey)
 	require.ErrorIs(t, err, ErrClusterNotFound)
 }
 
 func TestZeroizeClusterOIDCKey_DeletesKeyAndLeavesSiblingsIntact(t *testing.T) {
 	kv := newClusterStateTestKV(t)
-	_, _, err := GenerateClusterOIDCKeypair(kv, "alpha", testMasterKey)
+	_, _, err := GenerateClusterOIDCKeypair(t.Context(), kv, "alpha", testMasterKey)
 	require.NoError(t, err)
 
-	require.NoError(t, ZeroizeClusterOIDCKey(kv, "alpha"))
+	require.NoError(t, ZeroizeClusterOIDCKey(t.Context(), kv, "alpha"))
 
-	_, err = kv.Get(OIDCSigningKeyKey("alpha"))
-	assert.True(t, errors.Is(err, nats.ErrKeyNotFound))
+	_, err = kv.Get(t.Context(), OIDCSigningKeyKey("alpha"))
+	assert.ErrorIs(t, err, jetstream.ErrKeyNotFound)
 
-	jwks, err := kv.Get(OIDCJWKSKey("alpha"))
+	jwks, err := kv.Get(t.Context(), OIDCJWKSKey("alpha"))
 	require.NoError(t, err, "JWKS must survive zeroize (it carries no secret material)")
 	assert.NotEmpty(t, jwks.Value())
 }
 
 func TestZeroizeClusterOIDCKey_MissingIsNoop(t *testing.T) {
 	kv := newClusterStateTestKV(t)
-	require.NoError(t, ZeroizeClusterOIDCKey(kv, "ghost"))
+	require.NoError(t, ZeroizeClusterOIDCKey(t.Context(), kv, "ghost"))
 }
 
 func TestZeroizeClusterOIDCKey_EmptyNameRejected(t *testing.T) {
 	kv := newClusterStateTestKV(t)
-	require.Error(t, ZeroizeClusterOIDCKey(kv, ""))
+	require.Error(t, ZeroizeClusterOIDCKey(t.Context(), kv, ""))
 }
 
 func TestMarshalJWKS_DeterministicForSameKey(t *testing.T) {
@@ -217,12 +219,34 @@ func TestMarshalJWKS_DeterministicForSameKey(t *testing.T) {
 	assert.Equal(t, a, b)
 }
 
-func TestPadCoord_LeftPadsShortBigIntBytes(t *testing.T) {
-	got := padCoord([]byte{0x01, 0x02})
-	require.Len(t, got, p256CoordLen)
-	assert.Equal(t, byte(0x01), got[p256CoordLen-2])
-	assert.Equal(t, byte(0x02), got[p256CoordLen-1])
-	for _, b := range got[:p256CoordLen-2] {
-		assert.Zero(t, b)
-	}
+// Roughly 1 in 256 P-256 keys has a coordinate with a leading zero byte, which
+// big.Int.Bytes() strips. Emitting that as a 31-byte x yields a JWKS that OIDC
+// verifiers reject, so the fixture below pins a key with a short X coordinate to
+// keep the intermittent case deterministic.
+func TestMarshalJWKS_LeftPadsCoordinateWithLeadingZeroByte(t *testing.T) {
+	d, err := hex.DecodeString("aa5dcdd192d84607aaf45a4ba2fcc794c8bddb0cff0908c2cb204b3553c4d60f")
+	require.NoError(t, err)
+	priv, err := ecdsa.ParseRawPrivateKey(elliptic.P256(), d)
+	require.NoError(t, err)
+	require.Len(t, priv.X.Bytes(), p256CoordLen-1, "fixture key must have a short X coordinate")
+
+	jwksBytes, err := marshalJWKS(&priv.PublicKey)
+	require.NoError(t, err)
+
+	var doc oidcJWKS
+	require.NoError(t, json.Unmarshal(jwksBytes, &doc))
+	require.Len(t, doc.Keys, 1)
+
+	xBytes, err := base64.RawURLEncoding.DecodeString(doc.Keys[0].X)
+	require.NoError(t, err)
+	require.Len(t, xBytes, p256CoordLen, "JWK x must be a fixed-width coordinate")
+	assert.Zero(t, xBytes[0], "short coordinate must be left-padded, not truncated")
+	assert.Equal(t, priv.X.Bytes(), xBytes[1:])
+}
+
+func TestMarshalJWKS_RejectsNonP256Curve(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	require.NoError(t, err)
+	_, err = marshalJWKS(&priv.PublicKey)
+	require.Error(t, err, "a non-P-256 key must not be emitted as a P-256 JWK")
 }

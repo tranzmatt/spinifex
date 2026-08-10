@@ -4,11 +4,9 @@ package ecr
 
 import "testing"
 
-// TestECRCapacityLoad is the predastore capacity/load leg of Sprint 2f (parallel
-// crane push of many large images, asserting predastore throughput with no
-// manifest corruption). Deferred: it depends on predastore fixes mulga-siv-359
-// (':'-in-key SigV4 canonicalization) and mulga-siv-356 (404 NoSuchBucket),
-// which are owned elsewhere. Unskip once those land.
+// TestECRCapacityLoad pushes many large images with crane and asserts
+// Predastore throughput without manifest corruption. It remains disabled until
+// the required SigV4 canonicalization and NoSuchBucket behavior are available.
 func TestECRCapacityLoad(t *testing.T) {
-	t.Skip("deferred: blocked on predastore mulga-siv-359 / mulga-siv-356")
+	t.Skip("deferred: blocked on predastore fixes")
 }

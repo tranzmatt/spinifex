@@ -1,14 +1,16 @@
 package handlers_eks
 
 import (
+	"context"
 	"errors"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/eks"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
+	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -16,14 +18,14 @@ import (
 func setupTestService(t *testing.T) *EKSServiceImpl {
 	t.Helper()
 	_, nc, _ := testutil.StartTestJetStream(t)
-	svc, err := NewEKSServiceImplWithNATS(nil, nc)
+	svc, err := NewEKSServiceImpl(EKSServiceDeps{NATSConn: nc})
 	require.NoError(t, err)
 	return svc
 }
 
 // TestEKSServiceImpl_ClusterLifecycleShimMode covers the four lifecycle
-// methods when the service is constructed via NewEKSServiceImplWithNATS
-// (the shim path the daemon-handler routing test uses): orchestration deps
+// methods when the service is constructed with only NATS wiring (the path the
+// daemon-handler routing test uses): orchestration deps
 // are absent so CreateCluster/DeleteCluster short-circuit to ServiceUnavailable
 // (the missing deps are logged at ERROR), DescribeCluster hits an empty
 // per-account bucket and surfaces ResourceNotFoundException, and ListClusters
@@ -32,25 +34,51 @@ func setupTestService(t *testing.T) *EKSServiceImpl {
 func TestEKSServiceImpl_ClusterLifecycleShimMode(t *testing.T) {
 	svc := setupTestService(t)
 
-	_, err := svc.CreateCluster(&eks.CreateClusterInput{Name: aws.String("c1")}, testAccountID, "")
+	_, err := svc.CreateCluster(context.Background(), &eks.CreateClusterInput{Name: aws.String("c1")}, testAccountID, "")
 	require.EqualError(t, err, awserrors.ErrorServiceUnavailable)
 
-	_, err = svc.DescribeCluster(&eks.DescribeClusterInput{Name: aws.String("c1")}, testAccountID)
+	_, err = svc.DescribeCluster(context.Background(), &eks.DescribeClusterInput{Name: aws.String("c1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceNotFound)
 
-	out, err := svc.ListClusters(&eks.ListClustersInput{}, testAccountID)
+	out, err := svc.ListClusters(context.Background(), &eks.ListClustersInput{}, testAccountID)
 	require.NoError(t, err)
 	require.NotNil(t, out)
 	require.Empty(t, out.Clusters)
 
-	_, err = svc.UpdateClusterConfig(&eks.UpdateClusterConfigInput{Name: aws.String("c1")}, testAccountID)
+	_, err = svc.UpdateClusterConfig(context.Background(), &eks.UpdateClusterConfigInput{Name: aws.String("c1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorNotImplemented)
 
-	_, err = svc.UpdateClusterVersion(&eks.UpdateClusterVersionInput{Name: aws.String("c1")}, testAccountID)
+	_, err = svc.UpdateClusterVersion(context.Background(), &eks.UpdateClusterVersionInput{Name: aws.String("c1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorNotImplemented)
 
-	_, err = svc.DeleteCluster(&eks.DeleteClusterInput{Name: aws.String("c1")}, testAccountID)
+	_, err = svc.DeleteCluster(context.Background(), &eks.DeleteClusterInput{Name: aws.String("c1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorServiceUnavailable)
+}
+
+// A daemon that loaded its master key but whose IAM service was not ready at
+// boot (KV quorum still forming) must reject nodegroup orchestration rather than
+// launch workers with no instance profile, which leaves IMDS roleless and blocks
+// ALB creation. The gate reports IAM even though MasterKey is present.
+func TestMissingOrchestrationDeps_NilIAMRejectsNodegroup(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	f.svc.deps.IAM = nil
+
+	require.Equal(t, []string{"IAM"}, f.svc.missingOrchestrationDeps())
+
+	_, err := f.svc.CreateNodegroup(context.Background(), createNGInput("c1", "ng1", 1), testAccountID)
+	require.EqualError(t, err, awserrors.ErrorServiceUnavailable)
+}
+
+// Production wires the lazy IAMProvider and leaves deps.IAM nil. The gate must
+// resolve the ensurer (provider included), not read deps.IAM directly, or it
+// rejects every CreateCluster/CreateNodegroup with missing=[IAM] forever even
+// though the IAM service is fully available via the provider.
+func TestMissingOrchestrationDeps_IAMProviderSatisfiesGate(t *testing.T) {
+	f := newEKSServiceFixture(t)
+	f.svc.deps.IAM = nil
+	f.svc.deps.IAMProvider = func() handlers_iam.SystemInstanceRoleEnsurer { return newFakeEnsurer() }
+
+	require.Empty(t, f.svc.missingOrchestrationDeps())
 }
 
 // EKS only supports the API authentication mode here; CONFIG_MAP (and the
@@ -99,7 +127,7 @@ func TestValidateCreateClusterInput_RejectsMissingSubnetIds(t *testing.T) {
 func TestDescribeCluster_NotFoundWithFullDeps(t *testing.T) {
 	f := newEKSServiceFixture(t)
 
-	_, err := f.svc.DescribeCluster(&eks.DescribeClusterInput{Name: aws.String("ghost")}, testAccountID)
+	_, err := f.svc.DescribeCluster(context.Background(), &eks.DescribeClusterInput{Name: aws.String("ghost")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceNotFound)
 }
 
@@ -110,7 +138,7 @@ func TestDescribeCluster_NotFoundWithFullDeps(t *testing.T) {
 func TestDeleteCluster_NotFoundWithFullDeps(t *testing.T) {
 	f := newEKSServiceFixture(t)
 
-	out, err := f.svc.DeleteCluster(deleteInput("ghost"), testAccountID)
+	out, err := f.svc.DeleteCluster(context.Background(), deleteInput("ghost"), testAccountID)
 	require.NoError(t, err)
 	require.NotNil(t, out)
 	assert.Empty(t, f.inst.terminateCalls, "absent cluster must trigger no teardown")
@@ -124,13 +152,13 @@ func TestDeleteCluster_ZeroizesOIDCKeyBeforeTeardown(t *testing.T) {
 	f := newDeleteClusterFixture(t, "alpha")
 	f.inst.terminateErr = errors.New("hypervisor unreachable")
 
-	_, err := f.svc.DeleteCluster(deleteInput("alpha"), testAccountID)
+	_, err := f.svc.DeleteCluster(context.Background(), deleteInput("alpha"), testAccountID)
 	require.Error(t, err, "teardown failure must surface")
 
-	_, getErr := f.kv.Get(OIDCSigningKeyKey("alpha"))
-	assert.ErrorIs(t, getErr, nats.ErrKeyNotFound, "OIDC key must be zeroized before teardown, even when teardown fails")
+	_, getErr := f.kv.Get(t.Context(), OIDCSigningKeyKey("alpha"))
+	assert.ErrorIs(t, getErr, jetstream.ErrKeyNotFound, "OIDC key must be zeroized before teardown, even when teardown fails")
 
-	meta, metaErr := GetClusterMeta(f.kv, "alpha")
+	meta, metaErr := GetClusterMeta(t.Context(), f.kv, "alpha")
 	require.NoError(t, metaErr, "meta must survive a failed teardown for retry")
 	assert.Equal(t, ClusterStatusDeleting, meta.Status)
 }
@@ -142,22 +170,22 @@ func TestDeleteCluster_ZeroizesOIDCKeyBeforeTeardown(t *testing.T) {
 func TestEKSServiceImpl_NodegroupMethodsShimMode(t *testing.T) {
 	svc := setupTestService(t)
 
-	_, err := svc.CreateNodegroup(&eks.CreateNodegroupInput{ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1")}, testAccountID)
+	_, err := svc.CreateNodegroup(context.Background(), &eks.CreateNodegroupInput{ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorServiceUnavailable)
 
-	_, err = svc.DescribeNodegroup(&eks.DescribeNodegroupInput{ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1")}, testAccountID)
+	_, err = svc.DescribeNodegroup(context.Background(), &eks.DescribeNodegroupInput{ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceNotFound)
 
-	_, err = svc.ListNodegroups(&eks.ListNodegroupsInput{ClusterName: aws.String("c1")}, testAccountID)
+	_, err = svc.ListNodegroups(context.Background(), &eks.ListNodegroupsInput{ClusterName: aws.String("c1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceNotFound)
 
-	_, err = svc.UpdateNodegroupConfig(&eks.UpdateNodegroupConfigInput{ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1")}, testAccountID)
+	_, err = svc.UpdateNodegroupConfig(context.Background(), &eks.UpdateNodegroupConfigInput{ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorServiceUnavailable)
 
-	_, err = svc.UpdateNodegroupVersion(&eks.UpdateNodegroupVersionInput{ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1")}, testAccountID)
+	_, err = svc.UpdateNodegroupVersion(context.Background(), &eks.UpdateNodegroupVersionInput{ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorNotImplemented)
 
-	_, err = svc.DeleteNodegroup(&eks.DeleteNodegroupInput{ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1")}, testAccountID)
+	_, err = svc.DeleteNodegroup(context.Background(), &eks.DeleteNodegroupInput{ClusterName: aws.String("c1"), NodegroupName: aws.String("ng1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorServiceUnavailable)
 }
 
@@ -165,18 +193,17 @@ func TestEKSServiceImpl_NodegroupMethodsShimMode(t *testing.T) {
 // bucket so the AccessEntry handlers (which gate on cluster existence) can run.
 func seedTestCluster(t *testing.T, svc *EKSServiceImpl, cluster string) {
 	t.Helper()
-	js, err := svc.deps.NATSConn.JetStream()
+	js := testutil.NewJetStream(t, svc.deps.NATSConn)
+	kv, err := GetOrCreateAccountBucket(t.Context(), js, testAccountID, 1)
 	require.NoError(t, err)
-	kv, err := GetOrCreateAccountBucket(js, testAccountID)
-	require.NoError(t, err)
-	require.NoError(t, PutClusterMeta(kv, &ClusterMeta{Name: cluster, Status: ClusterStatusActive}))
+	require.NoError(t, PutClusterMeta(t.Context(), kv, &ClusterMeta{Name: cluster, Status: ClusterStatusActive}))
 }
 
 const testPrincipalARN = "arn:aws:iam::111122223333:role/dev"
 
 func TestAccessEntry_UnknownClusterIsNotFound(t *testing.T) {
 	svc := setupTestService(t)
-	_, err := svc.CreateAccessEntry(&eks.CreateAccessEntryInput{
+	_, err := svc.CreateAccessEntry(context.Background(), &eks.CreateAccessEntryInput{
 		ClusterName: aws.String("missing"), PrincipalArn: aws.String(testPrincipalARN),
 	}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceNotFound)
@@ -186,7 +213,7 @@ func TestAccessEntry_CreateDescribeListDelete(t *testing.T) {
 	svc := setupTestService(t)
 	seedTestCluster(t, svc, "c1")
 
-	out, err := svc.CreateAccessEntry(&eks.CreateAccessEntryInput{
+	out, err := svc.CreateAccessEntry(context.Background(), &eks.CreateAccessEntryInput{
 		ClusterName:      aws.String("c1"),
 		PrincipalArn:     aws.String(testPrincipalARN),
 		KubernetesGroups: aws.StringSlice([]string{"system:masters"}),
@@ -199,27 +226,27 @@ func TestAccessEntry_CreateDescribeListDelete(t *testing.T) {
 	assert.Contains(t, aws.StringValue(out.AccessEntry.AccessEntryArn), ":access-entry/c1/")
 
 	// Duplicate Create → ResourceInUseException.
-	_, err = svc.CreateAccessEntry(&eks.CreateAccessEntryInput{
+	_, err = svc.CreateAccessEntry(context.Background(), &eks.CreateAccessEntryInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN),
 	}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceInUse)
 
-	desc, err := svc.DescribeAccessEntry(&eks.DescribeAccessEntryInput{
+	desc, err := svc.DescribeAccessEntry(context.Background(), &eks.DescribeAccessEntryInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN),
 	}, testAccountID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"system:masters"}, aws.StringValueSlice(desc.AccessEntry.KubernetesGroups))
 
-	list, err := svc.ListAccessEntries(&eks.ListAccessEntriesInput{ClusterName: aws.String("c1")}, testAccountID)
+	list, err := svc.ListAccessEntries(context.Background(), &eks.ListAccessEntriesInput{ClusterName: aws.String("c1")}, testAccountID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{testPrincipalARN}, aws.StringValueSlice(list.AccessEntries))
 
-	_, err = svc.DeleteAccessEntry(&eks.DeleteAccessEntryInput{
+	_, err = svc.DeleteAccessEntry(context.Background(), &eks.DeleteAccessEntryInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN),
 	}, testAccountID)
 	require.NoError(t, err)
 
-	_, err = svc.DescribeAccessEntry(&eks.DescribeAccessEntryInput{
+	_, err = svc.DescribeAccessEntry(context.Background(), &eks.DescribeAccessEntryInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN),
 	}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceNotFound)
@@ -228,7 +255,7 @@ func TestAccessEntry_CreateDescribeListDelete(t *testing.T) {
 func TestAccessEntry_RejectsNodeType(t *testing.T) {
 	svc := setupTestService(t)
 	seedTestCluster(t, svc, "c1")
-	_, err := svc.CreateAccessEntry(&eks.CreateAccessEntryInput{
+	_, err := svc.CreateAccessEntry(context.Background(), &eks.CreateAccessEntryInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN), Type: aws.String("EC2_LINUX"),
 	}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorInvalidParameterValue)
@@ -237,11 +264,11 @@ func TestAccessEntry_RejectsNodeType(t *testing.T) {
 func TestAccessEntry_DescribeDeleteMissingIsNotFound(t *testing.T) {
 	svc := setupTestService(t)
 	seedTestCluster(t, svc, "c1")
-	_, err := svc.DescribeAccessEntry(&eks.DescribeAccessEntryInput{
+	_, err := svc.DescribeAccessEntry(context.Background(), &eks.DescribeAccessEntryInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN),
 	}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceNotFound)
-	_, err = svc.DeleteAccessEntry(&eks.DeleteAccessEntryInput{
+	_, err = svc.DeleteAccessEntry(context.Background(), &eks.DeleteAccessEntryInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN),
 	}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceNotFound)
@@ -250,13 +277,13 @@ func TestAccessEntry_DescribeDeleteMissingIsNotFound(t *testing.T) {
 func TestAccessPolicy_AssociateListDisassociate(t *testing.T) {
 	svc := setupTestService(t)
 	seedTestCluster(t, svc, "c1")
-	_, err := svc.CreateAccessEntry(&eks.CreateAccessEntryInput{
+	_, err := svc.CreateAccessEntry(context.Background(), &eks.CreateAccessEntryInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	const viewPolicy = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
-	assoc, err := svc.AssociateAccessPolicy(&eks.AssociateAccessPolicyInput{
+	assoc, err := svc.AssociateAccessPolicy(context.Background(), &eks.AssociateAccessPolicyInput{
 		ClusterName:  aws.String("c1"),
 		PrincipalArn: aws.String(testPrincipalARN),
 		PolicyArn:    aws.String(viewPolicy),
@@ -265,24 +292,24 @@ func TestAccessPolicy_AssociateListDisassociate(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, viewPolicy, aws.StringValue(assoc.AssociatedAccessPolicy.PolicyArn))
 
-	listed, err := svc.ListAssociatedAccessPolicies(&eks.ListAssociatedAccessPoliciesInput{
+	listed, err := svc.ListAssociatedAccessPolicies(context.Background(), &eks.ListAssociatedAccessPoliciesInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN),
 	}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, listed.AssociatedAccessPolicies, 1)
 
 	// Entry now discoverable by the associated-policy filter.
-	filtered, err := svc.ListAccessEntries(&eks.ListAccessEntriesInput{
+	filtered, err := svc.ListAccessEntries(context.Background(), &eks.ListAccessEntriesInput{
 		ClusterName: aws.String("c1"), AssociatedPolicyArn: aws.String(viewPolicy),
 	}, testAccountID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{testPrincipalARN}, aws.StringValueSlice(filtered.AccessEntries))
 
-	_, err = svc.DisassociateAccessPolicy(&eks.DisassociateAccessPolicyInput{
+	_, err = svc.DisassociateAccessPolicy(context.Background(), &eks.DisassociateAccessPolicyInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN), PolicyArn: aws.String(viewPolicy),
 	}, testAccountID)
 	require.NoError(t, err)
-	listed, err = svc.ListAssociatedAccessPolicies(&eks.ListAssociatedAccessPoliciesInput{
+	listed, err = svc.ListAssociatedAccessPolicies(context.Background(), &eks.ListAssociatedAccessPoliciesInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN),
 	}, testAccountID)
 	require.NoError(t, err)
@@ -292,13 +319,13 @@ func TestAccessPolicy_AssociateListDisassociate(t *testing.T) {
 func TestAccessPolicy_AssociateRejectsUnsupportedPolicyAndScope(t *testing.T) {
 	svc := setupTestService(t)
 	seedTestCluster(t, svc, "c1")
-	_, err := svc.CreateAccessEntry(&eks.CreateAccessEntryInput{
+	_, err := svc.CreateAccessEntry(context.Background(), &eks.CreateAccessEntryInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN),
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Unsupported policy ARN.
-	_, err = svc.AssociateAccessPolicy(&eks.AssociateAccessPolicyInput{
+	_, err = svc.AssociateAccessPolicy(context.Background(), &eks.AssociateAccessPolicyInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN),
 		PolicyArn:   aws.String("arn:aws:eks::aws:cluster-access-policy/MadeUpPolicy"),
 		AccessScope: &eks.AccessScope{Type: aws.String("cluster")},
@@ -306,7 +333,7 @@ func TestAccessPolicy_AssociateRejectsUnsupportedPolicyAndScope(t *testing.T) {
 	require.EqualError(t, err, awserrors.ErrorInvalidParameterValue)
 
 	// namespace scope without namespaces.
-	_, err = svc.AssociateAccessPolicy(&eks.AssociateAccessPolicyInput{
+	_, err = svc.AssociateAccessPolicy(context.Background(), &eks.AssociateAccessPolicyInput{
 		ClusterName: aws.String("c1"), PrincipalArn: aws.String(testPrincipalARN),
 		PolicyArn:   aws.String("arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"),
 		AccessScope: &eks.AccessScope{Type: aws.String("namespace")},
@@ -316,7 +343,7 @@ func TestAccessPolicy_AssociateRejectsUnsupportedPolicyAndScope(t *testing.T) {
 
 func TestListAccessPolicies_ReturnsSupportedCatalogue(t *testing.T) {
 	svc := setupTestService(t)
-	out, err := svc.ListAccessPolicies(&eks.ListAccessPoliciesInput{}, testAccountID)
+	out, err := svc.ListAccessPolicies(context.Background(), &eks.ListAccessPoliciesInput{}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, out.AccessPolicies, len(supportedAccessPolicies))
 	for _, p := range out.AccessPolicies {
@@ -329,56 +356,55 @@ func TestListAccessPolicies_ReturnsSupportedCatalogue(t *testing.T) {
 func TestEKSServiceImpl_OIDCMethodsReturnNotImplemented(t *testing.T) {
 	svc := setupTestService(t)
 
-	_, err := svc.AssociateIdentityProviderConfig(&eks.AssociateIdentityProviderConfigInput{ClusterName: aws.String("c1")}, testAccountID)
+	_, err := svc.AssociateIdentityProviderConfig(context.Background(), &eks.AssociateIdentityProviderConfigInput{ClusterName: aws.String("c1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorNotImplemented)
 
-	_, err = svc.DescribeIdentityProviderConfig(&eks.DescribeIdentityProviderConfigInput{ClusterName: aws.String("c1")}, testAccountID)
+	_, err = svc.DescribeIdentityProviderConfig(context.Background(), &eks.DescribeIdentityProviderConfigInput{ClusterName: aws.String("c1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorNotImplemented)
 
-	_, err = svc.ListIdentityProviderConfigs(&eks.ListIdentityProviderConfigsInput{ClusterName: aws.String("c1")}, testAccountID)
+	_, err = svc.ListIdentityProviderConfigs(context.Background(), &eks.ListIdentityProviderConfigsInput{ClusterName: aws.String("c1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorNotImplemented)
 
-	_, err = svc.DisassociateIdentityProviderConfig(&eks.DisassociateIdentityProviderConfigInput{ClusterName: aws.String("c1")}, testAccountID)
+	_, err = svc.DisassociateIdentityProviderConfig(context.Background(), &eks.DisassociateIdentityProviderConfigInput{ClusterName: aws.String("c1")}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorNotImplemented)
 }
 
 func TestEKSServiceImpl_ClusterTagRoundTrip(t *testing.T) {
 	svc := setupTestService(t)
-	js, err := svc.deps.NATSConn.JetStream()
-	require.NoError(t, err)
-	kv, err := GetOrCreateAccountBucket(js, testAccountID)
+	js := testutil.NewJetStream(t, svc.deps.NATSConn)
+	kv, err := GetOrCreateAccountBucket(t.Context(), js, testAccountID, 1)
 	require.NoError(t, err)
 
 	const arn = "arn:aws:eks:us-east-1:111122223333:cluster/c1"
-	require.NoError(t, PutClusterMeta(kv, &ClusterMeta{
+	require.NoError(t, PutClusterMeta(t.Context(), kv, &ClusterMeta{
 		Name:   "c1",
 		Status: ClusterStatusActive,
 		Tags:   map[string]string{"env": "prod"},
 	}))
 
 	// Create-time tags are echoed (the drift-killing round-trip).
-	lt, err := svc.ListTagsForResource(&eks.ListTagsForResourceInput{ResourceArn: aws.String(arn)}, testAccountID)
+	lt, err := svc.ListTagsForResource(context.Background(), &eks.ListTagsForResourceInput{ResourceArn: aws.String(arn)}, testAccountID)
 	require.NoError(t, err)
 	require.Equal(t, "prod", aws.StringValue(lt.Tags["env"]))
 
-	dc, err := svc.DescribeCluster(&eks.DescribeClusterInput{Name: aws.String("c1")}, testAccountID)
+	dc, err := svc.DescribeCluster(context.Background(), &eks.DescribeClusterInput{Name: aws.String("c1")}, testAccountID)
 	require.NoError(t, err)
 	require.Equal(t, "prod", aws.StringValue(dc.Cluster.Tags["env"]))
 
 	// TagResource merges, UntagResource removes — both store-only.
-	_, err = svc.TagResource(&eks.TagResourceInput{
+	_, err = svc.TagResource(context.Background(), &eks.TagResourceInput{
 		ResourceArn: aws.String(arn),
 		Tags:        aws.StringMap(map[string]string{"team": "platform"}),
 	}, testAccountID)
 	require.NoError(t, err)
 
-	_, err = svc.UntagResource(&eks.UntagResourceInput{
+	_, err = svc.UntagResource(context.Background(), &eks.UntagResourceInput{
 		ResourceArn: aws.String(arn),
 		TagKeys:     aws.StringSlice([]string{"env"}),
 	}, testAccountID)
 	require.NoError(t, err)
 
-	lt, err = svc.ListTagsForResource(&eks.ListTagsForResourceInput{ResourceArn: aws.String(arn)}, testAccountID)
+	lt, err = svc.ListTagsForResource(context.Background(), &eks.ListTagsForResourceInput{ResourceArn: aws.String(arn)}, testAccountID)
 	require.NoError(t, err)
 	require.Equal(t, "platform", aws.StringValue(lt.Tags["team"]))
 	_, hasEnv := lt.Tags["env"]
@@ -387,13 +413,12 @@ func TestEKSServiceImpl_ClusterTagRoundTrip(t *testing.T) {
 
 func TestEKSServiceImpl_NodegroupTagRoundTrip(t *testing.T) {
 	svc := setupTestService(t)
-	js, err := svc.deps.NATSConn.JetStream()
-	require.NoError(t, err)
-	kv, err := GetOrCreateAccountBucket(js, testAccountID)
+	js := testutil.NewJetStream(t, svc.deps.NATSConn)
+	kv, err := GetOrCreateAccountBucket(t.Context(), js, testAccountID, 1)
 	require.NoError(t, err)
 
 	const arn = "arn:aws:eks:us-east-1:111122223333:nodegroup/c1/ng1/abc123"
-	require.NoError(t, PutNodegroupRecord(kv, &NodegroupRecord{
+	require.NoError(t, PutNodegroupRecord(t.Context(), kv, &NodegroupRecord{
 		ClusterName: "c1",
 		Name:        "ng1",
 		Arn:         arn,
@@ -402,11 +427,11 @@ func TestEKSServiceImpl_NodegroupTagRoundTrip(t *testing.T) {
 	}))
 
 	// Create-time tags are echoed (the drift-killing round-trip).
-	lt, err := svc.ListTagsForResource(&eks.ListTagsForResourceInput{ResourceArn: aws.String(arn)}, testAccountID)
+	lt, err := svc.ListTagsForResource(context.Background(), &eks.ListTagsForResourceInput{ResourceArn: aws.String(arn)}, testAccountID)
 	require.NoError(t, err)
 	require.Equal(t, "prod", aws.StringValue(lt.Tags["env"]))
 
-	dn, err := svc.DescribeNodegroup(&eks.DescribeNodegroupInput{
+	dn, err := svc.DescribeNodegroup(context.Background(), &eks.DescribeNodegroupInput{
 		ClusterName:   aws.String("c1"),
 		NodegroupName: aws.String("ng1"),
 	}, testAccountID)
@@ -414,19 +439,19 @@ func TestEKSServiceImpl_NodegroupTagRoundTrip(t *testing.T) {
 	require.Equal(t, "prod", aws.StringValue(dn.Nodegroup.Tags["env"]))
 
 	// TagResource merges, UntagResource removes — both store-only.
-	_, err = svc.TagResource(&eks.TagResourceInput{
+	_, err = svc.TagResource(context.Background(), &eks.TagResourceInput{
 		ResourceArn: aws.String(arn),
 		Tags:        aws.StringMap(map[string]string{"team": "platform"}),
 	}, testAccountID)
 	require.NoError(t, err)
 
-	_, err = svc.UntagResource(&eks.UntagResourceInput{
+	_, err = svc.UntagResource(context.Background(), &eks.UntagResourceInput{
 		ResourceArn: aws.String(arn),
 		TagKeys:     aws.StringSlice([]string{"env"}),
 	}, testAccountID)
 	require.NoError(t, err)
 
-	lt, err = svc.ListTagsForResource(&eks.ListTagsForResourceInput{ResourceArn: aws.String(arn)}, testAccountID)
+	lt, err = svc.ListTagsForResource(context.Background(), &eks.ListTagsForResourceInput{ResourceArn: aws.String(arn)}, testAccountID)
 	require.NoError(t, err)
 	require.Equal(t, "platform", aws.StringValue(lt.Tags["team"]))
 	_, hasEnv := lt.Tags["env"]
@@ -437,16 +462,16 @@ func TestEKSServiceImpl_NodegroupTagMissingNotFound(t *testing.T) {
 	svc := setupTestService(t)
 	const arn = "arn:aws:eks:us-east-1:111122223333:nodegroup/c1/absent/abc123"
 
-	_, err := svc.ListTagsForResource(&eks.ListTagsForResourceInput{ResourceArn: aws.String(arn)}, testAccountID)
+	_, err := svc.ListTagsForResource(context.Background(), &eks.ListTagsForResourceInput{ResourceArn: aws.String(arn)}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceNotFound)
 
-	_, err = svc.TagResource(&eks.TagResourceInput{
+	_, err = svc.TagResource(context.Background(), &eks.TagResourceInput{
 		ResourceArn: aws.String(arn),
 		Tags:        aws.StringMap(map[string]string{"k": "v"}),
 	}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorEKSResourceNotFound)
 
-	_, err = svc.UntagResource(&eks.UntagResourceInput{
+	_, err = svc.UntagResource(context.Background(), &eks.UntagResourceInput{
 		ResourceArn: aws.String(arn),
 		TagKeys:     aws.StringSlice([]string{"k"}),
 	}, testAccountID)
@@ -457,12 +482,12 @@ func TestEKSServiceImpl_TagsUnsupportedARNNotImplemented(t *testing.T) {
 	svc := setupTestService(t)
 	const fpARN = "arn:aws:eks:us-east-1:111122223333:fargateprofile/c1/fp1/abc123"
 
-	_, err := svc.TagResource(&eks.TagResourceInput{ResourceArn: aws.String(fpARN)}, testAccountID)
+	_, err := svc.TagResource(context.Background(), &eks.TagResourceInput{ResourceArn: aws.String(fpARN)}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorNotImplemented)
 
-	_, err = svc.UntagResource(&eks.UntagResourceInput{ResourceArn: aws.String(fpARN)}, testAccountID)
+	_, err = svc.UntagResource(context.Background(), &eks.UntagResourceInput{ResourceArn: aws.String(fpARN)}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorNotImplemented)
 
-	_, err = svc.ListTagsForResource(&eks.ListTagsForResourceInput{ResourceArn: aws.String(fpARN)}, testAccountID)
+	_, err = svc.ListTagsForResource(context.Background(), &eks.ListTagsForResourceInput{ResourceArn: aws.String(fpARN)}, testAccountID)
 	require.EqualError(t, err, awserrors.ErrorNotImplemented)
 }

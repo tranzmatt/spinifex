@@ -1,12 +1,14 @@
 package handlers_eks
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // WebhookTokenReviewResult is the gateway's reply to the eks-token-webhook's
@@ -66,27 +68,27 @@ func Authenticate(
 // never speaks NATS. Returns an error only for a genuine infrastructure fault
 // (no JetStream / missing account bucket); a forged token resolves to an
 // Authenticated=false result, not an error.
-func ResolveTokenReview(nc *nats.Conn, accountID, clusterName, token string, verifyTimeout time.Duration) (WebhookTokenReviewResult, error) {
+func ResolveTokenReview(ctx context.Context, nc *nats.Conn, accountID, clusterName, token string, verifyTimeout time.Duration) (WebhookTokenReviewResult, error) {
 	if nc == nil {
 		return WebhookTokenReviewResult{}, fmt.Errorf("eks: ResolveTokenReview nil nats conn")
 	}
-	js, err := nc.JetStream()
+	js, err := jetstream.New(nc)
 	if err != nil {
 		return WebhookTokenReviewResult{}, fmt.Errorf("eks: jetstream: %w", err)
 	}
-	kv, err := js.KeyValue(AccountBucketName(accountID))
+	kv, err := js.KeyValue(ctx, AccountBucketName(accountID))
 	if err != nil {
 		return WebhookTokenReviewResult{}, fmt.Errorf("eks: open account KV %s: %w", accountID, err)
 	}
 
 	verify := func(presignedURL string) (*TokenVerifyResponse, error) {
 		return utils.NATSRequest[TokenVerifyResponse](
-			nc, TokenVerifySubject,
+			ctx, nc, TokenVerifySubject,
 			TokenVerifyRequest{PresignedURL: presignedURL, ClusterName: clusterName},
 			verifyTimeout, "")
 	}
 	lookup := func(principalARN string) (*AccessEntryRecord, error) {
-		return GetAccessEntryRecord(kv, clusterName, principalARN)
+		return GetAccessEntryRecord(ctx, kv, clusterName, principalARN)
 	}
 	return Authenticate(token, verify, lookup), nil
 }

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/mulgadc/spinifex/spinifex/network/ovn/nbdb"
 )
 
 // fakeClaimVerifier scripts a sequence of GatewayPortClaimed results and counts
@@ -19,11 +21,16 @@ type fakeClaimVerifier struct {
 	nudgeErr       error
 	reachErr       error
 	guestErr       error
+	sbNotConnected bool  // SBConnectionState reports the wedge ("not connected")
+	sbStateErr     error // SBConnectionState probe error
+	sbResetErr     error // ResetSBClusterState error
 	checks         int
 	nudges         int
 	repairs        int
 	reachChecks    int
 	guestChecks    int
+	sbChecks       int
+	sbResets       int
 	lastPort       string // most recent port name passed to GatewayPortClaimed
 	lastGwIP       string // most recent IP passed to GatewayReachable
 	lastEIP        string // most recent IP passed to EIPReachable
@@ -97,6 +104,23 @@ func (f *fakeClaimVerifier) GuestPortUp(_ context.Context, lspName string) (bool
 	return f.nudges >= f.guestUpAfter, nil
 }
 
+// SBConnectionState reports "connected" by default; sbNotConnected scripts the wedge.
+func (f *fakeClaimVerifier) SBConnectionState(_ context.Context) (string, error) {
+	f.sbChecks++
+	if f.sbStateErr != nil {
+		return "", f.sbStateErr
+	}
+	if f.sbNotConnected {
+		return "not connected", nil
+	}
+	return "connected", nil
+}
+
+func (f *fakeClaimVerifier) ResetSBClusterState(_ context.Context) error {
+	f.sbResets++
+	return f.sbResetErr
+}
+
 func withFastGuestPortBounds(t *testing.T) {
 	t.Helper()
 	to, iv := guestPortDatapathTimeout, guestPortDatapathInterval
@@ -155,7 +179,7 @@ func TestEnsureGatewayClaimed_NudgeThenConverge(t *testing.T) {
 	}
 }
 
-func TestEnsureGatewayClaimed_NeverConvergesNudgesOnceThenGivesUp(t *testing.T) {
+func TestEnsureGatewayClaimed_NeverConvergesRecomputesEachMiss(t *testing.T) {
 	withFastClaimBounds(t)
 	f := &fakeClaimVerifier{claimedAfter: -1} // never claims
 	r := &reconciler{gwClaim: f}
@@ -171,8 +195,11 @@ func TestEnsureGatewayClaimed_NeverConvergesNudgesOnceThenGivesUp(t *testing.T) 
 		t.Fatal("ensureGatewayClaimed did not return within deadline; blocking reconcile")
 	}
 
-	if f.nudges != 1 {
-		t.Errorf("nudges = %d, want exactly 1 (nudge once, do not spam)", f.nudges)
+	// Recompute on every miss, not once: on a fresh-VPC bring-up or after a chassis
+	// flap a single early nudge fires before ovn-controller processes the
+	// gateway_chassis update, so the cr port never binds.
+	if f.nudges < 2 {
+		t.Errorf("nudges = %d, want >=2 (recompute on each miss, not once)", f.nudges)
 	}
 	if f.checks < 2 {
 		t.Errorf("checks = %d, want >=2 (polled past the first nudge)", f.checks)
@@ -464,5 +491,104 @@ func TestEnsureGuestPortDatapath_ContextCancelStops(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("ensureGuestPortDatapath ignored context cancellation")
+	}
+}
+
+func withSmallSBResetThreshold(t *testing.T) {
+	t.Helper()
+	prev := sbResetEscalateAfter
+	sbResetEscalateAfter = 2
+	t.Cleanup(func() { sbResetEscalateAfter = prev })
+}
+
+func runToDeadline(t *testing.T, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { fn(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readiness loop did not return within deadline; blocking reconcile")
+	}
+}
+
+func TestEnsureGatewayClaimed_WedgedSBEscalatesResetOnce(t *testing.T) {
+	withFastClaimBounds(t)
+	withSmallSBResetThreshold(t)
+	// Never claims AND the SB is wedged: recompute cannot converge a stale-SB wedge,
+	// so after the miss threshold the loop escalates to exactly one reset.
+	f := &fakeClaimVerifier{claimedAfter: -1, sbNotConnected: true}
+	r := &reconciler{gwClaim: f}
+
+	runToDeadline(t, func() { r.ensureGatewayClaimed(context.Background(), "gw-vpc-a") })
+
+	if f.sbResets != 1 {
+		t.Errorf("sbResets = %d, want exactly 1 (escalate once, then stop resetting)", f.sbResets)
+	}
+	if f.nudges < 2 {
+		t.Errorf("nudges = %d, want >=2 (recompute still runs each miss)", f.nudges)
+	}
+}
+
+func TestEnsureGatewayClaimed_ConnectedSBNeverResets(t *testing.T) {
+	withFastClaimBounds(t)
+	withSmallSBResetThreshold(t)
+	// Never claims but SB is connected: the miss is not a wedge, so no reset —
+	// recompute is the right tool and a reset would needlessly churn the SB sync.
+	f := &fakeClaimVerifier{claimedAfter: -1, sbNotConnected: false}
+	r := &reconciler{gwClaim: f}
+
+	runToDeadline(t, func() { r.ensureGatewayClaimed(context.Background(), "gw-vpc-a") })
+
+	if f.sbResets != 0 {
+		t.Errorf("sbResets = %d, want 0 (connected SB must never be reset)", f.sbResets)
+	}
+}
+
+func TestEnsureGuestPortDatapath_WedgedSBEscalatesResetOnce(t *testing.T) {
+	withFastGuestPortBounds(t)
+	withSmallSBResetThreshold(t)
+	f := &fakeClaimVerifier{guestUpAfter: -1, sbNotConnected: true}
+	r := &reconciler{gwClaim: f}
+
+	runToDeadline(t, func() { r.ensureGuestPortDatapath(context.Background(), "vpc-a", "port-eni-1") })
+
+	if f.sbResets != 1 {
+		t.Errorf("sbResets = %d, want exactly 1 (escalate once on a wedged SB)", f.sbResets)
+	}
+}
+
+func TestEnsureGuestPortDatapath_ConnectedSBNeverResets(t *testing.T) {
+	withFastGuestPortBounds(t)
+	withSmallSBResetThreshold(t)
+	f := &fakeClaimVerifier{guestUpAfter: -1, sbNotConnected: false}
+	r := &reconciler{gwClaim: f}
+
+	runToDeadline(t, func() { r.ensureGuestPortDatapath(context.Background(), "vpc-a", "port-eni-1") })
+
+	if f.sbResets != 0 {
+		t.Errorf("sbResets = %d, want 0 (connected SB must never be reset)", f.sbResets)
+	}
+}
+
+// A distributed-NAT gateway LRP is link-local, so the host cannot route to it.
+// Probing it would fail forever and report external connectivity as degraded.
+func TestGatewayLRPIP_LinkLocalIsNotAProbeTarget(t *testing.T) {
+	cases := []struct {
+		name string
+		lrp  *nbdb.LogicalRouterPort
+		want string
+	}{
+		{"nil", nil, ""},
+		{"no networks", &nbdb.LogicalRouterPort{}, ""},
+		{"routable", &nbdb.LogicalRouterPort{Networks: []string{"216.218.163.111/27"}}, "216.218.163.111"},
+		{"link-local", &nbdb.LogicalRouterPort{Networks: []string{"169.254.0.1/30"}}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := gatewayLRPIP(tc.lrp); got != tc.want {
+				t.Errorf("gatewayLRPIP() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

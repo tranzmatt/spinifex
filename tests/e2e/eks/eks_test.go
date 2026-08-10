@@ -4,8 +4,11 @@ package eks
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,6 +47,7 @@ const (
 // would blow the suite timeout on dev nodes.
 func TestEKS(t *testing.T) {
 	env := harness.LoadEnv(t)
+	harness.RequireDNSEnabled(t, env)
 	artifacts := harness.ArtifactDir(t, env)
 	c := harness.NewAWSClient(t, env)
 
@@ -58,6 +62,7 @@ func TestEKS(t *testing.T) {
 		ca, err := base64.StdEncoding.DecodeString(aws.StringValue(cl.CertificateAuthority.Data))
 		require.NoError(t, err, "certificateAuthority.data must be base64")
 		assert.Contains(t, string(ca), "BEGIN CERTIFICATE", "CA data must be a PEM cert")
+		assertEKSEndpointResolves(t, aws.StringValue(cl.Endpoint))
 		fx.Cluster = cl
 	})
 
@@ -189,6 +194,17 @@ func TestEKS(t *testing.T) {
 		require.NoError(t, err, "addon ConfigMap must exist: %s", out)
 		assert.Contains(t, out, "delivered", "addon ConfigMap must carry the marker")
 
+		// The aggregated metrics API must be Available: apiserver discovery
+		// dials it through the konnectivity tunnel, and on a zero-worker or
+		// GPU-only cluster a konnectivity-agent gap makes it perpetually
+		// Unavailable — which is exactly what wedges namespace GC below, on
+		// every namespace, not just this one.
+		apiSvcOut, err := kc.Run(30*time.Second, "get", "apiservice", "v1beta1.metrics.k8s.io",
+			"-o", `jsonpath={.status.conditions[?(@.type=="Available")].status}`)
+		require.NoError(t, err, "get apiservice v1beta1.metrics.k8s.io: %s", apiSvcOut)
+		assert.Equal(t, "True", strings.TrimSpace(apiSvcOut),
+			"v1beta1.metrics.k8s.io must be Available or namespace GC (below) will never clear the kubernetes finalizer")
+
 		// DeleteAddon unstages the manifest; the agent GCs the rendered file and
 		// k3s' auto-deploy controller removes the objects.
 		_, err = c.EKS.DeleteAddon(&eks.DeleteAddonInput{
@@ -197,6 +213,11 @@ func TestEKS(t *testing.T) {
 		})
 		require.NoError(t, err, "delete-addon")
 
+		// Namespace GC enumerates every API group before it can clear the
+		// `kubernetes` finalizer, so a stuck aggregated API (checked above)
+		// leaves this stuck in Terminating forever rather than retrying it
+		// down — proving deletion actually completes, not just that it was
+		// attempted.
 		harness.EventuallyErr(t, func() error {
 			out, runErr := kc.Run(30*time.Second, "get", "namespace", "spinifex-noop",
 				"--ignore-not-found", "-o", `jsonpath={.metadata.name}`)
@@ -213,6 +234,11 @@ func TestEKS(t *testing.T) {
 	t.Run("IRSAWebIdentity", func(t *testing.T) {
 		requireClusterReady(t, fx)
 		runIRSAWebIdentity(t, c, env, artifacts, fx)
+	})
+
+	t.Run("IRSAPod", func(t *testing.T) {
+		requireClusterReady(t, fx)
+		runIRSAPod(t, c, env, artifacts, fx)
 	})
 
 	t.Run("EBSCSIVolume", func(t *testing.T) {
@@ -238,47 +264,15 @@ func TestEKS(t *testing.T) {
 func runIRSAWebIdentity(t *testing.T, c *harness.AWSClient, env *harness.Env, artifacts string, fx *clusterFixture) {
 	require.NotNil(t, fx.Cluster.Identity, "ACTIVE cluster must expose Identity")
 	require.NotNil(t, fx.Cluster.Identity.Oidc, "ACTIVE cluster must expose Identity.Oidc")
-	issuer := aws.StringValue(fx.Cluster.Identity.Oidc.Issuer)
-	require.NotEmpty(t, issuer, "cluster OIDC issuer must be published")
-	t.Logf("OIDC issuer: %s", issuer)
 
-	// 1) Register the cluster's OIDC provider in the caller account so the STS
-	//    handler will accept tokens carrying this issuer.
-	oidcOut, err := c.IAM.CreateOpenIDConnectProvider(&iam.CreateOpenIDConnectProviderInput{
-		Url:            aws.String(issuer),
-		ClientIDList:   aws.StringSlice([]string{"sts.amazonaws.com"}),
-		ThumbprintList: aws.StringSlice([]string{"0000000000000000000000000000000000000000"}),
-	})
-	require.NoError(t, err, "create-open-id-connect-provider")
-	providerArn := aws.StringValue(oidcOut.OpenIDConnectProviderArn)
-	require.NotEmpty(t, providerArn, "OIDC provider ARN empty")
-	t.Cleanup(func() {
-		_, _ = c.IAM.DeleteOpenIDConnectProvider(&iam.DeleteOpenIDConnectProviderInput{
-			OpenIDConnectProviderArn: aws.String(providerArn),
-		})
-	})
+	// 1) Register the cluster's OIDC provider in the caller account and create a
+	//    role whose trust policy federates it, so the STS handler accepts
+	//    web-identity tokens carrying this issuer.
+	providerArn, roleArn, roleName := registerOIDCRole(t, c, fx, "irsa", "E2E IRSA web-identity role")
 	t.Logf("OIDC provider: %s", providerArn)
-
-	// 2) Create a role whose trust policy federates the OIDC provider. No
-	//    Condition block — the Federated principal + AssumeRoleWithWebIdentity
-	//    action are sufficient to grant, which keeps the test independent of the
-	//    condition-key issuer-prefix format.
-	roleName := fmt.Sprintf("%s-irsa", fx.ClusterName)
-	trustPolicy := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":%q},"Action":"sts:AssumeRoleWithWebIdentity"}]}`, providerArn)
-	roleOut, err := c.IAM.CreateRole(&iam.CreateRoleInput{
-		RoleName:                 aws.String(roleName),
-		AssumeRolePolicyDocument: aws.String(trustPolicy),
-		Description:              aws.String("E2E IRSA web-identity role"),
-	})
-	require.NoError(t, err, "create-role")
-	roleArn := aws.StringValue(roleOut.Role.Arn)
-	require.NotEmpty(t, roleArn, "role ARN empty")
-	t.Cleanup(func() {
-		_, _ = c.IAM.DeleteRole(&iam.DeleteRoleInput{RoleName: aws.String(roleName)})
-	})
 	t.Logf("role: %s", roleArn)
 
-	// 3) Mint a ServiceAccount token bound to sts.amazonaws.com. `kubectl create
+	// 2) Mint a ServiceAccount token bound to sts.amazonaws.com. `kubectl create
 	//    token` uses the TokenRequest API — no pod required. The token's iss is
 	//    the cluster OIDC issuer and aud includes sts.amazonaws.com (k3s is wired
 	//    with --service-account-issuer / --api-audiences at CreateCluster).
@@ -290,7 +284,7 @@ func runIRSAWebIdentity(t *testing.T, c *harness.AWSClient, env *harness.Env, ar
 	token := strings.TrimSpace(tokenOut)
 	require.Equal(t, 2, strings.Count(token, "."), "web-identity token must be a JWT (3 dot-separated parts)")
 
-	// 4) Exchange the token. AssumeRoleWithWebIdentity is anonymous (the SDK
+	// 3) Exchange the token. AssumeRoleWithWebIdentity is anonymous (the SDK
 	//    strips SigV4 for this op); the JWT is the identity.
 	const sessionName = "e2e-irsa"
 	var assumeOut *sts.AssumeRoleWithWebIdentityOutput
@@ -312,7 +306,7 @@ func runIRSAWebIdentity(t *testing.T, c *harness.AWSClient, env *harness.Env, ar
 	require.True(t, strings.HasPrefix(aws.StringValue(assumeOut.Credentials.AccessKeyId), "ASIA"),
 		"web-identity credentials must be temporary (ASIA…)")
 
-	// 5) The returned temporary credentials must be usable: GetCallerIdentity
+	// 4) The returned temporary credentials must be usable: GetCallerIdentity
 	//    must resolve to the assumed-role principal.
 	sessClient := harness.NewAWSClientWithSessionCreds(t, env,
 		aws.StringValue(assumeOut.Credentials.AccessKeyId),
@@ -324,6 +318,329 @@ func runIRSAWebIdentity(t *testing.T, c *harness.AWSClient, env *harness.Env, ar
 	assert.Contains(t, aws.StringValue(ident.Arn), "assumed-role/"+roleName,
 		"caller ARN must reflect the assumed IRSA role")
 	t.Logf("GetCallerIdentity (web-identity creds): %s", aws.StringValue(ident.Arn))
+}
+
+// registerOIDCRole registers the cluster's OIDC provider in the caller account
+// and creates a role whose trust policy federates it — the shared setup every
+// IRSA scenario needs before a web-identity token can be exchanged. No
+// Condition block on the trust policy — the Federated principal +
+// AssumeRoleWithWebIdentity action are sufficient to grant, which keeps
+// callers independent of the condition-key issuer-prefix format. Both
+// resources are torn down via t.Cleanup (LIFO: role before provider).
+func registerOIDCRole(t *testing.T, c *harness.AWSClient, fx *clusterFixture, roleNameSuffix, description string) (providerArn, roleArn, roleName string) {
+	t.Helper()
+	require.NotNil(t, fx.Cluster.Identity, "ACTIVE cluster must expose Identity")
+	require.NotNil(t, fx.Cluster.Identity.Oidc, "ACTIVE cluster must expose Identity.Oidc")
+	issuer := aws.StringValue(fx.Cluster.Identity.Oidc.Issuer)
+	require.NotEmpty(t, issuer, "cluster OIDC issuer must be published")
+
+	oidcOut, err := c.IAM.CreateOpenIDConnectProvider(&iam.CreateOpenIDConnectProviderInput{
+		Url:            aws.String(issuer),
+		ClientIDList:   aws.StringSlice([]string{"sts.amazonaws.com"}),
+		ThumbprintList: aws.StringSlice([]string{"0000000000000000000000000000000000000000"}),
+	})
+	require.NoError(t, err, "create-open-id-connect-provider")
+	providerArn = aws.StringValue(oidcOut.OpenIDConnectProviderArn)
+	require.NotEmpty(t, providerArn, "OIDC provider ARN empty")
+	t.Cleanup(func() {
+		_, _ = c.IAM.DeleteOpenIDConnectProvider(&iam.DeleteOpenIDConnectProviderInput{
+			OpenIDConnectProviderArn: aws.String(providerArn),
+		})
+	})
+
+	roleName = fmt.Sprintf("%s-%s", fx.ClusterName, roleNameSuffix)
+	trustPolicy := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":%q},"Action":"sts:AssumeRoleWithWebIdentity"}]}`, providerArn)
+	roleOut, err := c.IAM.CreateRole(&iam.CreateRoleInput{
+		RoleName:                 aws.String(roleName),
+		AssumeRolePolicyDocument: aws.String(trustPolicy),
+		Description:              aws.String(description),
+	})
+	require.NoError(t, err, "create-role")
+	roleArn = aws.StringValue(roleOut.Role.Arn)
+	require.NotEmpty(t, roleArn, "role ARN empty")
+	t.Cleanup(func() {
+		_, _ = c.IAM.DeleteRole(&iam.DeleteRoleInput{RoleName: aws.String(roleName)})
+	})
+	return providerArn, roleArn, roleName
+}
+
+// ensureNodeRole creates the cluster's worker-node IAM role (standard
+// EC2-service trust policy — real EKS has the same prerequisite: the customer
+// creates the node instance role before CreateNodegroup). Both runIRSAPod and
+// runEBSCSIVolume call this independently rather than one leaking the role for
+// the other to pick up by naming convention: CreateNodegroup's worker launch
+// attaches the role to a same-named instance profile (ensureNodeInstanceProfile
+// in nodegroup.go), so DeleteRole fails while that attachment stands. The
+// cleanup here detaches it first and asserts the delete instead of discarding
+// its error, so a real leak fails the test instead of leaving the role behind
+// for the next subtest to silently depend on.
+func ensureNodeRole(t *testing.T, c *harness.AWSClient, fx *clusterFixture) (roleArn, roleName string) {
+	t.Helper()
+	roleName = fx.ClusterName + "-node"
+	const ec2TrustPolicy = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}`
+	out, err := c.IAM.CreateRole(&iam.CreateRoleInput{
+		RoleName:                 aws.String(roleName),
+		AssumeRolePolicyDocument: aws.String(ec2TrustPolicy),
+		Description:              aws.String("E2E node instance role"),
+	})
+	require.NoError(t, err, "create-node-role")
+	roleArn = aws.StringValue(out.Role.Arn)
+	t.Cleanup(func() {
+		_, err := c.IAM.RemoveRoleFromInstanceProfile(&iam.RemoveRoleFromInstanceProfileInput{
+			InstanceProfileName: aws.String(roleName),
+			RoleName:            aws.String(roleName),
+		})
+		if err != nil && !harness.ErrorCodeIs(err, iam.ErrCodeNoSuchEntityException) {
+			t.Errorf("remove-role-from-instance-profile %s: %v", roleName, err)
+		}
+		if _, err := c.IAM.DeleteRole(&iam.DeleteRoleInput{RoleName: aws.String(roleName)}); err != nil {
+			t.Errorf("delete-node-role %s: %v", roleName, err)
+		}
+	})
+	return roleArn, roleName
+}
+
+// runIRSAPod exercises the in-cluster IRSA path a real workload depends on:
+// spinifex ships no pod-identity webhook, so a pod must wire the projected SA
+// token + AWS_* env explicitly (mirroring
+// scripts/images/eks-node/mulga-eks-addon-sync.sh's {{IRSA_ENV}}/{{IRSA_VOLUME}}
+// blocks). The pod runs `aws sts get-caller-identity` against the awsgw STS
+// endpoint from inside the cluster; the returned ARN must resolve to the
+// assumed IRSA role, proving token mount + env wiring + in-cluster egress all
+// work together (unlike IRSAWebIdentity, which only proves the API exchange).
+func runIRSAPod(t *testing.T, c *harness.AWSClient, env *harness.Env, artifacts string, fx *clusterFixture) {
+	require.NotNil(t, fx.Cluster.Identity, "ACTIVE cluster must expose Identity")
+	require.NotNil(t, fx.Cluster.Identity.Oidc, "ACTIVE cluster must expose Identity.Oidc")
+	issuer := aws.StringValue(fx.Cluster.Identity.Oidc.Issuer)
+
+	_, roleArn, roleName := registerOIDCRole(t, c, fx, "irsa-pod", "E2E IRSA pod role")
+	t.Logf("IRSA pod role: %s", roleArn)
+
+	// awsgw enforces IAM on assumed-role STS calls, so the role needs a
+	// permission policy allowing GetCallerIdentity — an AWS-managed ARN is
+	// opaque and grants nothing, so use a customer-managed policy with an
+	// explicit allow (same pattern as the EBS CSI role below).
+	const stsPolicy = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:GetCallerIdentity","Resource":"*"}]}`
+	polOut, err := c.IAM.CreatePolicy(&iam.CreatePolicyInput{
+		PolicyName:     aws.String(roleName + "-policy"),
+		PolicyDocument: aws.String(stsPolicy),
+	})
+	require.NoError(t, err, "create-policy")
+	policyArn := aws.StringValue(polOut.Policy.Arn)
+	t.Cleanup(func() {
+		_, _ = c.IAM.DeletePolicy(&iam.DeletePolicyInput{PolicyArn: aws.String(policyArn)})
+	})
+	_, err = c.IAM.AttachRolePolicy(&iam.AttachRolePolicyInput{
+		RoleName:  aws.String(roleName),
+		PolicyArn: aws.String(policyArn),
+	})
+	require.NoError(t, err, "attach-role-policy")
+	t.Cleanup(func() {
+		_, _ = c.IAM.DetachRolePolicy(&iam.DetachRolePolicyInput{
+			RoleName:  aws.String(roleName),
+			PolicyArn: aws.String(policyArn),
+		})
+	})
+
+	// gatewayBaseURL is the issuer with its /oidc/eks/<region>/<acct>/<cluster>
+	// path stripped — the customer-facing WAN advertise addr (:9999) in-cluster
+	// pods reach, exactly what the addon-sync agent injects as
+	// AWS_ENDPOINT_URL_STS.
+	u, err := url.Parse(issuer)
+	require.NoErrorf(t, err, "parse issuer URL %q", issuer)
+	require.NotEmpty(t, u.Scheme, "issuer URL must carry a scheme")
+	require.NotEmpty(t, u.Host, "issuer URL must carry a host")
+	gatewayBaseURL := u.Scheme + "://" + u.Host
+	t.Logf("gateway base URL: %s", gatewayBaseURL)
+
+	region := envOr("SPINIFEX_AWS_REGION", "ap-southeast-2")
+
+	kcPath := writeKubeconfig(t, artifacts, fx.Cluster)
+	kc := harness.NewKubectl(t, kcPath, getTokenEnv(t, env))
+
+	// The control-plane node carries CriticalAddonsOnly=true:NoExecute (EKS
+	// parity: k3s_server_vm.go taints it to keep user workloads off), so this
+	// pod needs a customer worker node like EBSCSIVolume — there is no
+	// untainted node to land on. A 1-node nodegroup is created and the pod is
+	// pinned to it via the eks.amazonaws.com/nodegroup label the worker
+	// registers under (never set on the control-plane node).
+	//
+	// CreateNodegroup's worker launch attaches an instance profile for the
+	// declared NodeRole (ensureNodeInstanceProfile in nodegroup.go), which
+	// requires the role to actually exist in IAM — real EKS has the same
+	// prerequisite (the customer creates the node instance role before
+	// CreateNodegroup). No permission policy needed: the pod pulls from
+	// public.ecr.aws directly, never touching the node's own instance-profile
+	// credentials.
+	nodeRoleArn, _ := ensureNodeRole(t, c, fx)
+
+	const nodegroup = "irsa-pod-e2e-ng"
+	harness.Phase(t, "Creating worker nodegroup %s", nodegroup)
+	// e2e:allow-create — the worker nodegroup is the subject under test (customer-space node the IRSA pod schedules onto).
+	_, err = c.EKS.CreateNodegroup(&eks.CreateNodegroupInput{
+		ClusterName:   aws.String(fx.ClusterName),
+		NodegroupName: aws.String(nodegroup),
+		Subnets:       aws.StringSlice([]string{fx.SubnetID}),
+		NodeRole:      aws.String(nodeRoleArn),
+		ScalingConfig: &eks.NodegroupScalingConfig{
+			MinSize:     aws.Int64(1),
+			MaxSize:     aws.Int64(1),
+			DesiredSize: aws.Int64(1),
+		},
+	})
+	require.NoError(t, err, "create-nodegroup")
+	t.Cleanup(func() {
+		_, _ = c.EKS.DeleteNodegroup(&eks.DeleteNodegroupInput{
+			ClusterName:   aws.String(fx.ClusterName),
+			NodegroupName: aws.String(nodegroup),
+		})
+	})
+	harness.EventuallyErr(t, func() error {
+		out, derr := c.EKS.DescribeNodegroup(&eks.DescribeNodegroupInput{
+			ClusterName:   aws.String(fx.ClusterName),
+			NodegroupName: aws.String(nodegroup),
+		})
+		if derr != nil {
+			return fmt.Errorf("describe-nodegroup: %w", derr)
+		}
+		if s := aws.StringValue(out.Nodegroup.Status); s != eks.NodegroupStatusActive {
+			return fmt.Errorf("nodegroup status %q, want ACTIVE", s)
+		}
+		return nil
+	}, 8*time.Minute, 10*time.Second)
+
+	// Deliver the awsgw CA into the pod via a ConfigMap — the same CA the host
+	// already trusts for awsgw (harness.ResolveCACert), mounted read-only.
+	caPath, err := harness.ResolveCACert(env)
+	require.NoError(t, err, "resolve gateway CA cert")
+	const caConfigMap = "irsa-pod-gateway-ca"
+	out, err := kc.Run(30*time.Second, "create", "configmap", caConfigMap,
+		"-n", "default", "--from-file=ca.pem="+caPath)
+	require.NoErrorf(t, err, "create gateway-ca configmap:\n%s", out)
+	t.Cleanup(func() {
+		_, _ = kc.Run(30*time.Second, "delete", "configmap", caConfigMap, "-n", "default", "--ignore-not-found")
+	})
+
+	const sa = "irsa-pod-e2e"
+	const podName = "irsa-pod-e2e"
+	nodeSelector := fmt.Sprintf("  nodeSelector:\n    eks.amazonaws.com/nodegroup: %s\n", nodegroup)
+	manifestPath := filepath.Join(artifacts, "irsa-pod.yaml")
+	require.NoError(t, os.WriteFile(manifestPath,
+		[]byte(irsaPodManifest(sa, podName, roleArn, gatewayBaseURL, region, caConfigMap, nodeSelector)), 0o600))
+	t.Cleanup(func() {
+		_, _ = kc.Run(60*time.Second, "delete", "-f", manifestPath, "--ignore-not-found", "--wait=false")
+	})
+
+	harness.OnFailure(t, func() {
+		dumps := map[string][]string{
+			"irsa-pod-describe.txt": {"-n", "default", "describe", "pod", podName},
+			"irsa-pod-events.txt":   {"-n", "default", "get", "events", "--sort-by", ".lastTimestamp"},
+			"irsa-pod-nodes.txt":    {"get", "nodes", "-o", "wide", "--show-labels"},
+		}
+		for name, args := range dumps {
+			out, _ := kc.Run(45*time.Second, args...)
+			harness.DumpFile(t, artifacts, name, []byte(out))
+		}
+		errOut, _ := kc.Run(30*time.Second, "-n", "default", "exec", podName, "--", "cat", "/tmp/err.txt")
+		harness.DumpFile(t, artifacts, "irsa-pod-err.txt", []byte(errOut))
+	})
+
+	harness.Phase(t, "Applying IRSA pod")
+	out, err = kc.Run(60*time.Second, "apply", "-f", manifestPath)
+	require.NoErrorf(t, err, "apply irsa pod:\n%s", out)
+
+	waitPodReady(t, kc, podName)
+
+	// aws sts get-caller-identity writes JSON to /tmp/out.json inside the pod;
+	// poll (not just wait-once) since network egress + the STS round trip can
+	// outlast the container's Ready flip (Ready only means the shell started).
+	var ident struct {
+		UserId  string `json:"UserId"`
+		Account string `json:"Account"`
+		Arn     string `json:"Arn"`
+	}
+	harness.EventuallyErr(t, func() error {
+		raw, err := kc.Run(30*time.Second, "-n", "default", "exec", podName, "--", "cat", "/tmp/out.json")
+		if err != nil {
+			return fmt.Errorf("exec cat out.json: %v\n%s", err, raw)
+		}
+		if jerr := json.Unmarshal([]byte(raw), &ident); jerr != nil {
+			return fmt.Errorf("parse out.json: %v\nraw: %s", jerr, raw)
+		}
+		return nil
+	}, 3*time.Minute, 5*time.Second)
+
+	t.Logf("in-cluster GetCallerIdentity: %+v", ident)
+	assert.Equal(t, fx.AccountID, ident.Account, "caller account must match")
+	assert.Contains(t, ident.Arn, "assumed-role/"+roleName,
+		"caller ARN must reflect the assumed IRSA role")
+}
+
+// irsaPodManifest renders a ServiceAccount (carrying the decorative
+// eks.amazonaws.com/role-arn annotation) plus a pod wired for IRSA exactly as
+// mulga-eks-addon-sync.sh's {{IRSA_ENV}}/{{IRSA_VOLUME}}/{{IRSA_VOLUME_MOUNT}}
+// blocks would: a projected SA token (audience sts.amazonaws.com) mounted at
+// the well-known eks.amazonaws.com path, the AWS_* env pointing the SDK at the
+// awsgw STS endpoint, and the gateway CA trusted via ConfigMap. extraSpec is
+// injected verbatim into the Pod spec (e.g. a nodeSelector), or "" for none.
+func irsaPodManifest(sa, pod, roleArn, gatewayBaseURL, region, caConfigMap, extraSpec string) string {
+	return fmt.Sprintf(`apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: %[1]s
+  namespace: default
+  annotations:
+    eks.amazonaws.com/role-arn: %[3]q
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %[2]s
+  namespace: default
+spec:
+  serviceAccountName: %[1]s
+  restartPolicy: Never
+%[7]s  containers:
+  - name: aws-cli
+    image: public.ecr.aws/aws-cli/aws-cli:latest
+    command: ["sh", "-c", "aws sts get-caller-identity --output json >/tmp/out.json 2>/tmp/err.txt; sleep 3600"]
+    env:
+    - name: AWS_ROLE_ARN
+      value: %[3]q
+    - name: AWS_WEB_IDENTITY_TOKEN_FILE
+      value: /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+    - name: AWS_STS_REGIONAL_ENDPOINTS
+      value: regional
+    - name: AWS_REGION
+      value: %[5]q
+    - name: AWS_DEFAULT_REGION
+      value: %[5]q
+    - name: AWS_ENDPOINT_URL_STS
+      value: %[4]q
+    - name: AWS_CA_BUNDLE
+      value: /etc/spinifex/gateway-ca/ca.pem
+    - name: SSL_CERT_FILE
+      value: /etc/spinifex/gateway-ca/ca.pem
+    volumeMounts:
+    - name: aws-iam-token
+      mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
+      readOnly: true
+    - name: gateway-ca
+      mountPath: /etc/spinifex/gateway-ca
+      readOnly: true
+  volumes:
+  - name: aws-iam-token
+    projected:
+      defaultMode: 420
+      sources:
+      - serviceAccountToken:
+          audience: sts.amazonaws.com
+          expirationSeconds: 86400
+          path: token
+  - name: gateway-ca
+    configMap:
+      name: %[6]s
+`, sa, pod, roleArn, gatewayBaseURL, region, caConfigMap, extraSpec)
 }
 
 // runEBSCSIVolume exercises the full EBS CSI data path on the live cluster:
@@ -400,7 +717,10 @@ func runEBSCSIVolume(t *testing.T, c *harness.AWSClient, env *harness.Env, artif
 	// workloads need a customer worker node. Create a 1-node nodegroup; its
 	// worker is a customer-space instance, so the customer-owned volume can
 	// attach to it. DescribeNodegroup reports ACTIVE only once the worker has
-	// registered Ready.
+	// registered Ready. The node role is created here rather than assumed from
+	// another subtest — CreateNodegroup requires it to already exist in IAM.
+	nodeRoleArn, _ := ensureNodeRole(t, c, fx)
+
 	const nodegroup = "ebs-csi-e2e-ng"
 	harness.Phase(t, "Creating worker nodegroup %s", nodegroup)
 	// e2e:allow-create — the worker nodegroup is the subject under test (customer-space node for cross-space attach).
@@ -408,7 +728,7 @@ func runEBSCSIVolume(t *testing.T, c *harness.AWSClient, env *harness.Env, artif
 		ClusterName:   aws.String(fx.ClusterName),
 		NodegroupName: aws.String(nodegroup),
 		Subnets:       aws.StringSlice([]string{fx.SubnetID}),
-		NodeRole:      aws.String(fmt.Sprintf("arn:aws:iam::%s:role/%s-node", fx.AccountID, fx.ClusterName)),
+		NodeRole:      aws.String(nodeRoleArn),
 		ScalingConfig: &eks.NodegroupScalingConfig{
 			MinSize:     aws.Int64(1),
 			MaxSize:     aws.Int64(1),
@@ -532,6 +852,15 @@ func runEBSCSIVolume(t *testing.T, c *harness.AWSClient, env *harness.Env, artif
 	}, 5*time.Minute, 5*time.Second)
 	t.Logf("PVC %s Bound", pvcName)
 
+	// Resolved once, while the PVC is still bound, so the final cleanup can
+	// confirm the CSI driver actually deleted this exact volume rather than
+	// just that the Kubernetes objects are gone. Unlike production teardown
+	// (which cannot infer a PV's reclaim policy from EC2 tags alone), this
+	// suite owns the volume it provisioned and can safely wait for its
+	// ebs-gp3 StorageClass's Delete policy to reclaim it.
+	volID := csiVolumeID(t, kc, pvcName)
+	t.Logf("CSI volume for PVC %s: %s", pvcName, volID)
+
 	waitPodReady(t, kc, "ebs-csi-e2e-writer")
 
 	// The marker must have landed on the mounted volume.
@@ -548,8 +877,26 @@ func runEBSCSIVolume(t *testing.T, c *harness.AWSClient, env *harness.Env, artif
 	readerPath := filepath.Join(artifacts, "ebs-csi-reader.yaml")
 	require.NoError(t, os.WriteFile(readerPath, []byte(csiPVCPodManifest(pvcName, "ebs-csi-e2e-reader",
 		"cat /data/marker && sleep 3600")), 0o600))
+	// This runs before the addon/nodegroup cleanups registered earlier in this
+	// subtest, so the CSI controller that performs the actual DeleteVolume is
+	// still running when it does. It must not just fire the delete and move
+	// on: the suite provisioned this volume, so it must confirm EC2 shows it
+	// gone before continuing, not merely that the Kubernetes objects are.
 	t.Cleanup(func() {
-		_, _ = kc.Run(60*time.Second, "delete", "-f", readerPath, "--ignore-not-found", "--wait=false")
+		out, err := kc.Run(60*time.Second, "delete", "-f", readerPath, "--ignore-not-found", "--wait=false")
+		if err != nil {
+			t.Errorf("delete reader manifest:\n%s", out)
+		}
+		harness.EventuallyErr(t, func() error {
+			_, derr := c.EC2.DescribeVolumes(&ec2.DescribeVolumesInput{VolumeIds: aws.StringSlice([]string{volID})})
+			if derr != nil {
+				if harness.ErrorCodeIs(derr, "InvalidVolume.NotFound") {
+					return nil
+				}
+				return derr
+			}
+			return fmt.Errorf("CSI-provisioned volume %s still present after PVC deletion", volID)
+		}, 3*time.Minute, 5*time.Second)
 	})
 	out, err = kc.Run(60*time.Second, "apply", "-f", readerPath)
 	require.NoErrorf(t, err, "apply reader:\n%s", out)
@@ -559,6 +906,23 @@ func runEBSCSIVolume(t *testing.T, c *harness.AWSClient, env *harness.Env, artif
 	require.NoErrorf(t, err, "exec cat marker (reader):\n%s", got)
 	assert.Equal(t, marker, strings.TrimSpace(got), "marker must survive pod reschedule")
 	t.Logf("marker survived reschedule: %s", strings.TrimSpace(got))
+}
+
+// csiVolumeID resolves the EC2 volume ID backing a Bound PVC by following its
+// PersistentVolume's CSI volumeHandle, so teardown can confirm against EC2
+// that the specific volume this test provisioned is actually gone.
+func csiVolumeID(t *testing.T, kc *harness.Kubectl, pvc string) string {
+	t.Helper()
+	pvName, err := kc.Run(30*time.Second, "get", "pvc", pvc, "-o", `jsonpath={.spec.volumeName}`)
+	require.NoErrorf(t, err, "get pvc volumeName:\n%s", pvName)
+	pvName = strings.TrimSpace(pvName)
+	require.NotEmpty(t, pvName, "a Bound PVC must reference a PersistentVolume")
+
+	volID, err := kc.Run(30*time.Second, "get", "pv", pvName, "-o", `jsonpath={.spec.csi.volumeHandle}`)
+	require.NoErrorf(t, err, "get pv volumeHandle:\n%s", volID)
+	volID = strings.TrimSpace(volID)
+	require.NotEmpty(t, volID, "a CSI-provisioned PV must carry a volumeHandle")
+	return volID
 }
 
 // csiPVCPodManifest renders a gp3 PVC plus a single pod that mounts it at /data
@@ -620,20 +984,13 @@ func waitPodReady(t *testing.T, kc *harness.Kubectl, pod string) {
 // --- Fixture --------------------------------------------------------------
 
 type clusterFixture struct {
-	ClusterName     string
-	AccountID       string
-	VPCID           string
-	SubnetID        string // worker (private) subnet
-	IGWID           string
-	PubSubnetID     string
-	PubRTID         string
-	PubRTAssocID    string
-	EIPAllocID      string
-	NATGWID         string
-	WorkerRTID      string
-	WorkerRTAssocID string
-	Cluster         *eks.Cluster
-	Deleted         bool
+	ClusterName string
+	AccountID   string
+	VPCID       string
+	SubnetID    string // worker (private) subnet
+	Egress      *harness.WorkerEgress
+	Cluster     *eks.Cluster
+	Deleted     bool
 }
 
 func setupClusterFixture(t *testing.T, c *harness.AWSClient, env *harness.Env, artifacts string) *clusterFixture {
@@ -647,12 +1004,12 @@ func setupClusterFixture(t *testing.T, c *harness.AWSClient, env *harness.Env, a
 	t.Logf("account: %s", fx.AccountID)
 
 	harness.Phase(t, "Creating VPC topology (%s)", eksVPCCIDR)
-	createVPC(t, c, fx)
-	t.Cleanup(func() { deleteVPC(t, c, fx) })
-	createSubnet(t, c, fx)
-	t.Cleanup(func() { deleteSubnet(t, c, fx) })
-	createWorkerEgress(t, c, fx)
-	t.Cleanup(func() { deleteWorkerEgress(t, c, fx) })
+	fx.VPCID = harness.CreateVPC(t, c, eksVPCCIDR)
+	t.Cleanup(func() { harness.DeleteVPC(t, c, fx.VPCID) })
+	fx.SubnetID = harness.CreateSubnet(t, c, fx.VPCID, eksSubnetCIDR)
+	t.Cleanup(func() { harness.DeleteSubnet(t, c, fx.SubnetID) })
+	fx.Egress = harness.CreateWorkerEgress(t, c, fx.VPCID, fx.SubnetID, eksPublicSubnetCIDR)
+	t.Cleanup(func() { harness.DeleteWorkerEgress(t, c, fx.Egress) })
 
 	harness.Phase(t, "Creating cluster %q", fx.ClusterName)
 	roleArn := fmt.Sprintf("arn:aws:iam::%s:role/%s-role", fx.AccountID, fx.ClusterName)
@@ -681,236 +1038,6 @@ func requireClusterReady(t *testing.T, fx *clusterFixture) {
 	}
 }
 
-// --- VPC / Subnet ---------------------------------------------------------
-
-func createVPC(t *testing.T, c *harness.AWSClient, fx *clusterFixture) {
-	t.Helper()
-	out, err := c.EC2.CreateVpc(&ec2.CreateVpcInput{CidrBlock: aws.String(eksVPCCIDR)})
-	require.NoError(t, err, "create-vpc")
-	fx.VPCID = aws.StringValue(out.Vpc.VpcId)
-	t.Logf("VPC: %s", fx.VPCID)
-}
-
-func deleteVPC(t *testing.T, c *harness.AWSClient, fx *clusterFixture) {
-	if fx.VPCID == "" {
-		return
-	}
-	if _, err := c.EC2.DeleteVpc(&ec2.DeleteVpcInput{VpcId: aws.String(fx.VPCID)}); err != nil {
-		t.Logf("delete VPC %s: %v", fx.VPCID, err)
-	}
-}
-
-func createSubnet(t *testing.T, c *harness.AWSClient, fx *clusterFixture) {
-	t.Helper()
-	out, err := c.EC2.CreateSubnet(&ec2.CreateSubnetInput{
-		VpcId:     aws.String(fx.VPCID),
-		CidrBlock: aws.String(eksSubnetCIDR),
-	})
-	require.NoError(t, err, "create-subnet")
-	fx.SubnetID = aws.StringValue(out.Subnet.SubnetId)
-	t.Logf("subnet: %s", fx.SubnetID)
-}
-
-func deleteSubnet(t *testing.T, c *harness.AWSClient, fx *clusterFixture) {
-	if fx.SubnetID == "" {
-		return
-	}
-	if _, err := c.EC2.DeleteSubnet(&ec2.DeleteSubnetInput{SubnetId: aws.String(fx.SubnetID)}); err != nil {
-		t.Logf("delete subnet %s: %v", fx.SubnetID, err)
-	}
-}
-
-// createWorkerEgress gives the customer VPC the egress a real customer VPC
-// needs for private workers: an IGW-fronted public subnet hosting a NAT
-// Gateway, with the worker subnet default-routed to that NAT Gateway. AttachIGW
-// deliberately programs no SNAT (mirrors AWS: an IGW serves only public-IP
-// instances), so a private worker reaches the public NLB endpoint and pulls
-// public CSI images only through the NAT Gateway's subnet-wide SNAT.
-func createWorkerEgress(t *testing.T, c *harness.AWSClient, fx *clusterFixture) {
-	t.Helper()
-
-	igwOut, err := c.EC2.CreateInternetGateway(&ec2.CreateInternetGatewayInput{}) // e2e:allow-create
-	require.NoError(t, err, "create-internet-gateway")
-	fx.IGWID = aws.StringValue(igwOut.InternetGateway.InternetGatewayId)
-	_, err = c.EC2.AttachInternetGateway(&ec2.AttachInternetGatewayInput{
-		InternetGatewayId: aws.String(fx.IGWID),
-		VpcId:             aws.String(fx.VPCID),
-	})
-	require.NoError(t, err, "attach-internet-gateway")
-
-	// Public subnet routed straight to the IGW; the NAT Gateway lives here.
-	pubOut, err := c.EC2.CreateSubnet(&ec2.CreateSubnetInput{ // e2e:allow-create
-		VpcId:     aws.String(fx.VPCID),
-		CidrBlock: aws.String(eksPublicSubnetCIDR),
-	})
-	require.NoError(t, err, "create-public-subnet")
-	fx.PubSubnetID = aws.StringValue(pubOut.Subnet.SubnetId)
-
-	pubRT, err := c.EC2.CreateRouteTable(&ec2.CreateRouteTableInput{VpcId: aws.String(fx.VPCID)}) // e2e:allow-create
-	require.NoError(t, err, "create-public-route-table")
-	fx.PubRTID = aws.StringValue(pubRT.RouteTable.RouteTableId)
-	_, err = c.EC2.CreateRoute(&ec2.CreateRouteInput{
-		RouteTableId:         aws.String(fx.PubRTID),
-		DestinationCidrBlock: aws.String("0.0.0.0/0"),
-		GatewayId:            aws.String(fx.IGWID),
-	})
-	require.NoError(t, err, "create-public-route")
-	pubAssoc, err := c.EC2.AssociateRouteTable(&ec2.AssociateRouteTableInput{
-		RouteTableId: aws.String(fx.PubRTID),
-		SubnetId:     aws.String(fx.PubSubnetID),
-	})
-	require.NoError(t, err, "associate-public-route-table")
-	fx.PubRTAssocID = aws.StringValue(pubAssoc.AssociationId)
-
-	// Elastic IP + NAT Gateway in the public subnet.
-	eip, err := c.EC2.AllocateAddress(&ec2.AllocateAddressInput{Domain: aws.String("vpc")}) // e2e:allow-create
-	require.NoError(t, err, "allocate-address")
-	fx.EIPAllocID = aws.StringValue(eip.AllocationId)
-	natOut, err := c.EC2.CreateNatGateway(&ec2.CreateNatGatewayInput{ // e2e:allow-create
-		SubnetId:     aws.String(fx.PubSubnetID),
-		AllocationId: aws.String(fx.EIPAllocID),
-	})
-	require.NoError(t, err, "create-nat-gateway")
-	fx.NATGWID = aws.StringValue(natOut.NatGateway.NatGatewayId)
-	waitNatGatewayAvailable(t, c, fx.NATGWID)
-
-	// Worker (private) subnet default-routes to the NAT Gateway; associating
-	// the route table triggers the subnet-wide SNAT egress reroute.
-	workerRT, err := c.EC2.CreateRouteTable(&ec2.CreateRouteTableInput{VpcId: aws.String(fx.VPCID)}) // e2e:allow-create
-	require.NoError(t, err, "create-worker-route-table")
-	fx.WorkerRTID = aws.StringValue(workerRT.RouteTable.RouteTableId)
-	_, err = c.EC2.CreateRoute(&ec2.CreateRouteInput{
-		RouteTableId:         aws.String(fx.WorkerRTID),
-		DestinationCidrBlock: aws.String("0.0.0.0/0"),
-		NatGatewayId:         aws.String(fx.NATGWID),
-	})
-	require.NoError(t, err, "create-worker-route")
-	workerAssoc, err := c.EC2.AssociateRouteTable(&ec2.AssociateRouteTableInput{
-		RouteTableId: aws.String(fx.WorkerRTID),
-		SubnetId:     aws.String(fx.SubnetID),
-	})
-	require.NoError(t, err, "associate-worker-route-table")
-	fx.WorkerRTAssocID = aws.StringValue(workerAssoc.AssociationId)
-	t.Logf("egress: igw=%s nat=%s eip=%s pubrt=%s workerrt=%s",
-		fx.IGWID, fx.NATGWID, fx.EIPAllocID, fx.PubRTID, fx.WorkerRTID)
-}
-
-// waitNatGatewayAvailable blocks until the NAT Gateway reports "available";
-// SNAT is not programmed on the VPC router until then.
-func waitNatGatewayAvailable(t *testing.T, c *harness.AWSClient, natID string) {
-	t.Helper()
-	const timeout = 3 * time.Minute
-	deadline := time.Now().Add(timeout)
-	for {
-		out, err := c.EC2.DescribeNatGateways(&ec2.DescribeNatGatewaysInput{
-			NatGatewayIds: aws.StringSlice([]string{natID}),
-		})
-		if err == nil && len(out.NatGateways) > 0 {
-			switch aws.StringValue(out.NatGateways[0].State) {
-			case "available":
-				return
-			case "failed", "deleted":
-				t.Fatalf("nat gateway %s entered terminal state %q", natID, aws.StringValue(out.NatGateways[0].State))
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("nat gateway %s not available within %s", natID, timeout)
-		}
-		time.Sleep(3 * time.Second)
-	}
-}
-
-// deleteWorkerEgress tears the egress topology down in reverse: the worker
-// route table releases the private subnet, then the NAT Gateway is deleted and
-// drained before the public subnet + EIP it pins can be removed.
-func deleteWorkerEgress(t *testing.T, c *harness.AWSClient, fx *clusterFixture) {
-	if fx.WorkerRTAssocID != "" {
-		if _, err := c.EC2.DisassociateRouteTable(&ec2.DisassociateRouteTableInput{
-			AssociationId: aws.String(fx.WorkerRTAssocID),
-		}); err != nil {
-			t.Logf("disassociate worker route table %s: %v", fx.WorkerRTAssocID, err)
-		}
-	}
-	if fx.WorkerRTID != "" {
-		if _, err := c.EC2.DeleteRouteTable(&ec2.DeleteRouteTableInput{
-			RouteTableId: aws.String(fx.WorkerRTID),
-		}); err != nil {
-			t.Logf("delete worker route table %s: %v", fx.WorkerRTID, err)
-		}
-	}
-	if fx.NATGWID != "" {
-		if _, err := c.EC2.DeleteNatGateway(&ec2.DeleteNatGatewayInput{
-			NatGatewayId: aws.String(fx.NATGWID),
-		}); err != nil {
-			t.Logf("delete nat gateway %s: %v", fx.NATGWID, err)
-		}
-		waitNatGatewayDeleted(t, c, fx.NATGWID)
-	}
-	if fx.EIPAllocID != "" {
-		if _, err := c.EC2.ReleaseAddress(&ec2.ReleaseAddressInput{
-			AllocationId: aws.String(fx.EIPAllocID),
-		}); err != nil {
-			t.Logf("release address %s: %v", fx.EIPAllocID, err)
-		}
-	}
-	if fx.PubRTAssocID != "" {
-		if _, err := c.EC2.DisassociateRouteTable(&ec2.DisassociateRouteTableInput{
-			AssociationId: aws.String(fx.PubRTAssocID),
-		}); err != nil {
-			t.Logf("disassociate public route table %s: %v", fx.PubRTAssocID, err)
-		}
-	}
-	if fx.PubRTID != "" {
-		if _, err := c.EC2.DeleteRouteTable(&ec2.DeleteRouteTableInput{
-			RouteTableId: aws.String(fx.PubRTID),
-		}); err != nil {
-			t.Logf("delete public route table %s: %v", fx.PubRTID, err)
-		}
-	}
-	if fx.PubSubnetID != "" {
-		if _, err := c.EC2.DeleteSubnet(&ec2.DeleteSubnetInput{SubnetId: aws.String(fx.PubSubnetID)}); err != nil {
-			t.Logf("delete public subnet %s: %v", fx.PubSubnetID, err)
-		}
-	}
-	if fx.IGWID != "" {
-		if _, err := c.EC2.DetachInternetGateway(&ec2.DetachInternetGatewayInput{
-			InternetGatewayId: aws.String(fx.IGWID),
-			VpcId:             aws.String(fx.VPCID),
-		}); err != nil {
-			t.Logf("detach igw %s: %v", fx.IGWID, err)
-		}
-		if _, err := c.EC2.DeleteInternetGateway(&ec2.DeleteInternetGatewayInput{
-			InternetGatewayId: aws.String(fx.IGWID),
-		}); err != nil {
-			t.Logf("delete igw %s: %v", fx.IGWID, err)
-		}
-	}
-}
-
-// waitNatGatewayDeleted blocks until the NAT Gateway drains to "deleted" so the
-// public subnet + EIP it holds can be released; best-effort on timeout.
-func waitNatGatewayDeleted(t *testing.T, c *harness.AWSClient, natID string) {
-	t.Helper()
-	const timeout = 3 * time.Minute
-	deadline := time.Now().Add(timeout)
-	for {
-		out, err := c.EC2.DescribeNatGateways(&ec2.DescribeNatGatewaysInput{
-			NatGatewayIds: aws.StringSlice([]string{natID}),
-		})
-		if err != nil || len(out.NatGateways) == 0 {
-			return
-		}
-		if aws.StringValue(out.NatGateways[0].State) == "deleted" {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Logf("nat gateway %s not deleted within %s; continuing teardown", natID, timeout)
-			return
-		}
-		time.Sleep(3 * time.Second)
-	}
-}
-
 // deleteClusterBestEffort tears the cluster down if the DeleteCluster subtest did not.
 // Registered last so it runs before VPC/subnet Cleanups (LIFO), ensuring the NLB + VM
 // release the subnet before the VPC is removed.
@@ -930,6 +1057,32 @@ func deleteClusterBestEffort(t *testing.T, c *harness.AWSClient, fx *clusterFixt
 }
 
 // --- kubeconfig artifact --------------------------------------------------
+
+// assertEKSEndpointResolves confirms the DescribeCluster endpoint is an
+// AWS-shaped DNS name that resolves through the host resolver (the path a
+// kubectl/AWS SDK client uses), matching real EKS. The suite requires Northstar,
+// so a bare-IP endpoint is a failure. Retries because the endpoint A record is
+// published asynchronously by the control-plane writer.
+func assertEKSEndpointResolves(t *testing.T, endpoint string) {
+	t.Helper()
+	require.NotEmpty(t, endpoint, "cluster endpoint must be set")
+	u, err := url.Parse(endpoint)
+	require.NoErrorf(t, err, "parse cluster endpoint %q", endpoint)
+	host := u.Hostname()
+	require.Nilf(t, net.ParseIP(host), "EKS endpoint %q is a bare IP despite required Northstar DNS", endpoint)
+	deadline := time.Now().Add(90 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if addrs, lerr := net.LookupHost(host); lerr == nil && len(addrs) > 0 {
+			t.Logf("EKS endpoint %s resolved to %v (northstar path)", host, addrs)
+			return
+		} else {
+			lastErr = lerr
+		}
+		time.Sleep(3 * time.Second)
+	}
+	t.Fatalf("EKS endpoint host %q never resolved within 90s (last err=%v) — northstar did not serve the A record", host, lastErr)
+}
 
 // writeKubeconfig builds a kubeconfig from DescribeCluster output and writes it to the artifact
 // dir. Avoids shelling to `aws eks update-kubeconfig` so the structure assertion is hermetic.

@@ -8,6 +8,7 @@ import (
 
 	"github.com/mulgadc/spinifex/spinifex/network/external"
 	"github.com/mulgadc/spinifex/spinifex/network/external/dhcp"
+	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -35,10 +36,34 @@ func TestDHCPGatewayLRPAllocatorAllocate(t *testing.T) {
 	assert.Equal(t, 24, prefix)
 	assert.Equal(t, "192.0.2.1", nexthop, "nexthop must come from lease.Routers[0]")
 
-	entry, err := store.Get(dhcp.GatewayLRPClientID("vpc-1"))
+	entry, err := store.Get(t.Context(), dhcp.GatewayLRPClientID("vpc-1"))
 	require.NoError(t, err)
 	assert.Equal(t, dhcp.PurposeGatewayLRP, entry.Purpose)
 	assert.Equal(t, "vpc-1", entry.VPCID)
+}
+
+// chaddr is a derived HashMAC and option 61 carries that same MAC, so option 12
+// is the only field that can tell an upstream lease table which host took the
+// lease. Without the node prefix the table cannot be grouped by host.
+func TestDHCPGatewayLRPAllocatorHostnameCarriesNodeName(t *testing.T) {
+	fake := dhcp.NewFake()
+	_, nc, _ := testutil.StartTestJetStream(t)
+	store, err := dhcp.NewStore(t.Context(), testutil.NewJetStream(t, nc), "az1")
+	require.NoError(t, err)
+	mgr, err := dhcp.NewManager(dhcp.ManagerConfig{Client: fake, Store: store, NodeName: "banksia"})
+	require.NoError(t, err)
+	t.Cleanup(mgr.Stop)
+	require.NoError(t, mgr.Start(context.Background()))
+
+	pool := &external.ExternalPoolConfig{Name: "wan", Source: external.SourceDHCP, BindBridge: "br-wan"}
+	_, _, _, _, err = dhcp.NewDHCPGatewayLRPAllocator(mgr).Allocate(context.Background(), "vpc-1", pool)
+	require.NoError(t, err)
+
+	held, ok := fake.HeldLease(dhcp.GatewayLRPClientID("vpc-1"))
+	require.True(t, ok)
+	assert.Equal(t, "banksia-dhcp-gw-lrp-vpc-1", held.Hostname)
+	// One value per host, so the upstream table can group on option 60 directly.
+	assert.Equal(t, "mulga-spinifex/banksia", held.VendorClass)
 }
 
 func TestDHCPGatewayLRPAllocatorIdempotent(t *testing.T) {
@@ -72,7 +97,7 @@ func TestDHCPGatewayLRPAllocatorRelease(t *testing.T) {
 	require.True(t, ok)
 
 	require.NoError(t, allocator.Release(context.Background(), "vpc-1"))
-	_, err = store.Get(dhcp.GatewayLRPClientID("vpc-1"))
+	_, err = store.Get(t.Context(), dhcp.GatewayLRPClientID("vpc-1"))
 	assert.Error(t, err)
 	assert.Equal(t, 1, fake.ReleaseCount())
 }

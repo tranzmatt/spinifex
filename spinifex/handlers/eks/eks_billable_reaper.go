@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/mulgadc/spinifex/spinifex/tags"
 	"github.com/mulgadc/spinifex/spinifex/vm"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // EKSBillableReaper is ADR-0006 §5's meta-independent billable cleanup, built on
@@ -47,7 +48,7 @@ func (r *EKSBillableReaper) Sweep(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("list running VMs: %w", err)
 	}
 
-	js, err := r.svc.deps.NATSConn.JetStream()
+	js, err := jetstream.New(r.svc.deps.NATSConn)
 	if err != nil {
 		return 0, fmt.Errorf("jetstream: %w", err)
 	}
@@ -63,31 +64,31 @@ func (r *EKSBillableReaper) Sweep(ctx context.Context) (int, error) {
 			continue
 		}
 
-		clusterName, clusterAccount, ok := r.clusterRefFromENI(v)
+		clusterName, clusterAccount, ok := r.clusterRefFromENI(ctx, v)
 		if !ok {
 			continue // ENI gone or untagged: cannot confirm orphan-hood, never reap
 		}
 
-		acctKV, err := GetOrCreateAccountBucket(js, clusterAccount)
+		acctKV, err := GetOrCreateAccountBucket(ctx, js, clusterAccount, max(r.svc.deps.ClusterSize, 1))
 		if err != nil {
-			slog.Warn("eks-billable: account bucket lookup failed", "account", clusterAccount, "err", err)
+			slog.WarnContext(ctx, "eks-billable: account bucket lookup failed", "account", clusterAccount, "err", err)
 			continue
 		}
-		if _, err := GetClusterMeta(acctKV, clusterName); !errors.Is(err, ErrClusterNotFound) {
+		if _, err := GetClusterMeta(ctx, acctKV, clusterName); !errors.Is(err, ErrClusterNotFound) {
 			// Meta present (live/CREATING/DELETING) or unreadable: not a definitive
 			// orphan — leave it to the cluster's own teardown/retry.
 			continue
 		}
 
 		// ALARM + reap: the cluster is gone but its control-plane VM still runs.
-		slog.Warn("DATA-SAFETY ALARM: orphaned EKS control-plane VM reaped (cluster meta gone)",
+		slog.WarnContext(ctx, "DATA-SAFETY ALARM: orphaned EKS control-plane VM reaped (cluster meta gone)",
 			"instanceId", v.ID, "cluster", clusterName, "account", clusterAccount, "node", v.LastNode)
-		if err := TerminateK3sServerVM(r.svc.deps.VPCK3s, r.svc.deps.Instance, v.AccountID, v.ID, v.ENIId); err != nil {
-			slog.Warn("eks-billable: failed to terminate orphan CP VM", "instanceId", v.ID, "err", err)
+		if err := TerminateK3sServerVM(ctx, r.svc.deps.VPCK3s, r.svc.deps.Instance, v.AccountID, v.ID, v.ENIId); err != nil {
+			slog.WarnContext(ctx, "eks-billable: failed to terminate orphan CP VM", "instanceId", v.ID, "err", err)
 			continue
 		}
 		reaped++
-		r.reclaimOrphanInfra(v.AccountID, clusterName)
+		r.reclaimOrphanInfra(ctx, v.AccountID, clusterName)
 	}
 	return reaped, nil
 }
@@ -99,19 +100,19 @@ func (r *EKSBillableReaper) Sweep(ctx context.Context) (int, error) {
 // DeleteClusterCPVPC releases the NAT-GW EIP before the VPC delete, so the
 // billable address is reclaimed even if the now-empty VPC delete trails. account
 // is the infra account (system account for the managed CP VPC topology).
-func (r *EKSBillableReaper) reclaimOrphanInfra(account, clusterName string) {
-	if err := DeleteClusterNLB(r.svc.deps.NLB, account, clusterName); err != nil {
-		slog.Warn("eks-billable: reclaim orphan NLB failed", "cluster", clusterName, "err", err)
+func (r *EKSBillableReaper) reclaimOrphanInfra(ctx context.Context, account, clusterName string) {
+	if err := DeleteClusterNLB(ctx, r.svc.deps.NLB, account, clusterName); err != nil {
+		slog.WarnContext(ctx, "eks-billable: reclaim orphan NLB failed", "cluster", clusterName, "err", err)
 	}
-	if err := DeleteClusterCPVPC(r.svc.cpVPCDeps(), account, clusterName); err != nil {
-		slog.Warn("eks-billable: reclaim orphan CP VPC (NAT-GW EIP) failed", "cluster", clusterName, "err", err)
+	if err := DeleteClusterCPVPC(ctx, r.svc.cpVPCDeps(), account, clusterName, nil); err != nil {
+		slog.WarnContext(ctx, "eks-billable: reclaim orphan CP VPC (NAT-GW EIP) failed", "cluster", clusterName, "err", err)
 	}
 }
 
 // clusterRefFromENI reads the cluster name + customer account from the VM's
 // control-plane ENI tags. ok is false when the ENI is gone or missing either tag.
-func (r *EKSBillableReaper) clusterRefFromENI(v *vm.VM) (clusterName, clusterAccount string, ok bool) {
-	out, err := r.svc.deps.VPCK3s.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{
+func (r *EKSBillableReaper) clusterRefFromENI(ctx context.Context, v *vm.VM) (clusterName, clusterAccount string, ok bool) {
+	out, err := r.svc.deps.VPCK3s.DescribeNetworkInterfaces(ctx, &ec2.DescribeNetworkInterfacesInput{
 		NetworkInterfaceIds: aws.StringSlice([]string{v.ENIId}),
 	}, v.AccountID)
 	if err != nil || out == nil || len(out.NetworkInterfaces) == 0 {

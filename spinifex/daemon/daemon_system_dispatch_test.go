@@ -12,25 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSplitSubjectTail(t *testing.T) {
-	cases := []struct {
-		name    string
-		subject string
-		prefix  string
-		want    string
-	}{
-		{"happy", "system.TerminateInstance.i-abc", "system.TerminateInstance.", "i-abc"},
-		{"empty tail equals prefix length", "system.TerminateInstance.", "system.TerminateInstance.", ""},
-		{"prefix mismatch", "other.subject", "system.TerminateInstance.", ""},
-		{"shorter than prefix", "sys", "system.TerminateInstance.", ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, splitSubjectTail(tc.subject, tc.prefix))
-		})
-	}
-}
-
 func TestRespondWithSystemLaunchOutput(t *testing.T) {
 	nc, err := nats.Connect(sharedNATSURL)
 	require.NoError(t, err)
@@ -356,7 +337,7 @@ func TestLaunchSystemInstanceOnNode_RemoteWithoutConn(t *testing.T) {
 	require.Error(t, err, "remote placement requires a NATS connection")
 }
 
-// TestTerminateSystemInstanceRemote_RoundTrip locks mulga-siv-295.10: terminating
+// TestTerminateSystemInstanceRemote_RoundTrip locks the contract that terminating
 // a CP VM this node does not own routes over system.TerminateInstance.{id} to the
 // owning daemon, which stops qemu and cascade-deletes the ENI before replying —
 // so the cluster-wide teardown actually frees the remote ENI instead of deleting

@@ -27,6 +27,13 @@ const (
 	DefaultAWSInternalSuffix = "spinifex.internal"
 )
 
+// DefaultMgmtBridgeIP is the canonical br-mgmt host address the control plane
+// advertises: the EKS gateway URL, predastore endpoint, and node-group userdata
+// all target it. Kept in sync with setup-ovn.sh MGMT_CIDR. Server certs must
+// always carry this as a SAN so publish succeeds even when br-mgmt happens to be
+// down at cert-generation time (interface enumeration would otherwise miss it).
+const DefaultMgmtBridgeIP = "10.15.8.1"
+
 // AWSConfig holds cluster-wide AWS-parity settings shared across services.
 // Region scopes the default AWS region; InternalSuffix is the internal DNS
 // suffix used to build service endpoints (e.g. ecr.{region}.{suffix}).
@@ -40,6 +47,7 @@ type ExternalPool struct {
 	Name       string   `mapstructure:"name"`        // Pool identifier (e.g., "wan", "dc1-primary")
 	Source     string   `mapstructure:"source"`      // IP source: "static" (default) or "dhcp"
 	BindBridge string   `mapstructure:"bind_bridge"` // Linux bridge for DHCP DORA (source=dhcp only)
+	DHCPMAC    string   `mapstructure:"dhcp_mac"`    // DHCP client MAC strategy: "derived" (default) or "interface" (source=dhcp only)
 	RangeStart string   `mapstructure:"range_start"` // First IP in range (static source only)
 	RangeEnd   string   `mapstructure:"range_end"`   // Last IP in range (static source only)
 	Gateway    string   `mapstructure:"gateway"`     // WAN default gateway (next hop for 0.0.0.0/0)
@@ -60,6 +68,9 @@ type NetworkConfig struct {
 	ExternalPools []ExternalPool `mapstructure:"external_pools"` // One or more IP pools
 	// IPSecEnabled toggles OVN native IPsec (AES-256-GCM) on every node. Default true; disable only for trusted lab topologies.
 	IPSecEnabled bool `mapstructure:"ipsec_enabled"`
+	// NATExemptCIDRs are extra destinations that skip routed-mode SNAT (added
+	// to the transit /24 in the spinifex_nat_exempt set). nat mode only.
+	NATExemptCIDRs []string `mapstructure:"nat_exempt_cidrs"`
 }
 
 // BootstrapConfig holds the default VPC infrastructure IDs written by admin init.
@@ -73,7 +84,7 @@ type BootstrapConfig struct {
 	SubnetCidr string `mapstructure:"subnet_cidr"`
 }
 
-// Config holds all configuration for the application
+// Config holds all configuration for the application.
 type Config struct {
 	// Node config
 	Node string `json:"Node" mapstructure:"node"`
@@ -91,6 +102,10 @@ type Config struct {
 	Viperblock ViperblockConfig `json:"Viperblock" mapstructure:"viperblock"`
 	AWSGW      AWSGWConfig      `json:"AWSGW" mapstructure:"awsgw"`
 	VPCD       VPCDConfig       `json:"VPCD" mapstructure:"vpcd"`
+	Northstar  NorthstarConfig  `json:"Northstar" mapstructure:"northstar"`
+	RDS        RDSConfig        `json:"RDS" mapstructure:"rds"`
+	ACM        ACMConfig        `json:"ACM" mapstructure:"acm"`
+	Bedrock    BedrockConfig    `json:"Bedrock" mapstructure:"bedrock"`
 
 	BaseDir string `json:"BaseDir" mapstructure:"base_dir"`
 	WalDir  string `json:"WalDir" mapstructure:"wal_dir"`
@@ -112,14 +127,132 @@ type ViperblockConfig struct {
 	// EncryptionKeyFile is the path to the shared 32-byte AES-256 master key for viperblock at-rest encryption.
 	// Empty means cleartext. When set, all VB instances must load it via masterkey.LoadShared.
 	EncryptionKeyFile string `json:"EncryptionKeyFile" mapstructure:"encryption_key_file"`
+
+	// GCEnabled turns on viperblock chunk garbage collection (mark-and-sweep,
+	// snapshot-ancestry gated) on every VB this node constructs: the nbdkit
+	// plugin backing a mounted volume, and the short-lived VBs used by the
+	// volume service. Default false when nil so existing deployments keep
+	// today's behavior until explicitly opted in.
+	GCEnabled *bool `json:"GCEnabled" mapstructure:"gc_enabled"`
 }
 
 // VPCDConfig holds the VPC daemon (vpcd) configuration.
 type VPCDConfig struct {
-	OVNNBAddr         string `json:"OVNNBAddr" mapstructure:"ovn_nb_addr"`                // OVN Northbound DB address (e.g., "tcp:127.0.0.1:6641")
-	OVNSBAddr         string `json:"OVNSBAddr" mapstructure:"ovn_sb_addr"`                // OVN Southbound DB address (e.g., "tcp:127.0.0.1:6642")
+	OVNNBAddr         string `json:"OVNNBAddr" mapstructure:"ovn_nb_addr"`                // OVN Northbound DB address; comma-separated list for a RAFT cluster (e.g., "tcp:127.0.0.1:6641" or "tcp:ip1:6641,tcp:ip2:6641,tcp:ip3:6641")
+	OVNSBAddr         string `json:"OVNSBAddr" mapstructure:"ovn_sb_addr"`                // OVN Southbound DB address; comma-separated list for a RAFT cluster (e.g., "tcp:127.0.0.1:6642" or "tcp:ip1:6642,tcp:ip2:6642,tcp:ip3:6642")
 	ExternalInterface string `json:"ExternalInterface" mapstructure:"external_interface"` // WAN NIC name (e.g., "eth1", "enp0s3") — the physical NIC on the WAN bridge
 	BridgeMode        string `json:"BridgeMode" mapstructure:"bridge_mode"`               // "direct" or "veth" (auto-detected if empty)
+}
+
+// NorthstarConfig holds the per-node northstar DNS service configuration.
+type NorthstarConfig struct {
+	// ConfigPath is the path to northstar.toml written by `spx admin init`.
+	ConfigPath string `json:"ConfigPath" mapstructure:"config_path"`
+	// DefaultDomain and InternalDomain mirror the northstar zone domains as
+	// non-secret values so producers (daemon, vpcd) can resolve DNS names
+	// without reading the credential-bearing northstar.toml.
+	DefaultDomain  string `json:"DefaultDomain" mapstructure:"default_domain"`
+	InternalDomain string `json:"InternalDomain" mapstructure:"internal_domain"`
+}
+
+// Every DB VM's primary NIC lives in the shared system VPC, which gives the
+// in-guest agent management egress while the customer ENI stays ingress-only.
+type RDSConfig struct {
+	// The IPv4 /14 the system VPC's /22 is carved from. It must not overlap the
+	// EKS control-plane supernet or any customer VPC CIDR.
+	SystemVPCSupernet string `json:"SystemVPCSupernet" mapstructure:"system_vpc_supernet"`
+
+	// Clamped to 1..3. Zero defaults to one, which is all a single-AZ platform
+	// can place across.
+	SystemVPCPrivateSubnets int `json:"SystemVPCPrivateSubnets" mapstructure:"system_vpc_private_subnets"`
+
+	// How long a creating DB instance may go without a healthy agent heartbeat
+	// before the reconciler marks it failed. Zero takes the built-in default,
+	// which covers a cold boot plus initdb on the smallest instance class.
+	BootstrapTimeoutSeconds int `json:"BootstrapTimeoutSeconds" mapstructure:"bootstrap_timeout_seconds"`
+
+	// How long an available DB instance may be observed with its VM down and its
+	// agent silent before the reconciler reports it failed. Zero takes the
+	// built-in default of one heartbeat interval, which requires two reconciler
+	// passes to agree; raise it to give EC2's own VM auto-restart more room
+	// before a customer sees the instance reported as failed.
+	FailureGraceSeconds int `json:"FailureGraceSeconds" mapstructure:"failure_grace_seconds"`
+
+	// The upper bound on a DB instance's BackupRetentionPeriod, and what a create
+	// that names none gets. Zero takes the built-in 7 for both. Retention length
+	// does not change the physical footprint of a backed-up volume — any snapshot
+	// latches viperblock chunk GC off for the life of the volume — so a short
+	// retention buys nothing but a smaller restore surface.
+	BackupRetentionCapDays int `json:"BackupRetentionCapDays" mapstructure:"backup_retention_cap_days"`
+	BackupRetentionDays    int `json:"BackupRetentionDays" mapstructure:"backup_retention_days"`
+
+	// The daily UTC blocks an unnamed backup or maintenance window is assigned
+	// inside, as hh24:mi-hh24:mi. They must not overlap: the windows derived from
+	// them must not either. Empty takes the built-in 03:00-11:00 and 11:00-19:00.
+	BackupWindowBlock      string `json:"BackupWindowBlock" mapstructure:"backup_window_block"`
+	MaintenanceWindowBlock string `json:"MaintenanceWindowBlock" mapstructure:"maintenance_window_block"`
+
+	// How many automated snapshots one retention pass may delete. Zero takes the
+	// built-in bound; a pass that under-collects is corrected two minutes later.
+	BackupSweepDeleteLimit int `json:"BackupSweepDeleteLimit" mapstructure:"backup_sweep_delete_limit"`
+}
+
+// RDSDefaultSystemVPCSupernet anchors the RDS system VPC address space at
+// 10.248.0.0/14, immediately below and disjoint from the EKS control-plane
+// supernet, so a name-hash collision can never place an RDS subnet in EKS space.
+const RDSDefaultSystemVPCSupernet = "10.248.0.0/14"
+
+// Every self-hosted vLLM serving VM's primary NIC lives in the shared Bedrock
+// system VPC, mirroring RDS's DB-VM VPC: one shared VPC per region rather
+// than one per endpoint, since a serving VM has no customer ENI to isolate.
+type BedrockConfig struct {
+	// The IPv4 /14 the system VPC's /22 is carved from. It must not overlap the
+	// RDS or EKS control-plane supernets or any customer VPC CIDR.
+	SystemVPCSupernet string `json:"SystemVPCSupernet" mapstructure:"system_vpc_supernet"`
+
+	// Clamped to 1..3. Zero defaults to one, which is all a single-AZ platform
+	// can place across.
+	SystemVPCPrivateSubnets int `json:"SystemVPCPrivateSubnets" mapstructure:"system_vpc_private_subnets"`
+}
+
+// BedrockDefaultSystemVPCSupernet anchors the Bedrock system VPC address
+// space at 10.244.0.0/14, immediately below and disjoint from both the RDS
+// (10.248.0.0/14) and EKS control-plane (10.252.0.0/14) supernets.
+const BedrockDefaultSystemVPCSupernet = "10.244.0.0/14"
+
+// ACMConfig holds the operator-level ACM certificate-issuance configuration.
+// Deliberately small: four keys, nothing deployment-specific and nothing
+// derivable. In particular there is no allowed-domains list (public modes are
+// authorized by the ACME CA's own validation, PRIVATE_CA by the CA's own name
+// constraints), no default validation mode (derived from DNSProvider and
+// whether northstar hosts the zone, never configured), no renewal thresholds
+// (proportional, hence constants) and no private CA paths (folded into the
+// existing CA path handling in admin.ConfigSettings).
+type ACMConfig struct {
+	Enabled      bool   `json:"Enabled" mapstructure:"enabled"`
+	DirectoryURL string `json:"DirectoryURL" mapstructure:"directory_url"`
+	ContactEmail string `json:"ContactEmail" mapstructure:"contact_email"`
+	// DNSProvider is the lego DNS provider id used for PROVIDER_API DNS-01
+	// challenges. Its credentials come from environment variables per lego's
+	// own convention, never from this file — a provider token in a
+	// configuration file is a token in every backup. A non-empty value here is
+	// what selects PROVIDER_API at RequestCertificate time.
+	DNSProvider string `json:"DNSProvider" mapstructure:"dns_provider"`
+}
+
+// ParseEndpoints splits a comma-separated OVSDB endpoint list (NB/SB RAFT
+// cluster) into individual endpoints, trimming whitespace and dropping empties.
+// A single endpoint yields a one-element slice; empty input yields nil. Both the
+// libovsdb NB client (one WithEndpoint each) and ovn-sbctl --db= (which also
+// accepts the raw comma list) consume the cluster form.
+func ParseEndpoints(addr string) []string {
+	var out []string
+	for p := range strings.SplitSeq(addr, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 type PredastoreConfig struct {
@@ -129,7 +262,9 @@ type PredastoreConfig struct {
 	AccessKey string `json:"AccessKey" mapstructure:"accesskey"`
 	SecretKey string `json:"SecretKey" mapstructure:"secretkey"`
 	BaseDir   string `json:"BaseDir" mapstructure:"base_dir"`
-	NodeID    int    `json:"NodeID" mapstructure:"node_id"`
+	// HostID is which [[host]] of the predastore topology this node runs;
+	// unset means the node runs the whole topology in one process.
+	HostID int `json:"HostID" mapstructure:"host_id"`
 }
 
 // GPUModelOverride maps a PCI vendor/device ID to a GPU instance family for
@@ -148,7 +283,7 @@ type GPUModelOverride struct {
 	MIGProfile string `json:"MIGProfile" mapstructure:"mig_profile"`
 }
 
-// DaemonConfig holds the daemon configuration
+// DaemonConfig holds the daemon configuration.
 type DaemonConfig struct {
 	Host              string             `json:"Host" mapstructure:"host"`
 	TLSKey            string             `json:"TLSKey" mapstructure:"tlskey"`
@@ -161,7 +296,7 @@ type DaemonConfig struct {
 	MIGProfile string `json:"MIGProfile" mapstructure:"mig_profile"`
 }
 
-// NATSConfig holds the NATS configuration
+// NATSConfig holds the NATS configuration.
 type NATSConfig struct {
 	Host   string  `json:"Host" mapstructure:"host"`
 	CACert string  `json:"CACert" mapstructure:"cacert"`
@@ -169,12 +304,12 @@ type NATSConfig struct {
 	Sub    NATSSub `json:"Sub" mapstructure:"sub"`
 }
 
-// NATSACL holds the NATS ACL configuration
+// NATSACL holds the NATS ACL configuration.
 type NATSACL struct {
 	Token string `json:"Token" mapstructure:"token"`
 }
 
-// NATSSub holds the NATS subscription configuration
+// NATSSub holds the NATS subscription configuration.
 type NATSSub struct {
 	Subject string `json:"Subject" mapstructure:"subject"`
 }
@@ -216,7 +351,7 @@ func (c Config) GetServices() []string {
 	return c.Services
 }
 
-// LoadConfig loads the configuration from file and environment variables
+// LoadConfig loads the configuration from file and environment variables.
 func LoadConfig(configPath string) (*ClusterConfig, error) {
 	// Set environment variable prefix
 	viper.SetEnvPrefix("SPINIFEX")
@@ -285,6 +420,15 @@ func validateClusterConfig(cc *ClusterConfig) error {
 		}
 	}
 
+	if len(cc.Network.NATExemptCIDRs) > 0 && cc.Network.ExternalMode != "nat" {
+		return fmt.Errorf("config: [network] nat_exempt_cidrs requires external_mode = \"nat\"")
+	}
+	for _, c := range cc.Network.NATExemptCIDRs {
+		if _, err := netip.ParsePrefix(c); err != nil {
+			return fmt.Errorf("config: [network] nat_exempt_cidrs entry %q: %w", c, err)
+		}
+	}
+
 	type poolRange struct {
 		name  string
 		start netip.Addr
@@ -292,10 +436,18 @@ func validateClusterConfig(cc *ClusterConfig) error {
 	}
 	var ranges []poolRange
 	for _, p := range cc.Network.ExternalPools {
+		switch p.DHCPMAC {
+		case "", "derived", "interface":
+		default:
+			return fmt.Errorf("config: [[network.external_pools]] %q: dhcp_mac=%q unsupported; use \"derived\" or \"interface\"", p.Name, p.DHCPMAC)
+		}
 		switch p.Source {
 		case "", "static":
 			if p.BindBridge != "" {
 				return fmt.Errorf("config: [[network.external_pools]] %q: bind_bridge is only valid with source=\"dhcp\"", p.Name)
+			}
+			if p.DHCPMAC != "" {
+				return fmt.Errorf("config: [[network.external_pools]] %q: dhcp_mac is only valid with source=\"dhcp\"", p.Name)
 			}
 		case "dhcp":
 			if p.BindBridge == "" {

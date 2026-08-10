@@ -5,7 +5,9 @@ import (
 	"testing"
 
 	"github.com/mulgadc/spinifex/spinifex/config"
+	handlers_ec2_eip "github.com/mulgadc/spinifex/spinifex/handlers/ec2/eip"
 	handlers_elbv2 "github.com/mulgadc/spinifex/spinifex/handlers/elbv2"
+	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
@@ -18,7 +20,9 @@ func newWireLBTestDaemon(t *testing.T, cfg *config.Config) *Daemon {
 	t.Helper()
 	_, nc, _ := testutil.StartTestJetStream(t)
 
-	svc, err := handlers_elbv2.NewELBv2ServiceImplWithNATS(nil, nc)
+	masterKey, err := handlers_iam.GenerateMasterKey()
+	require.NoError(t, err)
+	svc, err := handlers_elbv2.NewELBv2ServiceImplWithNATS(nil, nc, masterKey)
 	require.NoError(t, err)
 	t.Cleanup(func() { svc.Close() })
 
@@ -177,7 +181,7 @@ func TestWireLBAgentConfig_NoMgmtRoute(t *testing.T) {
 
 // AdvertiseIP covers the single-node default install (no br-mgmt, AWSGW on
 // wildcard): the gateway URL falls back to the node's advertised off-host IP.
-// Replaces the siv-6 "empty gateway URL" silent failure.
+// Covers the "empty gateway URL" failure.
 func TestWireLBAgentConfig_GatewayURL_AdvertiseFallback(t *testing.T) {
 	cfg := &config.Config{
 		AdvertiseIP: "192.168.1.21",
@@ -193,7 +197,7 @@ func TestWireLBAgentConfig_GatewayURL_AdvertiseFallback(t *testing.T) {
 
 // When there's no br-mgmt, no AdvertiseIP, no DevNetworking, and AWSGW is on
 // the wildcard, the gateway URL must stay empty and the daemon must log an
-// error (rather than silently assigning a broken URL like pre-siv-8).
+// error rather than silently assigning a broken URL.
 func TestWireLBAgentConfig_GatewayURL_NoAdvertiseNoBridge(t *testing.T) {
 	cfg := &config.Config{
 		AWSGW: config.AWSGWConfig{Host: "0.0.0.0:9999"},
@@ -249,7 +253,9 @@ func TestWireLBAgentConfig_GatewayURL_SingleNodeBindMatchesAdvertise(t *testing.
 // newSubscribeTestDaemon creates a minimal Daemon wired enough for subscribeAll.
 func newSubscribeTestDaemon(t *testing.T, nc *nats.Conn, gatewayURL, accessKey string) *Daemon {
 	t.Helper()
-	svc, err := handlers_elbv2.NewELBv2ServiceImplWithNATS(nil, nc)
+	masterKey, err := handlers_iam.GenerateMasterKey()
+	require.NoError(t, err)
+	svc, err := handlers_elbv2.NewELBv2ServiceImplWithNATS(nil, nc, masterKey)
 	require.NoError(t, err)
 	t.Cleanup(func() { svc.Close() })
 	svc.GatewayURL = gatewayURL
@@ -261,6 +267,10 @@ func newSubscribeTestDaemon(t *testing.T, nc *nats.Conn, gatewayURL, accessKey s
 		natsSubscriptions: make(map[string]*nats.Subscription),
 		elbv2Service:      svc,
 		systemAccessKey:   accessKey,
+		// subscribeAll now binds d.eipService.Method eagerly; production always
+		// sets the disabled stub when EIP is unconfigured, so mirror that here to
+		// avoid a nil-interface method-value panic while building the table.
+		eipService: handlers_ec2_eip.NewDisabledEIPService(),
 	}
 }
 

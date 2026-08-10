@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"errors"
 	"maps"
 	"sync"
 
@@ -81,6 +82,20 @@ func (f *fakeStateStore) ListStoppedInstances() ([]*VM, error) {
 	return out, nil
 }
 
+// ClaimStoppedInstance mimics the real atomic-delete claim for tests: under
+// the store lock, remove and return the entry, or ErrStoppedInstanceClaimed
+// if it is already gone (claimed by a concurrent caller, or never existed).
+func (f *fakeStateStore) ClaimStoppedInstance(id string) (*VM, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.stopped[id]
+	if !ok {
+		return nil, ErrStoppedInstanceClaimed
+	}
+	delete(f.stopped, id)
+	return v, nil
+}
+
 func (f *fakeStateStore) WriteTerminatedInstance(id string, v *VM) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -103,6 +118,20 @@ func (f *fakeStateStore) DeleteTerminatedInstance(id string) error {
 	defer f.mu.Unlock()
 	delete(f.terminated, id)
 	return nil
+}
+
+// UpdateTerminatedInstance mimics the real CAS semantics for tests: mutate
+// runs under the store lock against the stored value, matching the
+// read-modify-write contract without needing a real KV revision.
+func (f *fakeStateStore) UpdateTerminatedInstance(id string, mutate func(*VM)) (*VM, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.terminated[id]
+	if !ok {
+		return nil, errors.New("terminated instance not found")
+	}
+	mutate(v)
+	return v, nil
 }
 
 var _ StateStore = (*fakeStateStore)(nil)
@@ -176,9 +205,10 @@ var _ VolumeMounter = (*fakeVolumeMounter)(nil)
 // of the API-form name (e.g. /dev/sdf) shows up as the wrong stored
 // device on the recorded call.
 type fakeVolumeStateUpdater struct {
-	mu    sync.Mutex
-	calls []volumeStateUpdate
-	err   error
+	mu       sync.Mutex
+	calls    []volumeStateUpdate
+	err      error
+	onUpdate func(volumeStateUpdate)
 }
 
 type volumeStateUpdate struct {
@@ -189,15 +219,23 @@ type volumeStateUpdate struct {
 }
 
 func (f *fakeVolumeStateUpdater) UpdateVolumeState(volumeID, state, instanceID, attachmentDevice string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls = append(f.calls, volumeStateUpdate{
+	update := volumeStateUpdate{
 		VolumeID:         volumeID,
 		State:            state,
 		InstanceID:       instanceID,
 		AttachmentDevice: attachmentDevice,
-	})
-	return f.err
+	}
+
+	f.mu.Lock()
+	f.calls = append(f.calls, update)
+	err := f.err
+	hook := f.onUpdate
+	f.mu.Unlock()
+
+	if hook != nil {
+		hook(update)
+	}
+	return err
 }
 
 func (f *fakeVolumeStateUpdater) snapshot() []volumeStateUpdate {

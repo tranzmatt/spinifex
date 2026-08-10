@@ -29,10 +29,25 @@ func seedVPCRouter(t *testing.T, m *mock.Client, vpcID, cidr string) {
 
 func newTestIGWManager(t *testing.T, m *mock.Client, mode policy.NATMode, pool *ExternalPoolConfig, allocator GatewayIPAllocator, chassis []string) (IGWManager, *int) {
 	t.Helper()
+	mgr, calls, err := newTestIGWManagerWithSeed(t, m, mode, pool, allocator, chassis, nil)
+	require.NoError(t, err)
+	return mgr, calls
+}
+
+// nexthopSeedCall records a single NexthopSeed invocation's arguments.
+type nexthopSeedCall struct {
+	lrpName   string
+	nexthopIP string
+}
+
+// newTestIGWManagerWithSeed is newTestIGWManager plus an optional capturing
+// NexthopSeed hook; pass nil to leave it unset (mirrors newTestIGWManager).
+func newTestIGWManagerWithSeed(t *testing.T, m *mock.Client, mode policy.NATMode, pool *ExternalPoolConfig, allocator GatewayIPAllocator, chassis []string, seedCalls *[]nexthopSeedCall) (IGWManager, *int, error) {
+	t.Helper()
 	nm, err := policy.NewNATManager(m, mode)
 	require.NoError(t, err)
 	barrierCalls := 0
-	mgr, err := NewIGWManager(IGWManagerConfig{
+	cfg := IGWManagerConfig{
 		OVN:       m,
 		Routes:    policy.NewRouteManager(m),
 		NAT:       nm,
@@ -44,9 +59,15 @@ func newTestIGWManager(t *testing.T, m *mock.Client, mode policy.NATMode, pool *
 			barrierCalls++
 			return nil
 		},
-	})
-	require.NoError(t, err)
-	return mgr, &barrierCalls
+	}
+	if seedCalls != nil {
+		cfg.NexthopSeed = func(_ context.Context, lrpName, nexthopIP string) error {
+			*seedCalls = append(*seedCalls, nexthopSeedCall{lrpName: lrpName, nexthopIP: nexthopIP})
+			return nil
+		}
+	}
+	mgr, err := NewIGWManager(cfg)
+	return mgr, &barrierCalls, err
 }
 
 func TestNewIGWManager_RejectsMissingDeps(t *testing.T) {
@@ -77,7 +98,12 @@ func TestAttachIGW_Distributed_LinkLocalLRP(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "external", localnet.Options["network_name"])
 	_, hasNat := localnet.Options["nat-addresses"]
-	assert.False(t, hasNat, "distributed mode must NOT set nat-addresses")
+	assert.False(t, hasNat, "nat-addresses is never valid on a localnet port")
+
+	gwPort, err := m.GetLogicalSwitchPort(ctx, topology.GatewaySwitchPort("vpc-1"))
+	require.NoError(t, err)
+	_, hasGwNat := gwPort.Options["nat-addresses"]
+	assert.False(t, hasGwNat, "distributed mode must NOT set nat-addresses")
 
 	// Gateway LRP exists with link-local network.
 	lrp, err := m.GetLogicalRouterPort(ctx, topology.GatewayRouterPort("vpc-1"))
@@ -127,12 +153,122 @@ func TestAttachIGW_Centralized_AllocatesGwLrpIP(t *testing.T) {
 
 	localnet, err := m.GetLogicalSwitchPort(ctx, topology.ExternalLocalnetPortShared())
 	require.NoError(t, err)
-	assert.Equal(t, "router", localnet.Options["nat-addresses"], "centralized mode must set nat-addresses=router")
+	_, hasNat := localnet.Options["nat-addresses"]
+	assert.False(t, hasNat, "nat-addresses is never valid on a localnet port")
+
+	gwPort, err := m.GetLogicalSwitchPort(ctx, topology.GatewaySwitchPort("vpc-1"))
+	require.NoError(t, err)
+	assert.Equal(t, "router", gwPort.Options["nat-addresses"], "centralized mode must set nat-addresses=router on the gateway port")
 
 	lrp, err := m.GetLogicalRouterPort(ctx, topology.GatewayRouterPort("vpc-1"))
 	require.NoError(t, err)
 	assert.Equal(t, []string{"192.168.1.240/24"}, lrp.Networks)
 	assert.Equal(t, "192.168.1.240", lrp.ExternalIDs[gatewayIPExtIDKey])
+}
+
+// A localnet port created before NAT advertisement moved to the gateway port
+// carries a stale nat-addresses that must be cleared on the next attach.
+func TestAttachIGW_ClearsStaleLocalnetNATAddresses(t *testing.T) {
+	ctx := context.Background()
+	m := mock.New()
+	seedVPCRouter(t, m, "vpc-1", "10.0.0.0/16")
+
+	extSwitchName := topology.ExternalSwitchShared()
+	portName := topology.ExternalLocalnetPortShared()
+	_, _, err := m.EnsureLogicalSwitch(ctx, &nbdb.LogicalSwitch{Name: extSwitchName})
+	require.NoError(t, err)
+	require.NoError(t, m.CreateLogicalSwitchPort(ctx, extSwitchName, &nbdb.LogicalSwitchPort{
+		Name:      portName,
+		Type:      "localnet",
+		Addresses: []string{"unknown"},
+		Options:   map[string]string{"network_name": "external", "nat-addresses": "router"},
+	}))
+
+	pool := &ExternalPoolConfig{Name: "p", Gateway: "192.168.1.1", PrefixLen: 24}
+	mgr, _ := newTestIGWManager(t, m, policy.NATModeDistributed, pool, LinkLocalAllocator{}, []string{"chassis-a"})
+	require.NoError(t, mgr.AttachIGW(ctx, IGWSpec{VPCID: "vpc-1", InternetGatewayID: "igw-1"}))
+
+	localnet, err := m.GetLogicalSwitchPort(ctx, portName)
+	require.NoError(t, err)
+	_, hasNat := localnet.Options["nat-addresses"]
+	assert.False(t, hasNat, "stale nat-addresses must be cleared from the localnet port")
+	assert.Equal(t, "external", localnet.Options["network_name"], "converge must not drop network_name")
+}
+
+// The LRP address is written once at attach, so a lease re-issued on a new IP
+// leaves the port answering ARP for an address nothing renews.
+func TestRebindGatewayIP_MovesLRPAndStamp(t *testing.T) {
+	ctx := context.Background()
+	m := mock.New()
+	seedVPCRouter(t, m, "vpc-1", "10.0.0.0/16")
+	pool := &ExternalPoolConfig{Name: "p", PrefixLen: 23}
+	mgr, _ := newTestIGWManager(t, m, policy.NATModeCentralized, pool,
+		fixedNexthopAllocator{ip: "192.168.1.115", prefix: 23, nexthop: "192.168.1.1"}, []string{"chassis-a"})
+	require.NoError(t, mgr.AttachIGW(ctx, IGWSpec{VPCID: "vpc-1", InternetGatewayID: "igw-1"}))
+
+	require.NoError(t, mgr.RebindGatewayIP(ctx, "vpc-1", "192.168.1.146", 23))
+
+	lrp, err := m.GetLogicalRouterPort(ctx, topology.GatewayRouterPort("vpc-1"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"192.168.1.146/23"}, lrp.Networks, "the old address must not linger on the port")
+	assert.Equal(t, "192.168.1.146", lrp.ExternalIDs[gatewayIPExtIDKey])
+}
+
+func TestRebindGatewayIP_IsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	m := mock.New()
+	seedVPCRouter(t, m, "vpc-1", "10.0.0.0/16")
+	pool := &ExternalPoolConfig{Name: "p", PrefixLen: 23}
+	mgr, barrierCalls := newTestIGWManager(t, m, policy.NATModeCentralized, pool,
+		fixedNexthopAllocator{ip: "192.168.1.115", prefix: 23, nexthop: "192.168.1.1"}, []string{"chassis-a"})
+	require.NoError(t, mgr.AttachIGW(ctx, IGWSpec{VPCID: "vpc-1", InternetGatewayID: "igw-1"}))
+	before := *barrierCalls
+
+	// Rebinding to the address already on the port must not touch OVN at all.
+	require.NoError(t, mgr.RebindGatewayIP(ctx, "vpc-1", "192.168.1.115", 23))
+	assert.Equal(t, before, *barrierCalls, "a no-op rebind must not wait on the flows barrier")
+}
+
+// Routed mode pins the VPC SNAT to the transit IP, so a rebind must move it or
+// egress keeps leaving via the released address.
+func TestRebindGatewayIP_RoutedMovesSNAT(t *testing.T) {
+	ctx := context.Background()
+	m := mock.New()
+	seedVPCRouter(t, m, "vpc-1", "10.0.0.0/16")
+	pool := &ExternalPoolConfig{Name: "p", PrefixLen: 23}
+	mgr, _ := newTestIGWManager(t, m, policy.NATModeRouted, pool,
+		fixedNexthopAllocator{ip: "10.99.0.10", prefix: 24, nexthop: "10.99.0.1"}, []string{"chassis-a"})
+	require.NoError(t, mgr.AttachIGW(ctx, IGWSpec{VPCID: "vpc-1", InternetGatewayID: "igw-1"}))
+
+	require.NoError(t, mgr.RebindGatewayIP(ctx, "vpc-1", "10.99.0.20", 24))
+
+	snat, err := m.FindNATByLogicalIP(ctx, topology.VPCRouter("vpc-1"), "snat", "10.0.0.0/16")
+	require.NoError(t, err)
+	require.NotNil(t, snat)
+	assert.Equal(t, "10.99.0.20", snat.ExternalIP)
+}
+
+// A gw-lrp lease only exists because a port was attached, so a missing port is
+// an unreachable OVSDB or a detach that kept the lease. Both mean an address is
+// held with no owner and must surface rather than read as "nothing to do".
+func TestRebindGatewayIP_MissingLRPErrors(t *testing.T) {
+	m := mock.New()
+	seedVPCRouter(t, m, "vpc-1", "10.0.0.0/16")
+	mgr, _ := newTestIGWManager(t, m, policy.NATModeCentralized, nil, LinkLocalAllocator{}, nil)
+
+	err := mgr.RebindGatewayIP(context.Background(), "vpc-1", "192.168.1.146", 23)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), topology.GatewayRouterPort("vpc-1"))
+}
+
+func TestRebindGatewayIP_RejectsBadArgs(t *testing.T) {
+	ctx := context.Background()
+	m := mock.New()
+	mgr, _ := newTestIGWManager(t, m, policy.NATModeCentralized, nil, LinkLocalAllocator{}, nil)
+
+	assert.Error(t, mgr.RebindGatewayIP(ctx, "", "192.168.1.146", 23))
+	assert.Error(t, mgr.RebindGatewayIP(ctx, "vpc-1", "", 23))
+	assert.Error(t, mgr.RebindGatewayIP(ctx, "vpc-1", "192.168.1.146", 0))
 }
 
 func TestAttachIGW_IsIdempotent(t *testing.T) {
@@ -548,4 +684,64 @@ func TestRemoveSubnetEgress_PropagatesDeleteError(t *testing.T) {
 
 	err := mgr.RemoveSubnetEgress(ctx, "vpc-missing", "subnet-pub", netip.MustParsePrefix("0.0.0.0/0"))
 	require.Error(t, err)
+}
+
+// TestAttachIGW_NexthopSeed_CalledWhenGatewayOwnsNAT covers centralized and
+// routed modes, both of which give the gateway LRP a real pool IP and a
+// non-empty wanNexthop — AttachIGW must invoke NexthopSeed with the gateway
+// port name and the resolved nexthop right after AddDefaultRoute.
+func TestAttachIGW_NexthopSeed_CalledWhenGatewayOwnsNAT(t *testing.T) {
+	for _, mode := range []policy.NATMode{policy.NATModeCentralized, policy.NATModeRouted} {
+		t.Run(mode.String(), func(t *testing.T) {
+			ctx := context.Background()
+			m := mock.New()
+			seedVPCRouter(t, m, "vpc-1", "10.0.0.0/16")
+			pool := &ExternalPoolConfig{
+				Name: "p", Gateway: "192.168.1.1", PrefixLen: 24,
+				GwLrpRangeStart: "192.168.1.240", GwLrpRangeEnd: "192.168.1.243",
+			}
+			var seedCalls []nexthopSeedCall
+			mgr, _, err := newTestIGWManagerWithSeed(t, m, mode, pool, NewStaticRangeAllocator(m), []string{"chassis-a"}, &seedCalls)
+			require.NoError(t, err)
+
+			require.NoError(t, mgr.AttachIGW(ctx, IGWSpec{VPCID: "vpc-1", InternetGatewayID: "igw-1"}))
+
+			require.Len(t, seedCalls, 1, "NexthopSeed must be invoked exactly once on attach")
+			assert.Equal(t, topology.GatewayRouterPort("vpc-1"), seedCalls[0].lrpName)
+			assert.Equal(t, "192.168.1.1", seedCalls[0].nexthopIP)
+		})
+	}
+}
+
+// TestAttachIGW_NexthopSeed_NotCalledWhenModeIsDistributed guards the
+// gatewayOwnsNAT() gate: distributed mode never owns NAT on the gateway
+// chassis, so seeding a static binding there would be meaningless.
+func TestAttachIGW_NexthopSeed_NotCalledWhenModeIsDistributed(t *testing.T) {
+	ctx := context.Background()
+	m := mock.New()
+	seedVPCRouter(t, m, "vpc-1", "10.0.0.0/16")
+	pool := &ExternalPoolConfig{Name: "p", Gateway: "192.168.1.1", PrefixLen: 24}
+	var seedCalls []nexthopSeedCall
+	mgr, _, err := newTestIGWManagerWithSeed(t, m, policy.NATModeDistributed, pool, LinkLocalAllocator{}, []string{"chassis-a"}, &seedCalls)
+	require.NoError(t, err)
+
+	require.NoError(t, mgr.AttachIGW(ctx, IGWSpec{VPCID: "vpc-1", InternetGatewayID: "igw-1"}))
+
+	assert.Empty(t, seedCalls, "NexthopSeed must not be invoked outside gatewayOwnsNAT modes")
+}
+
+// TestAttachIGW_NexthopSeed_NilHookSkipped asserts a nil NexthopSeed (the
+// default in all existing tests/wiring paths) is simply never called, and
+// AttachIGW proceeds normally.
+func TestAttachIGW_NexthopSeed_NilHookSkipped(t *testing.T) {
+	ctx := context.Background()
+	m := mock.New()
+	seedVPCRouter(t, m, "vpc-1", "10.0.0.0/16")
+	pool := &ExternalPoolConfig{
+		Name: "p", Gateway: "192.168.1.1", PrefixLen: 24,
+		GwLrpRangeStart: "192.168.1.240", GwLrpRangeEnd: "192.168.1.243",
+	}
+	mgr, _ := newTestIGWManager(t, m, policy.NATModeCentralized, pool, NewStaticRangeAllocator(m), []string{"chassis-a"})
+
+	require.NoError(t, mgr.AttachIGW(ctx, IGWSpec{VPCID: "vpc-1", InternetGatewayID: "igw-1"}))
 }

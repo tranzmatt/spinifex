@@ -1,7 +1,6 @@
 package viperblockd
 
-// Tests for NATS message handlers: ebs.delete, ebs.sync, ebs.unmount, ebs.snapshot
-// These extend the existing integration tests to cover untested handler paths.
+// Tests for NATS message handlers: ebs.delete, ebs.sync, ebs.unmount
 
 import (
 	"encoding/json"
@@ -58,17 +57,17 @@ func TestIntegration_EBSDeleteMountedVolume(t *testing.T) {
 	require.NoError(t, err)
 	defer nc.Close()
 
-	snapSub, err := nc.Subscribe("ebs.snapshot.vol-del-test", func(msg *nats.Msg) {})
+	configSub, err := nc.Subscribe("ebs.config.vol-del-test", func(msg *nats.Msg) {})
 	require.NoError(t, err)
 
 	cfg := setupTestConfig(t, natsURL)
 	cfg.MountedVolumes = []MountedVolume{
 		{
-			Name:        "vol-del-test",
-			Port:        10809,
-			Socket:      socketPath,
-			PID:         99999, // Fake PID
-			SnapshotSub: snapSub,
+			Name:      "vol-del-test",
+			Port:      10809,
+			Socket:    socketPath,
+			PID:       99999,
+			ConfigSub: configSub,
 		},
 	}
 
@@ -88,14 +87,14 @@ func TestIntegration_EBSDeleteMountedVolume(t *testing.T) {
 
 	// Verify volume removed from config
 	cfg.mu.Lock()
-	assert.Len(t, cfg.MountedVolumes, 0)
+	assert.Empty(t, cfg.MountedVolumes)
 	cfg.mu.Unlock()
 
 	// Verify socket file deleted
 	assert.False(t, fileExistsCheck(socketPath))
 
-	// Verify snapshot subscription was unsubscribed
-	assert.False(t, snapSub.IsValid())
+	// Verify config subscription was unsubscribed
+	assert.False(t, configSub.IsValid())
 }
 
 func TestIntegration_EBSDeleteUnmountedVolume(t *testing.T) {
@@ -124,6 +123,166 @@ func TestIntegration_EBSDeleteUnmountedVolume(t *testing.T) {
 	var resp types.EBSDeleteResponse
 	require.NoError(t, json.Unmarshal(msg.Data, &resp))
 	assert.True(t, resp.Success)
+}
+
+// TestIntegration_EBSDeleteRemovesLocalVolumeDirectory covers the residual
+// leak: terminateCleanup always unmounts before DeleteVolumes sends
+// ebs.delete, so the common case is an already-unmounted volume. Before the
+// fix, ebs.delete only cleaned up a still-mounted volume's nbdkit
+// process/socket and never touched cfg.BaseDir/<volume>, so the
+// WAL/checkpoint directory a prior mount (or a failed unmount seal) left
+// behind survived every DeleteVolume call — including for -efi companion
+// volumes, which never go through the unmount seal at all (isAuxVolume skips
+// it), so they leaked unconditionally rather than only on a failed seal.
+func TestIntegration_EBSDeleteRemovesLocalVolumeDirectory(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ns, natsURL := setupEmbeddedNATS(t)
+	defer ns.Shutdown()
+
+	cfg := setupTestConfig(t, natsURL)
+	// No mounted volumes: matches the terminate path where Unmount already
+	// ran and left local state behind (a failed seal for the main volume, or
+	// unconditionally for the -efi companion) before ebs.delete fires.
+	createMockVolumeState(t, cfg.BaseDir, "vol-residual-test")
+	createMockVolumeState(t, cfg.BaseDir, "vol-residual-test-efi")
+
+	go func() { launchService(cfg) }()
+	time.Sleep(500 * time.Millisecond)
+
+	nc, err := nats.Connect(natsURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	for _, volume := range []string{"vol-residual-test", "vol-residual-test-efi"} {
+		reqData, _ := json.Marshal(types.EBSDeleteRequest{Volume: volume})
+		msg, err := nc.Request("ebs.delete", reqData, 3*time.Second)
+		require.NoError(t, err)
+
+		var resp types.EBSDeleteResponse
+		require.NoError(t, json.Unmarshal(msg.Data, &resp))
+		assert.True(t, resp.Success)
+
+		assert.False(t, fileExistsCheck(filepath.Join(cfg.BaseDir, volume)),
+			"ebs.delete must remove the local volume directory for %s", volume)
+	}
+}
+
+// TestIntegration_EBSDeleteEmptyVolumeNameDoesNotWipeBaseDir is the
+// regression test for the data-destruction hazard: before validation,
+// filepath.Join(cfg.BaseDir, "") collapsed to cfg.BaseDir itself, so an empty
+// Volume made ebs.delete os.RemoveAll the node's entire local WAL/checkpoint
+// cache. This must be rejected, and BaseDir must survive.
+func TestIntegration_EBSDeleteEmptyVolumeNameDoesNotWipeBaseDir(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ns, natsURL := setupEmbeddedNATS(t)
+	defer ns.Shutdown()
+
+	cfg := setupTestConfig(t, natsURL)
+	createMockVolumeState(t, cfg.BaseDir, "vol-survivor")
+
+	go func() { launchService(cfg) }()
+	time.Sleep(500 * time.Millisecond)
+
+	nc, err := nats.Connect(natsURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	reqData, _ := json.Marshal(types.EBSDeleteRequest{Volume: ""})
+	msg, err := nc.Request("ebs.delete", reqData, 3*time.Second)
+	require.NoError(t, err)
+
+	var resp types.EBSDeleteResponse
+	require.NoError(t, json.Unmarshal(msg.Data, &resp))
+	assert.False(t, resp.Success, "an empty volume name must not report success")
+	assert.NotEmpty(t, resp.Error)
+
+	assert.True(t, fileExistsCheck(cfg.BaseDir), "BaseDir itself must survive an empty volume name")
+	assert.True(t, fileExistsCheck(filepath.Join(cfg.BaseDir, "vol-survivor")),
+		"an unrelated volume directory must survive an empty volume name")
+}
+
+// TestIntegration_EBSDeleteRejectsPathTraversal covers names that would
+// otherwise let ebs.delete escape BaseDir via filepath.Join's ".." cleaning.
+// Both cases must be refused before any RemoveAll runs, and Success must not
+// come back true for a request that was refused.
+func TestIntegration_EBSDeleteRejectsPathTraversal(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ns, natsURL := setupEmbeddedNATS(t)
+	defer ns.Shutdown()
+
+	cfg := setupTestConfig(t, natsURL)
+	createMockVolumeState(t, cfg.BaseDir, "vol-survivor")
+
+	go func() { launchService(cfg) }()
+	time.Sleep(500 * time.Millisecond)
+
+	nc, err := nats.Connect(natsURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	for _, name := range []string{"../..", "a/b"} {
+		reqData, _ := json.Marshal(types.EBSDeleteRequest{Volume: name})
+		msg, err := nc.Request("ebs.delete", reqData, 3*time.Second)
+		require.NoError(t, err)
+
+		var resp types.EBSDeleteResponse
+		require.NoError(t, json.Unmarshal(msg.Data, &resp))
+		assert.False(t, resp.Success, "volume name %q must not report success", name)
+		assert.NotEmpty(t, resp.Error, "volume name %q must return an error", name)
+	}
+
+	assert.True(t, fileExistsCheck(filepath.Join(cfg.BaseDir, "vol-survivor")),
+		"an unrelated volume directory must survive a path-traversal attempt")
+}
+
+// TestIntegration_EBSDeleteValidNameLeavesSiblingsUntouched is the essential
+// non-regression check for the new validation: a legitimate delete must still
+// remove exactly its own directory, and nothing else under BaseDir.
+func TestIntegration_EBSDeleteValidNameLeavesSiblingsUntouched(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ns, natsURL := setupEmbeddedNATS(t)
+	defer ns.Shutdown()
+
+	cfg := setupTestConfig(t, natsURL)
+	createMockVolumeState(t, cfg.BaseDir, "vol-target")
+	createMockVolumeState(t, cfg.BaseDir, "vol-sibling")
+
+	go func() { launchService(cfg) }()
+	time.Sleep(500 * time.Millisecond)
+
+	nc, err := nats.Connect(natsURL)
+	require.NoError(t, err)
+	defer nc.Close()
+
+	reqData, _ := json.Marshal(types.EBSDeleteRequest{Volume: "vol-target"})
+	msg, err := nc.Request("ebs.delete", reqData, 3*time.Second)
+	require.NoError(t, err)
+
+	var resp types.EBSDeleteResponse
+	require.NoError(t, json.Unmarshal(msg.Data, &resp))
+	assert.True(t, resp.Success)
+	assert.Empty(t, resp.Error)
+
+	assert.False(t, fileExistsCheck(filepath.Join(cfg.BaseDir, "vol-target")),
+		"the targeted volume directory must be removed")
+	assert.True(t, fileExistsCheck(filepath.Join(cfg.BaseDir, "vol-sibling")),
+		"a sibling volume directory must survive deleting a different volume")
 }
 
 func TestIntegration_EBSDeleteInvalidJSON(t *testing.T) {
@@ -297,7 +456,6 @@ func TestIntegration_EBSDeleteRemovesSocket(t *testing.T) {
 	tmpDir := t.TempDir()
 	socketPath := filepath.Join(tmpDir, "vol-del-socket.sock")
 	require.NoError(t, os.WriteFile(socketPath, []byte("fake"), 0600))
-
 	cfg := setupTestConfig(t, natsURL)
 	cfg.MountedVolumes = []MountedVolume{
 		{Name: "vol-del-socket", Socket: socketPath, PID: 99999},
@@ -318,101 +476,6 @@ func TestIntegration_EBSDeleteRemovesSocket(t *testing.T) {
 	require.NoError(t, json.Unmarshal(msg.Data, &resp))
 	assert.True(t, resp.Success)
 	assert.False(t, fileExistsCheck(socketPath))
-}
-
-// --- ebs.snapshot handler tests ---
-
-func TestIntegration_SnapshotHandler_Success(t *testing.T) {
-	t.Parallel()
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
-
-	ns, natsURL := setupEmbeddedNATS(t)
-	defer ns.Shutdown()
-
-	nc, err := nats.Connect(natsURL)
-	require.NoError(t, err)
-	defer nc.Close()
-
-	vb := createTestVBWithState(t, "vol-snap-ok")
-
-	snapSub, err := nc.Subscribe("ebs.snapshot.vol-snap-ok", makeSnapshotHandler(vb, "vol-snap-ok"))
-	require.NoError(t, err)
-	defer snapSub.Unsubscribe()
-	nc.Flush()
-
-	reqData, _ := json.Marshal(types.EBSSnapshotRequest{Volume: "vol-snap-ok", SnapshotID: "snap-001"})
-	msg, err := nc.Request("ebs.snapshot.vol-snap-ok", reqData, 3*time.Second)
-	require.NoError(t, err)
-
-	var resp types.EBSSnapshotResponse
-	require.NoError(t, json.Unmarshal(msg.Data, &resp))
-	assert.True(t, resp.Success)
-	assert.Equal(t, "snap-001", resp.SnapshotID)
-	assert.Empty(t, resp.Error)
-}
-
-func TestIntegration_SnapshotHandler_InvalidJSON(t *testing.T) {
-	t.Parallel()
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
-
-	ns, natsURL := setupEmbeddedNATS(t)
-	defer ns.Shutdown()
-
-	nc, err := nats.Connect(natsURL)
-	require.NoError(t, err)
-	defer nc.Close()
-
-	vb := createTestVBWithState(t, "vol-snap-badjson")
-
-	snapSub, err := nc.Subscribe("ebs.snapshot.vol-snap-badjson", makeSnapshotHandler(vb, "vol-snap-badjson"))
-	require.NoError(t, err)
-	defer snapSub.Unsubscribe()
-	nc.Flush()
-
-	msg, err := nc.Request("ebs.snapshot.vol-snap-badjson", []byte("not json {{{"), 3*time.Second)
-	require.NoError(t, err)
-
-	var resp types.EBSSnapshotResponse
-	require.NoError(t, json.Unmarshal(msg.Data, &resp))
-	assert.Contains(t, resp.Error, "bad request:")
-}
-
-func TestIntegration_SnapshotHandler_CreateSnapshotFailure(t *testing.T) {
-	t.Parallel()
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
-
-	ns, natsURL := setupEmbeddedNATS(t)
-	defer ns.Shutdown()
-
-	nc, err := nats.Connect(natsURL)
-	require.NoError(t, err)
-	defer nc.Close()
-
-	vb := createTestVBWithState(t, "vol-snap-fail")
-
-	// Make the base directory read-only so WriteTo fails with permission denied
-	require.NoError(t, os.Chmod(vb.BaseDir, 0555))
-	t.Cleanup(func() { os.Chmod(vb.BaseDir, 0755) })
-
-	snapSub, err := nc.Subscribe("ebs.snapshot.vol-snap-fail", makeSnapshotHandler(vb, "vol-snap-fail"))
-	require.NoError(t, err)
-	defer snapSub.Unsubscribe()
-	nc.Flush()
-
-	reqData, _ := json.Marshal(types.EBSSnapshotRequest{Volume: "vol-snap-fail", SnapshotID: "snap-fail-001"})
-	msg, err := nc.Request("ebs.snapshot.vol-snap-fail", reqData, 3*time.Second)
-	require.NoError(t, err)
-
-	var resp types.EBSSnapshotResponse
-	require.NoError(t, json.Unmarshal(msg.Data, &resp))
-	assert.False(t, resp.Success)
-	assert.Contains(t, resp.Error, "snapshot failed:")
 }
 
 // --- ebs.sync with VB instance ---
@@ -500,17 +563,17 @@ func TestIntegration_EBSDeleteWithVBInstance(t *testing.T) {
 	socketPath := filepath.Join(tmpDir, "vol-del-vb.sock")
 	require.NoError(t, os.WriteFile(socketPath, []byte("fake"), 0600))
 
-	snapSub, err := nc.Subscribe("ebs.snapshot.vol-del-vb", func(msg *nats.Msg) {})
+	configSub, err := nc.Subscribe("ebs.config.vol-del-vb", func(msg *nats.Msg) {})
 	require.NoError(t, err)
 
 	cfg := setupTestConfig(t, natsURL)
 	cfg.MountedVolumes = []MountedVolume{
 		{
-			Name:        "vol-del-vb",
-			Socket:      socketPath,
-			PID:         99999,
-			VB:          vb,
-			SnapshotSub: snapSub,
+			Name:      "vol-del-vb",
+			Socket:    socketPath,
+			PID:       99999,
+			VB:        vb,
+			ConfigSub: configSub,
 		},
 	}
 
@@ -528,10 +591,10 @@ func TestIntegration_EBSDeleteWithVBInstance(t *testing.T) {
 
 	// Verify full cleanup
 	assert.False(t, fileExistsCheck(socketPath))
-	assert.False(t, snapSub.IsValid())
+	assert.False(t, configSub.IsValid())
 }
 
-// --- ebs.unmount with VB instance + SnapshotSub ---
+// --- ebs.unmount with VB instance + ConfigSub ---
 
 func TestIntegration_EBSUnmountWithVBInstance(t *testing.T) {
 	t.Parallel()
@@ -552,17 +615,17 @@ func TestIntegration_EBSUnmountWithVBInstance(t *testing.T) {
 	socketPath := filepath.Join(tmpDir, "vol-unmount-vb.sock")
 	require.NoError(t, os.WriteFile(socketPath, []byte("fake"), 0600))
 
-	snapSub, err := nc.Subscribe("ebs.snapshot.vol-unmount-vb", func(msg *nats.Msg) {})
+	configSub, err := nc.Subscribe("ebs.config.vol-unmount-vb", func(msg *nats.Msg) {})
 	require.NoError(t, err)
 
 	cfg := setupTestConfig(t, natsURL)
 	cfg.MountedVolumes = []MountedVolume{
 		{
-			Name:        "vol-unmount-vb",
-			Socket:      socketPath,
-			PID:         99999,
-			VB:          vb,
-			SnapshotSub: snapSub,
+			Name:      "vol-unmount-vb",
+			Socket:    socketPath,
+			PID:       99999,
+			VB:        vb,
+			ConfigSub: configSub,
 		},
 	}
 
@@ -581,7 +644,7 @@ func TestIntegration_EBSUnmountWithVBInstance(t *testing.T) {
 
 	// Verify cleanup
 	assert.False(t, fileExistsCheck(socketPath))
-	assert.False(t, snapSub.IsValid())
+	assert.False(t, configSub.IsValid())
 }
 
 // --- ebs.unmount dual-publish verification ---

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestReadMachineID_ReturnsNonEmpty(t *testing.T) {
@@ -29,8 +28,14 @@ func TestSendTelemetry_PostsCorrectPayload(t *testing.T) {
 		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
 
 		body, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
-		require.NoError(t, json.Unmarshal(body, &received))
+		if !assert.NoError(t, err) {
+			http.Error(w, "read request body", http.StatusBadRequest)
+			return
+		}
+		if !assert.NoError(t, json.Unmarshal(body, &received)) {
+			http.Error(w, "decode request body", http.StatusBadRequest)
+			return
+		}
 
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -63,7 +68,9 @@ func TestSendTelemetry_RespectsTimeout(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(10 * time.Second)
+		// Outlive the 100ms client deadline so SendTelemetry aborts on its own
+		// context, but return quickly enough that server.Close() does not block.
+		time.Sleep(300 * time.Millisecond)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()

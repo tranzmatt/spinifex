@@ -88,12 +88,14 @@ The inventory in [§1](#1-inbound-listeners)–[§2](#2-outbound-connections) sa
 | 8443 | spinifex-predastore | HTTPS | Cluster | S3-compatible object storage (AMIs, snapshots, user objects) | AWS SigV4 + TLS |
 | 6660–6662 | predastore (Raft) | TCP | Cluster | Metadata consensus (3 nodes) | Cluster network only |
 | 9991–9993 | predastore (data shards) | TCP | Cluster | Erasure-coded data shard transport | Cluster network only |
-| 6641 | OVN Northbound DB | OVSDB/TCP | Cluster | Logical network topology consumed by vpcd | Cluster network only; TLS planned |
-| 6642 | OVN Southbound DB | OVSDB/TCP | Cluster | Chassis / port / MAC binding state | Cluster network only; TLS planned |
+| 6641 | OVN Northbound DB (client) | OVSDB/TCP | Cluster | Logical network topology consumed by vpcd | Cluster network only; TLS planned |
+| 6642 | OVN Southbound DB (client) | OVSDB/TCP | Cluster | Chassis / port / MAC binding state | Cluster network only; TLS planned |
+| 6643 | OVN Northbound DB (RAFT) | OVSDB/TCP | Cluster | NB database RAFT replication between the 3 quorum nodes | Cluster network only; TLS planned |
+| 6644 | OVN Southbound DB (RAFT) | OVSDB/TCP | Cluster | SB database RAFT replication between the 3 quorum nodes | Cluster network only; TLS planned |
 | 8222 | spinifex-nats (monitoring) | HTTP | Localhost | `varz`/`subsz` metrics consumed by the daemon | Loopback only |
 | socket / dynamic TCP | nbdkit (Viperblock) | NBD | Host-local / cluster | Block device transport for guest EBS volumes | Unix socket by default; TCP only in remote/DPU mode |
 
-¹ **Formation port lifecycle.** 4432 opens during `spx admin init` / `spx admin join` while a bootstrap token is outstanding and closes once the cluster is formed (token TTL default 30 min, `--token-ttl`). The server presents an ephemeral self-signed cert that pre-dates trust bootstrap, so the joining node dials with `InsecureSkipVerify` — the only production dial that does. Authenticity rests on the operator supplying the leader address out-of-band plus possession of the bearer token. Document in the security plan so reviewers do not flag 4432 as a persistent open port.
+¹ **Formation port lifecycle.** 4432 opens during `spx admin init` / `spx admin join` while a bootstrap token is outstanding and closes once the cluster is formed (token TTL default 30 min, `--token-ttl`). The server presents an ephemeral self-signed cert that pre-dates trust bootstrap, so the joining node does not verify the certificate chain for this single dial. Authenticity rests on the operator supplying the leader address out-of-band plus possession of the bearer token. Document in the security plan so reviewers do not flag 4432 as a persistent open port.
 
 **Development-only listeners.** When `dev_networking=true`, QEMU opens arbitrary host TCP ports for SSH port-forwarding into guest VMs. Production installs (the `/etc/spinifex` layout) do not enable this; it must not appear on compliance nodes.
 
@@ -105,8 +107,10 @@ Spinifex nodes initiate a small, fixed set of outbound connections.
 
 | Destination | Purpose | Protocol | Verification |
 |-------------|---------|----------|--------------|
-| `https://cloud.debian.org/images/cloud/trixie/` | Debian 13 cloud image download | HTTPS | TLS + checksum verification |
-| `https://cloud-images.ubuntu.com/resolute/` | Ubuntu 26.04 LTS cloud image download | HTTPS | TLS + checksum verification |
+| `https://cloud.debian.org/images/cloud/trixie/latest/` | Debian 13 cloud image download | HTTPS | TLS + checksum verification |
+| `https://cloud-images.ubuntu.com/releases/resolute/release/` | Ubuntu 26.04 LTS cloud image download | HTTPS | TLS + checksum verification |
+| `https://dl.rockylinux.org/pub/rocky/10/images/` | Rocky Linux 10 cloud image download | HTTPS | TLS + checksum verification |
+| `https://dl-cdn.alpinelinux.org/alpine/` | Alpine Linux cloud image download | HTTPS | TLS + checksum verification |
 | `https://d2yp8ipz5jfqcw.cloudfront.net` | Alpine image for managed HAProxy load-balancer | HTTPS | TLS + checksum verification |
 | `https://install.mulgadc.com/install` | One-shot install telemetry POST on `spx admin init` / `join`. | HTTPS | TLS |
 
@@ -114,7 +118,7 @@ Spinifex nodes initiate a small, fixed set of outbound connections.
 
 **Update checks and metadata.** Spinifex does not check for updates and does not consume a cloud metadata service (`169.254.169.254` is served *by* the cluster to guest VMs). Node software updates come from the operator's OS package channel. The install-telemetry endpoint above is the only vendor-operated destination contacted by a node; closed-egress deployments should disable it and record the opt-out in the security plan.
 
-**Air-gapped deployments.** The three image URLs are the only destinations needed for the standard image catalogue. Mirror them locally and use `spx admin images import --file` with pre-staged files. Telemetry must also be disabled. See [Air-Gapped Install](/docs/install-airgapped).
+**Air-gapped deployments.** The image URLs above are the only destinations needed for the standard image catalogue. Mirror them locally and use `spx admin images import --file` with pre-staged files. Telemetry must also be disabled. See [Air-Gapped Install](/docs/install-airgapped).
 
 ## 3. Cross-Node (Internal) Connections
 
@@ -126,7 +130,8 @@ Control-plane and data-plane traffic between Spinifex nodes, for completeness an
 | Predastore S3 | 8443 | TLS + AWS SigV4 | Cross-node object reads/writes |
 | Predastore Raft | 6660–6662 | Cluster network only | Metadata consensus |
 | Predastore shards | 9991–9993 | Cluster network only | Erasure-coded data shards |
-| OVN NB/SB | 6641 / 6642 | Cluster network only (TLS planned) | Network control plane |
+| OVN NB/SB (client) | 6641 / 6642 | Cluster network only (TLS planned) | Network control plane; vpcd and ovn-controller dial the quorum |
+| OVN NB/SB (RAFT) | 6643 / 6644 | Cluster network only (TLS planned) | NB/SB database replication across the 3 quorum nodes |
 | OVN tunnels (Geneve) | UDP 6081 | None | Tenant traffic overlay between chassis, inside the cluster subnet |
 
 Nodes **must** sit on a network segment that is not routed to tenant/guest VMs or to the internet. Predastore Raft/shards and OVN DBs are cluster-internal and must not be reachable from anywhere else.
@@ -140,7 +145,7 @@ Default external surface is three listeners — **9999** (AWS API), **3000** (UI
 tcp dport { 22, 9999, 3000 } accept
 
 # Cluster-only: replace 10.0.1.0/24 with your cluster CIDR
-ip saddr 10.0.1.0/24 tcp dport { 4222, 4248, 8443, 6641, 6642, 6660-6662, 9991-9993 } accept
+ip saddr 10.0.1.0/24 tcp dport { 4222, 4248, 8443, 6641-6644, 6660-6662, 9991-9993 } accept
 ip saddr 10.0.1.0/24 udp dport 6081 accept
 
 # Default deny
@@ -158,11 +163,11 @@ Every listener and outbound destination is controlled by one of these files. Cha
 |------|------|----------|
 | `/etc/spinifex/spinifex.toml` | `nodes.<node>.{awsgw,nats,predastore,daemon}.host`, `nodes.<node>.vpcd.ovn_{nb,sb}_addr`, `nodes.<node>.daemon.dev_networking` | Per-service bind addresses/ports; dev-mode QEMU port forwarding. |
 | `/etc/spinifex/nats.conf` | `listen`, `cluster.listen`, `cluster.routes`, `http`, `tls`, `cluster.authorization` | NATS client/cluster/monitoring listeners, peer routes, TLS, cluster token. |
-| `/etc/spinifex/predastore.toml` | `host`, `port`, `[[db]].port`, `[[nodes]].port`, `tls.*` | Predastore S3 listener, Raft ports, shard ports, TLS certs. |
+| `/etc/spinifex/predastore.toml` | `[[host]].bind_addr`, `[[host]].public_addr`, `[[node]].role`, `tls.*` | Predastore intra-cluster listener (one socket per host, carrying every node pinned to it), node placement, TLS certs. The S3 listener itself is set by the service's `--host`/`--port`. |
 | OVN packages (`ovn-central`, `ovn-host`) | `ovn-nb-db`, `ovn-sb-db` (via `ovs-vsctl set open_vswitch …`) | OVN DB bind addresses. |
 | Spinifex UI service | Built-in defaults: `host = "0.0.0.0"`, `port = 3000`. No `spinifex.toml` block today. | UI listener. |
 | `spx admin init` / `spx admin join` | `--port`, `--token-ttl`, `--no-telemetry` (or `SPX_NO_TELEMETRY=1`) | Formation port, token TTL, telemetry opt-out. |
-| `utils/images.go` `AvailableImages` | Image catalogue URLs | Outbound HTTPS destinations for image downloads. |
+| Image catalogue (built-in) | Fixed URLs listed in [§2](#2-outbound-connections); not operator-configurable | Outbound HTTPS destinations for image downloads. |
 
 ## 6. Operator Checklist
 
@@ -172,6 +177,6 @@ Every listener and outbound destination is controlled by one of these files. Cha
 - Formation port 4432 is closed on nodes not actively running a bootstrap token.
 - Outbound HTTPS restricted to the [§2](#2-outbound-connections) image-catalogue hosts, or replaced with air-gapped import.
 - Install telemetry (`install.mulgadc.com`) is either permitted and recorded in the security plan, or disabled via `SPX_NO_TELEMETRY=1` / `--no-telemetry`.
-- OVN NB/SB (6641/6642) exposure limited to the cluster subnet pending the L2 TLS work.
+- OVN NB/SB client and RAFT ports (6641–6644) exposure limited to the cluster subnet pending the L2 TLS work.
 - SSH (22) configured to operator-managed keys only; password auth disabled in `sshd_config`.
 - Periodic review (at least annually, and after any topology change) confirms this inventory still matches the deployed configuration.

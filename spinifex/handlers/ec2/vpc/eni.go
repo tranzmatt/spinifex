@@ -1,6 +1,7 @@
 package handlers_ec2_vpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +15,7 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/filterutil"
 	"github.com/mulgadc/spinifex/spinifex/network/topology"
 	"github.com/mulgadc/spinifex/spinifex/utils"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 const (
@@ -22,24 +23,29 @@ const (
 	KVBucketENIsVersion = 1
 )
 
-// ENIRecord represents a stored Elastic Network Interface
+// ENIRecord represents a stored Elastic Network Interface.
 type ENIRecord struct {
-	NetworkInterfaceId string            `json:"network_interface_id"`
-	SubnetId           string            `json:"subnet_id"`
-	VpcId              string            `json:"vpc_id"`
-	AvailabilityZone   string            `json:"availability_zone"`
-	PrivateIpAddress   string            `json:"private_ip_address"`
-	MacAddress         string            `json:"mac_address"`
-	Description        string            `json:"description"`
-	Status             string            `json:"status"` // available, in-use
-	AttachmentId       string            `json:"attachment_id,omitempty"`
-	InstanceId         string            `json:"instance_id,omitempty"`
-	DeviceIndex        int64             `json:"device_index"`
-	PublicIpAddress    string            `json:"public_ip_address,omitempty"` // Auto-assigned or EIP
-	PublicIpPool       string            `json:"public_ip_pool,omitempty"`    // Pool name the public IP came from
-	SecurityGroupIds   []string          `json:"security_group_ids,omitempty"`
-	Tags               map[string]string `json:"tags"`
-	CreatedAt          time.Time         `json:"created_at"`
+	NetworkInterfaceId string `json:"network_interface_id"`
+	SubnetId           string `json:"subnet_id"`
+	VpcId              string `json:"vpc_id"`
+	AvailabilityZone   string `json:"availability_zone"`
+	PrivateIpAddress   string `json:"private_ip_address"`
+	MacAddress         string `json:"mac_address"`
+	Description        string `json:"description"`
+	Status             string `json:"status"` // available, in-use
+	AttachmentId       string `json:"attachment_id,omitempty"`
+	InstanceId         string `json:"instance_id,omitempty"`
+	// InstanceOwnerId is the account that owns the attached instance, mirroring
+	// AWS's Attachment.InstanceOwnerId. It differs from the ENI's own account only
+	// for system VMs (LB/EKS) that plug into a customer-account ENI; IMDS resolves
+	// the instance and its IAM role under this account. Empty means same-account.
+	InstanceOwnerId  string            `json:"instance_owner_id,omitempty"`
+	DeviceIndex      int64             `json:"device_index"`
+	PublicIpAddress  string            `json:"public_ip_address,omitempty"` // Auto-assigned or EIP
+	PublicIpPool     string            `json:"public_ip_pool,omitempty"`    // Pool name the public IP came from
+	SecurityGroupIds []string          `json:"security_group_ids,omitempty"`
+	Tags             map[string]string `json:"tags"`
+	CreatedAt        time.Time         `json:"created_at"`
 
 	// AttachmentStatus carries the hot-plug transition state independent of
 	// Status. AWS-parity field: "" (not transitioning), "attaching",
@@ -64,6 +70,13 @@ type ENIRecord struct {
 	// transition. The reconciler ages transitions against this so it never
 	// rolls back a record a live attach/detach handler is mid-pipeline on.
 	AttachmentStateAt time.Time `json:"attachment_state_at,omitzero"`
+	// DeleteOnTermination mirrors AWS's Attachment.DeleteOnTermination: true
+	// deletes the ENI when its instance terminates, false only detaches it.
+	// A pointer so a nil value (unset, including every record written before
+	// this field existed) reads as true — the default for a system-attached
+	// interface and the value DescribeNetworkInterfaces already advertised
+	// before this field backed it.
+	DeleteOnTermination *bool `json:"delete_on_termination,omitempty"`
 }
 
 // eniIsLiveAttachment reports whether the ENI record is a live attachment to
@@ -76,8 +89,8 @@ func eniIsLiveAttachment(r *ENIRecord) bool {
 	return r.Status == "in-use" || r.InstanceId != "" || r.AttachmentId != ""
 }
 
-// CreateNetworkInterface creates a new ENI in the specified subnet
-func (s *VPCServiceImpl) CreateNetworkInterface(input *ec2.CreateNetworkInterfaceInput, accountID string) (*ec2.CreateNetworkInterfaceOutput, error) {
+// CreateNetworkInterface creates a new ENI in the specified subnet.
+func (s *VPCServiceImpl) CreateNetworkInterface(ctx context.Context, input *ec2.CreateNetworkInterfaceInput, accountID string) (*ec2.CreateNetworkInterfaceOutput, error) {
 	if input.SubnetId == nil || *input.SubnetId == "" {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
 	}
@@ -85,7 +98,7 @@ func (s *VPCServiceImpl) CreateNetworkInterface(input *ec2.CreateNetworkInterfac
 	subnetId := *input.SubnetId
 
 	// Verify subnet exists and belongs to this account
-	subnetEntry, err := s.subnetKV.Get(utils.AccountKey(accountID, subnetId))
+	subnetEntry, err := s.subnetKV.Get(ctx, utils.AccountKey(accountID, subnetId))
 	if err != nil {
 		return nil, errors.New(awserrors.ErrorInvalidSubnetIDNotFound)
 	}
@@ -103,13 +116,13 @@ func (s *VPCServiceImpl) CreateNetworkInterface(input *ec2.CreateNetworkInterfac
 	}
 	if len(sgIdsIn) == 0 {
 		// AWS attaches the per-VPC default SG when the caller omits Groups.
-		defaultSGId, err := s.FindDefaultSGForVPC(accountID, subnet.VpcId)
+		defaultSGId, err := s.findDefaultSGForVPC(ctx, accountID, subnet.VpcId)
 		if err != nil || defaultSGId == "" {
 			return nil, errors.New(awserrors.ErrorServerInternal)
 		}
 		sgIdsIn = []string{defaultSGId}
 	}
-	if err := s.validateSGAttachment(accountID, sgIdsIn, subnet.VpcId); err != nil {
+	if err := s.validateSGAttachment(ctx, accountID, sgIdsIn, subnet.VpcId); err != nil {
 		return nil, err
 	}
 
@@ -121,7 +134,7 @@ func (s *VPCServiceImpl) CreateNetworkInterface(input *ec2.CreateNetworkInterfac
 		// TODO: validate the requested IP is in the subnet range and not already allocated
 		privateIP = *input.PrivateIpAddress
 	} else {
-		ip, err := s.ipam.AllocateIP(subnetId, subnet.CidrBlock, PurposeENIPrimary, eniId)
+		ip, err := s.ipam.AllocateIP(ctx, subnetId, subnet.CidrBlock, PurposeENIPrimary, eniId)
 		if err != nil {
 			return nil, errors.New(awserrors.ErrorServerInternal)
 		}
@@ -154,18 +167,18 @@ func (s *VPCServiceImpl) CreateNetworkInterface(input *ec2.CreateNetworkInterfac
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal ENI record: %w", err)
 	}
-	if _, err := s.eniKV.Put(utils.AccountKey(accountID, eniId), data); err != nil {
+	if _, err := s.eniKV.Put(ctx, utils.AccountKey(accountID, eniId), data); err != nil {
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
-	slog.Info("CreateNetworkInterface completed", "eniId", eniId, "subnetId", subnetId, "ip", privateIP, "accountID", accountID)
+	slog.InfoContext(ctx, "CreateNetworkInterface completed", "eniId", eniId, "subnetId", subnetId, "ip", privateIP, "accountID", accountID)
 
 	// Send vpc.create-port synchronously so vpcd OVSDB errors surface to the
 	// caller. Fire-and-forget would let CreateNetworkInterface return success
 	// while the LSP joins zero port groups (NATS hiccup or vpcd OVSDB error),
 	// leaving the port unrestricted until the 30s reconciler heals it.
 	if err := s.requestPortEvent("vpc.create-port", eniId, subnetId, subnet.VpcId, privateIP, macAddr, sgIdsIn); err != nil {
-		slog.Error("CreateNetworkInterface: vpcd create-port failed", "eniId", eniId, "err", err)
+		slog.ErrorContext(ctx, "CreateNetworkInterface: vpcd create-port failed", "eniId", eniId, "err", err)
 		return nil, err
 	}
 
@@ -176,32 +189,32 @@ func (s *VPCServiceImpl) CreateNetworkInterface(input *ec2.CreateNetworkInterfac
 
 // DeleteNetworkInterface deletes an ENI. An in-use ENI is rejected; instance
 // teardown of its own ENI uses ForceDeleteInstanceENI instead.
-func (s *VPCServiceImpl) DeleteNetworkInterface(input *ec2.DeleteNetworkInterfaceInput, accountID string) (*ec2.DeleteNetworkInterfaceOutput, error) {
+func (s *VPCServiceImpl) DeleteNetworkInterface(ctx context.Context, input *ec2.DeleteNetworkInterfaceInput, accountID string) (*ec2.DeleteNetworkInterfaceOutput, error) {
 	if input.NetworkInterfaceId == nil || *input.NetworkInterfaceId == "" {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
 	}
-	return s.deleteNetworkInterface(*input.NetworkInterfaceId, accountID, false)
+	return s.deleteNetworkInterface(ctx, *input.NetworkInterfaceId, accountID, false)
 }
 
 // ForceDeleteInstanceENI deletes an instance's own ENI, bypassing the in-use
 // guard. The guard protects against deleting an ENI a *different* live instance
 // holds; an instance tearing down its own ENI is always permitted (ADR-0003 §2),
 // which breaks the un-terminable-ENI deadlock. Absent is success (idempotent).
-func (s *VPCServiceImpl) ForceDeleteInstanceENI(accountID, eniId string) error {
+func (s *VPCServiceImpl) ForceDeleteInstanceENI(ctx context.Context, accountID, eniId string) error {
 	if eniId == "" {
 		return errors.New(awserrors.ErrorMissingParameter)
 	}
-	_, err := s.deleteNetworkInterface(eniId, accountID, true)
+	_, err := s.deleteNetworkInterface(ctx, eniId, accountID, true)
 	return err
 }
 
-func (s *VPCServiceImpl) deleteNetworkInterface(eniId, accountID string, force bool) (*ec2.DeleteNetworkInterfaceOutput, error) {
+func (s *VPCServiceImpl) deleteNetworkInterface(ctx context.Context, eniId, accountID string, force bool) (*ec2.DeleteNetworkInterfaceOutput, error) {
 	key := utils.AccountKey(accountID, eniId)
 
 	// Get the ENI record
-	entry, err := s.eniKV.Get(key)
+	entry, err := s.eniKV.Get(ctx, key)
 	if err != nil {
-		if errors.Is(err, nats.ErrKeyNotFound) {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			// Internal teardown (force) tolerates an already-gone ENI so
 			// instance terminate converges (ADR-0003 §2); the public API is
 			// AWS-faithful and returns NotFound.
@@ -225,35 +238,13 @@ func (s *VPCServiceImpl) deleteNetworkInterface(eniId, accountID string, force b
 		return nil, errors.New(awserrors.ErrorInvalidNetworkInterfaceInUse)
 	}
 
-	// Release the private IP back to the IPAM pool
-	if err := s.ipam.ReleaseIP(record.SubnetId, record.PrivateIpAddress); err != nil {
-		slog.Warn("Failed to release IP during ENI delete", "eni", eniId, "ip", record.PrivateIpAddress, "err", err)
-	}
+	s.releaseENISideEffects(ctx, eniId, accountID, &record)
 
-	// Release auto-assigned public IP (if any) and remove NAT rule.
-	// Skip if the public IP belongs to an EIP — those are managed independently.
-	if record.PublicIpAddress != "" && s.externalIPAM != nil {
-		owned, err := s.isEIPOwned(eniId, accountID)
-		if err != nil {
-			slog.Error("DeleteNetworkInterface: failed to check EIP ownership, skipping public IP release to avoid data loss", "eniId", eniId, "err", err)
-		} else if owned {
-			slog.Info("DeleteNetworkInterface: public IP owned by EIP, skipping release", "eniId", eniId, "publicIp", record.PublicIpAddress)
-		} else {
-			portName := topology.Port(eniId)
-			s.publishNATEvent("vpc.delete-nat", record.VpcId, record.PublicIpAddress, record.PrivateIpAddress, portName, record.MacAddress)
-			if err := s.externalIPAM.ReleaseIP(record.PublicIpPool, record.PublicIpAddress, eniId); err != nil {
-				slog.Warn("Failed to release public IP during ENI delete", "eni", eniId, "ip", record.PublicIpAddress, "pool", record.PublicIpPool, "err", err)
-			} else {
-				slog.Info("Released auto-assigned public IP during ENI delete", "eniId", eniId, "publicIp", record.PublicIpAddress, "pool", record.PublicIpPool)
-			}
-		}
-	}
-
-	if err := s.eniKV.Delete(key); err != nil {
+	if err := s.eniKV.Delete(ctx, key); err != nil {
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
-	slog.Info("DeleteNetworkInterface completed", "eniId", eniId, "accountID", accountID)
+	slog.InfoContext(ctx, "DeleteNetworkInterface completed", "eniId", eniId, "accountID", accountID)
 
 	// Publish vpc.delete-port event for vpcd topology cleanup. SG IDs are
 	// included for consistency with create-port; vpcd's delete handler reads
@@ -263,26 +254,144 @@ func (s *VPCServiceImpl) deleteNetworkInterface(eniId, accountID string, force b
 	return &ec2.DeleteNetworkInterfaceOutput{}, nil
 }
 
-// ModifyNetworkInterfaceAttribute modifies ENI attributes (security groups, description).
-func (s *VPCServiceImpl) ModifyNetworkInterfaceAttribute(input *ec2.ModifyNetworkInterfaceAttributeInput, accountID string) (*ec2.ModifyNetworkInterfaceAttributeOutput, error) {
+// releaseENISideEffects releases the IPAM allocation and any auto-assigned
+// public IP that belonged to record, ahead of the KV delete that finalizes
+// it. Best-effort: a release failure is logged, not returned — a stuck IP
+// release must never block the ENI delete it precedes.
+func (s *VPCServiceImpl) releaseENISideEffects(ctx context.Context, eniId, accountID string, record *ENIRecord) {
+	if err := s.ipam.ReleaseIP(ctx, record.SubnetId, record.PrivateIpAddress); err != nil {
+		slog.WarnContext(ctx, "Failed to release IP during ENI delete", "eni", eniId, "ip", record.PrivateIpAddress, "err", err)
+	}
+
+	// Release auto-assigned public IP (if any) and remove NAT rule.
+	// Skip if the public IP belongs to an EIP — those are managed independently.
+	if record.PublicIpAddress != "" && s.externalIPAM != nil {
+		owned, err := s.isEIPOwned(ctx, eniId, accountID)
+		if err != nil {
+			slog.ErrorContext(ctx, "releaseENISideEffects: failed to check EIP ownership, skipping public IP release to avoid data loss", "eniId", eniId, "err", err)
+		} else if owned {
+			slog.InfoContext(ctx, "releaseENISideEffects: public IP owned by EIP, skipping release", "eniId", eniId, "publicIp", record.PublicIpAddress)
+		} else {
+			portName := topology.Port(eniId)
+			s.publishNATEvent("vpc.delete-nat", record.VpcId, record.PublicIpAddress, record.PrivateIpAddress, portName, record.MacAddress)
+			if err := s.externalIPAM.ReleaseIP(ctx, record.PublicIpPool, record.PublicIpAddress, eniId); err != nil {
+				slog.WarnContext(ctx, "Failed to release public IP during ENI delete", "eni", eniId, "ip", record.PublicIpAddress, "pool", record.PublicIpPool, "err", err)
+			} else {
+				slog.InfoContext(ctx, "Released auto-assigned public IP during ENI delete", "eniId", eniId, "publicIp", record.PublicIpAddress, "pool", record.PublicIpPool)
+			}
+		}
+	}
+}
+
+// DetachAndDeleteENI detaches eniID and deletes it under a single KV read,
+// carrying the revision from the detach into the delete via
+// jetstream.LastRevision so a lagging replica's re-read can never decide the
+// outcome. eniKV direct-gets may be served by any replica at R3 (nats.go
+// hardcodes AllowDirect on KV buckets); reading twice — once for detach, once
+// for delete, as the previous detach-then-delete call sequence did — left a
+// window where the second read raced the first write. force skips the
+// in-use guard for owner-driven teardown (an LB or instance deleting its own
+// ENI). A revision conflict on either write means the local view was stale,
+// so the whole flow (read, detach, delete) retries from a fresh read, bounded
+// at 3 attempts.
+//
+// deleted reports whether this call actually removed the ENI, so callers can
+// distinguish a real delete from an already-absent one instead of logging a
+// deletion that did not happen.
+func (s *VPCServiceImpl) DetachAndDeleteENI(ctx context.Context, accountID, eniID string, force bool) (deleted bool, err error) {
+	const maxAttempts = 3
+	key := utils.AccountKey(accountID, eniID)
+	var lastErr error
+
+	for range maxAttempts {
+		entry, getErr := s.eniKV.Get(ctx, key)
+		if getErr != nil {
+			if errors.Is(getErr, jetstream.ErrKeyNotFound) {
+				// Force (owner-driven) teardown tolerates an already-gone ENI,
+				// matching ForceDeleteInstanceENI's convergence contract.
+				if force {
+					return false, nil
+				}
+				return false, errors.New(awserrors.ErrorInvalidNetworkInterfaceIDNotFound)
+			}
+			return false, errors.New(awserrors.ErrorServerInternal)
+		}
+
+		var record ENIRecord
+		if err := json.Unmarshal(entry.Value(), &record); err != nil {
+			return false, errors.New(awserrors.ErrorServerInternal)
+		}
+
+		if !force && eniIsLiveAttachment(&record) {
+			return false, errors.New(awserrors.ErrorInvalidNetworkInterfaceInUse)
+		}
+
+		record.Status = "available"
+		record.AttachmentId = ""
+		record.InstanceId = ""
+		record.DeviceIndex = 0
+
+		data, marshalErr := json.Marshal(record)
+		if marshalErr != nil {
+			return false, fmt.Errorf("marshal ENI record: %w", marshalErr)
+		}
+		revision, updateErr := s.eniKV.Update(ctx, key, data, entry.Revision())
+		if updateErr != nil {
+			// Stale read: the key moved under us between Get and Update.
+			// Retry the whole flow from a fresh read rather than trusting
+			// anything else about this attempt.
+			lastErr = updateErr
+			continue
+		}
+
+		if delErr := s.eniKV.Delete(ctx, key, jetstream.LastRevision(revision)); delErr != nil {
+			if errors.Is(delErr, jetstream.ErrKeyNotFound) {
+				return false, nil // a concurrent delete already won
+			}
+			lastErr = delErr
+			continue // revision moved again — retry the whole flow
+		}
+
+		// After the delete, never before it: a failed delete retries the whole
+		// flow, and releasing twice can hand back an IP already reallocated to
+		// another ENI.
+		s.releaseENISideEffects(ctx, eniID, accountID, &record)
+
+		slog.InfoContext(ctx, "DetachAndDeleteENI completed", "eniId", eniID, "accountID", accountID, "force", force)
+		s.publishPortEvent("vpc.delete-port", eniID, record.SubnetId, record.VpcId, record.PrivateIpAddress, record.MacAddress, record.SecurityGroupIds)
+		return true, nil
+	}
+
+	// Carry the last write error: exhaustion from a genuine NATS fault must not
+	// read as ordinary contention.
+	return false, fmt.Errorf("DetachAndDeleteENI: exhausted %d CAS attempts for %s: %w", maxAttempts, eniID, lastErr)
+}
+
+// ModifyNetworkInterfaceAttribute modifies ENI attributes (security groups,
+// description). SourceDestCheck=true is accepted as a no-op.
+func (s *VPCServiceImpl) ModifyNetworkInterfaceAttribute(ctx context.Context, input *ec2.ModifyNetworkInterfaceAttributeInput, accountID string) (*ec2.ModifyNetworkInterfaceAttributeOutput, error) {
 	if input.NetworkInterfaceId == nil || *input.NetworkInterfaceId == "" {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
 	}
-	if len(input.Groups) == 0 && input.Description == nil {
+	if len(input.Groups) == 0 && input.Description == nil && input.SourceDestCheck == nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
+	}
+	// Disabling source/dest check is unsupported: OVN port security enforces it.
+	if input.SourceDestCheck != nil && input.SourceDestCheck.Value != nil && !*input.SourceDestCheck.Value {
+		return nil, errors.New(awserrors.ErrorUnsupported)
 	}
 
 	eniId := *input.NetworkInterfaceId
 	key := utils.AccountKey(accountID, eniId)
 
-	entry, err := s.eniKV.Get(key)
+	entry, err := s.eniKV.Get(ctx, key)
 	if err != nil {
 		return nil, errors.New(awserrors.ErrorInvalidNetworkInterfaceIDNotFound)
 	}
 
 	var record ENIRecord
 	if err := json.Unmarshal(entry.Value(), &record); err != nil {
-		slog.Error("ModifyNetworkInterfaceAttribute: corrupted ENI record", "eniId", eniId, "accountID", accountID, "err", err)
+		slog.ErrorContext(ctx, "ModifyNetworkInterfaceAttribute: corrupted ENI record", "eniId", eniId, "accountID", accountID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
@@ -294,7 +403,7 @@ func (s *VPCServiceImpl) ModifyNetworkInterfaceAttribute(input *ec2.ModifyNetwor
 				sgIds = append(sgIds, *id)
 			}
 		}
-		if err := s.validateSGAttachment(accountID, sgIds, record.VpcId); err != nil {
+		if err := s.validateSGAttachment(ctx, accountID, sgIds, record.VpcId); err != nil {
 			return nil, err
 		}
 		record.SecurityGroupIds = sgIds
@@ -307,19 +416,19 @@ func (s *VPCServiceImpl) ModifyNetworkInterfaceAttribute(input *ec2.ModifyNetwor
 
 	data, err := json.Marshal(record)
 	if err != nil {
-		slog.Error("ModifyNetworkInterfaceAttribute: failed to marshal ENI record", "eniId", eniId, "accountID", accountID, "err", err)
+		slog.ErrorContext(ctx, "ModifyNetworkInterfaceAttribute: failed to marshal ENI record", "eniId", eniId, "accountID", accountID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
-	if _, err := s.eniKV.Update(key, data, entry.Revision()); err != nil {
-		slog.Error("ModifyNetworkInterfaceAttribute: KV update failed", "eniId", eniId, "accountID", accountID, "err", err)
+	if _, err := s.eniKV.Update(ctx, key, data, entry.Revision()); err != nil {
+		slog.ErrorContext(ctx, "ModifyNetworkInterfaceAttribute: KV update failed", "eniId", eniId, "accountID", accountID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
-	slog.Info("ModifyNetworkInterfaceAttribute completed", "eniId", eniId, "accountID", accountID)
+	slog.InfoContext(ctx, "ModifyNetworkInterfaceAttribute completed", "eniId", eniId, "accountID", accountID)
 
 	if sgsChanged {
 		if err := s.requestUpdatePortSGsEvent(eniId, record.PrivateIpAddress, record.SecurityGroupIds); err != nil {
-			slog.Error("ModifyNetworkInterfaceAttribute: vpcd request failed", "eniId", eniId, "err", err)
+			slog.ErrorContext(ctx, "ModifyNetworkInterfaceAttribute: vpcd request failed", "eniId", eniId, "err", err)
 			return nil, err
 		}
 	}
@@ -342,11 +451,11 @@ var describeNetworkInterfacesValidFilters = map[string]bool{
 	"attachment.status":        true,
 }
 
-// DescribeNetworkInterfaces lists ENIs with optional filters
-func (s *VPCServiceImpl) DescribeNetworkInterfaces(input *ec2.DescribeNetworkInterfacesInput, accountID string) (*ec2.DescribeNetworkInterfacesOutput, error) {
+// DescribeNetworkInterfaces lists ENIs with optional filters.
+func (s *VPCServiceImpl) DescribeNetworkInterfaces(ctx context.Context, input *ec2.DescribeNetworkInterfacesInput, accountID string) (*ec2.DescribeNetworkInterfacesOutput, error) {
 	parsedFilters, err := filterutil.ParseFilters(input.Filters, describeNetworkInterfacesValidFilters)
 	if err != nil {
-		slog.Warn("DescribeNetworkInterfaces: invalid filter", "err", err)
+		slog.WarnContext(ctx, "DescribeNetworkInterfaces: invalid filter", "err", err)
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 
@@ -360,8 +469,8 @@ func (s *VPCServiceImpl) DescribeNetworkInterfaces(input *ec2.DescribeNetworkInt
 	}
 
 	prefix := accountID + "."
-	keys, err := s.eniKV.Keys()
-	if err != nil && !errors.Is(err, nats.ErrNoKeysFound) {
+	keys, err := s.eniKV.Keys(ctx)
+	if err != nil && !errors.Is(err, jetstream.ErrNoKeysFound) {
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
@@ -373,15 +482,15 @@ func (s *VPCServiceImpl) DescribeNetworkInterfaces(input *ec2.DescribeNetworkInt
 			continue
 		}
 
-		entry, err := s.eniKV.Get(key)
+		entry, err := s.eniKV.Get(ctx, key)
 		if err != nil {
-			slog.Warn("Failed to get ENI record", "key", key, "error", err)
+			slog.WarnContext(ctx, "Failed to get ENI record", "key", key, "error", err)
 			continue
 		}
 
 		var record ENIRecord
 		if err := json.Unmarshal(entry.Value(), &record); err != nil {
-			slog.Warn("Failed to unmarshal ENI record", "key", key, "error", err)
+			slog.WarnContext(ctx, "Failed to unmarshal ENI record", "key", key, "error", err)
 			continue
 		}
 
@@ -410,7 +519,7 @@ func (s *VPCServiceImpl) DescribeNetworkInterfaces(input *ec2.DescribeNetworkInt
 		}
 	}
 
-	slog.Info("DescribeNetworkInterfaces completed", "count", len(enis), "accountID", accountID)
+	slog.InfoContext(ctx, "DescribeNetworkInterfaces completed", "count", len(enis), "accountID", accountID)
 
 	return &ec2.DescribeNetworkInterfacesOutput{
 		NetworkInterfaces: enis,
@@ -493,8 +602,12 @@ func eniMatchesFilters(record *ENIRecord, filters map[string][]string) bool {
 // AttachENI marks an ENI as attached to an instance (internal use by RunInstances).
 // accountID scopes the lookup to the correct KV key.
 func (s *VPCServiceImpl) AttachENI(accountID, eniId, instanceId string, deviceIndex int64) (string, error) {
+	return s.attachENI(context.Background(), accountID, eniId, instanceId, deviceIndex)
+}
+
+func (s *VPCServiceImpl) attachENI(ctx context.Context, accountID, eniId, instanceId string, deviceIndex int64) (string, error) {
 	key := utils.AccountKey(accountID, eniId)
-	entry, err := s.eniKV.Get(key)
+	entry, err := s.eniKV.Get(ctx, key)
 	if err != nil {
 		return "", errors.New(awserrors.ErrorInvalidNetworkInterfaceIDNotFound)
 	}
@@ -513,24 +626,30 @@ func (s *VPCServiceImpl) AttachENI(accountID, eniId, instanceId string, deviceIn
 	record.AttachmentId = attachmentId
 	record.InstanceId = instanceId
 	record.DeviceIndex = deviceIndex
+	// Default DeleteOnTermination to true on first attach, matching what
+	// DescribeNetworkInterfaces already advertises; a record carrying an
+	// explicit value from an earlier attach keeps it across re-attach.
+	if record.DeleteOnTermination == nil {
+		record.DeleteOnTermination = aws.Bool(true)
+	}
 
 	data, err := json.Marshal(record)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal ENI record: %w", err)
 	}
-	if _, err := s.eniKV.Update(key, data, entry.Revision()); err != nil {
+	if _, err := s.eniKV.Update(ctx, key, data, entry.Revision()); err != nil {
 		return "", errors.New(awserrors.ErrorServerInternal)
 	}
 
-	slog.Info("ENI attached", "eniId", eniId, "instanceId", instanceId, "attachmentId", attachmentId)
+	slog.InfoContext(ctx, "ENI attached", "eniId", eniId, "instanceId", instanceId, "attachmentId", attachmentId)
 	return attachmentId, nil
 }
 
 // DetachENI marks an ENI as detached from an instance (internal use by TerminateInstances).
 // accountID scopes the lookup to the correct KV key.
-func (s *VPCServiceImpl) DetachENI(accountID, eniId string) error {
+func (s *VPCServiceImpl) DetachENI(ctx context.Context, accountID, eniId string) error {
 	key := utils.AccountKey(accountID, eniId)
-	entry, err := s.eniKV.Get(key)
+	entry, err := s.eniKV.Get(ctx, key)
 	if err != nil {
 		return errors.New(awserrors.ErrorInvalidNetworkInterfaceIDNotFound)
 	}
@@ -549,11 +668,11 @@ func (s *VPCServiceImpl) DetachENI(accountID, eniId string) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal ENI record: %w", err)
 	}
-	if _, err := s.eniKV.Update(key, data, entry.Revision()); err != nil {
+	if _, err := s.eniKV.Update(ctx, key, data, entry.Revision()); err != nil {
 		return errors.New(awserrors.ErrorServerInternal)
 	}
 
-	slog.Info("ENI detached", "eniId", eniId)
+	slog.InfoContext(ctx, "ENI detached", "eniId", eniId)
 	return nil
 }
 
@@ -561,8 +680,12 @@ func (s *VPCServiceImpl) DetachENI(accountID, eniId string) error {
 // hot-plug handlers that need the record's MAC + AttachmentId before
 // running the QMP pipeline.
 func (s *VPCServiceImpl) GetENIRecord(accountID, eniId string) (ENIRecord, error) {
+	return s.getENIRecord(context.Background(), accountID, eniId)
+}
+
+func (s *VPCServiceImpl) getENIRecord(ctx context.Context, accountID, eniId string) (ENIRecord, error) {
 	key := utils.AccountKey(accountID, eniId)
-	entry, err := s.eniKV.Get(key)
+	entry, err := s.eniKV.Get(ctx, key)
 	if err != nil {
 		return ENIRecord{}, errors.New(awserrors.ErrorInvalidNetworkInterfaceIDNotFound)
 	}
@@ -577,8 +700,12 @@ func (s *VPCServiceImpl) GetENIRecord(accountID, eniId string) (ENIRecord, error
 // the result under the same revision token (compare-and-swap). fn must
 // not block on external I/O; the KV update slot is contended.
 func (s *VPCServiceImpl) UpdateENI(accountID, eniId string, fn func(*ENIRecord)) error {
+	return s.updateENI(context.Background(), accountID, eniId, fn)
+}
+
+func (s *VPCServiceImpl) updateENI(ctx context.Context, accountID, eniId string, fn func(*ENIRecord)) error {
 	key := utils.AccountKey(accountID, eniId)
-	entry, err := s.eniKV.Get(key)
+	entry, err := s.eniKV.Get(ctx, key)
 	if err != nil {
 		return errors.New(awserrors.ErrorInvalidNetworkInterfaceIDNotFound)
 	}
@@ -591,7 +718,7 @@ func (s *VPCServiceImpl) UpdateENI(accountID, eniId string, fn func(*ENIRecord))
 	if err != nil {
 		return fmt.Errorf("marshal ENI record: %w", err)
 	}
-	if _, err := s.eniKV.Update(key, data, entry.Revision()); err != nil {
+	if _, err := s.eniKV.Update(ctx, key, data, entry.Revision()); err != nil {
 		return errors.New(awserrors.ErrorServerInternal)
 	}
 	return nil
@@ -601,9 +728,13 @@ func (s *VPCServiceImpl) UpdateENI(accountID, eniId string, fn func(*ENIRecord))
 // instanceID. Used by the hot-plug reconciler to converge a node's instances
 // against KV on restart.
 func (s *VPCServiceImpl) ListInstanceENIs(accountID, instanceID string) ([]ENIRecord, error) {
-	keys, err := s.eniKV.Keys()
+	return s.listInstanceENIs(context.Background(), accountID, instanceID)
+}
+
+func (s *VPCServiceImpl) listInstanceENIs(ctx context.Context, accountID, instanceID string) ([]ENIRecord, error) {
+	keys, err := s.eniKV.Keys(ctx)
 	if err != nil {
-		if errors.Is(err, nats.ErrNoKeysFound) {
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
 			return nil, nil
 		}
 		return nil, errors.New(awserrors.ErrorServerInternal)
@@ -614,7 +745,7 @@ func (s *VPCServiceImpl) ListInstanceENIs(accountID, instanceID string) ([]ENIRe
 		if key == utils.VersionKey || !strings.HasPrefix(key, prefix) {
 			continue
 		}
-		entry, err := s.eniKV.Get(key)
+		entry, err := s.eniKV.Get(ctx, key)
 		if err != nil {
 			continue
 		}
@@ -632,8 +763,12 @@ func (s *VPCServiceImpl) ListInstanceENIs(accountID, instanceID string) ([]ENIRe
 // FindENIByAttachment scans the ENI bucket for the record with the given
 // AttachmentId. Used by DetachNetworkInterface which identifies by attachment ID.
 func (s *VPCServiceImpl) FindENIByAttachment(accountID, attachmentId string) (ENIRecord, error) {
-	keys, err := s.eniKV.Keys()
-	if err != nil && !errors.Is(err, nats.ErrNoKeysFound) {
+	return s.findENIByAttachment(context.Background(), accountID, attachmentId)
+}
+
+func (s *VPCServiceImpl) findENIByAttachment(ctx context.Context, accountID, attachmentId string) (ENIRecord, error) {
+	keys, err := s.eniKV.Keys(ctx)
+	if err != nil && !errors.Is(err, jetstream.ErrNoKeysFound) {
 		return ENIRecord{}, errors.New(awserrors.ErrorServerInternal)
 	}
 	prefix := accountID + "."
@@ -641,7 +776,7 @@ func (s *VPCServiceImpl) FindENIByAttachment(accountID, attachmentId string) (EN
 		if key == utils.VersionKey || !strings.HasPrefix(key, prefix) {
 			continue
 		}
-		entry, err := s.eniKV.Get(key)
+		entry, err := s.eniKV.Get(ctx, key)
 		if err != nil {
 			continue
 		}
@@ -658,8 +793,12 @@ func (s *VPCServiceImpl) FindENIByAttachment(accountID, attachmentId string) (EN
 
 // UpdateENIPublicIP updates the PublicIpAddress and PublicIpPool on an ENI record.
 func (s *VPCServiceImpl) UpdateENIPublicIP(accountID, eniId, publicIP, poolName string) error {
+	return s.updateENIPublicIP(context.Background(), accountID, eniId, publicIP, poolName)
+}
+
+func (s *VPCServiceImpl) updateENIPublicIP(ctx context.Context, accountID, eniId, publicIP, poolName string) error {
 	key := utils.AccountKey(accountID, eniId)
-	entry, err := s.eniKV.Get(key)
+	entry, err := s.eniKV.Get(ctx, key)
 	if err != nil {
 		return fmt.Errorf("ENI %s not found: %w", eniId, err)
 	}
@@ -676,15 +815,15 @@ func (s *VPCServiceImpl) UpdateENIPublicIP(accountID, eniId, publicIP, poolName 
 	if err != nil {
 		return fmt.Errorf("marshal ENI record: %w", err)
 	}
-	if _, err := s.eniKV.Update(key, data, entry.Revision()); err != nil {
+	if _, err := s.eniKV.Update(ctx, key, data, entry.Revision()); err != nil {
 		return fmt.Errorf("update ENI record: %w", err)
 	}
 
-	slog.Info("Updated ENI with public IP", "eniId", eniId, "publicIp", publicIP, "pool", poolName)
+	slog.InfoContext(ctx, "Updated ENI with public IP", "eniId", eniId, "publicIp", publicIP, "pool", poolName)
 	return nil
 }
 
-// eniRecordToEC2 converts an ENI record to an EC2 NetworkInterface
+// eniRecordToEC2 converts an ENI record to an EC2 NetworkInterface.
 func (s *VPCServiceImpl) eniRecordToEC2(record *ENIRecord, accountID string) *ec2.NetworkInterface {
 	// ENIs with spinifex:managed-by tag are system-managed (e.g. by ELBv2)
 	requesterManaged := record.Tags["spinifex:managed-by"] != ""
@@ -733,7 +872,7 @@ func (s *VPCServiceImpl) eniRecordToEC2(record *ENIRecord, accountID string) *ec
 			InstanceId:          aws.String(record.InstanceId),
 			DeviceIndex:         aws.Int64(record.DeviceIndex),
 			Status:              aws.String("attached"),
-			DeleteOnTermination: aws.Bool(true),
+			DeleteOnTermination: aws.Bool(record.DeleteOnTermination == nil || *record.DeleteOnTermination),
 		}
 	}
 
@@ -821,7 +960,7 @@ func (s *VPCServiceImpl) publishNATEvent(topic, vpcId, externalIP, logicalIP, po
 // or MissingParameter per AWS contract.
 const sgPerInterfaceLimit = 5
 
-func (s *VPCServiceImpl) validateSGAttachment(accountID string, sgIds []string, vpcId string) error {
+func (s *VPCServiceImpl) validateSGAttachment(ctx context.Context, accountID string, sgIds []string, vpcId string) error {
 	if len(sgIds) == 0 {
 		return errors.New(awserrors.ErrorMissingParameter)
 	}
@@ -829,13 +968,13 @@ func (s *VPCServiceImpl) validateSGAttachment(accountID string, sgIds []string, 
 		return errors.New(awserrors.ErrorSecurityGroupsPerInterfaceLimitExceeded)
 	}
 
-	if err := s.requireVPCExists(accountID, vpcId); err != nil {
+	if err := s.requireVPCExists(ctx, accountID, vpcId); err != nil {
 		return err
 	}
 
 	// Each SG must exist in the caller's account and belong to the same VPC.
 	for _, sgId := range sgIds {
-		sgEntry, err := s.sgKV.Get(utils.AccountKey(accountID, sgId))
+		sgEntry, err := s.sgKV.Get(ctx, utils.AccountKey(accountID, sgId))
 		if err != nil {
 			return errors.New(awserrors.ErrorInvalidGroupNotFound)
 		}
@@ -853,13 +992,13 @@ func (s *VPCServiceImpl) validateSGAttachment(accountID string, sgIds []string, 
 // isEIPOwned checks whether the given ENI's public IP is owned by an Elastic IP.
 // Returns (true, nil) if an EIP record references this ENI, (false, nil) if none
 // match, or (false, err) if the KV store could not be read.
-func (s *VPCServiceImpl) isEIPOwned(eniId, accountID string) (bool, error) {
+func (s *VPCServiceImpl) isEIPOwned(ctx context.Context, eniId, accountID string) (bool, error) {
 	if s.eipKV == nil {
 		return false, nil
 	}
-	keys, err := s.eipKV.Keys()
+	keys, err := s.eipKV.Keys(ctx)
 	if err != nil {
-		if errors.Is(err, nats.ErrNoKeysFound) {
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
 			return false, nil
 		}
 		return false, fmt.Errorf("eipKV.Keys: %w", err)
@@ -869,7 +1008,7 @@ func (s *VPCServiceImpl) isEIPOwned(eniId, accountID string) (bool, error) {
 		if len(k) < len(prefix) || k[:len(prefix)] != prefix {
 			continue
 		}
-		entry, err := s.eipKV.Get(k)
+		entry, err := s.eipKV.Get(ctx, k)
 		if err != nil {
 			return false, fmt.Errorf("eipKV.Get(%s): %w", k, err)
 		}
@@ -877,7 +1016,7 @@ func (s *VPCServiceImpl) isEIPOwned(eniId, accountID string) (bool, error) {
 			ENIId string `json:"eni_id"`
 		}
 		if err := json.Unmarshal(entry.Value(), &record); err != nil {
-			slog.Warn("isEIPOwned: malformed EIP record", "key", k, "err", err)
+			slog.WarnContext(ctx, "isEIPOwned: malformed EIP record", "key", k, "err", err)
 			continue
 		}
 		if record.ENIId == eniId {

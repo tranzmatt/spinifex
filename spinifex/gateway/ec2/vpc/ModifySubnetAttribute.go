@@ -1,6 +1,7 @@
 package gateway_ec2_vpc
 
 import (
+	"context"
 	"errors"
 
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -19,8 +20,8 @@ func ValidateModifySubnetAttributeInput(input *ec2.ModifySubnetAttributeInput) e
 	return nil
 }
 
-// ModifySubnetAttribute handles the EC2 ModifySubnetAttribute API call
-func ModifySubnetAttribute(input *ec2.ModifySubnetAttributeInput, natsConn *nats.Conn, accountID string) (ec2.ModifySubnetAttributeOutput, error) {
+// ModifySubnetAttribute handles the EC2 ModifySubnetAttribute API call.
+func ModifySubnetAttribute(ctx context.Context, input *ec2.ModifySubnetAttributeInput, natsConn *nats.Conn, accountID string) (ec2.ModifySubnetAttributeOutput, error) {
 	var output ec2.ModifySubnetAttributeOutput
 
 	if err := ValidateModifySubnetAttributeInput(input); err != nil {
@@ -28,7 +29,7 @@ func ModifySubnetAttribute(input *ec2.ModifySubnetAttributeInput, natsConn *nats
 	}
 
 	svc := handlers_ec2_vpc.NewNATSVPCService(natsConn)
-	result, err := svc.ModifySubnetAttribute(input, accountID)
+	result, err := svc.ModifySubnetAttribute(ctx, input, accountID)
 	if err != nil {
 		return output, err
 	}

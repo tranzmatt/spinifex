@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -97,6 +98,20 @@ var iamActions = map[string]IAMHandler{
 		return gateway_iam.ListAttachedUserPolicies(accountID, input, gw.IAMService)
 	}),
 
+	// User inline policies
+	"PutUserPolicy": iamHandler(func(accountID string, input *iam.PutUserPolicyInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.PutUserPolicy(accountID, input, gw.IAMService)
+	}),
+	"GetUserPolicy": iamHandler(func(accountID string, input *iam.GetUserPolicyInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.GetUserPolicy(accountID, input, gw.IAMService)
+	}),
+	"DeleteUserPolicy": iamHandler(func(accountID string, input *iam.DeleteUserPolicyInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.DeleteUserPolicy(accountID, input, gw.IAMService)
+	}),
+	"ListUserPolicies": iamHandler(func(accountID string, input *iam.ListUserPoliciesInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.ListUserPolicies(accountID, input, gw.IAMService)
+	}),
+
 	// Role CRUD
 	"CreateRole": iamHandler(func(accountID string, input *iam.CreateRoleInput, gw *GatewayConfig) (any, error) {
 		return gateway_iam.CreateRole(accountID, input, gw.IAMService)
@@ -152,7 +167,8 @@ var iamActions = map[string]IAMHandler{
 	}),
 	"DeleteInstanceProfile": iamHandler(func(accountID string, input *iam.DeleteInstanceProfileInput, gw *GatewayConfig) (any, error) {
 		countLive := func(profileARN string) (int, error) {
-			return gateway_ec2_instance.CountInstanceProfileAssociations(gw.NATSConn, gw.DiscoverActiveNodes(), accountID, profileARN)
+			ctx := context.Background()
+			return gateway_ec2_instance.CountInstanceProfileAssociations(ctx, gw.NATSConn, gw.DiscoverActiveNodes(ctx), accountID, profileARN)
 		}
 		return gateway_iam.DeleteInstanceProfile(accountID, input, gw.IAMService, countLive)
 	}),
@@ -180,6 +196,108 @@ var iamActions = map[string]IAMHandler{
 	}),
 	"DeleteOpenIDConnectProvider": iamHandler(func(accountID string, input *iam.DeleteOpenIDConnectProviderInput, gw *GatewayConfig) (any, error) {
 		return gateway_iam.DeleteOpenIDConnectProvider(accountID, input, gw.IAMService)
+	}),
+
+	// Resource tagging
+	"TagUser": iamHandler(func(accountID string, input *iam.TagUserInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.TagUser(accountID, input, gw.IAMService)
+	}),
+	"UntagUser": iamHandler(func(accountID string, input *iam.UntagUserInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.UntagUser(accountID, input, gw.IAMService)
+	}),
+	"ListUserTags": iamHandler(func(accountID string, input *iam.ListUserTagsInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.ListUserTags(accountID, input, gw.IAMService)
+	}),
+	"TagRole": iamHandler(func(accountID string, input *iam.TagRoleInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.TagRole(accountID, input, gw.IAMService)
+	}),
+	"UntagRole": iamHandler(func(accountID string, input *iam.UntagRoleInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.UntagRole(accountID, input, gw.IAMService)
+	}),
+	"ListRoleTags": iamHandler(func(accountID string, input *iam.ListRoleTagsInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.ListRoleTags(accountID, input, gw.IAMService)
+	}),
+	"TagPolicy": iamHandler(func(accountID string, input *iam.TagPolicyInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.TagPolicy(accountID, input, gw.IAMService)
+	}),
+	"UntagPolicy": iamHandler(func(accountID string, input *iam.UntagPolicyInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.UntagPolicy(accountID, input, gw.IAMService)
+	}),
+	"ListPolicyTags": iamHandler(func(accountID string, input *iam.ListPolicyTagsInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.ListPolicyTags(accountID, input, gw.IAMService)
+	}),
+	"TagInstanceProfile": iamHandler(func(accountID string, input *iam.TagInstanceProfileInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.TagInstanceProfile(accountID, input, gw.IAMService)
+	}),
+	"UntagInstanceProfile": iamHandler(func(accountID string, input *iam.UntagInstanceProfileInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.UntagInstanceProfile(accountID, input, gw.IAMService)
+	}),
+	"ListInstanceProfileTags": iamHandler(func(accountID string, input *iam.ListInstanceProfileTagsInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.ListInstanceProfileTags(accountID, input, gw.IAMService)
+	}),
+	"TagOpenIDConnectProvider": iamHandler(func(accountID string, input *iam.TagOpenIDConnectProviderInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.TagOpenIDConnectProvider(accountID, input, gw.IAMService)
+	}),
+	"UntagOpenIDConnectProvider": iamHandler(func(accountID string, input *iam.UntagOpenIDConnectProviderInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.UntagOpenIDConnectProvider(accountID, input, gw.IAMService)
+	}),
+	"ListOpenIDConnectProviderTags": iamHandler(func(accountID string, input *iam.ListOpenIDConnectProviderTagsInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.ListOpenIDConnectProviderTags(accountID, input, gw.IAMService)
+	}),
+
+	// Group CRUD
+	"CreateGroup": iamHandler(func(accountID string, input *iam.CreateGroupInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.CreateGroup(accountID, input, gw.IAMService)
+	}),
+	"GetGroup": iamHandler(func(accountID string, input *iam.GetGroupInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.GetGroup(accountID, input, gw.IAMService)
+	}),
+	"ListGroups": iamHandler(func(accountID string, input *iam.ListGroupsInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.ListGroups(accountID, input, gw.IAMService)
+	}),
+	"DeleteGroup": iamHandler(func(accountID string, input *iam.DeleteGroupInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.DeleteGroup(accountID, input, gw.IAMService)
+	}),
+
+	// Group membership
+	"AddUserToGroup": iamHandler(func(accountID string, input *iam.AddUserToGroupInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.AddUserToGroup(accountID, input, gw.IAMService)
+	}),
+	"RemoveUserFromGroup": iamHandler(func(accountID string, input *iam.RemoveUserFromGroupInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.RemoveUserFromGroup(accountID, input, gw.IAMService)
+	}),
+	"ListGroupsForUser": iamHandler(func(accountID string, input *iam.ListGroupsForUserInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.ListGroupsForUser(accountID, input, gw.IAMService)
+	}),
+
+	// Group policy attachment
+	"AttachGroupPolicy": iamHandler(func(accountID string, input *iam.AttachGroupPolicyInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.AttachGroupPolicy(accountID, input, gw.IAMService)
+	}),
+	"DetachGroupPolicy": iamHandler(func(accountID string, input *iam.DetachGroupPolicyInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.DetachGroupPolicy(accountID, input, gw.IAMService)
+	}),
+	"ListAttachedGroupPolicies": iamHandler(func(accountID string, input *iam.ListAttachedGroupPoliciesInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.ListAttachedGroupPolicies(accountID, input, gw.IAMService)
+	}),
+
+	// Group inline policies
+	"PutGroupPolicy": iamHandler(func(accountID string, input *iam.PutGroupPolicyInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.PutGroupPolicy(accountID, input, gw.IAMService)
+	}),
+	"GetGroupPolicy": iamHandler(func(accountID string, input *iam.GetGroupPolicyInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.GetGroupPolicy(accountID, input, gw.IAMService)
+	}),
+	"DeleteGroupPolicy": iamHandler(func(accountID string, input *iam.DeleteGroupPolicyInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.DeleteGroupPolicy(accountID, input, gw.IAMService)
+	}),
+	"ListGroupPolicies": iamHandler(func(accountID string, input *iam.ListGroupPoliciesInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.ListGroupPolicies(accountID, input, gw.IAMService)
+	}),
+
+	// Account
+	"GetAccountSummary": iamHandler(func(accountID string, input *iam.GetAccountSummaryInput, gw *GatewayConfig) (any, error) {
+		return gateway_iam.GetAccountSummary(accountID, input, gw.IAMService)
 	}),
 }
 

@@ -7,6 +7,7 @@ import {
   Camera,
   Container,
   Crosshair,
+  FileStack,
   Globe,
   HardDrive,
   Home,
@@ -26,6 +27,7 @@ import {
   ShieldCheck,
   UserCog,
   Users,
+  UsersRound,
   Waypoints,
 } from "lucide-react"
 
@@ -118,6 +120,21 @@ export function SidebarLayout() {
                 >
                   <Server className="size-4" />
                   <span>Instances</span>
+                </SidebarMenuButton>
+              </Link>
+            </SidebarMenuItem>
+
+            <SidebarMenuItem>
+              <Link to="/ec2/describe-launch-templates">
+                <SidebarMenuButton
+                  isActive={
+                    pathname.startsWith("/ec2/describe-launch-templates") ||
+                    pathname.startsWith("/ec2/create-launch-template")
+                  }
+                  tooltip="Launch Templates"
+                >
+                  <FileStack className="size-4" />
+                  <span>Launch Templates</span>
                 </SidebarMenuButton>
               </Link>
             </SidebarMenuItem>
@@ -389,6 +406,21 @@ export function SidebarLayout() {
                 >
                   <Users className="size-4" />
                   <span>Users</span>
+                </SidebarMenuButton>
+              </Link>
+            </SidebarMenuItem>
+
+            <SidebarMenuItem>
+              <Link to="/iam/list-groups">
+                <SidebarMenuButton
+                  isActive={
+                    pathname.startsWith("/iam/list-groups") ||
+                    pathname.startsWith("/iam/create-group")
+                  }
+                  tooltip="Groups"
+                >
+                  <UsersRound className="size-4" />
+                  <span>Groups</span>
                 </SidebarMenuButton>
               </Link>
             </SidebarMenuItem>

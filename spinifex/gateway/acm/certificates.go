@@ -1,6 +1,7 @@
 package gateway_acm
 
 import (
+	"context"
 	"errors"
 
 	"github.com/aws/aws-sdk-go/service/acm"
@@ -9,65 +10,74 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// ImportCertificate — CertificateManager.ImportCertificate
-func ImportCertificate(natsConn *nats.Conn, accountID string, body []byte) (*acm.ImportCertificateOutput, error) {
+// ImportCertificate — CertificateManager.ImportCertificate.
+func ImportCertificate(ctx context.Context, natsConn *nats.Conn, accountID string, body []byte) (*acm.ImportCertificateOutput, error) {
 	input := new(acm.ImportCertificateInput)
 	if err := unmarshalIfBody(body, input); err != nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameter)
 	}
-	return handlers_acm.NewNATSACMService(natsConn).ImportCertificate(input, accountID)
+	return handlers_acm.NewNATSACMService(natsConn).ImportCertificate(ctx, input, accountID)
 }
 
-// DescribeCertificate — CertificateManager.DescribeCertificate
-func DescribeCertificate(natsConn *nats.Conn, accountID string, body []byte) (*acm.DescribeCertificateOutput, error) {
+// DescribeCertificate — CertificateManager.DescribeCertificate.
+func DescribeCertificate(ctx context.Context, natsConn *nats.Conn, accountID string, body []byte) (*acm.DescribeCertificateOutput, error) {
 	input := new(acm.DescribeCertificateInput)
 	if err := unmarshalIfBody(body, input); err != nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameter)
 	}
-	return handlers_acm.NewNATSACMService(natsConn).DescribeCertificate(input, accountID)
+	return handlers_acm.NewNATSACMService(natsConn).DescribeCertificate(ctx, input, accountID)
 }
 
-// ListCertificates — CertificateManager.ListCertificates
-func ListCertificates(natsConn *nats.Conn, accountID string, body []byte) (*acm.ListCertificatesOutput, error) {
+// GetCertificate — CertificateManager.GetCertificate.
+func GetCertificate(ctx context.Context, natsConn *nats.Conn, accountID string, body []byte) (*acm.GetCertificateOutput, error) {
+	input := new(acm.GetCertificateInput)
+	if err := unmarshalIfBody(body, input); err != nil {
+		return nil, errors.New(awserrors.ErrorInvalidParameter)
+	}
+	return handlers_acm.NewNATSACMService(natsConn).GetCertificate(ctx, input, accountID)
+}
+
+// ListCertificates — CertificateManager.ListCertificates.
+func ListCertificates(ctx context.Context, natsConn *nats.Conn, accountID string, body []byte) (*acm.ListCertificatesOutput, error) {
 	input := new(acm.ListCertificatesInput)
 	if err := unmarshalIfBody(body, input); err != nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameter)
 	}
-	return handlers_acm.NewNATSACMService(natsConn).ListCertificates(input, accountID)
+	return handlers_acm.NewNATSACMService(natsConn).ListCertificates(ctx, input, accountID)
 }
 
-// DeleteCertificate — CertificateManager.DeleteCertificate
-func DeleteCertificate(natsConn *nats.Conn, accountID string, body []byte) (*acm.DeleteCertificateOutput, error) {
+// DeleteCertificate — CertificateManager.DeleteCertificate.
+func DeleteCertificate(ctx context.Context, natsConn *nats.Conn, accountID string, body []byte) (*acm.DeleteCertificateOutput, error) {
 	input := new(acm.DeleteCertificateInput)
 	if err := unmarshalIfBody(body, input); err != nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameter)
 	}
-	return handlers_acm.NewNATSACMService(natsConn).DeleteCertificate(input, accountID)
+	return handlers_acm.NewNATSACMService(natsConn).DeleteCertificate(ctx, input, accountID)
 }
 
-// ListTagsForCertificate — CertificateManager.ListTagsForCertificate
-func ListTagsForCertificate(natsConn *nats.Conn, accountID string, body []byte) (*acm.ListTagsForCertificateOutput, error) {
+// ListTagsForCertificate — CertificateManager.ListTagsForCertificate.
+func ListTagsForCertificate(ctx context.Context, natsConn *nats.Conn, accountID string, body []byte) (*acm.ListTagsForCertificateOutput, error) {
 	input := new(acm.ListTagsForCertificateInput)
 	if err := unmarshalIfBody(body, input); err != nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameter)
 	}
-	return handlers_acm.NewNATSACMService(natsConn).ListTagsForCertificate(input, accountID)
+	return handlers_acm.NewNATSACMService(natsConn).ListTagsForCertificate(ctx, input, accountID)
 }
 
-// AddTagsToCertificate — CertificateManager.AddTagsToCertificate
-func AddTagsToCertificate(natsConn *nats.Conn, accountID string, body []byte) (*acm.AddTagsToCertificateOutput, error) {
+// AddTagsToCertificate — CertificateManager.AddTagsToCertificate.
+func AddTagsToCertificate(ctx context.Context, natsConn *nats.Conn, accountID string, body []byte) (*acm.AddTagsToCertificateOutput, error) {
 	input := new(acm.AddTagsToCertificateInput)
 	if err := unmarshalIfBody(body, input); err != nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameter)
 	}
-	return handlers_acm.NewNATSACMService(natsConn).AddTagsToCertificate(input, accountID)
+	return handlers_acm.NewNATSACMService(natsConn).AddTagsToCertificate(ctx, input, accountID)
 }
 
-// RemoveTagsFromCertificate — CertificateManager.RemoveTagsFromCertificate
-func RemoveTagsFromCertificate(natsConn *nats.Conn, accountID string, body []byte) (*acm.RemoveTagsFromCertificateOutput, error) {
+// RemoveTagsFromCertificate — CertificateManager.RemoveTagsFromCertificate.
+func RemoveTagsFromCertificate(ctx context.Context, natsConn *nats.Conn, accountID string, body []byte) (*acm.RemoveTagsFromCertificateOutput, error) {
 	input := new(acm.RemoveTagsFromCertificateInput)
 	if err := unmarshalIfBody(body, input); err != nil {
 		return nil, errors.New(awserrors.ErrorInvalidParameter)
 	}
-	return handlers_acm.NewNATSACMService(natsConn).RemoveTagsFromCertificate(input, accountID)
+	return handlers_acm.NewNATSACMService(natsConn).RemoveTagsFromCertificate(ctx, input, accountID)
 }

@@ -2,6 +2,7 @@ package handlers_ec2_image
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,14 +21,13 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/filterutil"
 	handlers_ec2_snapshot "github.com/mulgadc/spinifex/spinifex/handlers/ec2/snapshot"
 	"github.com/mulgadc/spinifex/spinifex/objectstore"
-	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/viperblock/viperblock"
 	vbs3 "github.com/mulgadc/viperblock/viperblock/backends/s3"
 	"github.com/nats-io/nats.go"
 )
 
-// Ensure ImageServiceImpl implements ImageService
+// Ensure ImageServiceImpl implements ImageService.
 var _ ImageService = (*ImageServiceImpl)(nil)
 
 // CreateImageParams holds parameters for creating an AMI from an instance.
@@ -36,18 +36,20 @@ type CreateImageParams struct {
 	Input         *ec2.CreateImageInput
 	RootVolumeID  string
 	SourceImageID string
-	IsRunning     bool // true = use ebs.snapshot NATS, false = snapshot from S3 state
+	IsRunning     bool // true = use live checkpoint (instance still running), false = use numbered checkpoint from Close
 }
 
-// ImageServiceImpl handles AMI image operations with S3 storage
+// ImageServiceImpl handles AMI image operations with S3 storage.
 type ImageServiceImpl struct {
 	config     *config.Config
 	store      objectstore.ObjectStore
-	natsConn   *nats.Conn
 	bucketName string
+	natsConn   *nats.Conn
 }
 
-// NewImageServiceImpl creates a new daemon-side image service
+// NewImageServiceImpl creates a new daemon-side image service. natsConn is used
+// to drain a running instance's volume (routed to the node hosting it) before
+// CreateImageFromInstance reads its live checkpoint.
 func NewImageServiceImpl(cfg *config.Config, natsConn *nats.Conn) *ImageServiceImpl {
 	store := objectstore.NewS3ObjectStoreFromConfig(
 		cfg.Predastore.Host,
@@ -59,16 +61,28 @@ func NewImageServiceImpl(cfg *config.Config, natsConn *nats.Conn) *ImageServiceI
 	return &ImageServiceImpl{
 		config:     cfg,
 		store:      store,
-		natsConn:   natsConn,
 		bucketName: cfg.Predastore.Bucket,
+		natsConn:   natsConn,
 	}
 }
 
-// NewImageServiceImplWithStore creates an image service with a custom object store (for testing)
+// NewImageServiceImplWithStore creates an image service with a custom object store (for testing).
 func NewImageServiceImplWithStore(store objectstore.ObjectStore, bucketName string) *ImageServiceImpl {
 	return &ImageServiceImpl{
 		store:      store,
 		bucketName: bucketName,
+	}
+}
+
+// NewImageServiceImplWithConfig creates an image service with an explicit
+// config and NATS connection (for testing the running-volume drain path,
+// which needs config.DataDir/Predastore and a NATS connection to route to).
+func NewImageServiceImplWithConfig(cfg *config.Config, store objectstore.ObjectStore, natsConn *nats.Conn) *ImageServiceImpl {
+	return &ImageServiceImpl{
+		config:     cfg,
+		store:      store,
+		bucketName: cfg.Predastore.Bucket,
+		natsConn:   natsConn,
 	}
 }
 
@@ -86,28 +100,28 @@ var describeImagesValidFilters = map[string]bool{
 	"root-device-type":    true,
 }
 
-// DescribeImages lists available AMI images by reading config.json files from S3
-func (s *ImageServiceImpl) DescribeImages(input *ec2.DescribeImagesInput, accountID string) (*ec2.DescribeImagesOutput, error) {
+// DescribeImages lists available AMI images by reading config.json files from S3.
+func (s *ImageServiceImpl) DescribeImages(ctx context.Context, input *ec2.DescribeImagesInput, accountID string) (*ec2.DescribeImagesOutput, error) {
 	if input == nil {
 		input = &ec2.DescribeImagesInput{}
 	}
 
-	slog.Info("Describing images", "filters", input.Filters, "imageIds", input.ImageIds)
+	slog.InfoContext(ctx, "Describing images", "filters", input.Filters, "imageIds", input.ImageIds)
 
 	parsedFilters, err := filterutil.ParseFilters(input.Filters, describeImagesValidFilters)
 	if err != nil {
-		slog.Warn("DescribeImages: invalid filter", "err", err)
+		slog.WarnContext(ctx, "DescribeImages: invalid filter", "err", err)
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 
 	// List all prefixes in the bucket (AMIs are stored as ami-<id>/ directories)
-	result, err := s.store.ListObjectsV2(&s3.ListObjectsV2Input{
+	result, err := s.store.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(s.bucketName),
 		Delimiter: aws.String("/"),
 	})
 
 	if err != nil {
-		slog.Error("Failed to list S3 objects", "err", err)
+		slog.ErrorContext(ctx, "Failed to list S3 objects", "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
@@ -121,6 +135,11 @@ func (s *ImageServiceImpl) DescribeImages(input *ec2.DescribeImagesInput, accoun
 	var images []*ec2.Image
 	encryptedAtRest := s.clusterEncryptionEnabled()
 
+	// Counting prefixes seen against those dropped for an unreadable config.json
+	// makes a mismatch with len(images) visible at INFO, so an empty result is
+	// distinguishable from one where every config failed to load.
+	var prefixesExamined, unreadableConfigs int
+
 	// Iterate over CommonPrefixes to find ami-* directories
 	for _, prefix := range result.CommonPrefixes {
 		if prefix.Prefix == nil {
@@ -128,12 +147,13 @@ func (s *ImageServiceImpl) DescribeImages(input *ec2.DescribeImagesInput, accoun
 		}
 
 		prefixStr := *prefix.Prefix
-		slog.Info("Processing S3 prefix", "prefix", prefixStr)
+		slog.InfoContext(ctx, "Processing S3 prefix", "prefix", prefixStr)
 
 		// Only check prefixes that match pattern: ami-<id>/
 		if !strings.HasPrefix(prefixStr, "ami-") {
 			continue
 		}
+		prefixesExamined++
 
 		// Early skip: if image-id filter is set, check the prefix (ami-xxx/)
 		// against filter values before fetching config from S3.
@@ -148,25 +168,31 @@ func (s *ImageServiceImpl) DescribeImages(input *ec2.DescribeImagesInput, accoun
 		configKey := prefixStr + "config.json"
 
 		// Get the config.json file
-		getResult, err := s.store.GetObject(&s3.GetObjectInput{
+		getResult, err := s.store.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(s.bucketName),
 			Key:    aws.String(configKey),
 		})
 		if err != nil {
 			if objectstore.IsNoSuchKeyError(err) {
-				slog.Debug("Config file not found", "key", configKey)
+				// No config.json means this is a legitimate non-AMI directory,
+				// not a fault, so it stays at DEBUG and isn't counted below.
+				slog.DebugContext(ctx, "Config file not found", "key", configKey)
 			} else {
-				slog.Debug("Failed to get config file", "key", configKey, "err", err)
+				unreadableConfigs++
+				slog.WarnContext(ctx, "Failed to get config file", "key", configKey, "err", err)
 			}
 			continue
 		}
 
 		body, err := io.ReadAll(getResult.Body)
-		if err := getResult.Body.Close(); err != nil {
-			slog.Debug("Failed to close config body", "key", configKey, "err", err)
+		// A close failure alone doesn't drop the prefix (read below may still
+		// succeed), so it's only warned about, not counted as unreadable.
+		if closeErr := getResult.Body.Close(); closeErr != nil {
+			slog.WarnContext(ctx, "Failed to close config body", "key", configKey, "err", closeErr)
 		}
 		if err != nil {
-			slog.Debug("Failed to read config body", "key", configKey, "err", err)
+			unreadableConfigs++
+			slog.WarnContext(ctx, "Failed to read config body", "key", configKey, "err", err)
 			continue
 		}
 
@@ -177,7 +203,8 @@ func (s *ImageServiceImpl) DescribeImages(input *ec2.DescribeImagesInput, accoun
 			VolumeConfig viperblock.VolumeConfig `json:"VolumeConfig"`
 		}
 		if err := json.Unmarshal(viperblock.StateBody(body), &vbConfig); err != nil {
-			slog.Debug("Failed to unmarshal config", "key", configKey, "err", err)
+			unreadableConfigs++
+			slog.WarnContext(ctx, "Failed to unmarshal config", "key", configKey, "err", err)
 			continue
 		}
 
@@ -258,13 +285,14 @@ func (s *ImageServiceImpl) DescribeImages(input *ec2.DescribeImagesInput, accoun
 			Description:        aws.String(amiMeta.Description),
 			Architecture:       aws.String(amiMeta.Architecture),
 			PlatformDetails:    aws.String(amiMeta.PlatformDetails),
+			Platform:           utils.PlatformFromDetails(amiMeta.PlatformDetails),
 			CreationDate:       aws.String(amiMeta.CreationDate.Format("2006-01-02T15:04:05.000Z")),
 			RootDeviceType:     aws.String(amiMeta.RootDeviceType),
 			VirtualizationType: aws.String(amiMeta.Virtualization),
 			ImageOwnerAlias:    aws.String(amiMeta.ImageOwnerAlias),
 			OwnerId:            aws.String(ownerID),
 			Public:             aws.Bool(false),
-			State:              aws.String("available"),
+			State:              aws.String(amiImageState(amiMeta.State)),
 			ImageType:          aws.String("machine"),
 			Hypervisor:         aws.String("xen"), // Default hypervisor
 			BootMode:           aws.String(amiMeta.BootMode),
@@ -300,11 +328,23 @@ func (s *ImageServiceImpl) DescribeImages(input *ec2.DescribeImagesInput, accoun
 		}
 	}
 
-	slog.Info("DescribeImages completed", "count", len(images))
+	slog.InfoContext(ctx, "DescribeImages completed", "count", len(images),
+		"prefixesExamined", prefixesExamined, "unreadableConfigs", unreadableConfigs)
 
 	return &ec2.DescribeImagesOutput{
 		Images: images,
 	}, nil
+}
+
+// amiImageState maps AMIMetadata.State to the ec2.Image state string. An
+// empty State means the AMI was registered before the field existed, and
+// MUST report as "available" — those images are already complete and
+// launchable, so treating empty as anything else would hide them.
+func amiImageState(state string) string {
+	if state == "" {
+		return "available"
+	}
+	return state
 }
 
 // imageMatchesFilters checks whether an ec2.Image satisfies all parsed filters.
@@ -370,7 +410,7 @@ func imageMatchesFilters(image *ec2.Image, filters map[string][]string, tags map
 
 // CreateImage is the generic interface method — on the daemon side, the handler
 // calls CreateImageFromInstance directly with the extra instance context.
-func (s *ImageServiceImpl) CreateImage(input *ec2.CreateImageInput, accountID string) (*ec2.CreateImageOutput, error) {
+func (s *ImageServiceImpl) CreateImage(ctx context.Context, input *ec2.CreateImageInput, accountID string) (*ec2.CreateImageOutput, error) {
 	return nil, errors.New("CreateImage requires instance context; use CreateImageFromInstance on daemon side")
 }
 
@@ -385,7 +425,7 @@ func (s *ImageServiceImpl) CreateImageFromInstance(params CreateImageParams, acc
 	// Check for duplicate AMI name before doing any expensive work
 	name := aws.StringValue(input.Name)
 	if name != "" {
-		if exists, err := s.amiNameExists(name); err != nil {
+		if exists, err := s.amiNameExists(context.Background(), name); err != nil {
 			slog.Error("CreateImageFromInstance: failed to check AMI name uniqueness", "name", name, "err", err)
 			return nil, errors.New(awserrors.ErrorServerInternal)
 		} else if exists {
@@ -401,16 +441,18 @@ func (s *ImageServiceImpl) CreateImageFromInstance(params CreateImageParams, acc
 		"isRunning", params.IsRunning)
 
 	// Step 1: Snapshot root volume (live via NATS or offline from S3)
-	snapshotFn := s.snapshotStoppedVolume
+	var snapshotErr error
 	if params.IsRunning {
-		snapshotFn = s.snapshotRunningVolume
+		snapshotErr = s.snapshotRunningVolume(params.RootVolumeID, snapshotID, accountID)
+	} else {
+		snapshotErr = s.snapshotStoppedVolume(params.RootVolumeID, snapshotID)
 	}
-	if err := snapshotFn(params.RootVolumeID, snapshotID); err != nil {
-		return nil, err
+	if snapshotErr != nil {
+		return nil, snapshotErr
 	}
 
 	// Step 2: Read source volume config for size
-	volumeConfig, err := s.getVolumeConfig(params.RootVolumeID)
+	volumeConfig, err := s.getVolumeConfig(context.Background(), params.RootVolumeID)
 	if err != nil {
 		slog.Error("CreateImageFromInstance: failed to read volume config", "volumeId", params.RootVolumeID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
@@ -424,7 +466,7 @@ func (s *ImageServiceImpl) CreateImageFromInstance(params CreateImageParams, acc
 		Virtualization:  "hvm",
 	}
 	if params.SourceImageID != "" {
-		srcCfg, err := s.GetAMIConfig(params.SourceImageID)
+		srcCfg, err := s.GetAMIConfig(context.Background(), params.SourceImageID)
 		if err != nil {
 			slog.Error("CreateImageFromInstance: failed to read source AMI config", "sourceImageId", params.SourceImageID, "err", err)
 			return nil, errors.New(awserrors.ErrorServerInternal)
@@ -433,7 +475,7 @@ func (s *ImageServiceImpl) CreateImageFromInstance(params CreateImageParams, acc
 	}
 
 	// Step 4: Store snapshot metadata
-	if err := s.putSnapshotMetadata(snapshotID, params.RootVolumeID, volumeSizeGiB, accountID); err != nil {
+	if err := s.putSnapshotMetadata(context.Background(), snapshotID, params.RootVolumeID, volumeSizeGiB, accountID); err != nil {
 		slog.Error("CreateImageFromInstance: failed to write snapshot metadata", "snapshotId", snapshotID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
@@ -452,9 +494,13 @@ func (s *ImageServiceImpl) CreateImageFromInstance(params CreateImageParams, acc
 		RootDeviceType:  ec2.DeviceTypeEbs,
 		ImageOwnerAlias: accountID,
 		BootMode:        sourceAMI.BootMode,
+		Distro:          sourceAMI.Distro,
+		DistroFamily:    sourceAMI.DistroFamily,
+		// Snapshot succeeded before this point, so the image is complete.
+		State: "available",
 	}
 
-	if err := s.putAMIConfig(amiID, meta); err != nil {
+	if err := s.putAMIConfig(context.Background(), amiID, meta); err != nil {
 		slog.Error("CreateImageFromInstance: failed to store AMI config", "amiId", amiID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
@@ -466,32 +512,85 @@ func (s *ImageServiceImpl) CreateImageFromInstance(params CreateImageParams, acc
 	}, nil
 }
 
-// snapshotRunningVolume triggers a snapshot via NATS on a running viperblockd instance
-func (s *ImageServiceImpl) snapshotRunningVolume(volumeID, snapshotID string) error {
-	if s.natsConn == nil {
+// snapshotRunningVolume creates a snapshot of a running instance's volume by
+// draining it to the node hosting it (so any writes buffered there reach S3),
+// then reading the live checkpoint written by nbdkit on every NBD Flush. This
+// shares handlers/ec2/snapshot's DrainVolume with ec2.CreateSnapshot so the two
+// live-snapshot paths cannot diverge on when a drain is required.
+func (s *ImageServiceImpl) snapshotRunningVolume(volumeID, snapshotID, accountID string) error {
+	if s.config == nil {
 		return errors.New(awserrors.ErrorServerInternal)
 	}
 
-	snapReq := types.EBSSnapshotRequest{Volume: volumeID, SnapshotID: snapshotID}
-	snapData, err := json.Marshal(snapReq)
+	volConfig, err := s.getVolumeConfig(context.Background(), volumeID)
 	if err != nil {
-		slog.Error("snapshotRunningVolume: failed to marshal snapshot request", "volumeId", volumeID, "err", err)
+		slog.Error("snapshotRunningVolume: failed to read volume config", "volumeId", volumeID, "err", err)
+		return errors.New(awserrors.ErrorServerInternal)
+	}
+	volumeSize := volConfig.VolumeMetadata.SizeGiB * 1024 * 1024 * 1024
+
+	// Flush the writes still buffered by whichever node serves the volume, so
+	// the live checkpoint below is current rather than an arbitrarily stale one
+	// predating e.g. a guest-triggered GPT rewrite (growpart on first boot). An
+	// attached volume that cannot be drained fails here rather than silently
+	// producing an image from a stale checkpoint.
+	if err := handlers_ec2_snapshot.DrainVolume(context.Background(), s.config, s.store, s.natsConn, volumeID, volConfig.VolumeMetadata, accountID); err != nil {
+		slog.Error("snapshotRunningVolume: drain failed", "volumeId", volumeID, "err", err)
 		return errors.New(awserrors.ErrorServerInternal)
 	}
 
-	msg, err := s.natsConn.Request(fmt.Sprintf("ebs.snapshot.%s", volumeID), snapData, 30*time.Second)
+	cfg := vbs3.S3Config{
+		VolumeName: volumeID,
+		VolumeSize: volumeSize,
+		Bucket:     s.config.Predastore.Bucket,
+		Region:     s.config.Predastore.Region,
+		AccessKey:  s.config.Predastore.AccessKey,
+		SecretKey:  s.config.Predastore.SecretKey,
+		Host:       s.config.Predastore.Host,
+	}
+
+	mkey, err := utils.LoadViperblockMasterKey(s.config.Viperblock.EncryptionKeyFile)
 	if err != nil {
-		slog.Error("snapshotRunningVolume: NATS request failed", "volumeId", volumeID, "snapshotId", snapshotID, "err", err)
+		slog.Error("snapshotRunningVolume: failed to load encryption key", "volumeId", volumeID, "err", err)
 		return errors.New(awserrors.ErrorServerInternal)
 	}
 
-	var snapResp types.EBSSnapshotResponse
-	if err := json.Unmarshal(msg.Data, &snapResp); err != nil {
-		slog.Error("snapshotRunningVolume: failed to unmarshal response", "err", err)
+	vbconfig := viperblock.VB{
+		VolumeName:        volumeID,
+		VolumeSize:        volumeSize,
+		BaseDir:           s.config.WalDir,
+		Cache:             viperblock.Cache{Config: viperblock.CacheConfig{Size: 0}},
+		MasterKey:         mkey,
+		EncryptionEnabled: mkey != nil,
+	}
+
+	vb, err := viperblock.New(&vbconfig, "s3", cfg)
+	if err != nil {
+		slog.Error("snapshotRunningVolume: failed to create viperblock instance", "volumeId", volumeID, "err", err)
 		return errors.New(awserrors.ErrorServerInternal)
 	}
-	if !snapResp.Success || snapResp.Error != "" {
-		slog.Error("snapshotRunningVolume: snapshot failed", "volumeId", volumeID, "err", snapResp.Error)
+	defer func() {
+		vb.StopChunkUploader()
+		vb.StopWALSyncer()
+	}()
+
+	if err := vb.Backend.Init(); err != nil {
+		slog.Error("snapshotRunningVolume: failed to init backend", "volumeId", volumeID, "err", err)
+		return errors.New(awserrors.ErrorServerInternal)
+	}
+
+	if err := vb.LoadState(); err != nil {
+		slog.Error("snapshotRunningVolume: failed to load state", "volumeId", volumeID, "err", err)
+		return errors.New(awserrors.ErrorServerInternal)
+	}
+
+	if err := vb.LoadLiveCheckpoint(); err != nil {
+		slog.Error("snapshotRunningVolume: failed to load live checkpoint", "volumeId", volumeID, "err", err)
+		return errors.New(awserrors.ErrorServerInternal)
+	}
+
+	if _, err := vb.CreateSnapshot(snapshotID); err != nil {
+		slog.Error("snapshotRunningVolume: CreateSnapshot failed", "volumeId", volumeID, "snapshotId", snapshotID, "err", err)
 		return errors.New(awserrors.ErrorServerInternal)
 	}
 
@@ -499,14 +598,14 @@ func (s *ImageServiceImpl) snapshotRunningVolume(volumeID, snapshotID string) er
 	return nil
 }
 
-// snapshotStoppedVolume creates a snapshot offline by loading viperblock state from S3
+// snapshotStoppedVolume creates a snapshot offline by loading viperblock state from S3.
 func (s *ImageServiceImpl) snapshotStoppedVolume(volumeID, snapshotID string) error {
 	if s.config == nil {
 		return errors.New(awserrors.ErrorServerInternal)
 	}
 
 	// Read volume config to get the size (required by viperblock.New)
-	volConfig, err := s.getVolumeConfig(volumeID)
+	volConfig, err := s.getVolumeConfig(context.Background(), volumeID)
 	if err != nil {
 		slog.Error("snapshotStoppedVolume: failed to read volume config", "volumeId", volumeID, "err", err)
 		return errors.New(awserrors.ErrorServerInternal)
@@ -543,14 +642,23 @@ func (s *ImageServiceImpl) snapshotStoppedVolume(volumeID, snapshotID string) er
 		slog.Error("snapshotStoppedVolume: failed to create viperblock instance", "volumeId", volumeID, "err", err)
 		return errors.New(awserrors.ErrorServerInternal)
 	}
+	defer func() {
+		vb.StopChunkUploader()
+		vb.StopWALSyncer()
+	}()
 
 	if err := vb.Backend.Init(); err != nil {
 		slog.Error("snapshotStoppedVolume: failed to init backend", "volumeId", volumeID, "err", err)
 		return errors.New(awserrors.ErrorServerInternal)
 	}
 
-	if _, err := vb.LoadStateRequest(""); err != nil {
+	if err := vb.LoadState(); err != nil {
 		slog.Error("snapshotStoppedVolume: failed to load state", "volumeId", volumeID, "err", err)
+		return errors.New(awserrors.ErrorServerInternal)
+	}
+
+	if err := vb.LoadBlockState(); err != nil {
+		slog.Error("snapshotStoppedVolume: failed to load block state", "volumeId", volumeID, "err", err)
 		return errors.New(awserrors.ErrorServerInternal)
 	}
 
@@ -570,10 +678,10 @@ func (s *ImageServiceImpl) snapshotStoppedVolume(volumeID, snapshotID string) er
 	return nil
 }
 
-// getVolumeConfig reads a volume's VBState config from S3
-func (s *ImageServiceImpl) getVolumeConfig(volumeID string) (*viperblock.VolumeConfig, error) {
+// getVolumeConfig reads a volume's VBState config from S3.
+func (s *ImageServiceImpl) getVolumeConfig(ctx context.Context, volumeID string) (*viperblock.VolumeConfig, error) {
 	configKey := fmt.Sprintf("%s/config.json", volumeID)
-	result, err := s.store.GetObject(&s3.GetObjectInput{
+	result, err := s.store.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucketName),
 		Key:    aws.String(configKey),
 	})
@@ -596,8 +704,8 @@ func (s *ImageServiceImpl) getVolumeConfig(volumeID string) (*viperblock.VolumeC
 // amiNameExists checks if any existing AMI already uses the given name.
 // NoSuchKey is skipped (concurrent deregister race); any other read/decode
 // error is surfaced so we don't silently allow a duplicate.
-func (s *ImageServiceImpl) amiNameExists(name string) (bool, error) {
-	listResult, err := s.store.ListObjectsV2(&s3.ListObjectsV2Input{
+func (s *ImageServiceImpl) amiNameExists(ctx context.Context, name string) (bool, error) {
+	listResult, err := s.store.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(s.bucketName),
 		Prefix:    aws.String("ami-"),
 		Delimiter: aws.String("/"),
@@ -611,7 +719,7 @@ func (s *ImageServiceImpl) amiNameExists(name string) (bool, error) {
 			continue
 		}
 		configKey := *prefix.Prefix + "config.json"
-		result, err := s.store.GetObject(&s3.GetObjectInput{
+		result, err := s.store.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(s.bucketName),
 			Key:    aws.String(configKey),
 		})
@@ -647,9 +755,9 @@ var ErrCorruptAMIConfig = errors.New("corrupt AMI config")
 
 // GetAMIConfig returns NoSuchKeyError if the AMI is missing, or an error
 // wrapping ErrCorruptAMIConfig on decode failure.
-func (s *ImageServiceImpl) GetAMIConfig(imageID string) (viperblock.AMIMetadata, error) {
+func (s *ImageServiceImpl) GetAMIConfig(ctx context.Context, imageID string) (viperblock.AMIMetadata, error) {
 	configKey := fmt.Sprintf("%s/config.json", imageID)
-	result, err := s.store.GetObject(&s3.GetObjectInput{
+	result, err := s.store.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucketName),
 		Key:    aws.String(configKey),
 	})
@@ -660,18 +768,18 @@ func (s *ImageServiceImpl) GetAMIConfig(imageID string) (viperblock.AMIMetadata,
 
 	body, err := io.ReadAll(result.Body)
 	if err != nil {
-		return viperblock.AMIMetadata{}, fmt.Errorf("%w: %s: %v", ErrCorruptAMIConfig, configKey, err)
+		return viperblock.AMIMetadata{}, fmt.Errorf("%w: %s: %w", ErrCorruptAMIConfig, configKey, err)
 	}
 	var vbState viperblock.VBState
 	if err := json.Unmarshal(viperblock.StateBody(body), &vbState); err != nil {
-		return viperblock.AMIMetadata{}, fmt.Errorf("%w: %s: %v", ErrCorruptAMIConfig, configKey, err)
+		return viperblock.AMIMetadata{}, fmt.Errorf("%w: %s: %w", ErrCorruptAMIConfig, configKey, err)
 	}
 	return vbState.VolumeConfig.AMIMetadata, nil
 }
 
 // putAMIConfig writes AMI metadata to {imageID}/config.json, preserving the
 // VBState wrapper used by GetAMIConfig.
-func (s *ImageServiceImpl) putAMIConfig(imageID string, meta viperblock.AMIMetadata) error {
+func (s *ImageServiceImpl) putAMIConfig(ctx context.Context, imageID string, meta viperblock.AMIMetadata) error {
 	state := viperblock.VBState{
 		VolumeConfig: viperblock.VolumeConfig{
 			AMIMetadata: meta,
@@ -684,7 +792,7 @@ func (s *ImageServiceImpl) putAMIConfig(imageID string, meta viperblock.AMIMetad
 	}
 
 	configKey := fmt.Sprintf("%s/config.json", imageID)
-	_, err = s.store.PutObject(&s3.PutObjectInput{
+	_, err = s.store.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(s.bucketName),
 		Key:         aws.String(configKey),
 		Body:        bytes.NewReader(data),
@@ -701,18 +809,12 @@ func (s *ImageServiceImpl) ApplyRecordTags(input *ec2.CreateTagsInput, accountID
 	if input == nil {
 		return nil
 	}
-	merge := func(tags map[string]string) {
-		for _, t := range input.Tags {
-			if t.Key != nil && t.Value != nil {
-				tags[*t.Key] = *t.Value
-			}
-		}
-	}
+	merge := utils.MergeTagsMut(input)
 	for _, res := range input.Resources {
 		if res == nil || !strings.HasPrefix(*res, "ami-") {
 			continue
 		}
-		if err := s.updateAMITags(*res, accountID, merge); err != nil {
+		if err := s.updateAMITags(context.Background(), *res, accountID, merge); err != nil {
 			return err
 		}
 	}
@@ -726,29 +828,12 @@ func (s *ImageServiceImpl) RemoveRecordTags(input *ec2.DeleteTagsInput, accountI
 	if input == nil {
 		return nil
 	}
-	remove := func(tags map[string]string) {
-		if len(input.Tags) == 0 {
-			for k := range tags {
-				delete(tags, k)
-			}
-			return
-		}
-		for _, t := range input.Tags {
-			if t.Key == nil {
-				continue
-			}
-			if t.Value == nil {
-				delete(tags, *t.Key)
-			} else if cur, ok := tags[*t.Key]; ok && cur == *t.Value {
-				delete(tags, *t.Key)
-			}
-		}
-	}
+	remove := utils.RemoveTagsMut(input)
 	for _, res := range input.Resources {
 		if res == nil || !strings.HasPrefix(*res, "ami-") {
 			continue
 		}
-		if err := s.updateAMITags(*res, accountID, remove); err != nil {
+		if err := s.updateAMITags(context.Background(), *res, accountID, remove); err != nil {
 			return err
 		}
 	}
@@ -758,8 +843,8 @@ func (s *ImageServiceImpl) RemoveRecordTags(input *ec2.DeleteTagsInput, accountI
 // updateAMITags read-modify-writes the tag map of the AMI config identified by
 // imageID. An AMI absent from this store or owned by another account is skipped
 // (its tags are not this service's to mutate); a corrupt config propagates.
-func (s *ImageServiceImpl) updateAMITags(imageID, accountID string, mut func(map[string]string)) error {
-	meta, err := s.GetAMIConfig(imageID)
+func (s *ImageServiceImpl) updateAMITags(ctx context.Context, imageID, accountID string, mut func(map[string]string)) error {
+	meta, err := s.GetAMIConfig(ctx, imageID)
 	if err != nil {
 		if objectstore.IsNoSuchKeyError(err) {
 			return nil
@@ -777,7 +862,7 @@ func (s *ImageServiceImpl) updateAMITags(imageID, accountID string, mut func(map
 		meta.Tags = map[string]string{}
 	}
 	mut(meta.Tags)
-	return s.putAMIConfig(imageID, meta)
+	return s.putAMIConfig(ctx, imageID, meta)
 }
 
 // checkAMIOwnership rejects cross-account and system-AMI mutations. Empty
@@ -810,12 +895,12 @@ func callerCanReadAMI(meta viperblock.AMIMetadata, accountID string) bool {
 // loadAMIForMutation fetches the AMI and enforces ownership. Cross-account
 // callers see UnauthorizedOperation, not NotFound (they already know the ID).
 // No CAS: concurrent writers last-write-wins on the full struct.
-func (s *ImageServiceImpl) loadAMIForMutation(imageID, accountID string) (viperblock.AMIMetadata, error) {
+func (s *ImageServiceImpl) loadAMIForMutation(ctx context.Context, imageID, accountID string) (viperblock.AMIMetadata, error) {
 	if !strings.HasPrefix(imageID, "ami-") {
 		return viperblock.AMIMetadata{}, errors.New(awserrors.ErrorInvalidAMIIDMalformed)
 	}
 
-	meta, err := s.GetAMIConfig(imageID)
+	meta, err := s.GetAMIConfig(ctx, imageID)
 	if err != nil {
 		if objectstore.IsNoSuchKeyError(err) {
 			return viperblock.AMIMetadata{}, errors.New(awserrors.ErrorInvalidAMIIDNotFound)
@@ -830,8 +915,8 @@ func (s *ImageServiceImpl) loadAMIForMutation(imageID, accountID string) (viperb
 	return meta, nil
 }
 
-// putSnapshotMetadata stores snapshot metadata in S3 using the canonical SnapshotConfig type
-func (s *ImageServiceImpl) putSnapshotMetadata(snapshotID, volumeID string, volumeSizeGiB uint64, accountID string) error {
+// putSnapshotMetadata stores snapshot metadata in S3 using the canonical SnapshotConfig type.
+func (s *ImageServiceImpl) putSnapshotMetadata(ctx context.Context, snapshotID, volumeID string, volumeSizeGiB uint64, accountID string) error {
 	cfg := handlers_ec2_snapshot.SnapshotConfig{
 		SnapshotID: snapshotID,
 		VolumeID:   volumeID,
@@ -847,7 +932,7 @@ func (s *ImageServiceImpl) putSnapshotMetadata(snapshotID, volumeID string, volu
 // CopyImage clones an AMI same-region, metadata-only: the new snapshot shares the
 // source's VolumeID and a fresh config.json points at it. Source visibility is checked
 // before the name-uniqueness scan so cross-account sources fast-fail.
-func (s *ImageServiceImpl) CopyImage(input *ec2.CopyImageInput, accountID string) (*ec2.CopyImageOutput, error) {
+func (s *ImageServiceImpl) CopyImage(ctx context.Context, input *ec2.CopyImageInput, accountID string) (*ec2.CopyImageOutput, error) {
 	if input == nil || input.Name == nil || *input.Name == "" ||
 		input.SourceImageId == nil || *input.SourceImageId == "" {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
@@ -856,14 +941,14 @@ func (s *ImageServiceImpl) CopyImage(input *ec2.CopyImageInput, accountID string
 	name := *input.Name
 	sourceImageID := *input.SourceImageId
 
-	srcMeta, err := s.GetAMIConfig(sourceImageID)
+	srcMeta, err := s.GetAMIConfig(ctx, sourceImageID)
 	if err != nil {
 		// Corrupt source is treated as NotFound so callers can't tell which
 		// half of the AMI/snapshot pair is broken.
 		if objectstore.IsNoSuchKeyError(err) || errors.Is(err, ErrCorruptAMIConfig) {
 			return nil, errors.New(awserrors.ErrorInvalidAMIIDNotFound)
 		}
-		slog.Error("CopyImage: failed to read source AMI config", "sourceImageId", sourceImageID, "err", err)
+		slog.ErrorContext(ctx, "CopyImage: failed to read source AMI config", "sourceImageId", sourceImageID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
@@ -889,14 +974,14 @@ func (s *ImageServiceImpl) CopyImage(input *ec2.CopyImageInput, accountID string
 		} else if objectstore.IsNoSuchKeyError(err) || errors.Is(err, handlers_ec2_snapshot.ErrCorruptSnapshotMetadata) {
 			return nil, errors.New(awserrors.ErrorInvalidAMIIDNotFound)
 		} else {
-			slog.Error("CopyImage: failed to read source snapshot metadata",
+			slog.ErrorContext(ctx, "CopyImage: failed to read source snapshot metadata",
 				"sourceImageId", sourceImageID, "snapshotId", srcMeta.SnapshotID, "err", err)
 			return nil, errors.New(awserrors.ErrorServerInternal)
 		}
 	}
 
-	if exists, err := s.amiNameExists(name); err != nil {
-		slog.Error("CopyImage: failed to check AMI name uniqueness", "name", name, "err", err)
+	if exists, err := s.amiNameExists(ctx, name); err != nil {
+		slog.ErrorContext(ctx, "CopyImage: failed to check AMI name uniqueness", "name", name, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	} else if exists {
 		return nil, errors.New(awserrors.ErrorInvalidAMINameDuplicate)
@@ -910,8 +995,8 @@ func (s *ImageServiceImpl) CopyImage(input *ec2.CopyImageInput, accountID string
 	if srcSnap.VolumeSize > 0 {
 		snapSizeGiB = uint64(srcSnap.VolumeSize)
 	}
-	if err := s.putSnapshotMetadata(newSnapshotID, srcSnap.VolumeID, snapSizeGiB, accountID); err != nil {
-		slog.Error("CopyImage: failed to write snapshot metadata", "snapshotId", newSnapshotID, "err", err)
+	if err := s.putSnapshotMetadata(ctx, newSnapshotID, srcSnap.VolumeID, snapSizeGiB, accountID); err != nil {
+		slog.ErrorContext(ctx, "CopyImage: failed to write snapshot metadata", "snapshotId", newSnapshotID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
@@ -941,24 +1026,27 @@ func (s *ImageServiceImpl) CopyImage(input *ec2.CopyImageInput, accountID string
 		CreationDate:    time.Now(),
 		BootMode:        srcMeta.BootMode,
 		Tags:            tags,
+		// Zero-copy: the new config shares the source's already-durable
+		// snapshot, so the image is complete as soon as this is written.
+		State: "available",
 	}
 
-	if err := s.putAMIConfig(newImageID, meta); err != nil {
-		slog.Error("CopyImage: failed to write AMI config",
+	if err := s.putAMIConfig(ctx, newImageID, meta); err != nil {
+		slog.ErrorContext(ctx, "CopyImage: failed to write AMI config",
 			"amiId", newImageID, "orphanSnapshotId", newSnapshotID, "err", err)
 		// Best-effort rollback of the orphaned snapshot metadata.
 		snapKey := handlers_ec2_snapshot.GetSnapshotKey(newSnapshotID)
-		if _, delErr := s.store.DeleteObject(&s3.DeleteObjectInput{
+		if _, delErr := s.store.DeleteObject(ctx, &s3.DeleteObjectInput{
 			Bucket: aws.String(s.bucketName),
 			Key:    aws.String(snapKey),
 		}); delErr != nil {
-			slog.Error("CopyImage: failed to roll back orphaned snapshot metadata",
+			slog.ErrorContext(ctx, "CopyImage: failed to roll back orphaned snapshot metadata",
 				"snapshotId", newSnapshotID, "err", delErr)
 		}
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
-	slog.Info("CopyImage completed",
+	slog.InfoContext(ctx, "CopyImage completed",
 		"sourceImageId", sourceImageID, "newImageId", newImageID,
 		"sourceSnapshotId", srcMeta.SnapshotID, "newSnapshotId", newSnapshotID,
 		"accountId", accountID)
@@ -984,7 +1072,7 @@ func mergeCopyImageTags(srcTags map[string]string, specs []*ec2.TagSpecification
 // DescribeImageAttribute supports description and blockDeviceMapping only.
 // Cross-account reads return NotFound so the caller can't learn the ID exists
 // in another account.
-func (s *ImageServiceImpl) DescribeImageAttribute(input *ec2.DescribeImageAttributeInput, accountID string) (*ec2.DescribeImageAttributeOutput, error) {
+func (s *ImageServiceImpl) DescribeImageAttribute(ctx context.Context, input *ec2.DescribeImageAttributeInput, accountID string) (*ec2.DescribeImageAttributeOutput, error) {
 	if input == nil || input.ImageId == nil || *input.ImageId == "" ||
 		input.Attribute == nil || *input.Attribute == "" {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
@@ -993,12 +1081,12 @@ func (s *ImageServiceImpl) DescribeImageAttribute(input *ec2.DescribeImageAttrib
 	imageID := *input.ImageId
 	attribute := *input.Attribute
 
-	meta, err := s.GetAMIConfig(imageID)
+	meta, err := s.GetAMIConfig(ctx, imageID)
 	if err != nil {
 		if objectstore.IsNoSuchKeyError(err) {
 			return nil, errors.New(awserrors.ErrorInvalidAMIIDNotFound)
 		}
-		slog.Error("DescribeImageAttribute: failed to read AMI config", "imageId", imageID, "err", err)
+		slog.ErrorContext(ctx, "DescribeImageAttribute: failed to read AMI config", "imageId", imageID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
@@ -1019,7 +1107,7 @@ func (s *ImageServiceImpl) DescribeImageAttribute(input *ec2.DescribeImageAttrib
 		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
 	}
 
-	slog.Info("DescribeImageAttribute completed", "imageId", imageID, "attribute", attribute, "accountId", accountID)
+	slog.InfoContext(ctx, "DescribeImageAttribute completed", "imageId", imageID, "attribute", attribute, "accountId", accountID)
 	return output, nil
 }
 
@@ -1063,7 +1151,7 @@ func synthesizeRootBlockDeviceMapping(meta viperblock.AMIMetadata, encrypted boo
 // RegisterImage writes AMI metadata pointing at an existing snapshot. Never
 // touches block data. The snapshot read runs before the O(n) name-uniqueness
 // scan so a missing snapshot fast-fails.
-func (s *ImageServiceImpl) RegisterImage(input *ec2.RegisterImageInput, accountID string) (*ec2.RegisterImageOutput, error) {
+func (s *ImageServiceImpl) RegisterImage(ctx context.Context, input *ec2.RegisterImageInput, accountID string) (*ec2.RegisterImageOutput, error) {
 	if input == nil || input.Name == nil || *input.Name == "" {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
 	}
@@ -1082,13 +1170,13 @@ func (s *ImageServiceImpl) RegisterImage(input *ec2.RegisterImageInput, accountI
 		if objectstore.IsNoSuchKeyError(err) || errors.Is(err, handlers_ec2_snapshot.ErrCorruptSnapshotMetadata) {
 			return nil, errors.New(awserrors.ErrorInvalidSnapshotNotFound)
 		}
-		slog.Error("RegisterImage: failed to read snapshot metadata", "snapshotId", snapshotID, "err", err)
+		slog.ErrorContext(ctx, "RegisterImage: failed to read snapshot metadata", "snapshotId", snapshotID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
 	// Only the snapshot owner (or any caller for system snapshots) can register.
 	if utils.IsAccountID(snapCfg.OwnerID) && snapCfg.OwnerID != accountID {
-		slog.Warn("RegisterImage: rejected cross-account snapshot",
+		slog.WarnContext(ctx, "RegisterImage: rejected cross-account snapshot",
 			"snapshotId", snapshotID, "snapshotOwner", snapCfg.OwnerID, "accountId", accountID)
 		return nil, errors.New(awserrors.ErrorUnauthorizedOperation)
 	}
@@ -1107,8 +1195,8 @@ func (s *ImageServiceImpl) RegisterImage(input *ec2.RegisterImageInput, accountI
 		volumeSizeGiB = requested
 	}
 
-	if exists, err := s.amiNameExists(name); err != nil {
-		slog.Error("RegisterImage: failed to check AMI name uniqueness", "name", name, "err", err)
+	if exists, err := s.amiNameExists(ctx, name); err != nil {
+		slog.ErrorContext(ctx, "RegisterImage: failed to check AMI name uniqueness", "name", name, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	} else if exists {
 		return nil, errors.New(awserrors.ErrorInvalidAMINameDuplicate)
@@ -1143,14 +1231,18 @@ func (s *ImageServiceImpl) RegisterImage(input *ec2.RegisterImageInput, accountI
 		ImageOwnerAlias: accountID,
 		CreationDate:    time.Now(),
 		Tags:            tags,
+		BootMode:        aws.StringValue(input.BootMode),
+		// The referenced snapshot already exists (checked above), so the
+		// image is complete as soon as this config is written.
+		State: "available",
 	}
 
-	if err := s.putAMIConfig(amiID, meta); err != nil {
-		slog.Error("RegisterImage: failed to write AMI config", "amiId", amiID, "err", err)
+	if err := s.putAMIConfig(ctx, amiID, meta); err != nil {
+		slog.ErrorContext(ctx, "RegisterImage: failed to write AMI config", "amiId", amiID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
-	slog.Info("RegisterImage completed", "amiId", amiID, "snapshotId", snapshotID, "accountId", accountID)
+	slog.InfoContext(ctx, "RegisterImage completed", "amiId", amiID, "snapshotId", snapshotID, "accountId", accountID)
 	return &ec2.RegisterImageOutput{ImageId: aws.String(amiID)}, nil
 }
 
@@ -1178,33 +1270,33 @@ func pickRootSnapshotBDM(mappings []*ec2.BlockDeviceMapping, rootDeviceName *str
 
 // DeregisterImage hard-deletes config.json. Backing snapshot is untouched, so
 // operators run delete-snapshot separately to reclaim block storage.
-func (s *ImageServiceImpl) DeregisterImage(input *ec2.DeregisterImageInput, accountID string) (*ec2.DeregisterImageOutput, error) {
+func (s *ImageServiceImpl) DeregisterImage(ctx context.Context, input *ec2.DeregisterImageInput, accountID string) (*ec2.DeregisterImageOutput, error) {
 	if input == nil || input.ImageId == nil || *input.ImageId == "" {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
 	}
 
 	imageID := *input.ImageId
 
-	if _, err := s.loadAMIForMutation(imageID, accountID); err != nil {
+	if _, err := s.loadAMIForMutation(ctx, imageID, accountID); err != nil {
 		return nil, err
 	}
 
 	configKey := fmt.Sprintf("%s/config.json", imageID)
-	if _, err := s.store.DeleteObject(&s3.DeleteObjectInput{
+	if _, err := s.store.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucketName),
 		Key:    aws.String(configKey),
 	}); err != nil {
-		slog.Error("DeregisterImage: failed to delete AMI config", "imageId", imageID, "err", err)
+		slog.ErrorContext(ctx, "DeregisterImage: failed to delete AMI config", "imageId", imageID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
-	slog.Info("DeregisterImage completed", "imageId", imageID, "accountId", accountID)
+	slog.InfoContext(ctx, "DeregisterImage completed", "imageId", imageID, "accountId", accountID)
 	return &ec2.DeregisterImageOutput{}, nil
 }
 
 // ModifyImageAttribute writes a modifiable AMI attribute; only description is writable.
 // Ownership is checked first so cross-account callers always see UnauthorizedOperation.
-func (s *ImageServiceImpl) ModifyImageAttribute(input *ec2.ModifyImageAttributeInput, accountID string) (*ec2.ModifyImageAttributeOutput, error) {
+func (s *ImageServiceImpl) ModifyImageAttribute(ctx context.Context, input *ec2.ModifyImageAttributeInput, accountID string) (*ec2.ModifyImageAttributeOutput, error) {
 	if input == nil || input.ImageId == nil || *input.ImageId == "" ||
 		input.Attribute == nil || *input.Attribute == "" {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
@@ -1213,7 +1305,7 @@ func (s *ImageServiceImpl) ModifyImageAttribute(input *ec2.ModifyImageAttributeI
 	imageID := *input.ImageId
 	attribute := *input.Attribute
 
-	meta, err := s.loadAMIForMutation(imageID, accountID)
+	meta, err := s.loadAMIForMutation(ctx, imageID, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -1228,23 +1320,23 @@ func (s *ImageServiceImpl) ModifyImageAttribute(input *ec2.ModifyImageAttributeI
 	}
 	// No-op guard: Terraform aws_ami refresh otherwise churns out no-op writes.
 	if meta.Description == newValue {
-		slog.Info("ModifyImageAttribute no-op", "imageId", imageID, "attribute", attribute, "accountId", accountID)
+		slog.InfoContext(ctx, "ModifyImageAttribute no-op", "imageId", imageID, "attribute", attribute, "accountId", accountID)
 		return &ec2.ModifyImageAttributeOutput{}, nil
 	}
 	meta.Description = newValue
 
-	if err := s.putAMIConfig(imageID, meta); err != nil {
-		slog.Error("ModifyImageAttribute: failed to write AMI config", "imageId", imageID, "err", err)
+	if err := s.putAMIConfig(ctx, imageID, meta); err != nil {
+		slog.ErrorContext(ctx, "ModifyImageAttribute: failed to write AMI config", "imageId", imageID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
-	slog.Info("ModifyImageAttribute completed", "imageId", imageID, "attribute", attribute, "accountId", accountID)
+	slog.InfoContext(ctx, "ModifyImageAttribute completed", "imageId", imageID, "attribute", attribute, "accountId", accountID)
 	return &ec2.ModifyImageAttributeOutput{}, nil
 }
 
 // ResetImageAttribute clears the description (the only supported attribute).
 // launchPermission — AWS's default reset target — is out of scope.
-func (s *ImageServiceImpl) ResetImageAttribute(input *ec2.ResetImageAttributeInput, accountID string) (*ec2.ResetImageAttributeOutput, error) {
+func (s *ImageServiceImpl) ResetImageAttribute(ctx context.Context, input *ec2.ResetImageAttributeInput, accountID string) (*ec2.ResetImageAttributeOutput, error) {
 	if input == nil || input.ImageId == nil || *input.ImageId == "" ||
 		input.Attribute == nil || *input.Attribute == "" {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
@@ -1253,7 +1345,7 @@ func (s *ImageServiceImpl) ResetImageAttribute(input *ec2.ResetImageAttributeInp
 	imageID := *input.ImageId
 	attribute := *input.Attribute
 
-	meta, err := s.loadAMIForMutation(imageID, accountID)
+	meta, err := s.loadAMIForMutation(ctx, imageID, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -1263,16 +1355,16 @@ func (s *ImageServiceImpl) ResetImageAttribute(input *ec2.ResetImageAttributeInp
 	}
 
 	if meta.Description == "" {
-		slog.Info("ResetImageAttribute no-op", "imageId", imageID, "attribute", attribute, "accountId", accountID)
+		slog.InfoContext(ctx, "ResetImageAttribute no-op", "imageId", imageID, "attribute", attribute, "accountId", accountID)
 		return &ec2.ResetImageAttributeOutput{}, nil
 	}
 	meta.Description = ""
 
-	if err := s.putAMIConfig(imageID, meta); err != nil {
-		slog.Error("ResetImageAttribute: failed to write AMI config", "imageId", imageID, "err", err)
+	if err := s.putAMIConfig(ctx, imageID, meta); err != nil {
+		slog.ErrorContext(ctx, "ResetImageAttribute: failed to write AMI config", "imageId", imageID, "err", err)
 		return nil, errors.New(awserrors.ErrorServerInternal)
 	}
 
-	slog.Info("ResetImageAttribute completed", "imageId", imageID, "attribute", attribute, "accountId", accountID)
+	slog.InfoContext(ctx, "ResetImageAttribute completed", "imageId", imageID, "attribute", attribute, "accountId", accountID)
 	return &ec2.ResetImageAttributeOutput{}, nil
 }

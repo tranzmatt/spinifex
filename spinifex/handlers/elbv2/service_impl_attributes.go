@@ -1,6 +1,7 @@
 package handlers_elbv2
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"maps"
@@ -157,14 +158,16 @@ func sdkAttrsOut[A any](pairs []attrPair, mk func(key, value string) A) []A {
 	return out
 }
 
-func (s *ELBv2ServiceImpl) tgAttrResource(arn, accountID, opName string) attrResource[TargetGroupRecord] {
+func (s *ELBv2ServiceImpl) tgAttrResource(ctx context.Context, arn, accountID, opName string) attrResource[TargetGroupRecord] {
 	return attrResource[TargetGroupRecord]{
-		arn:         arn,
-		accountID:   accountID,
-		opName:      opName,
-		notFound:    awserrors.ErrorELBv2TargetGroupNotFound,
-		fetch:       s.store.GetTargetGroupByArn,
-		save:        s.store.PutTargetGroup,
+		arn:       arn,
+		accountID: accountID,
+		opName:    opName,
+		notFound:  awserrors.ErrorELBv2TargetGroupNotFound,
+		// fetch/save close over ctx: attrResource is consumed by the generic
+		// attribute helpers, which have no context of their own to pass down.
+		fetch:       func(arn string) (*TargetGroupRecord, error) { return s.store.GetTargetGroupByArn(ctx, arn) },
+		save:        func(tg *TargetGroupRecord) error { return s.store.PutTargetGroup(ctx, tg) },
 		accountIDOf: func(r *TargetGroupRecord) string { return r.AccountID },
 		defaults:    func(*TargetGroupRecord) map[string]string { return DefaultTargetGroupAttributes() },
 		attrsOf:     func(r *TargetGroupRecord) map[string]string { return r.Attributes },
@@ -172,14 +175,15 @@ func (s *ELBv2ServiceImpl) tgAttrResource(arn, accountID, opName string) attrRes
 	}
 }
 
-func (s *ELBv2ServiceImpl) lbAttrResource(arn, accountID, opName string) attrResource[LoadBalancerRecord] {
+func (s *ELBv2ServiceImpl) lbAttrResource(ctx context.Context, arn, accountID, opName string) attrResource[LoadBalancerRecord] {
 	return attrResource[LoadBalancerRecord]{
-		arn:         arn,
-		accountID:   accountID,
-		opName:      opName,
-		notFound:    awserrors.ErrorELBv2LoadBalancerNotFound,
-		fetch:       s.store.GetLoadBalancerByArn,
-		save:        s.store.PutLoadBalancer,
+		arn:       arn,
+		accountID: accountID,
+		opName:    opName,
+		notFound:  awserrors.ErrorELBv2LoadBalancerNotFound,
+		// See tgAttrResource: the generic helpers carry no context.
+		fetch:       func(arn string) (*LoadBalancerRecord, error) { return s.store.GetLoadBalancerByArn(ctx, arn) },
+		save:        func(lb *LoadBalancerRecord) error { return s.store.PutLoadBalancer(ctx, lb) },
 		accountIDOf: func(r *LoadBalancerRecord) string { return r.AccountID },
 		defaults:    func(r *LoadBalancerRecord) map[string]string { return DefaultLoadBalancerAttributes(r.Type) },
 		attrsOf:     func(r *LoadBalancerRecord) map[string]string { return r.Attributes },
@@ -209,54 +213,54 @@ func mkLBAttr(key, value string) *elbv2.LoadBalancerAttribute {
 	return &elbv2.LoadBalancerAttribute{Key: aws.String(key), Value: aws.String(value)}
 }
 
-func (s *ELBv2ServiceImpl) ModifyTargetGroupAttributes(input *elbv2.ModifyTargetGroupAttributesInput, accountID string) (*elbv2.ModifyTargetGroupAttributesOutput, error) {
+func (s *ELBv2ServiceImpl) ModifyTargetGroupAttributes(ctx context.Context, input *elbv2.ModifyTargetGroupAttributesInput, accountID string) (*elbv2.ModifyTargetGroupAttributesOutput, error) {
 	if input == nil {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
 	}
 	const op = "ModifyTargetGroupAttributes"
 	arn := aws.StringValue(input.TargetGroupArn)
 	pairs, raw := sdkAttrsIn(input.Attributes, tgAttrKeyVal, arn, op)
-	submitted, err := modifyResourceAttributes(s.tgAttrResource(arn, accountID, op), pairs, raw)
+	submitted, err := modifyResourceAttributes(s.tgAttrResource(ctx, arn, accountID, op), pairs, raw)
 	if err != nil {
 		return nil, err
 	}
 	return &elbv2.ModifyTargetGroupAttributesOutput{Attributes: sdkAttrsOut(submitted, mkTGAttr)}, nil
 }
 
-func (s *ELBv2ServiceImpl) DescribeTargetGroupAttributes(input *elbv2.DescribeTargetGroupAttributesInput, accountID string) (*elbv2.DescribeTargetGroupAttributesOutput, error) {
+func (s *ELBv2ServiceImpl) DescribeTargetGroupAttributes(ctx context.Context, input *elbv2.DescribeTargetGroupAttributesInput, accountID string) (*elbv2.DescribeTargetGroupAttributesOutput, error) {
 	if input == nil {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
 	}
 	const op = "DescribeTargetGroupAttributes"
 	arn := aws.StringValue(input.TargetGroupArn)
-	pairs, err := describeResourceAttributes(s.tgAttrResource(arn, accountID, op))
+	pairs, err := describeResourceAttributes(s.tgAttrResource(ctx, arn, accountID, op))
 	if err != nil {
 		return nil, err
 	}
 	return &elbv2.DescribeTargetGroupAttributesOutput{Attributes: sdkAttrsOut(pairs, mkTGAttr)}, nil
 }
 
-func (s *ELBv2ServiceImpl) ModifyLoadBalancerAttributes(input *elbv2.ModifyLoadBalancerAttributesInput, accountID string) (*elbv2.ModifyLoadBalancerAttributesOutput, error) {
+func (s *ELBv2ServiceImpl) ModifyLoadBalancerAttributes(ctx context.Context, input *elbv2.ModifyLoadBalancerAttributesInput, accountID string) (*elbv2.ModifyLoadBalancerAttributesOutput, error) {
 	if input == nil {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
 	}
 	const op = "ModifyLoadBalancerAttributes"
 	arn := aws.StringValue(input.LoadBalancerArn)
 	pairs, raw := sdkAttrsIn(input.Attributes, lbAttrKeyVal, arn, op)
-	submitted, err := modifyResourceAttributes(s.lbAttrResource(arn, accountID, op), pairs, raw)
+	submitted, err := modifyResourceAttributes(s.lbAttrResource(ctx, arn, accountID, op), pairs, raw)
 	if err != nil {
 		return nil, err
 	}
 	return &elbv2.ModifyLoadBalancerAttributesOutput{Attributes: sdkAttrsOut(submitted, mkLBAttr)}, nil
 }
 
-func (s *ELBv2ServiceImpl) DescribeLoadBalancerAttributes(input *elbv2.DescribeLoadBalancerAttributesInput, accountID string) (*elbv2.DescribeLoadBalancerAttributesOutput, error) {
+func (s *ELBv2ServiceImpl) DescribeLoadBalancerAttributes(ctx context.Context, input *elbv2.DescribeLoadBalancerAttributesInput, accountID string) (*elbv2.DescribeLoadBalancerAttributesOutput, error) {
 	if input == nil {
 		return nil, errors.New(awserrors.ErrorMissingParameter)
 	}
 	const op = "DescribeLoadBalancerAttributes"
 	arn := aws.StringValue(input.LoadBalancerArn)
-	pairs, err := describeResourceAttributes(s.lbAttrResource(arn, accountID, op))
+	pairs, err := describeResourceAttributes(s.lbAttrResource(ctx, arn, accountID, op))
 	if err != nil {
 		return nil, err
 	}

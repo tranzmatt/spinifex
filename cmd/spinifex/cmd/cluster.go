@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -12,6 +13,42 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/spf13/cobra"
 )
+
+// systemIsSystemRunning is overridable in tests so hostIsStopping does not
+// need a real systemd. systemctl exits non-zero for every state other than
+// "running", so callers must inspect the output, not just the error.
+var systemIsSystemRunning = func() (string, error) {
+	out, err := exec.Command("systemctl", "is-system-running").Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+// knownSystemStates are the documented systemctl is-system-running values.
+var knownSystemStates = map[string]bool{
+	"running": true, "degraded": true, "maintenance": true,
+	"stopping": true, "initializing": true, "starting": true, "offline": true,
+}
+
+// hostIsStopping reports whether systemd is genuinely unwinding into
+// shutdown.target (reboot/poweroff/halt/kexec), as opposed to a plain
+// `systemctl restart/stop spinifex.target` where the host stays up.
+func hostIsStopping() (bool, error) {
+	out, err := systemIsSystemRunning()
+
+	// systemctl did not run at all, so the state is genuinely unknown. Fail
+	// toward draining: a skipped drain on a real shutdown hard-kills guests,
+	// while a spurious drain only costs a graceful stop/relaunch cycle.
+	if out == "" {
+		return true, fmt.Errorf("systemctl is-system-running produced no output: %w", err)
+	}
+
+	// Unrecognized output is untrusted; an unknown state must never be
+	// mistaken for shutdown.
+	if !knownSystemStates[out] {
+		return false, fmt.Errorf("systemctl is-system-running returned unrecognized state %q", out)
+	}
+
+	return out == "stopping", nil
+}
 
 // runClusterShutdown orchestrates a phased, coordinated shutdown of the cluster.
 func runClusterShutdown(cmd *cobra.Command, args []string) {
@@ -123,7 +160,7 @@ func runClusterShutdown(cmd *cobra.Command, args []string) {
 		phaseStart := time.Now()
 		fmt.Printf("[%s] Sending to %d node(s)...\n", strings.ToUpper(phase), nodeCount)
 
-		acks, err := collectShutdownACKs(nc, topic, reqData, nodeCount, timeout)
+		acks, err := collectShutdownACKs(nc, topic, reqData, nodeCount, "", timeout)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[%s] Error: %v\n", strings.ToUpper(phase), err)
 			if !force {
@@ -169,9 +206,24 @@ func runClusterShutdown(cmd *cobra.Command, args []string) {
 func runNodeDrainLocal(cmd *cobra.Command, args []string) {
 	local, _ := cmd.Flags().GetBool("local")
 	timeout, _ := cmd.Flags().GetDuration("timeout")
+	onlyIfHostStopping, _ := cmd.Flags().GetBool("only-if-host-stopping")
 	if !local {
 		fmt.Fprintln(os.Stderr, "Error: node drain currently supports only --local")
 		os.Exit(1)
+	}
+
+	// Unset (an operator running this by hand), the command drains
+	// unconditionally. Set, it skips anything short of a real host shutdown,
+	// since PartOf=spinifex.target fires ExecStop on restarts too.
+	if onlyIfHostStopping {
+		stopping, err := hostIsStopping()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not determine host shutdown state: %v\n", err)
+		}
+		if !stopping {
+			fmt.Println("Host is not shutting down; skipping guest drain.")
+			return
+		}
 	}
 
 	cfg, nc, err := loadConfigAndConnect()
@@ -216,36 +268,14 @@ func runNodeDrainLocal(cmd *cobra.Command, args []string) {
 // from the local node, ignoring ACKs from any other node. Returns an error if
 // the local node does not respond within timeout.
 func collectLocalShutdownACK(nc *nats.Conn, topic string, reqData []byte, node string, timeout time.Duration) (daemon.ShutdownACK, error) {
-	inbox := nats.NewInbox()
-	sub, err := nc.SubscribeSync(inbox)
+	acks, err := collectShutdownACKs(nc, topic, reqData, 1, node, timeout)
 	if err != nil {
-		return daemon.ShutdownACK{}, fmt.Errorf("failed to subscribe to inbox: %w", err)
+		return daemon.ShutdownACK{}, err
 	}
-	defer sub.Unsubscribe()
-
-	if err := nc.PublishRequest(topic, inbox, reqData); err != nil {
-		return daemon.ShutdownACK{}, fmt.Errorf("failed to publish request: %w", err)
+	if len(acks) == 0 {
+		return daemon.ShutdownACK{}, fmt.Errorf("timeout waiting for local node %q ACK", node)
 	}
-	nc.Flush()
-
-	deadline := time.Now().Add(timeout)
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return daemon.ShutdownACK{}, fmt.Errorf("timeout waiting for local node %q ACK", node)
-		}
-		msg, err := sub.NextMsg(remaining)
-		if err != nil {
-			return daemon.ShutdownACK{}, fmt.Errorf("timeout waiting for local node %q ACK", node)
-		}
-		var ack daemon.ShutdownACK
-		if err := json.Unmarshal(msg.Data, &ack); err != nil {
-			continue
-		}
-		if ack.Node == node {
-			return ack, nil
-		}
-	}
+	return acks[0], nil
 }
 
 // runClusterDrainDHCP asks every vpcd to DHCPRELEASE all external-pool leases
@@ -322,7 +352,9 @@ func drainDHCPLeases(nc *nats.Conn, timeout time.Duration) (released, responders
 }
 
 // collectShutdownACKs publishes a shutdown request and collects ACKs from nodes.
-func collectShutdownACKs(nc *nats.Conn, topic string, reqData []byte, nodeCount int, timeout time.Duration) ([]daemon.ShutdownACK, error) {
+// When nodeFilter is non-empty, only ACKs from that node count toward nodeCount
+// and all others are ignored (used by the single-node local-drain path).
+func collectShutdownACKs(nc *nats.Conn, topic string, reqData []byte, nodeCount int, nodeFilter string, timeout time.Duration) ([]daemon.ShutdownACK, error) {
 	inbox := nats.NewInbox()
 	sub, err := nc.SubscribeSync(inbox)
 	if err != nil {
@@ -348,6 +380,9 @@ func collectShutdownACKs(nc *nats.Conn, topic string, reqData []byte, nodeCount 
 		}
 		var ack daemon.ShutdownACK
 		if err := json.Unmarshal(msg.Data, &ack); err != nil {
+			continue
+		}
+		if nodeFilter != "" && ack.Node != nodeFilter {
 			continue
 		}
 		acks = append(acks, ack)

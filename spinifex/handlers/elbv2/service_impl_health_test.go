@@ -1,12 +1,14 @@
 package handlers_elbv2
 
 import (
+	"context"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/elbv2"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
+	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,20 +21,22 @@ func setupTestServiceWithInstance(t *testing.T, instanceID, instanceIP string) (
 	_, nc, _ := testutil.StartTestJetStream(t)
 	testutil.StubVpcdSGResponder(t, nc)
 
-	vpcSvc, err := handlers_ec2_vpc.NewVPCServiceImplWithNATS(nil, nc)
+	vpcSvc, err := handlers_ec2_vpc.NewVPCServiceImplWithNATS(t.Context(), nil, nc)
 	require.NoError(t, err)
 
-	elbv2Svc, err := NewELBv2ServiceImplWithNATS(nil, nc)
+	masterKey, err := handlers_iam.GenerateMasterKey()
+	require.NoError(t, err)
+	elbv2Svc, err := NewELBv2ServiceImplWithNATS(nil, nc, masterKey)
 	require.NoError(t, err)
 	elbv2Svc.VPCService = vpcSvc
 
 	// Create VPC + subnet
-	vpcOut, err := vpcSvc.CreateVpc(&ec2.CreateVpcInput{
+	vpcOut, err := vpcSvc.CreateVpc(context.Background(), &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.0/16"),
 	}, testAccountID)
 	require.NoError(t, err)
 
-	subnetOut, err := vpcSvc.CreateSubnet(&ec2.CreateSubnetInput{
+	subnetOut, err := vpcSvc.CreateSubnet(context.Background(), &ec2.CreateSubnetInput{
 		VpcId:            vpcOut.Vpc.VpcId,
 		CidrBlock:        aws.String("10.0.1.0/24"),
 		AvailabilityZone: aws.String("us-east-1a"),
@@ -40,7 +44,7 @@ func setupTestServiceWithInstance(t *testing.T, instanceID, instanceIP string) (
 	require.NoError(t, err)
 
 	// Create an ENI for the "instance" with specific IP
-	eniOut, err := vpcSvc.CreateNetworkInterface(&ec2.CreateNetworkInterfaceInput{
+	eniOut, err := vpcSvc.CreateNetworkInterface(context.Background(), &ec2.CreateNetworkInterfaceInput{
 		SubnetId:         subnetOut.Subnet.SubnetId,
 		PrivateIpAddress: aws.String(instanceIP),
 		Description:      aws.String("Primary ENI for " + instanceID),
@@ -58,7 +62,7 @@ func TestRegisterTargets_ResolvesPrivateIP(t *testing.T) {
 	svc, _, _ := setupTestServiceWithInstance(t, "i-web001", "10.0.1.50")
 
 	// Create target group
-	tgOut, err := svc.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
+	tgOut, err := svc.CreateTargetGroup(context.Background(), &elbv2.CreateTargetGroupInput{
 		Name: aws.String("ip-resolve-tg"),
 		Port: aws.Int64(80),
 	}, testAccountID)
@@ -66,21 +70,21 @@ func TestRegisterTargets_ResolvesPrivateIP(t *testing.T) {
 	tgArn := tgOut.TargetGroups[0].TargetGroupArn
 
 	// Register the instance
-	_, err = svc.RegisterTargets(&elbv2.RegisterTargetsInput{
+	_, err = svc.RegisterTargets(context.Background(), &elbv2.RegisterTargetsInput{
 		TargetGroupArn: tgArn,
 		Targets:        []*elbv2.TargetDescription{{Id: aws.String("i-web001")}},
 	}, testAccountID)
 	require.NoError(t, err)
 
 	// Verify private IP was resolved
-	health, err := svc.DescribeTargetHealth(&elbv2.DescribeTargetHealthInput{
+	health, err := svc.DescribeTargetHealth(context.Background(), &elbv2.DescribeTargetHealthInput{
 		TargetGroupArn: tgArn,
 	}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, health.TargetHealthDescriptions, 1)
 
 	// The target should have been registered with the resolved IP in the store
-	tg, err := svc.store.GetTargetGroupByArn(*tgArn)
+	tg, err := svc.store.GetTargetGroupByArn(t.Context(), *tgArn)
 	require.NoError(t, err)
 	require.Len(t, tg.Targets, 1)
 	assert.Equal(t, "10.0.1.50", tg.Targets[0].PrivateIP)
@@ -89,64 +93,64 @@ func TestRegisterTargets_ResolvesPrivateIP(t *testing.T) {
 func TestRegisterTargets_UnresolvableIP(t *testing.T) {
 	svc, _, _ := setupTestServiceWithInstance(t, "i-web001", "10.0.1.50")
 
-	tgOut, _ := svc.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
+	tgOut, _ := svc.CreateTargetGroup(context.Background(), &elbv2.CreateTargetGroupInput{
 		Name: aws.String("unresolvable-tg"),
 		Port: aws.Int64(80),
 	}, testAccountID)
 	tgArn := tgOut.TargetGroups[0].TargetGroupArn
 
 	// Register an instance that doesn't exist — should still succeed with empty IP
-	_, err := svc.RegisterTargets(&elbv2.RegisterTargetsInput{
+	_, err := svc.RegisterTargets(context.Background(), &elbv2.RegisterTargetsInput{
 		TargetGroupArn: tgArn,
 		Targets:        []*elbv2.TargetDescription{{Id: aws.String("i-nonexistent")}},
 	}, testAccountID)
 	require.NoError(t, err)
 
-	tg, _ := svc.store.GetTargetGroupByArn(*tgArn)
+	tg, _ := svc.store.GetTargetGroupByArn(t.Context(), *tgArn)
 	require.Len(t, tg.Targets, 1)
-	assert.Equal(t, "", tg.Targets[0].PrivateIP)
+	assert.Empty(t, tg.Targets[0].PrivateIP)
 }
 
 func TestRegisterTargets_WithoutVPCService(t *testing.T) {
 	// When VPC service is nil, IP resolution is skipped gracefully
 	svc := setupTestService(t)
 
-	tgOut, _ := svc.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
+	tgOut, _ := svc.CreateTargetGroup(context.Background(), &elbv2.CreateTargetGroupInput{
 		Name: aws.String("no-vpc-tg"),
 		Port: aws.Int64(80),
 	}, testAccountID)
 	tgArn := tgOut.TargetGroups[0].TargetGroupArn
 
-	_, err := svc.RegisterTargets(&elbv2.RegisterTargetsInput{
+	_, err := svc.RegisterTargets(context.Background(), &elbv2.RegisterTargetsInput{
 		TargetGroupArn: tgArn,
 		Targets:        []*elbv2.TargetDescription{{Id: aws.String("i-any")}},
 	}, testAccountID)
 	require.NoError(t, err)
 
-	tg, _ := svc.store.GetTargetGroupByArn(*tgArn)
-	assert.Equal(t, "", tg.Targets[0].PrivateIP)
+	tg, _ := svc.store.GetTargetGroupByArn(t.Context(), *tgArn)
+	assert.Empty(t, tg.Targets[0].PrivateIP)
 }
 
 func TestRegisterTargets_MultipleInstances(t *testing.T) {
 	svc, vpcSvc, _ := setupTestServiceWithInstance(t, "i-web001", "10.0.1.50")
 
 	// Create a second instance ENI
-	subnets, _ := vpcSvc.DescribeSubnets(&ec2.DescribeSubnetsInput{}, testAccountID)
+	subnets, _ := vpcSvc.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{}, testAccountID)
 	subnetID := subnets.Subnets[0].SubnetId
 
-	eni2, _ := vpcSvc.CreateNetworkInterface(&ec2.CreateNetworkInterfaceInput{
+	eni2, _ := vpcSvc.CreateNetworkInterface(context.Background(), &ec2.CreateNetworkInterfaceInput{
 		SubnetId:         subnetID,
 		PrivateIpAddress: aws.String("10.0.1.51"),
 	}, testAccountID)
 	vpcSvc.AttachENI(testAccountID, *eni2.NetworkInterface.NetworkInterfaceId, "i-web002", 0)
 
-	tgOut, _ := svc.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
+	tgOut, _ := svc.CreateTargetGroup(context.Background(), &elbv2.CreateTargetGroupInput{
 		Name: aws.String("multi-inst-tg"),
 		Port: aws.Int64(80),
 	}, testAccountID)
 	tgArn := tgOut.TargetGroups[0].TargetGroupArn
 
-	_, err := svc.RegisterTargets(&elbv2.RegisterTargetsInput{
+	_, err := svc.RegisterTargets(context.Background(), &elbv2.RegisterTargetsInput{
 		TargetGroupArn: tgArn,
 		Targets: []*elbv2.TargetDescription{
 			{Id: aws.String("i-web001")},
@@ -155,7 +159,7 @@ func TestRegisterTargets_MultipleInstances(t *testing.T) {
 	}, testAccountID)
 	require.NoError(t, err)
 
-	tg, _ := svc.store.GetTargetGroupByArn(*tgArn)
+	tg, _ := svc.store.GetTargetGroupByArn(t.Context(), *tgArn)
 	require.Len(t, tg.Targets, 2)
 	assert.Equal(t, "10.0.1.50", tg.Targets[0].PrivateIP)
 	assert.Equal(t, "10.0.1.51", tg.Targets[1].PrivateIP)
@@ -180,11 +184,11 @@ func TestResetTargetHealthOnStartup_TransitionsAllNonDrainingToInitial(t *testin
 			{Id: "i-i", HealthState: TargetHealthInitial, PrivateIP: "10.0.0.4"},
 		},
 	}
-	require.NoError(t, store.PutTargetGroup(tg))
+	require.NoError(t, store.PutTargetGroup(t.Context(), tg))
 
 	require.NoError(t, svc.ResetTargetHealthOnStartup(t.Context()))
 
-	got, err := store.GetTargetGroup("tg-reset")
+	got, err := store.GetTargetGroup(t.Context(), "tg-reset")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	require.Len(t, got.Targets, 4)
@@ -212,19 +216,19 @@ func TestResetTargetHealthOnStartup_NilSafe(t *testing.T) {
 func TestDescribeTargetHealth_UnusedWhenNoListener(t *testing.T) {
 	svc, _, _ := setupTestServiceWithInstance(t, "i-web001", "10.0.1.50")
 
-	tgOut, err := svc.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
+	tgOut, err := svc.CreateTargetGroup(context.Background(), &elbv2.CreateTargetGroupInput{
 		Name: aws.String("detached-tg"), Port: aws.Int64(80),
 	}, testAccountID)
 	require.NoError(t, err)
 	tgArn := tgOut.TargetGroups[0].TargetGroupArn
 
-	_, err = svc.RegisterTargets(&elbv2.RegisterTargetsInput{
+	_, err = svc.RegisterTargets(context.Background(), &elbv2.RegisterTargetsInput{
 		TargetGroupArn: tgArn,
 		Targets:        []*elbv2.TargetDescription{{Id: aws.String("i-web001")}},
 	}, testAccountID)
 	require.NoError(t, err)
 
-	health, err := svc.DescribeTargetHealth(&elbv2.DescribeTargetHealthInput{TargetGroupArn: tgArn}, testAccountID)
+	health, err := svc.DescribeTargetHealth(context.Background(), &elbv2.DescribeTargetHealthInput{TargetGroupArn: tgArn}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, health.TargetHealthDescriptions, 1)
 	th := health.TargetHealthDescriptions[0].TargetHealth
@@ -237,28 +241,28 @@ func TestDescribeTargetHealth_UnusedWhenNoListener(t *testing.T) {
 func TestDescribeTargetHealth_InUseWhenListenerForwards(t *testing.T) {
 	svc, _, _ := setupTestServiceWithInstance(t, "i-web001", "10.0.1.50")
 
-	tgOut, err := svc.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
+	tgOut, err := svc.CreateTargetGroup(context.Background(), &elbv2.CreateTargetGroupInput{
 		Name: aws.String("attached-tg"), Port: aws.Int64(80),
 	}, testAccountID)
 	require.NoError(t, err)
 	tgArn := tgOut.TargetGroups[0].TargetGroupArn
 
-	lbOut, err := svc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{Name: aws.String("attached-lb")}, testAccountID)
+	lbOut, err := svc.CreateLoadBalancer(context.Background(), &elbv2.CreateLoadBalancerInput{Name: aws.String("attached-lb")}, testAccountID)
 	require.NoError(t, err)
-	_, err = svc.CreateListener(&elbv2.CreateListenerInput{
+	_, err = svc.CreateListener(context.Background(), &elbv2.CreateListenerInput{
 		LoadBalancerArn: lbOut.LoadBalancers[0].LoadBalancerArn,
 		Protocol:        aws.String("HTTP"), Port: aws.Int64(80),
 		DefaultActions: []*elbv2.Action{{Type: aws.String("forward"), TargetGroupArn: tgArn}},
 	}, testAccountID)
 	require.NoError(t, err)
 
-	_, err = svc.RegisterTargets(&elbv2.RegisterTargetsInput{
+	_, err = svc.RegisterTargets(context.Background(), &elbv2.RegisterTargetsInput{
 		TargetGroupArn: tgArn,
 		Targets:        []*elbv2.TargetDescription{{Id: aws.String("i-web001")}},
 	}, testAccountID)
 	require.NoError(t, err)
 
-	health, err := svc.DescribeTargetHealth(&elbv2.DescribeTargetHealthInput{TargetGroupArn: tgArn}, testAccountID)
+	health, err := svc.DescribeTargetHealth(context.Background(), &elbv2.DescribeTargetHealthInput{TargetGroupArn: tgArn}, testAccountID)
 	require.NoError(t, err)
 	require.Len(t, health.TargetHealthDescriptions, 1)
 	assert.Equal(t, TargetHealthInitial, aws.StringValue(health.TargetHealthDescriptions[0].TargetHealth.State))

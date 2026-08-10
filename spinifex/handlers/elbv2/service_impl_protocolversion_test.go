@@ -1,6 +1,7 @@
 package handlers_elbv2
 
 import (
+	"context"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -12,11 +13,11 @@ import (
 // An HTTP/HTTPS target group must default ProtocolVersion to HTTP1 and round-trip
 // it through both the Create output and DescribeTargetGroups. The load balancer
 // controller always sends ProtocolVersion and recreates the TG (DuplicateTargetGroupName
-// loop) if Describe reads it back empty — see mulga-siv-416.
+// loop) if Describe reads it back empty.
 func TestCreateTargetGroup_ProtocolVersionDefaultsAndRoundTrips(t *testing.T) {
 	svc := setupTestService(t)
 
-	out, err := svc.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
+	out, err := svc.CreateTargetGroup(context.Background(), &elbv2.CreateTargetGroupInput{
 		Name:     aws.String("pv-default-tg"),
 		Protocol: aws.String(ProtocolHTTP),
 		Port:     aws.Int64(80),
@@ -26,7 +27,7 @@ func TestCreateTargetGroup_ProtocolVersionDefaultsAndRoundTrips(t *testing.T) {
 	assert.Equal(t, ProtocolVersionHTTP1, *out.TargetGroups[0].ProtocolVersion)
 
 	arn := out.TargetGroups[0].TargetGroupArn
-	desc, err := svc.DescribeTargetGroups(&elbv2.DescribeTargetGroupsInput{
+	desc, err := svc.DescribeTargetGroups(context.Background(), &elbv2.DescribeTargetGroupsInput{
 		TargetGroupArns: []*string{arn},
 	}, testAccountID)
 	require.NoError(t, err)
@@ -39,7 +40,7 @@ func TestCreateTargetGroup_ProtocolVersionDefaultsAndRoundTrips(t *testing.T) {
 func TestCreateTargetGroup_ProtocolVersionExplicitPreserved(t *testing.T) {
 	svc := setupTestService(t)
 
-	out, err := svc.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
+	out, err := svc.CreateTargetGroup(context.Background(), &elbv2.CreateTargetGroupInput{
 		Name:            aws.String("pv-http2-tg"),
 		Protocol:        aws.String(ProtocolHTTPS),
 		Port:            aws.Int64(443),
@@ -54,7 +55,7 @@ func TestCreateTargetGroup_ProtocolVersionExplicitPreserved(t *testing.T) {
 func TestCreateTargetGroup_ProtocolVersionInvalidRejected(t *testing.T) {
 	svc := setupTestService(t)
 
-	_, err := svc.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
+	_, err := svc.CreateTargetGroup(context.Background(), &elbv2.CreateTargetGroupInput{
 		Name:            aws.String("pv-bad-tg"),
 		Protocol:        aws.String(ProtocolHTTP),
 		ProtocolVersion: aws.String("HTTP9"),
@@ -67,7 +68,7 @@ func TestCreateTargetGroup_ProtocolVersionInvalidRejected(t *testing.T) {
 func TestCreateTargetGroup_ProtocolVersionOmittedForNLB(t *testing.T) {
 	svc := setupTestService(t)
 
-	out, err := svc.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
+	out, err := svc.CreateTargetGroup(context.Background(), &elbv2.CreateTargetGroupInput{
 		Name:     aws.String("pv-tcp-tg"),
 		Protocol: aws.String(ProtocolTCP),
 		Port:     aws.Int64(80),

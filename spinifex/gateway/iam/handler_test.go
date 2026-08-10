@@ -12,9 +12,14 @@ import (
 
 const testAccountID = "000000000000"
 
-// stubIAMService returns empty non-nil outputs for all methods. Individual
-// tests can override a method by setting the matching function field.
+// stubIAMService embeds the IAMService interface and returns empty non-nil
+// outputs for the handler methods every happy-path test drives; those methods
+// are load-bearing and stay explicit. Methods no gateway/iam path reaches are
+// promoted from the embedded interface and nil-panic if unexpectedly called.
+// Individual tests can override a method by setting the matching function field.
 type stubIAMService struct {
+	handlers_iam.IAMService
+
 	getInstanceProfile func(string, *iam.GetInstanceProfileInput) (*iam.GetInstanceProfileOutput, error)
 }
 
@@ -86,28 +91,6 @@ func (s *stubIAMService) ListAttachedUserPolicies(_ string, _ *iam.ListAttachedU
 	return &iam.ListAttachedUserPoliciesOutput{}, nil
 }
 
-func (s *stubIAMService) GetUserPolicies(_, _ string) ([]handlers_iam.PolicyDocument, error) {
-	return nil, nil
-}
-
-func (s *stubIAMService) GetRolePolicies(_, _ string) ([]handlers_iam.PolicyDocument, error) {
-	return nil, nil
-}
-
-func (s *stubIAMService) LookupAccessKey(_ string) (*handlers_iam.AccessKey, error) {
-	return nil, nil
-}
-
-func (s *stubIAMService) DecryptSecret(_ string) (string, error)            { return "", nil }
-func (s *stubIAMService) SeedBootstrap(_ *handlers_iam.BootstrapData) error { return nil }
-func (s *stubIAMService) IsEmpty() (bool, error)                            { return true, nil }
-
-func (s *stubIAMService) CreateAccount(_ string) (*handlers_iam.Account, error) {
-	return nil, nil
-}
-func (s *stubIAMService) GetAccount(_ string) (*handlers_iam.Account, error) { return nil, nil }
-func (s *stubIAMService) ListAccounts() ([]*handlers_iam.Account, error)     { return nil, nil }
-
 func (s *stubIAMService) CreateRole(_ string, _ *iam.CreateRoleInput) (*iam.CreateRoleOutput, error) {
 	return &iam.CreateRoleOutput{}, nil
 }
@@ -171,8 +154,106 @@ func (s *stubIAMService) AddRoleToInstanceProfile(_ string, _ *iam.AddRoleToInst
 func (s *stubIAMService) RemoveRoleFromInstanceProfile(_ string, _ *iam.RemoveRoleFromInstanceProfileInput) (*iam.RemoveRoleFromInstanceProfileOutput, error) {
 	return &iam.RemoveRoleFromInstanceProfileOutput{}, nil
 }
-func (s *stubIAMService) ResolveInstanceProfile(_, _ string) (*handlers_iam.InstanceProfile, error) {
-	return nil, nil
+
+func (s *stubIAMService) TagUser(_ string, _ *iam.TagUserInput) (*iam.TagUserOutput, error) {
+	return &iam.TagUserOutput{}, nil
+}
+func (s *stubIAMService) UntagUser(_ string, _ *iam.UntagUserInput) (*iam.UntagUserOutput, error) {
+	return &iam.UntagUserOutput{}, nil
+}
+func (s *stubIAMService) ListUserTags(_ string, _ *iam.ListUserTagsInput) (*iam.ListUserTagsOutput, error) {
+	return &iam.ListUserTagsOutput{}, nil
+}
+func (s *stubIAMService) TagRole(_ string, _ *iam.TagRoleInput) (*iam.TagRoleOutput, error) {
+	return &iam.TagRoleOutput{}, nil
+}
+func (s *stubIAMService) UntagRole(_ string, _ *iam.UntagRoleInput) (*iam.UntagRoleOutput, error) {
+	return &iam.UntagRoleOutput{}, nil
+}
+func (s *stubIAMService) ListRoleTags(_ string, _ *iam.ListRoleTagsInput) (*iam.ListRoleTagsOutput, error) {
+	return &iam.ListRoleTagsOutput{}, nil
+}
+func (s *stubIAMService) TagPolicy(_ string, _ *iam.TagPolicyInput) (*iam.TagPolicyOutput, error) {
+	return &iam.TagPolicyOutput{}, nil
+}
+func (s *stubIAMService) UntagPolicy(_ string, _ *iam.UntagPolicyInput) (*iam.UntagPolicyOutput, error) {
+	return &iam.UntagPolicyOutput{}, nil
+}
+func (s *stubIAMService) ListPolicyTags(_ string, _ *iam.ListPolicyTagsInput) (*iam.ListPolicyTagsOutput, error) {
+	return &iam.ListPolicyTagsOutput{}, nil
+}
+func (s *stubIAMService) TagInstanceProfile(_ string, _ *iam.TagInstanceProfileInput) (*iam.TagInstanceProfileOutput, error) {
+	return &iam.TagInstanceProfileOutput{}, nil
+}
+func (s *stubIAMService) UntagInstanceProfile(_ string, _ *iam.UntagInstanceProfileInput) (*iam.UntagInstanceProfileOutput, error) {
+	return &iam.UntagInstanceProfileOutput{}, nil
+}
+func (s *stubIAMService) ListInstanceProfileTags(_ string, _ *iam.ListInstanceProfileTagsInput) (*iam.ListInstanceProfileTagsOutput, error) {
+	return &iam.ListInstanceProfileTagsOutput{}, nil
+}
+func (s *stubIAMService) TagOpenIDConnectProvider(_ string, _ *iam.TagOpenIDConnectProviderInput) (*iam.TagOpenIDConnectProviderOutput, error) {
+	return &iam.TagOpenIDConnectProviderOutput{}, nil
+}
+func (s *stubIAMService) UntagOpenIDConnectProvider(_ string, _ *iam.UntagOpenIDConnectProviderInput) (*iam.UntagOpenIDConnectProviderOutput, error) {
+	return &iam.UntagOpenIDConnectProviderOutput{}, nil
+}
+func (s *stubIAMService) ListOpenIDConnectProviderTags(_ string, _ *iam.ListOpenIDConnectProviderTagsInput) (*iam.ListOpenIDConnectProviderTagsOutput, error) {
+	return &iam.ListOpenIDConnectProviderTagsOutput{}, nil
+}
+
+func (s *stubIAMService) CreateGroup(_ string, _ *iam.CreateGroupInput) (*iam.CreateGroupOutput, error) {
+	return &iam.CreateGroupOutput{}, nil
+}
+func (s *stubIAMService) GetGroup(_ string, _ *iam.GetGroupInput) (*iam.GetGroupOutput, error) {
+	return &iam.GetGroupOutput{}, nil
+}
+func (s *stubIAMService) ListGroups(_ string, _ *iam.ListGroupsInput) (*iam.ListGroupsOutput, error) {
+	return &iam.ListGroupsOutput{}, nil
+}
+func (s *stubIAMService) DeleteGroup(_ string, _ *iam.DeleteGroupInput) (*iam.DeleteGroupOutput, error) {
+	return &iam.DeleteGroupOutput{}, nil
+}
+func (s *stubIAMService) AddUserToGroup(_ string, _ *iam.AddUserToGroupInput) (*iam.AddUserToGroupOutput, error) {
+	return &iam.AddUserToGroupOutput{}, nil
+}
+func (s *stubIAMService) RemoveUserFromGroup(_ string, _ *iam.RemoveUserFromGroupInput) (*iam.RemoveUserFromGroupOutput, error) {
+	return &iam.RemoveUserFromGroupOutput{}, nil
+}
+func (s *stubIAMService) ListGroupsForUser(_ string, _ *iam.ListGroupsForUserInput) (*iam.ListGroupsForUserOutput, error) {
+	return &iam.ListGroupsForUserOutput{}, nil
+}
+func (s *stubIAMService) AttachGroupPolicy(_ string, _ *iam.AttachGroupPolicyInput) (*iam.AttachGroupPolicyOutput, error) {
+	return &iam.AttachGroupPolicyOutput{}, nil
+}
+func (s *stubIAMService) DetachGroupPolicy(_ string, _ *iam.DetachGroupPolicyInput) (*iam.DetachGroupPolicyOutput, error) {
+	return &iam.DetachGroupPolicyOutput{}, nil
+}
+func (s *stubIAMService) ListAttachedGroupPolicies(_ string, _ *iam.ListAttachedGroupPoliciesInput) (*iam.ListAttachedGroupPoliciesOutput, error) {
+	return &iam.ListAttachedGroupPoliciesOutput{}, nil
+}
+func (s *stubIAMService) PutGroupPolicy(_ string, _ *iam.PutGroupPolicyInput) (*iam.PutGroupPolicyOutput, error) {
+	return &iam.PutGroupPolicyOutput{}, nil
+}
+func (s *stubIAMService) GetGroupPolicy(_ string, _ *iam.GetGroupPolicyInput) (*iam.GetGroupPolicyOutput, error) {
+	return &iam.GetGroupPolicyOutput{}, nil
+}
+func (s *stubIAMService) DeleteGroupPolicy(_ string, _ *iam.DeleteGroupPolicyInput) (*iam.DeleteGroupPolicyOutput, error) {
+	return &iam.DeleteGroupPolicyOutput{}, nil
+}
+func (s *stubIAMService) ListGroupPolicies(_ string, _ *iam.ListGroupPoliciesInput) (*iam.ListGroupPoliciesOutput, error) {
+	return &iam.ListGroupPoliciesOutput{}, nil
+}
+func (s *stubIAMService) PutUserPolicy(_ string, _ *iam.PutUserPolicyInput) (*iam.PutUserPolicyOutput, error) {
+	return &iam.PutUserPolicyOutput{}, nil
+}
+func (s *stubIAMService) GetUserPolicy(_ string, _ *iam.GetUserPolicyInput) (*iam.GetUserPolicyOutput, error) {
+	return &iam.GetUserPolicyOutput{}, nil
+}
+func (s *stubIAMService) DeleteUserPolicy(_ string, _ *iam.DeleteUserPolicyInput) (*iam.DeleteUserPolicyOutput, error) {
+	return &iam.DeleteUserPolicyOutput{}, nil
+}
+func (s *stubIAMService) ListUserPolicies(_ string, _ *iam.ListUserPoliciesInput) (*iam.ListUserPoliciesOutput, error) {
+	return &iam.ListUserPoliciesOutput{}, nil
 }
 
 func TestCreateUser(t *testing.T) {

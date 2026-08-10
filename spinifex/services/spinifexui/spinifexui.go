@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/mulgadc/spinifex/internal/tlsconfig"
+	"github.com/mulgadc/spinifex/spinifex/otelsetup"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 )
 
@@ -27,22 +29,24 @@ var serviceName = "spinifex-ui"
 //go:embed all:frontend/dist
 var distFS embed.FS
 
-// Config holds the configuration for the spinifex-ui service
+// Config holds the configuration for the spinifex-ui service.
 type Config struct {
 	Port    int    `json:"port"`
 	Host    string `json:"host"`
 	TLSCert string `json:"tls_cert"`
 	TLSKey  string `json:"tls_key"`
+	// BaseDir is the base directory for PID files and state.
+	BaseDir string `json:"base_dir"`
 }
 
-// Service represents the spinifex-ui service
+// Service represents the spinifex-ui service.
 type Service struct {
 	Config *Config
 	server *http.Server
 	mu     sync.Mutex
 }
 
-// New creates a new spinifex-ui service
+// New creates a new spinifex-ui service.
 func New(config any) (*Service, error) {
 	cfg, ok := config.(*Config)
 	if !ok {
@@ -82,9 +86,9 @@ func New(config any) (*Service, error) {
 	}, nil
 }
 
-// Start starts the spinifex-ui service
+// Start starts the spinifex-ui service.
 func (svc *Service) Start() (int, error) {
-	if err := utils.WritePidFile(serviceName, os.Getpid()); err != nil {
+	if err := utils.WritePidFileTo(svc.Config.BaseDir, serviceName, os.Getpid()); err != nil {
 		slog.Error("Failed to write pid file", "err", err)
 	}
 
@@ -96,17 +100,17 @@ func (svc *Service) Start() (int, error) {
 	return os.Getpid(), nil
 }
 
-// Stop stops the spinifex-ui service
+// Stop stops the spinifex-ui service.
 func (svc *Service) Stop() error {
-	return utils.StopProcess(serviceName)
+	return utils.StopProcessAt(svc.Config.BaseDir, serviceName)
 }
 
-// Status returns the status of the spinifex-ui service
+// Status returns the status of the spinifex-ui service.
 func (svc *Service) Status() (string, error) {
-	return utils.ServiceStatus("", serviceName)
+	return utils.ServiceStatus(svc.Config.BaseDir, serviceName)
 }
 
-// Shutdown gracefully shuts down the spinifex-ui service
+// Shutdown gracefully shuts down the spinifex-ui service.
 func (svc *Service) Shutdown() error {
 	svc.mu.Lock()
 	server := svc.server
@@ -120,12 +124,12 @@ func (svc *Service) Shutdown() error {
 	return svc.Stop()
 }
 
-// Reload reloads the spinifex-ui service configuration
+// Reload reloads the spinifex-ui service configuration.
 func (svc *Service) Reload() error {
 	return nil
 }
 
-// launchService starts the HTTP server
+// launchService starts the HTTP server.
 func (svc *Service) launchService() error {
 	// Strip the "frontend/dist" prefix from embedded filesystem
 	contentFS, err := fs.Sub(distFS, "frontend/dist")
@@ -219,7 +223,8 @@ func (svc *Service) launchService() error {
 	compressor := middleware.NewCompressor(5, "text/html", "text/css",
 		"application/javascript", "text/javascript", "application/json",
 		"image/svg+xml", "text/plain")
-	finalHandler := securityHeadersMiddleware(compressor.Handler(mux))
+	traced := otelsetup.HTTPMiddleware("spinifex-ui")(mux)
+	finalHandler := securityHeadersMiddleware(compressor.Handler(traced))
 
 	addr := fmt.Sprintf("%s:%d", svc.Config.Host, svc.Config.Port)
 
@@ -275,7 +280,13 @@ func (svc *Service) launchService() error {
 	}
 
 	slog.Info("Starting spinifex-ui service with HTTPS (auto-redirect HTTP)", "addr", addr)
-	return server.Serve(splitLn)
+	// ErrServerClosed is Serve's documented return value after Shutdown was
+	// called deliberately (see the SIGTERM handler above) -- success, not a
+	// failure to report or exit non-zero for.
+	if err := server.Serve(splitLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
 
 // Content-Security-Policy header. All API requests are proxied through the

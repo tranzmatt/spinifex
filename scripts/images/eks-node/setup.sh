@@ -44,13 +44,27 @@ ln -sf /usr/local/bin/k3s /usr/local/bin/ctr
 # role's services are baked; the selector enables the right ones at first boot.
 chmod 0755 /etc/init.d/eks-node-role /etc/init.d/k3s /etc/init.d/k3s-agent \
     /etc/init.d/eks-token-webhook /etc/init.d/k3s-first-boot /etc/init.d/mulga-eks-state-report \
-    /etc/init.d/mulga-eks-addon-sync
+    /etc/init.d/mulga-eks-addon-sync /etc/init.d/konnectivity-server
 chmod 0755 /usr/local/sbin/eks-node-role /usr/local/sbin/k3s-first-boot \
     /usr/local/sbin/mulga-eks-state-report /usr/local/sbin/mulga-eks-addon-sync
+# start_pre helpers shared with the systemd wrappers that will eventually
+# replace these runscripts.
+chmod 0755 /usr/local/sbin/k3s-prestart /usr/local/sbin/k3s-agent-prestart \
+    /usr/local/sbin/konnectivity-server-prestart
 chmod 0755 /etc/init.d/mulga-ebs-byid /usr/local/sbin/mulga-ebs-byid
 chmod 0755 /etc/init.d/mulga-eks-provider-id /usr/local/sbin/mulga-eks-provider-id
 chmod 0755 /etc/init.d/mulga-mgmt-net /usr/local/sbin/mulga-mgmt-net
-chmod 0755 /etc/periodic/daily/mulga-eks-etcd-snapshot
+chmod 0755 /etc/init.d/mulga-vpc-mtu /usr/local/sbin/mulga-vpc-mtu
+chmod 0755 /etc/init.d/mulga-eks-k3s-recovery /usr/local/sbin/mulga-eks-k3s-recovery
+# etcd snapshot runs on two crond cadences (nightly + a 15-min RPO window); the
+# same script picks its tier from the dir it is invoked from. Both must be 0755.
+mkdir -p /etc/periodic/15min
+chmod 0755 /etc/periodic/daily/mulga-eks-etcd-snapshot /etc/periodic/15min/mulga-eks-etcd-snapshot
+
+# mulga-mgmt-net goes in the boot runlevel, not default (where ENABLE_SERVICES
+# lands services). It DHCPs the data NIC so the init-local Ec2 crawl reaches
+# IMDS; a default entry runs after cloud-init-local and is too late.
+rc-update add mulga-mgmt-net boot
 
 # EBS by-id bridge: route every virtio-blk event through mulga-ebs-byid, which
 # delegates to the stock persistent-storage helper and then mints the
@@ -118,5 +132,30 @@ sed -i \
 # kept so the menu stays interruptible over serial; TIMEOUT 0 would wait forever.
 sed -i 's/^timeout=.*/timeout=1/' /etc/update-extlinux.conf
 sed -i 's/^TIMEOUT[[:space:]].*/TIMEOUT 10/' /boot/extlinux.conf
+
+# Disable dhcpcd IPv4LL so it never hijacks IMDS on a multi-NIC system VM. The
+# EKS control plane is dual-NIC; the mgmt NIC sits on br-mgmt (no DHCP server),
+# so dhcpcd's no-lease fallback would assign a 169.254.x.x address and a
+# 169.254.0.0/16 route on it. That /16 captures 169.254.169.254 and steers IMDS
+# off the data NIC (away from the per-tap br-imds datapath) and onto the mgmt
+# NIC, where the host RSTs it. noipv4ll turns off only the no-lease fallback:
+# real DHCP leases (workers, the data ENI) are unaffected, and IMDS reaches .254
+# through the data NIC's default route and the br-imds demux, as single-NIC
+# instances already do.
+if ! grep -qxF 'noipv4ll' /etc/dhcpcd.conf 2>/dev/null; then
+    echo 'noipv4ll' >> /etc/dhcpcd.conf
+fi
+
+# Ignore the DHCP MTU (option 26). dhcpcd honours it by stamping the advertised
+# value onto every route it installs, and Linux prefers a route's MTU metric over
+# the device MTU — so the subnet's advertised MTU wins over the link MTU that
+# mulga-vpc-mtu pins, and the node advertises an MSS too large for the real path.
+# Large inbound segments then blackhole in the host netns (image pulls fail with
+# `TLS handshake timeout`) while pod traffic, sized off cni0, is unaffected.
+# mulga-vpc-mtu is the single source of truth for this node's MTU; this stops
+# dhcpcd re-stamping a different one on every lease renewal.
+if ! grep -qxF 'nooption interface_mtu' /etc/dhcpcd.conf 2>/dev/null; then
+    echo 'nooption interface_mtu' >> /etc/dhcpcd.conf
+fi
 
 echo "[eks-node-setup] done"

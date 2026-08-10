@@ -48,30 +48,50 @@ type IGWManager interface {
 	// SNATs the instance, so the reroute alone lets the inbound connection's reply
 	// (and instance-initiated egress) bypass the subnet drop gate. Idempotent.
 	EnsureEIPInstanceEgress(ctx context.Context, vpcID, subnetID, instanceIP string) error
+	// RebindGatewayIP moves the VPC gateway LRP onto a new external address
+	// after its DHCP lease came back on a different IP. Idempotent; a no-op
+	// when no gateway port is attached.
+	RebindGatewayIP(ctx context.Context, vpcID, newIP string, prefixLen int) error
+}
+
+// RoutedIngressHooks deliver host-side ingress plumbing in routed-NAT mode:
+// Ensure installs the host route sending VPC-CIDR traffic into OVN via the
+// gateway LRP transit IP; Remove tears it down on detach. Both idempotent.
+// Nil hooks (all other modes) are never called.
+type RoutedIngressHooks struct {
+	Ensure func(ctx context.Context, vpcID, vpcCIDR, gwLrpIP string) error
+	Remove func(ctx context.Context, vpcID, vpcCIDR, gwLrpIP string) error
 }
 
 // IGWManagerConfig is the construction-time bag for igwManager.
 // FlowsBarrier defaults to a no-op when nil.
 type IGWManagerConfig struct {
-	OVN          ovn.Client
-	Routes       policy.RouteManager
-	NAT          policy.NATManager
-	Pool         *ExternalPoolConfig
-	Allocator    GatewayIPAllocator
-	Chassis      []string
-	NATMode      policy.NATMode
-	FlowsBarrier FlowsBarrier
+	OVN           ovn.Client
+	Routes        policy.RouteManager
+	NAT           policy.NATManager
+	Pool          *ExternalPoolConfig
+	Allocator     GatewayIPAllocator
+	Chassis       []string
+	NATMode       policy.NATMode
+	FlowsBarrier  FlowsBarrier
+	RoutedIngress *RoutedIngressHooks
+	// NexthopSeed installs a static OVN MAC binding for the gateway router's
+	// upstream nexthop, removing the dependency on lazy dynamic ARP. Optional;
+	// nil skips seeding.
+	NexthopSeed func(ctx context.Context, lrpName, nexthopIP string) error
 }
 
 type igwManager struct {
-	ovn       ovn.Client
-	routes    policy.RouteManager
-	nat       policy.NATManager
-	pool      *ExternalPoolConfig
-	allocator GatewayIPAllocator
-	chassis   []string
-	natMode   policy.NATMode
-	barrier   FlowsBarrier
+	ovn           ovn.Client
+	routes        policy.RouteManager
+	nat           policy.NATManager
+	pool          *ExternalPoolConfig
+	allocator     GatewayIPAllocator
+	chassis       []string
+	natMode       policy.NATMode
+	barrier       FlowsBarrier
+	routedIngress *RoutedIngressHooks
+	nexthopSeed   func(ctx context.Context, lrpName, nexthopIP string) error
 }
 
 var _ IGWManager = (*igwManager)(nil)
@@ -95,15 +115,24 @@ func NewIGWManager(cfg IGWManagerConfig) (IGWManager, error) {
 		barrier = func() error { return nil }
 	}
 	return &igwManager{
-		ovn:       cfg.OVN,
-		routes:    cfg.Routes,
-		nat:       cfg.NAT,
-		pool:      cfg.Pool,
-		allocator: cfg.Allocator,
-		chassis:   cfg.Chassis,
-		natMode:   cfg.NATMode,
-		barrier:   barrier,
+		ovn:           cfg.OVN,
+		routes:        cfg.Routes,
+		nat:           cfg.NAT,
+		pool:          cfg.Pool,
+		allocator:     cfg.Allocator,
+		chassis:       cfg.Chassis,
+		natMode:       cfg.NATMode,
+		barrier:       barrier,
+		routedIngress: cfg.RoutedIngress,
+		nexthopSeed:   cfg.NexthopSeed,
 	}, nil
+}
+
+// gatewayOwnsNAT reports whether the gateway chassis owns NAT for VM egress —
+// true for centralized and routed modes, where the gateway LRP gets a real IP
+// from the pool and the localnet advertises router NAT addresses.
+func (m *igwManager) gatewayOwnsNAT() bool {
+	return m.natMode == policy.NATModeCentralized || m.natMode == policy.NATModeRouted
 }
 
 // AttachIGW wires external connectivity for spec.VPCID onto the shared external
@@ -129,6 +158,13 @@ func (m *igwManager) AttachIGW(ctx context.Context, spec IGWSpec) error {
 
 	// The gateway switch port on the shared switch is the per-VPC attach marker.
 	if _, err := m.ovn.GetLogicalSwitchPort(ctx, switchGWPortName); err == nil {
+		// OVN state survives reboots but host routes do not: re-run the routed
+		// leg so reconcile's replayed attach re-ensures ingress + SNAT.
+		if m.natMode == policy.NATModeRouted {
+			if err := m.ensureRoutedLeg(ctx, spec.VPCID, m.gatewayLRPIP(ctx, spec.VPCID)); err != nil {
+				return err
+			}
+		}
 		slog.Debug("external: IGW already attached for VPC, skipping",
 			"vpc_id", spec.VPCID, "gw_port", switchGWPortName)
 		return nil
@@ -162,11 +198,17 @@ func (m *igwManager) AttachIGW(ctx context.Context, spec IGWSpec) error {
 		createdLRP = true
 	}
 
+	// nat-addresses is only honoured on a router-type port; OVN silently ignores
+	// it on the localnet, which leaves EIPs unadvertised on the physical network.
+	gwPortOpts := map[string]string{"router-port": gwPortName}
+	if m.gatewayOwnsNAT() {
+		gwPortOpts["nat-addresses"] = "router"
+	}
 	if err := m.ovn.CreateLogicalSwitchPort(ctx, extSwitchName, &nbdb.LogicalSwitchPort{
 		Name:      switchGWPortName,
 		Type:      "router",
 		Addresses: []string{"router"},
-		Options:   map[string]string{"router-port": gwPortName},
+		Options:   gwPortOpts,
 		ExternalIDs: map[string]string{
 			"spinifex:vpc_id": spec.VPCID,
 			"spinifex:igw_id": spec.InternetGatewayID,
@@ -181,6 +223,20 @@ func (m *igwManager) AttachIGW(ctx context.Context, spec IGWSpec) error {
 
 	if err := m.routes.AddDefaultRoute(ctx, spec.VPCID, wanNexthop, gwPortName); err != nil {
 		return fmt.Errorf("add default route on %s: %w", routerName, err)
+	}
+
+	if m.nexthopSeed != nil && m.gatewayOwnsNAT() && wanNexthop != "" {
+		if err := m.nexthopSeed(ctx, gwPortName, wanNexthop); err != nil {
+			slog.Warn("external: seed nexthop MAC binding failed; egress relies on dynamic ARP",
+				"vpc_id", spec.VPCID, "gw_port", gwPortName, "nexthop", wanNexthop, "err", err)
+		}
+	}
+
+	// Routed mode: egress SNATs the VPC CIDR to the gateway LRP transit IP so
+	// the host only ever masquerades the transit /24, and the host gets an
+	// ingress route to the VPC CIDR. DetachIGW reverses both.
+	if err := m.ensureRoutedLeg(ctx, spec.VPCID, gwLrpIP); err != nil {
+		return err
 	}
 
 	if len(m.chassis) == 0 {
@@ -209,29 +265,136 @@ func (m *igwManager) AttachIGW(ctx context.Context, spec IGWSpec) error {
 	return nil
 }
 
+// ensureRoutedLeg installs the routed-mode datapath legs for a VPC: the OVN
+// SNAT (VPC CIDR → gateway LRP transit IP) and the host ingress route into
+// it. No-op outside routed mode or without a gateway IP. Idempotent — the
+// reconcile loop replays AttachIGW, re-ensuring host state lost on reboot.
+func (m *igwManager) ensureRoutedLeg(ctx context.Context, vpcID, gwLrpIP string) error {
+	if m.natMode != policy.NATModeRouted || gwLrpIP == "" {
+		return nil
+	}
+	routerName := topology.VPCRouter(vpcID)
+	router, err := m.ovn.GetLogicalRouter(ctx, routerName)
+	if err != nil {
+		return fmt.Errorf("get router %s for routed SNAT: %w", routerName, err)
+	}
+	vpcCIDR := router.ExternalIDs["spinifex:cidr"]
+	if vpcCIDR == "" {
+		return fmt.Errorf("routed NAT: router %s has no spinifex:cidr external_id", routerName)
+	}
+	if err := m.nat.AddSNAT(ctx, vpcID, vpcCIDR, gwLrpIP); err != nil {
+		return fmt.Errorf("install routed SNAT %s -> %s: %w", vpcCIDR, gwLrpIP, err)
+	}
+	if m.routedIngress != nil && m.routedIngress.Ensure != nil {
+		if err := m.routedIngress.Ensure(ctx, vpcID, vpcCIDR, gwLrpIP); err != nil {
+			return fmt.Errorf("install routed ingress route %s via %s: %w", vpcCIDR, gwLrpIP, err)
+		}
+	}
+	return nil
+}
+
+// RebindGatewayIP repoints the VPC gateway LRP at newIP. The LRP address is
+// otherwise written once at attach and never revisited, so a lease re-issued on
+// a different IP would leave the port answering ARP for an address nothing
+// renews — burning it upstream and losing egress once the server reassigns it.
+func (m *igwManager) RebindGatewayIP(ctx context.Context, vpcID, newIP string, prefixLen int) error {
+	switch {
+	case vpcID == "":
+		return errors.New("RebindGatewayIP: vpcID required")
+	case newIP == "":
+		return errors.New("RebindGatewayIP: newIP required")
+	case prefixLen <= 0:
+		return fmt.Errorf("RebindGatewayIP: vpc %s: prefixLen must be positive, got %d", vpcID, prefixLen)
+	}
+
+	// A gw-lrp lease only exists because AttachIGW allocated one, so a missing
+	// port means either an unreachable OVSDB or a detach that kept the lease —
+	// both leave an address held with no owner, so neither is swallowed here.
+	gwPortName := topology.GatewayRouterPort(vpcID)
+	lrp, err := m.ovn.GetLogicalRouterPort(ctx, gwPortName)
+	if err != nil {
+		return fmt.Errorf("get gateway port %s to rebind onto %s: %w", gwPortName, newIP, err)
+	}
+	if lrp == nil {
+		return fmt.Errorf("gateway port %s absent; cannot rebind vpc %s onto %s", gwPortName, vpcID, newIP)
+	}
+
+	network := fmt.Sprintf("%s/%d", newIP, prefixLen)
+	if len(lrp.Networks) == 1 && lrp.Networks[0] == network && lrp.ExternalIDs[gatewayIPExtIDKey] == newIP {
+		return nil
+	}
+	oldNetworks := lrp.Networks
+	lrp.Networks = []string{network}
+	if lrp.ExternalIDs == nil {
+		lrp.ExternalIDs = map[string]string{}
+	}
+	lrp.ExternalIDs[gatewayIPExtIDKey] = newIP
+	if err := m.ovn.UpdateLogicalRouterPort(ctx, lrp); err != nil {
+		return fmt.Errorf("rebind gateway port %s to %s: %w", gwPortName, network, err)
+	}
+
+	// Routed mode pins the VPC SNAT and the host ingress route to the transit
+	// IP. AddSNAT scrubs a stale row whose external IP changed, and the ingress
+	// hook rewrites its route, so re-running the leg is enough.
+	if err := m.ensureRoutedLeg(ctx, vpcID, newIP); err != nil {
+		return err
+	}
+	if err := m.barrier(); err != nil {
+		return fmt.Errorf("flows barrier after rebinding %s: %w", gwPortName, err)
+	}
+	slog.Warn("external: gateway LRP rebound after DHCP lease moved",
+		"vpc_id", vpcID, "gw_port", gwPortName, "old_networks", oldNetworks, "new_network", network)
+	return nil
+}
+
+// gatewayLRPIP returns the transit IP of the VPC's gateway LRP — the stamped
+// external_id, falling back to the host part of Networks[0]. Empty on miss.
+func (m *igwManager) gatewayLRPIP(ctx context.Context, vpcID string) string {
+	lrp, err := m.ovn.GetLogicalRouterPort(ctx, topology.GatewayRouterPort(vpcID))
+	if err != nil || lrp == nil {
+		return ""
+	}
+	if ip := lrp.ExternalIDs[gatewayIPExtIDKey]; ip != "" {
+		return ip
+	}
+	if len(lrp.Networks) > 0 {
+		if pfx, err := netip.ParsePrefix(lrp.Networks[0]); err == nil {
+			return pfx.Addr().String()
+		}
+	}
+	return ""
+}
+
 // ensureSharedExternal idempotently creates the singleton shared external switch
-// and its single localnet port. The localnet advertises router NAT addresses in
-// centralized mode so gateways behind it are reachable from the uplink.
+// and its single localnet port. NAT advertisement lives on the per-VPC gateway
+// port, not here — OVN ignores nat-addresses on a localnet port.
 func (m *igwManager) ensureSharedExternal(ctx context.Context, switchName, portName string) error {
 	extSwitch := &nbdb.LogicalSwitch{
 		Name:        switchName,
 		ExternalIDs: map[string]string{"spinifex:role": "external"},
 	}
-	if _, err := m.ovn.EnsureLogicalSwitch(ctx, extSwitch); err != nil {
+	if _, _, err := m.ovn.EnsureLogicalSwitch(ctx, extSwitch); err != nil {
 		return fmt.Errorf("ensure shared external switch %s: %w", switchName, err)
 	}
-	if _, err := m.ovn.GetLogicalSwitchPort(ctx, portName); err == nil {
+	// Converge rather than early-return: deployments created before NAT
+	// advertisement moved to the gateway port still carry a stale nat-addresses
+	// here, and it must not survive an upgrade.
+	if existing, err := m.ovn.GetLogicalSwitchPort(ctx, portName); err == nil {
+		if _, stale := existing.Options["nat-addresses"]; !stale {
+			return nil
+		}
+		delete(existing.Options, "nat-addresses")
+		if err := m.ovn.UpdateLogicalSwitchPort(ctx, existing); err != nil {
+			return fmt.Errorf("clear stale nat-addresses on %s: %w", portName, err)
+		}
+		slog.Info("external: cleared stale nat-addresses from localnet port", "port", portName)
 		return nil
-	}
-	localnetOpts := map[string]string{"network_name": "external"}
-	if m.natMode == policy.NATModeCentralized {
-		localnetOpts["nat-addresses"] = "router"
 	}
 	if err := m.ovn.CreateLogicalSwitchPort(ctx, switchName, &nbdb.LogicalSwitchPort{
 		Name:        portName,
 		Type:        "localnet",
 		Addresses:   []string{"unknown"},
-		Options:     localnetOpts,
+		Options:     map[string]string{"network_name": "external"},
 		ExternalIDs: map[string]string{"spinifex:role": "external-localnet"},
 	}); err != nil {
 		return fmt.Errorf("create shared localnet port %s: %w", portName, err)
@@ -261,6 +424,14 @@ func (m *igwManager) DetachIGW(ctx context.Context, vpcID string) error {
 		if vpcCIDR != "" {
 			if err := m.nat.DeleteSNAT(ctx, vpcID, vpcCIDR); err != nil {
 				slog.Warn("external: delete IGW SNAT failed", "router", routerName, "cidr", vpcCIDR, "err", err)
+			}
+			if m.routedIngress != nil && m.routedIngress.Remove != nil {
+				// gwLrpIP resolved before the LRP is deleted below — Remove
+				// needs it to prove this VPC owns the host route it deletes.
+				gwLrpIP := m.gatewayLRPIP(ctx, vpcID)
+				if err := m.routedIngress.Remove(ctx, vpcID, vpcCIDR, gwLrpIP); err != nil {
+					slog.Warn("external: remove routed ingress route failed", "cidr", vpcCIDR, "err", err)
+				}
 			}
 		}
 	} else {
@@ -345,14 +516,26 @@ func (m *igwManager) ensureSubnetEgressAtPriority(ctx context.Context, vpcID, su
 	if nexthop == "" {
 		return fmt.Errorf("%s: no gateway nexthop available for %s (IGW not attached?)", opName, vpcID)
 	}
-	return m.routes.AddSubnetEgress(ctx, vpcID, policy.SubnetEgressSpec{
+	if err := m.routes.AddSubnetEgress(ctx, vpcID, policy.SubnetEgressSpec{
 		SubnetID:     subnetID,
 		Prefix:       prefix,
 		Nexthop:      nexthop,
 		OutputPort:   topology.GatewayRouterPort(vpcID),
 		Priority:     priority,
 		ExcludeCIDRs: m.rerouteExcludeCIDRs(ctx, vpcID),
-	})
+	}); err != nil {
+		return err
+	}
+	// The priority-1100 drop gate is installed while a subnet is routeless and
+	// outranks both reroutes (IGW 1000, NATGW 900), so a gate left in place once
+	// a route lands black-holes the subnet's egress before it reaches routing or
+	// SNAT. Clear it now that this prefix has a reroute. Idempotent and
+	// prefix-scoped: gates only exist for the default route, so a specific-prefix
+	// reroute is a no-op and leaves the default gate intact.
+	if err := m.RemoveSubnetEgressDrop(ctx, vpcID, subnetID, prefix); err != nil {
+		return fmt.Errorf("%s: clear drop gate for %s: %w", opName, subnetID, err)
+	}
+	return nil
 }
 
 // EnsureSystemInstanceEgress installs a /32 reroute above the drop gate plus a plain
@@ -496,7 +679,7 @@ func (m *igwManager) resolveGatewayNetwork(ctx context.Context, vpcID string) (n
 		nexthop = m.pool.Gateway
 	}
 
-	if m.natMode != policy.NATModeCentralized || m.pool == nil {
+	if !m.gatewayOwnsNAT() || m.pool == nil {
 		return network, nexthop, "", nil
 	}
 

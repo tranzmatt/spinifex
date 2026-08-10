@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -56,6 +57,21 @@ func unitFiles(t *testing.T, dir string) []string {
 func hasDirective(unit, line string) bool {
 	for l := range strings.SplitSeq(unit, "\n") {
 		if strings.TrimSpace(l) == line {
+			return true
+		}
+	}
+	return false
+}
+
+// directiveContains reports whether an active list directive contains a value.
+func directiveContains(unit, key, value string) bool {
+	prefix := key + "="
+	for line := range strings.SplitSeq(unit, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") || !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		if slices.Contains(strings.Fields(strings.TrimPrefix(line, prefix)), value) {
 			return true
 		}
 	}
@@ -116,6 +132,23 @@ func TestRG9_TierConfinement(t *testing.T) {
 		}
 	}
 
+	// Northstar: locked-down baseline plus exactly CAP_NET_BIND_SERVICE so the
+	// unprivileged user binds :53 without root. No broader; ambient caps stay
+	// compatible with NoNewPrivileges=yes.
+	northstar := readUnit(t, dir, "spinifex-northstar.service")
+	for _, want := range []string{
+		"AmbientCapabilities=CAP_NET_BIND_SERVICE",
+		"CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
+		"NoNewPrivileges=yes",
+		"ProtectSystem=strict",
+		"MemoryDenyWriteExecute=yes",
+		"SystemCallArchitectures=native",
+	} {
+		if !hasDirective(northstar, want) {
+			t.Errorf("RG-9: northstar must carry %q (exactly CAP_NET_BIND_SERVICE for :53)", want)
+		}
+	}
+
 	// Network tier (vpcd): per-tap IMDS dropped the in-process setns, so CAP_SYS_ADMIN
 	// is gone and the cap set is exactly the network minimum. NoNewPrivileges stays off
 	// (RG-10: vpcd shells out to sudo for ip/ovs-vsctl/dhcpcd, like the daemon).
@@ -136,11 +169,34 @@ func TestRG9_TierConfinement(t *testing.T) {
 	}
 }
 
+// TestOptionalNorthstarActivation keeps the static target and restart wiring
+// that surrounds the command's configuration-aware activation behavior.
+func TestOptionalNorthstarActivation(t *testing.T) {
+	dir := unitsDir(t)
+	target := readUnit(t, dir, "spinifex.target")
+	if !directiveContains(target, "Wants", "spinifex-northstar.service") {
+		t.Error("spinifex.target must start Northstar when node configuration enables it")
+	}
+
+	northstar := readUnit(t, dir, "spinifex-northstar.service")
+	for _, want := range []string{
+		"ExecStart=/usr/local/bin/spx service northstar start",
+		"Environment=SPINIFEX_CONFIG_PATH=/etc/spinifex/spinifex.toml",
+		"Restart=on-failure",
+		"RestartSec=5",
+	} {
+		if !hasDirective(northstar, want) {
+			t.Errorf("configured Northstar activation must retain %q", want)
+		}
+	}
+}
+
 // TestGracefulDrainOrdering asserts the graceful-shutdown contract: the drain
 // oneshot orders After= the storage/daemon units (so a target/host stop runs its
 // ExecStop drain first, while those services are still up), the daemon keeps
-// KillMode=process (guests survive a daemon restart — DDIL reattach), and the
-// drain is wired into the target so a target/host stop triggers it.
+// KillMode=process (guests survive a daemon restart — DDIL reattach), and
+// ExecStop passes --only-if-host-stopping so PartOf=spinifex.target firing on
+// every target stop (restart included) does not drain guests that stay up.
 func TestGracefulDrainOrdering(t *testing.T) {
 	dir := unitsDir(t)
 
@@ -164,13 +220,21 @@ func TestGracefulDrainOrdering(t *testing.T) {
 			t.Errorf("spinifex-shutdown.service After= must include %s so the drain stops before it", dep)
 		}
 	}
-	if !hasDirective(drain, "ExecStop=/usr/local/bin/spx admin node drain --local --timeout=120s") {
-		t.Error("spinifex-shutdown.service must drain the local node on stop via ExecStop")
+	if !hasDirective(drain, "ExecStop=/usr/local/bin/spx admin node drain --local --timeout=120s --only-if-host-stopping") {
+		t.Error("spinifex-shutdown.service must run spx admin node drain --local --only-if-host-stopping on stop via ExecStop")
 	}
 
 	daemon := readUnit(t, dir, "spinifex-daemon.service")
 	if !hasDirective(daemon, "KillMode=process") {
 		t.Error("spinifex-daemon.service must keep KillMode=process — guests survive daemon restart (DDIL)")
+	}
+
+	// shutdownVolumes deliberately spares nbdkit that a guest is still writing
+	// through. Without KillMode=process the cgroup SIGTERMs then SIGKILLs it
+	// anyway at TimeoutStopSec, which is the corruption that skip exists to avoid.
+	viperblock := readUnit(t, dir, "spinifex-viperblock.service")
+	if !hasDirective(viperblock, "KillMode=process") {
+		t.Error("spinifex-viperblock.service must keep KillMode=process — in-use nbdkit survives a viperblock restart (DDIL)")
 	}
 
 	target := readUnit(t, dir, "spinifex.target")
@@ -181,10 +245,10 @@ func TestGracefulDrainOrdering(t *testing.T) {
 
 // TestRG11_LeanUnits asserts the RG-11 contract: unit/slice files carry settings
 // plus terse # RG-n references, not paragraphs of rationale, and never reference
-// a plan doc, bead, or CI run (project policy — reasoning lives in the ADR).
+// external planning or CI artifacts (reasoning is kept separately).
 func TestRG11_LeanUnits(t *testing.T) {
 	dir := unitsDir(t)
-	// Plan/bead/doc/CI-run references that must not appear in a unit comment.
+	// External planning and CI references that must not appear in a unit comment.
 	planRef := regexp.MustCompile(`(?i)siv-[0-9]+|mulga-[a-z0-9-]+|[a-z0-9_-]+\.md|\b[0-9]{9,}\b`)
 	const maxComments = 12
 
@@ -198,11 +262,69 @@ func TestRG11_LeanUnits(t *testing.T) {
 			}
 			comments++
 			if m := planRef.FindString(ls); m != "" {
-				t.Errorf("RG-11: %s comment references a plan/bead/CI artifact (%q); rationale belongs in the ADR: %s", name, m, ls)
+				t.Errorf("unit comment references external planning or CI material (%q): %s", m, ls)
 			}
 		}
 		if comments > maxComments {
 			t.Errorf("RG-11: %s has %d comment lines (budget %d) — strip the rationale novel, keep settings + a terse # RG-n tag", name, comments, maxComments)
+		}
+	}
+}
+
+// TestAllServiceUnitsDeclareTimeoutStopSec asserts every .service unit pins an
+// explicit TimeoutStopSec, so a newly added unit that forgets one falls back to
+// systemd's blanket 90s default instead of a value chosen for that service's
+// own SIGTERM handling.
+func TestAllServiceUnitsDeclareTimeoutStopSec(t *testing.T) {
+	dir := unitsDir(t)
+	for _, name := range unitFiles(t, dir) {
+		if !strings.HasSuffix(name, ".service") {
+			continue
+		}
+		u := readUnit(t, dir, name)
+		found := false
+		for l := range strings.SplitSeq(u, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(l), "TimeoutStopSec=") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s must declare an explicit TimeoutStopSec=", name)
+		}
+	}
+}
+
+// TestApplicationUnitsExportTelemetry asserts every unit that runs an spx
+// application service sources the telemetry drop-in. That file carries
+// OTEL_EXPORTER_OTLP_ENDPOINT, MULGA_ENV and MULGA_SOURCE, so a unit missing it
+// starts a service whose instruments record into a no-op provider — the process
+// runs healthy and simply reports nothing, which is invisible until someone
+// notices an empty dashboard.
+//
+// Units that host an agent or a one-shot rather than an spx service are exempt:
+// they either export on their own (the collectors) or have nothing to export.
+func TestApplicationUnitsExportTelemetry(t *testing.T) {
+	dir := unitsDir(t)
+	const telemetry = "EnvironmentFile=-/etc/spinifex/telemetry.env"
+
+	exempt := []string{
+		"spinifex-nats-watchdog.service", // periodic health probe, no OTel SDK
+		"spinifex-shutdown.service",      // one-shot drain on halt
+		"regenerate-ssh-host-keys.service",
+	}
+
+	for _, name := range unitFiles(t, dir) {
+		if !strings.HasSuffix(name, ".service") || slices.Contains(exempt, name) {
+			continue
+		}
+		u := readUnit(t, dir, name)
+		// Only units that actually launch an spx service can emit telemetry.
+		if !strings.Contains(u, "/usr/local/bin/spx service ") {
+			continue
+		}
+		if !hasDirective(u, telemetry) {
+			t.Errorf("%s runs an spx service but does not source %s; its telemetry would be silently dropped", name, telemetry)
 		}
 	}
 }

@@ -1,6 +1,7 @@
 package gateway_ec2_eigw
 
 import (
+	"context"
 	"errors"
 
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -21,8 +22,8 @@ func ValidateDeleteEgressOnlyInternetGatewayInput(input *ec2.DeleteEgressOnlyInt
 	return nil
 }
 
-// DeleteEgressOnlyInternetGateway handles the EC2 DeleteEgressOnlyInternetGateway API call
-func DeleteEgressOnlyInternetGateway(input *ec2.DeleteEgressOnlyInternetGatewayInput, natsConn *nats.Conn, accountID string) (ec2.DeleteEgressOnlyInternetGatewayOutput, error) {
+// DeleteEgressOnlyInternetGateway handles the EC2 DeleteEgressOnlyInternetGateway API call.
+func DeleteEgressOnlyInternetGateway(ctx context.Context, input *ec2.DeleteEgressOnlyInternetGatewayInput, natsConn *nats.Conn, accountID string) (ec2.DeleteEgressOnlyInternetGatewayOutput, error) {
 	var output ec2.DeleteEgressOnlyInternetGatewayOutput
 
 	if err := ValidateDeleteEgressOnlyInternetGatewayInput(input); err != nil {
@@ -30,7 +31,7 @@ func DeleteEgressOnlyInternetGateway(input *ec2.DeleteEgressOnlyInternetGatewayI
 	}
 
 	svc := handlers_ec2_eigw.NewNATSEgressOnlyIGWService(natsConn)
-	result, err := svc.DeleteEgressOnlyInternetGateway(input, accountID)
+	result, err := svc.DeleteEgressOnlyInternetGateway(ctx, input, accountID)
 	if err != nil {
 		return output, err
 	}

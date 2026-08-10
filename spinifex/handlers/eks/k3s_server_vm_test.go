@@ -1,6 +1,7 @@
 package handlers_eks
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -40,7 +41,7 @@ type fakeK3sVPC struct {
 
 var _ k3sVPCProvisioner = (*fakeK3sVPC)(nil)
 
-func (f *fakeK3sVPC) CreateNetworkInterface(input *ec2.CreateNetworkInterfaceInput, _ string) (*ec2.CreateNetworkInterfaceOutput, error) {
+func (f *fakeK3sVPC) CreateNetworkInterface(_ context.Context, input *ec2.CreateNetworkInterfaceInput, _ string) (*ec2.CreateNetworkInterfaceOutput, error) {
 	f.createCalls = append(f.createCalls, input)
 	if f.createErr != nil {
 		return nil, f.createErr
@@ -57,7 +58,7 @@ func (f *fakeK3sVPC) CreateNetworkInterface(input *ec2.CreateNetworkInterfaceInp
 	}, nil
 }
 
-func (f *fakeK3sVPC) DeleteNetworkInterface(input *ec2.DeleteNetworkInterfaceInput, _ string) (*ec2.DeleteNetworkInterfaceOutput, error) {
+func (f *fakeK3sVPC) DeleteNetworkInterface(_ context.Context, input *ec2.DeleteNetworkInterfaceInput, _ string) (*ec2.DeleteNetworkInterfaceOutput, error) {
 	f.deleteCalls = append(f.deleteCalls, input)
 	if id := aws.StringValue(input.NetworkInterfaceId); f.inUseUntilDetached[id] && !f.detached[id] {
 		return nil, errors.New(awserrors.ErrorInvalidNetworkInterfaceInUse)
@@ -68,7 +69,7 @@ func (f *fakeK3sVPC) DeleteNetworkInterface(input *ec2.DeleteNetworkInterfaceInp
 	return &ec2.DeleteNetworkInterfaceOutput{}, nil
 }
 
-func (f *fakeK3sVPC) DetachENI(_, eniID string) error {
+func (f *fakeK3sVPC) DetachENI(_ context.Context, _, eniID string) error {
 	f.detachCalls = append(f.detachCalls, eniID)
 	if f.detachErr != nil {
 		return f.detachErr
@@ -80,7 +81,7 @@ func (f *fakeK3sVPC) DetachENI(_, eniID string) error {
 	return nil
 }
 
-func (f *fakeK3sVPC) DescribeNetworkInterfaces(input *ec2.DescribeNetworkInterfacesInput, _ string) (*ec2.DescribeNetworkInterfacesOutput, error) {
+func (f *fakeK3sVPC) DescribeNetworkInterfaces(_ context.Context, input *ec2.DescribeNetworkInterfacesInput, _ string) (*ec2.DescribeNetworkInterfacesOutput, error) {
 	if f.describeErr != nil {
 		return nil, f.describeErr
 	}
@@ -136,7 +137,7 @@ type fakeK3sAMI struct {
 
 var _ k3sAMIResolver = (*fakeK3sAMI)(nil)
 
-func (f *fakeK3sAMI) DescribeImages(input *ec2.DescribeImagesInput, _ string) (*ec2.DescribeImagesOutput, error) {
+func (f *fakeK3sAMI) DescribeImages(_ context.Context, input *ec2.DescribeImagesInput, _ string) (*ec2.DescribeImagesOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.describeCalls = append(f.describeCalls, input)
@@ -177,6 +178,10 @@ func validK3sInput() K3sServerInput {
 		SecretKey:         "s3cr3t-key",
 		GatewayCACert:     "-----BEGIN CERTIFICATE-----\nFAKECA\n-----END CERTIFICATE-----\n",
 		JoinToken:         "clustertok-deadbeef",
+
+		PredastoreEndpoint:  "https://10.15.8.1:8443",
+		PredastoreAccessKey: "AKIAPREDASTORE",
+		PredastoreSecretKey: "pred-s3cr3t-key",
 	}
 }
 
@@ -204,11 +209,14 @@ func TestLaunchK3sServerVM_EmptyInputsRejected(t *testing.T) {
 		{"empty AccessKey", mk(func(in *K3sServerInput) { in.AccessKey = "" })},
 		{"empty SecretKey", mk(func(in *K3sServerInput) { in.SecretKey = "" })},
 		{"empty GatewayCACert", mk(func(in *K3sServerInput) { in.GatewayCACert = "  \n" })},
+		{"empty PredastoreEndpoint", mk(func(in *K3sServerInput) { in.PredastoreEndpoint = "" })},
+		{"empty PredastoreAccessKey", mk(func(in *K3sServerInput) { in.PredastoreAccessKey = "" })},
+		{"empty PredastoreSecretKey", mk(func(in *K3sServerInput) { in.PredastoreSecretKey = "" })},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			vpc, inst, ami := &fakeK3sVPC{}, &fakeK3sInst{}, &fakeK3sAMI{}
-			_, err := LaunchK3sServerVM(vpc, inst, ami, tc.in)
+			_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, tc.in)
 			require.Error(t, err)
 			assert.Empty(t, vpc.createCalls)
 			assert.Empty(t, inst.launchCalls)
@@ -217,11 +225,54 @@ func TestLaunchK3sServerVM_EmptyInputsRejected(t *testing.T) {
 	}
 }
 
+func TestValidateK3sServerInput_ProfileOnlyAccepted(t *testing.T) {
+	in := validK3sInput()
+	in.AccessKey = ""
+	in.SecretKey = ""
+	in.IamInstanceProfileArn = "arn:aws:iam::000000000000:instance-profile/spinifex-eks-server"
+	require.NoError(t, validateK3sServerInput(in))
+}
+
+func TestValidateK3sServerInput_NoCredsNoProfileRejected(t *testing.T) {
+	in := validK3sInput()
+	in.AccessKey = ""
+	in.SecretKey = ""
+	require.Error(t, validateK3sServerInput(in))
+}
+
+func TestBuildK3sUserData_StaticCredsBakeKeys(t *testing.T) {
+	ud := buildK3sUserData(validK3sInput())
+	assert.Contains(t, ud, "EKS_ACCESS_KEY=AKIAEXAMPLE")
+	assert.Contains(t, ud, "EKS_SECRET_KEY=s3cr3t-key")
+}
+
+func TestBuildK3sUserData_WritesEtcdSnapshotEnv(t *testing.T) {
+	ud := buildK3sUserData(validK3sInput())
+	require.Contains(t, ud, "path: "+k3sSnapshotEnvPath)
+	assert.Contains(t, ud, "EKS_ACCOUNT_ID=111122223333")
+	assert.Contains(t, ud, "EKS_CLUSTER_NAME=alpha")
+	assert.Contains(t, ud, "SPINIFEX_PREDASTORE_ENDPOINT=https://10.15.8.1:8443")
+	assert.Contains(t, ud, "SPINIFEX_PREDASTORE_AKID=AKIAPREDASTORE")
+	assert.Contains(t, ud, "SPINIFEX_PREDASTORE_SECRET=pred-s3cr3t-key")
+}
+
+func TestBuildK3sUserData_ProfileModeOmitsKeys(t *testing.T) {
+	in := validK3sInput()
+	in.AccessKey = ""
+	in.SecretKey = ""
+	in.IamInstanceProfileArn = "arn:aws:iam::000000000000:instance-profile/spinifex-eks-server"
+	ud := buildK3sUserData(in)
+	assert.NotContains(t, ud, "EKS_ACCESS_KEY=")
+	assert.NotContains(t, ud, "EKS_SECRET_KEY=")
+	// Non-credential env still present.
+	assert.Contains(t, ud, "EKS_CLUSTER_NAME=alpha")
+}
+
 func TestLaunchK3sServerVM_AMINotFound(t *testing.T) {
 	vpc, inst := &fakeK3sVPC{}, &fakeK3sInst{}
 	ami := &fakeK3sAMI{describeOut: &ec2.DescribeImagesOutput{}}
 
-	_, err := LaunchK3sServerVM(vpc, inst, ami, validK3sInput())
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, validK3sInput())
 	require.ErrorIs(t, err, ErrEKSServerAMINotFound)
 	assert.Contains(t, err.Error(), "spinifex:managed-by=eks")
 	assert.Empty(t, vpc.createCalls, "no ENI created when AMI lookup fails")
@@ -232,7 +283,7 @@ func TestLaunchK3sServerVM_AMILookupErrorPropagated(t *testing.T) {
 	vpc, inst := &fakeK3sVPC{}, &fakeK3sInst{}
 	ami := &fakeK3sAMI{describeErr: errors.New("DescribeImages backend down")}
 
-	_, err := LaunchK3sServerVM(vpc, inst, ami, validK3sInput())
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, validK3sInput())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "describe eks AMI")
 	assert.Empty(t, vpc.createCalls)
@@ -243,7 +294,7 @@ func TestLaunchK3sServerVM_ENICreateFailureNoRunInstances(t *testing.T) {
 	vpc := &fakeK3sVPC{createErr: errors.New("InsufficientFreeAddressesInSubnet")}
 	inst, ami := &fakeK3sInst{}, &fakeK3sAMI{}
 
-	_, err := LaunchK3sServerVM(vpc, inst, ami, validK3sInput())
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, validK3sInput())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "create K3s ENI in subnet subnet-aaa")
 	assert.Empty(t, inst.launchCalls)
@@ -255,7 +306,7 @@ func TestLaunchK3sServerVM_RunInstancesFailureRollsBackENI(t *testing.T) {
 	inst := &fakeK3sInst{launchErr: errors.New("InsufficientInstanceCapacity")}
 	ami := &fakeK3sAMI{}
 
-	_, err := LaunchK3sServerVM(vpc, inst, ami, validK3sInput())
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, validK3sInput())
 	require.Error(t, err)
 	require.Len(t, vpc.createCalls, 1)
 	require.Len(t, vpc.deleteCalls, 1, "ENI must roll back when RunInstances fails")
@@ -265,7 +316,7 @@ func TestLaunchK3sServerVM_RunInstancesFailureRollsBackENI(t *testing.T) {
 func TestLaunchK3sServerVM_HappyPath(t *testing.T) {
 	vpc, inst, ami := &fakeK3sVPC{}, &fakeK3sInst{}, &fakeK3sAMI{}
 
-	out, err := LaunchK3sServerVM(vpc, inst, ami, validK3sInput())
+	out, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, validK3sInput())
 	require.NoError(t, err)
 	require.NotNil(t, out)
 	assert.Equal(t, "i-aaa111", out.InstanceID)
@@ -300,7 +351,7 @@ func TestLaunchK3sServerVM_HonorsCustomInstanceType(t *testing.T) {
 	in := validK3sInput()
 	in.InstanceType = "t3.large"
 
-	_, err := LaunchK3sServerVM(vpc, inst, ami, in)
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, in)
 	require.NoError(t, err)
 	require.Len(t, inst.launchCalls, 1)
 	assert.Equal(t, "t3.large", inst.launchCalls[0].InstanceType)
@@ -312,7 +363,7 @@ func TestLaunchK3sServerVM_DefaultsToSystemInstanceType(t *testing.T) {
 	assert.Equal(t, "sys.medium", defaultK3sServerInstanceType)
 
 	vpc, inst, ami := &fakeK3sVPC{}, &fakeK3sInst{}, &fakeK3sAMI{}
-	_, err := LaunchK3sServerVM(vpc, inst, ami, validK3sInput())
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, validK3sInput())
 	require.NoError(t, err)
 	require.Len(t, inst.launchCalls, 1)
 	assert.Equal(t, "sys.medium", inst.launchCalls[0].InstanceType)
@@ -321,7 +372,7 @@ func TestLaunchK3sServerVM_DefaultsToSystemInstanceType(t *testing.T) {
 func TestLaunchK3sServerVM_NoTargetNodeLaunchesLocal(t *testing.T) {
 	vpc, inst, ami := &fakeK3sVPC{}, &fakeK3sInst{}, &fakeK3sAMI{}
 
-	_, err := LaunchK3sServerVM(vpc, inst, ami, validK3sInput())
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, validK3sInput())
 	require.NoError(t, err)
 	require.Len(t, inst.launchNodes, 1)
 	assert.Empty(t, inst.launchNodes[0], "empty TargetNodeID launches on the local node")
@@ -332,7 +383,7 @@ func TestLaunchK3sServerVM_TargetNodeIDRoutedToLauncher(t *testing.T) {
 	in := validK3sInput()
 	in.TargetNodeID = "node-c"
 
-	_, err := LaunchK3sServerVM(vpc, inst, ami, in)
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, in)
 	require.NoError(t, err)
 	require.Len(t, inst.launchNodes, 1)
 	assert.Equal(t, "node-c", inst.launchNodes[0], "TargetNodeID pins placement to a specific host")
@@ -378,16 +429,53 @@ func TestBuildK3sUserData_AdvertiseAddressFallsBackToEndpoint(t *testing.T) {
 	assert.Contains(t, ud, "advertise-address: 203.0.113.9")
 }
 
-func TestBuildK3sUserData_EgressSelectorClusterMode(t *testing.T) {
+func TestBuildK3sUserData_EgressSelectorDisabledWithKonnConfig(t *testing.T) {
 	ud := buildK3sUserData(validK3sInput())
-	assert.Contains(t, ud, "egress-selector-mode: cluster",
-		"managed-CP apiserver must tunnel pod/service traffic (webhooks) through the agent")
+	assert.Contains(t, ud, "egress-selector-mode: disabled",
+		"k3s remotedialer is off; the apiserver egress rides upstream konnectivity")
+	assert.NotContains(t, ud, "egress-selector-mode: cluster")
+	assert.Contains(t, ud, "egress-selector-config-file="+k3sEgressSelectorConfigPath,
+		"apiserver cluster egress must point at the konnectivity UDS")
+	assert.Contains(t, ud, "udsName: "+konnectivityUDSPath,
+		"the EgressSelectorConfiguration file routes the cluster egress to the konn socket")
+}
+
+func TestBuildK3sUserData_KonnectivityEnv(t *testing.T) {
+	in := validK3sInput()
+	in.PrivateEndpointIP = "10.32.100.4"
+	in.EndpointIP = "203.0.113.9"
+	in.KonnServerCount = 3
+
+	ud := buildK3sUserData(in)
+	assert.Contains(t, ud, "EKS_KONNECTIVITY_HOST=10.32.100.4",
+		"agents dial the private-endpoint IP to reach the konnectivity-server")
+	assert.Contains(t, ud, "EKS_KONNECTIVITY_SERVER_COUNT=3",
+		"agents must learn the apiserver replica count to tunnel to every replica")
+	assert.Contains(t, ud, "EKS_KONNECTIVITY_SANS=10.32.100.4,203.0.113.9,"+in.NLBDNS)
+}
+
+func TestBuildK3sUserData_KonnServerCountDefaultsToOne(t *testing.T) {
+	in := validK3sInput()
+	in.KonnServerCount = 0
+	ud := buildK3sUserData(in)
+	assert.Contains(t, ud, "EKS_KONNECTIVITY_SERVER_COUNT=1",
+		"a zero/unset count means a single apiserver")
+}
+
+func TestLaunchK3sServerVM_SingleControlPlaneENI(t *testing.T) {
+	vpc, inst, ami := &fakeK3sVPC{}, &fakeK3sInst{}, &fakeK3sAMI{}
+
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, validK3sInput())
+	require.NoError(t, err)
+	require.Len(t, vpc.createCalls, 1, "only the primary CP ENI; konnectivity needs no extra NIC")
+	require.Len(t, inst.launchCalls, 1)
+	assert.Empty(t, inst.launchCalls[0].ExtraENIs)
 }
 
 func TestLaunchK3sServerVM_UserDataContainsAllArtifacts(t *testing.T) {
 	vpc, inst, ami := &fakeK3sVPC{}, &fakeK3sInst{}, &fakeK3sAMI{}
 
-	_, err := LaunchK3sServerVM(vpc, inst, ami, validK3sInput())
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, validK3sInput())
 	require.NoError(t, err)
 	require.Len(t, inst.launchCalls, 1)
 
@@ -482,7 +570,7 @@ func TestLaunchK3sServerVM_UserDataContainsAllArtifacts(t *testing.T) {
 func TestLaunchK3sServerVM_UsesEmbeddedEtcd(t *testing.T) {
 	vpc, inst, ami := &fakeK3sVPC{}, &fakeK3sInst{}, &fakeK3sAMI{}
 
-	_, err := LaunchK3sServerVM(vpc, inst, ami, validK3sInput())
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, validK3sInput())
 	require.NoError(t, err)
 	require.Len(t, inst.launchCalls, 1)
 
@@ -498,7 +586,7 @@ func TestLaunchK3sServerVM_FirstServerTokenNoServerURL(t *testing.T) {
 
 	in := validK3sInput()
 	in.JoinToken = "sharedtok123"
-	_, err := LaunchK3sServerVM(vpc, inst, ami, in)
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, in)
 	require.NoError(t, err)
 	require.Len(t, inst.launchCalls, 1)
 
@@ -517,7 +605,7 @@ func TestLaunchK3sServerVM_JoinServerRendersServerAndJoinRole(t *testing.T) {
 	in := validK3sInput()
 	in.JoinToken = "sharedtok123"
 	in.ServerURL = "https://10.0.1.7:6443"
-	_, err := LaunchK3sServerVM(vpc, inst, ami, in)
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, in)
 	require.NoError(t, err)
 	require.Len(t, inst.launchCalls, 1)
 
@@ -537,7 +625,7 @@ func TestLaunchK3sServerVM_JoinServerRequiresToken(t *testing.T) {
 	in := validK3sInput()
 	in.JoinToken = ""
 	in.ServerURL = "https://10.0.1.7:6443" // ServerURL set, token cleared
-	_, err := LaunchK3sServerVM(vpc, inst, ami, in)
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, in)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "JoinToken")
 	assert.Empty(t, inst.launchCalls)
@@ -560,7 +648,7 @@ func TestLaunchK3sServerVM_RunInstancesEmptyReservationRollsBack(t *testing.T) {
 	vpc, ami := &fakeK3sVPC{}, &fakeK3sAMI{}
 	inst := &fakeK3sInst{launchOut: &sysinstance.SystemInstanceOutput{}}
 
-	_, err := LaunchK3sServerVM(vpc, inst, ami, validK3sInput())
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, validK3sInput())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "LaunchSystemInstance returned no instance")
 	require.Len(t, vpc.deleteCalls, 1, "must roll back ENI when reservation empty")
@@ -569,7 +657,7 @@ func TestLaunchK3sServerVM_RunInstancesEmptyReservationRollsBack(t *testing.T) {
 func TestLaunchK3sServerVM_AMIFilterShape(t *testing.T) {
 	vpc, inst, ami := &fakeK3sVPC{}, &fakeK3sInst{}, &fakeK3sAMI{}
 
-	_, err := LaunchK3sServerVM(vpc, inst, ami, validK3sInput())
+	_, err := LaunchK3sServerVM(context.Background(), vpc, inst, ami, validK3sInput())
 	require.NoError(t, err)
 	require.Len(t, ami.describeCalls, 1)
 	filters := ami.describeCalls[0].Filters
@@ -581,7 +669,7 @@ func TestLaunchK3sServerVM_AMIFilterShape(t *testing.T) {
 func TestTerminateK3sServerVM_BothNoopOnEmpty(t *testing.T) {
 	vpc, inst := &fakeK3sVPC{}, &fakeK3sInst{}
 
-	require.NoError(t, TerminateK3sServerVM(vpc, inst, "111122223333", "", ""))
+	require.NoError(t, TerminateK3sServerVM(context.Background(), vpc, inst, "111122223333", "", ""))
 	assert.Empty(t, inst.terminateCalls)
 	assert.Empty(t, vpc.deleteCalls)
 }
@@ -589,7 +677,7 @@ func TestTerminateK3sServerVM_BothNoopOnEmpty(t *testing.T) {
 func TestTerminateK3sServerVM_TerminatesInstanceAndDeletesENI(t *testing.T) {
 	vpc, inst := &fakeK3sVPC{}, &fakeK3sInst{}
 
-	require.NoError(t, TerminateK3sServerVM(vpc, inst, "111122223333", "i-aaa111", "eni-aaa111"))
+	require.NoError(t, TerminateK3sServerVM(context.Background(), vpc, inst, "111122223333", "i-aaa111", "eni-aaa111"))
 	require.Len(t, inst.terminateCalls, 1)
 	assert.Equal(t, "i-aaa111", inst.terminateCalls[0])
 	// Teardown owns its CP ENI: detach first to clear any stale attachment, then
@@ -603,7 +691,7 @@ func TestTerminateK3sServerVM_InstanceErrorReturnedENIStillDeleted(t *testing.T)
 	vpc := &fakeK3sVPC{}
 	inst := &fakeK3sInst{terminateErr: errors.New("IncorrectInstanceState")}
 
-	err := TerminateK3sServerVM(vpc, inst, "111122223333", "i-aaa111", "eni-aaa111")
+	err := TerminateK3sServerVM(context.Background(), vpc, inst, "111122223333", "i-aaa111", "eni-aaa111")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "terminate instance i-aaa111")
 	require.Len(t, vpc.deleteCalls, 1, "ENI delete should still run after instance terminate fails")
@@ -616,20 +704,20 @@ func TestTerminateK3sServerVM_ENINotFoundIsIdempotent(t *testing.T) {
 	vpc := &fakeK3sVPC{deleteErr: errors.New(awserrors.ErrorInvalidNetworkInterfaceIDNotFound)}
 	inst := &fakeK3sInst{}
 
-	err := TerminateK3sServerVM(vpc, inst, "111122223333", "i-aaa111", "eni-aaa111")
+	err := TerminateK3sServerVM(context.Background(), vpc, inst, "111122223333", "i-aaa111", "eni-aaa111")
 	require.NoError(t, err, "ENI already gone must be idempotent success, not a blocking error")
 	require.Len(t, vpc.deleteCalls, 1)
 }
 
 func TestTerminateK3sServerVM_ENIInUseDetachedThenDeletes(t *testing.T) {
-	// mulga-siv-407: the ENI record still shows the attachment (VM gone but
+	// The ENI record still shows the attachment (VM gone but
 	// fields never cleared), so a plain force=false delete returns InUse forever
 	// and wedges EKSDeletingReaper. Teardown owns the ENI: detach clears the
 	// stale attachment, then the delete succeeds — no retry loop.
 	vpc := &fakeK3sVPC{inUseUntilDetached: map[string]bool{"eni-aaa111": true}}
 	inst := &fakeK3sInst{}
 
-	err := TerminateK3sServerVM(vpc, inst, "111122223333", "i-aaa111", "eni-aaa111")
+	err := TerminateK3sServerVM(context.Background(), vpc, inst, "111122223333", "i-aaa111", "eni-aaa111")
 	require.NoError(t, err, "detach-then-delete must clear the stale attachment, not surface InUse")
 	require.Equal(t, []string{"eni-aaa111"}, vpc.detachCalls, "must detach before deleting")
 	require.Len(t, vpc.deleteCalls, 1, "single delete after detach; no InUse-retry loop")
@@ -641,7 +729,7 @@ func TestTerminateK3sServerVM_ENIDeleteErrorSurfaces(t *testing.T) {
 	vpc := &fakeK3sVPC{deleteErr: errors.New(awserrors.ErrorInvalidNetworkInterfaceInUse)}
 	inst := &fakeK3sInst{}
 
-	err := TerminateK3sServerVM(vpc, inst, "111122223333", "i-aaa111", "eni-aaa111")
+	err := TerminateK3sServerVM(context.Background(), vpc, inst, "111122223333", "i-aaa111", "eni-aaa111")
 	require.Error(t, err, "a non-NotFound delete error must surface")
 	assert.Contains(t, err.Error(), "delete ENI eni-aaa111")
 }
@@ -653,9 +741,96 @@ func TestTerminateK3sServerVM_InstanceAlreadyGoneIsIdempotent(t *testing.T) {
 	vpc := &fakeK3sVPC{}
 	inst := &fakeK3sInst{terminateErr: fmt.Errorf("%w: i-aaa111", sysinstance.ErrSystemInstanceNotFound)}
 
-	err := TerminateK3sServerVM(vpc, inst, "111122223333", "i-aaa111", "eni-aaa111")
+	err := TerminateK3sServerVM(context.Background(), vpc, inst, "111122223333", "i-aaa111", "eni-aaa111")
 	require.NoError(t, err, "instance already gone must be idempotent success")
 	require.Len(t, vpc.deleteCalls, 1, "ENI delete still runs after a tolerated instance-gone")
+}
+
+func gpuAMIImage(id, created, vendor string) *ec2.Image {
+	return &ec2.Image{
+		ImageId:      aws.String(id),
+		Name:         aws.String("spinifex-eks-node-gpu"),
+		CreationDate: aws.String(created),
+		Tags: []*ec2.Tag{
+			{Key: aws.String(tags.ManagedByKey), Value: aws.String(tags.ManagedByEKS)},
+			{Key: aws.String(tags.GPUVendorKey), Value: aws.String(vendor)},
+		},
+	}
+}
+
+func TestLookupEKSGPUNodeAMI_SelectsGPUTaggedAMI(t *testing.T) {
+	ami := &fakeK3sAMI{describeOut: &ec2.DescribeImagesOutput{
+		Images: []*ec2.Image{gpuAMIImage("ami-gpu-001", "2026-06-01T00:00:00.000Z", tags.GPUVendorNVIDIA)},
+	}}
+
+	got, err := lookupEKSGPUNodeAMI(context.Background(), ami, "000000000000", tags.GPUVendorNVIDIA)
+	require.NoError(t, err)
+	assert.Equal(t, "ami-gpu-001", got)
+
+	require.Len(t, ami.describeCalls, 1)
+	filters := ami.describeCalls[0].Filters
+	require.Len(t, filters, 2)
+	assert.Equal(t, "tag:"+tags.ManagedByKey, aws.StringValue(filters[0].Name))
+	assert.Equal(t, []string{tags.ManagedByEKS}, aws.StringValueSlice(filters[0].Values))
+	assert.Equal(t, "tag:"+tags.GPUVendorKey, aws.StringValue(filters[1].Name))
+	assert.Equal(t, []string{tags.GPUVendorNVIDIA}, aws.StringValueSlice(filters[1].Values))
+}
+
+func TestLookupEKSGPUNodeAMI_NoGPUAMINoFallback(t *testing.T) {
+	// Only a plain (non-GPU) eks AMI resolves; the GPU lookup must error, never
+	// fall back to the driverless image.
+	ami := &fakeK3sAMI{describeOut: &ec2.DescribeImagesOutput{}}
+
+	_, err := lookupEKSGPUNodeAMI(context.Background(), ami, "000000000000", tags.GPUVendorNVIDIA)
+	require.ErrorIs(t, err, ErrEKSGPUNodeAMINotFound)
+	assert.Contains(t, err.Error(), "gpu-vendor=nvidia")
+}
+
+func TestLookupEKSGPUNodeAMI_NewestCreationDateWins(t *testing.T) {
+	ami := &fakeK3sAMI{describeOut: &ec2.DescribeImagesOutput{
+		Images: []*ec2.Image{
+			gpuAMIImage("ami-gpu-old", "2026-01-01T00:00:00.000Z", tags.GPUVendorNVIDIA),
+			gpuAMIImage("ami-gpu-new", "2026-06-01T00:00:00.000Z", tags.GPUVendorNVIDIA),
+			gpuAMIImage("ami-gpu-mid", "2026-03-01T00:00:00.000Z", tags.GPUVendorNVIDIA),
+		},
+	}}
+
+	got, err := lookupEKSGPUNodeAMI(context.Background(), ami, "000000000000", tags.GPUVendorNVIDIA)
+	require.NoError(t, err)
+	assert.Equal(t, "ami-gpu-new", got)
+}
+
+func TestLookupEKSServerAMI_NewestCreationDateWins(t *testing.T) {
+	ami := &fakeK3sAMI{describeOut: &ec2.DescribeImagesOutput{
+		Images: []*ec2.Image{
+			{ImageId: aws.String("ami-old"), CreationDate: aws.String("2026-01-01T00:00:00.000Z"),
+				Tags: []*ec2.Tag{{Key: aws.String(tags.ManagedByKey), Value: aws.String(tags.ManagedByEKS)}}},
+			{ImageId: aws.String("ami-new"), CreationDate: aws.String("2026-06-01T00:00:00.000Z"),
+				Tags: []*ec2.Tag{{Key: aws.String(tags.ManagedByKey), Value: aws.String(tags.ManagedByEKS)}}},
+		},
+	}}
+
+	got, err := lookupEKSServerAMI(context.Background(), ami, "000000000000")
+	require.NoError(t, err)
+	assert.Equal(t, "ami-new", got)
+}
+
+func TestLookupEKSServerAMI_ExcludesGPUTaggedAMI(t *testing.T) {
+	// The GPU node AMI also carries managed-by=eks, so a managed-by DescribeImages
+	// returns it too. Even when it is newer, the plain server/worker lookup must
+	// skip it — otherwise ordinary nodes would boot the heavy driverless-mismatch
+	// GPU image.
+	ami := &fakeK3sAMI{describeOut: &ec2.DescribeImagesOutput{
+		Images: []*ec2.Image{
+			{ImageId: aws.String("ami-plain"), CreationDate: aws.String("2026-01-01T00:00:00.000Z"),
+				Tags: []*ec2.Tag{{Key: aws.String(tags.ManagedByKey), Value: aws.String(tags.ManagedByEKS)}}},
+			gpuAMIImage("ami-gpu-newer", "2026-06-01T00:00:00.000Z", tags.GPUVendorNVIDIA),
+		},
+	}}
+
+	got, err := lookupEKSServerAMI(context.Background(), ami, "000000000000")
+	require.NoError(t, err)
+	assert.Equal(t, "ami-plain", got, "newer gpu-vendor-tagged AMI must not hijack the plain lookup")
 }
 
 func assertEC2TaggedAsEKSControlPlane(t *testing.T, ec2Tags []*ec2.Tag, clusterName string) {

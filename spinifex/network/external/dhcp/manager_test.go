@@ -1,11 +1,14 @@
 package dhcp_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,14 +17,16 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/network/external/dhcp"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func newTestManager(t *testing.T, az string, fake *dhcp.Fake, now func() time.Time) (*dhcp.Manager, *dhcp.Store, *nats.Conn) {
 	t.Helper()
-	_, nc, js := testutil.StartTestJetStream(t)
-	store, err := dhcp.NewStore(js, az)
+	_, nc, _ := testutil.StartTestJetStream(t)
+	js := testutil.NewJetStream(t, nc)
+	store, err := dhcp.NewStore(t.Context(), js, az)
 	require.NoError(t, err)
 	mgr, err := dhcp.NewManager(dhcp.ManagerConfig{Client: fake, Store: store, Now: now})
 	require.NoError(t, err)
@@ -50,7 +55,7 @@ func TestManagerStartScansAndReaffirms(t *testing.T) {
 		})
 		require.NoError(t, err)
 		held, _ := fake.HeldLease(id)
-		require.NoError(t, store.Put(dhcp.Entry{Purpose: "eip", PoolName: "default", Lease: held}))
+		require.NoError(t, store.Put(t.Context(), dhcp.Entry{Purpose: "eip", PoolName: "default", Lease: held}))
 	}
 	require.Equal(t, 0, fake.RenewCount())
 
@@ -59,7 +64,9 @@ func TestManagerStartScansAndReaffirms(t *testing.T) {
 	assert.Equal(t, 2, mgr.LoopCount())
 }
 
-func TestManagerStartDropsExpiredLeases(t *testing.T) {
+// Deleting an expired lease at startup leaves whatever was configured from it
+// forwarding on an address nothing holds, so the lease is re-acquired instead.
+func TestManagerStartReacquiresExpiredLeases(t *testing.T) {
 	fake := dhcp.NewFake()
 	fixed := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
 	mgr, store, _ := newTestManager(t, "az1", fake, func() time.Time { return fixed })
@@ -73,13 +80,315 @@ func TestManagerStartDropsExpiredLeases(t *testing.T) {
 		AcquiredAt:    fixed.Add(-2 * time.Hour),
 		LeaseDuration: time.Hour,
 	}
-	require.NoError(t, store.Put(dhcp.Entry{Purpose: "eip", PoolName: "default", Lease: expired}))
+	require.NoError(t, store.Put(t.Context(), dhcp.Entry{Purpose: "eip", PoolName: "default", Lease: expired}))
 
 	require.NoError(t, mgr.Start(context.Background()))
-	_, err := store.Get("eipalloc-old")
-	assert.ErrorIs(t, err, nats.ErrKeyNotFound)
+
+	// The KV write trails the DORA, so waiting on the acquire count would race
+	// the assertion against it. The persisted address is the barrier.
+	require.Eventually(t, func() bool {
+		entry, getErr := store.Get(t.Context(), "eipalloc-old")
+		return getErr == nil && entry.Lease.IP.String() == "192.0.2.100"
+	}, time.Second, 10*time.Millisecond, "the KV record must name the new address")
+	assert.Equal(t, 1, fake.AcquireCount(),
+		"an expired lease whose resource still exists must be re-DORA'd, not dropped")
+	assert.Equal(t, 1, mgr.LoopCount())
+	// A reaffirm RENEW on a lease the server has already aged out only delays
+	// the re-DORA behind its timeout.
 	assert.Equal(t, 0, fake.RenewCount())
-	assert.Equal(t, 0, mgr.LoopCount())
+}
+
+// The re-DORA can land elsewhere, and the expired address is then held by
+// nobody: an upstream server that ages leases by liveness keeps it indefinitely.
+// That is how 20 addresses were stranded on the office LAN.
+func TestManagerStartReleasesExpiredLeaseUpstream(t *testing.T) {
+	fake := dhcp.NewFake()
+	fixed := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
+	mgr, store, _ := newTestManager(t, "az1", fake, func() time.Time { return fixed })
+
+	hw, _ := net.ParseMAC("02:00:00:aa:bb:cc")
+	lease, err := fake.Acquire(context.Background(), dhcp.AcquireRequest{
+		Bridge: "br-wan", ClientID: "eipalloc-stale", HWAddr: hw,
+	})
+	require.NoError(t, err)
+	lease.IP = net.IPv4(192, 0, 2, 50)
+	lease.AcquiredAt = fixed.Add(-2 * time.Hour)
+	lease.LeaseDuration = time.Hour
+	require.NoError(t, store.Put(t.Context(), dhcp.Entry{Purpose: "eip", PoolName: "wan", Lease: lease}))
+
+	require.NoError(t, mgr.Start(context.Background()))
+
+	require.Eventually(t, func() bool {
+		entry, getErr := store.Get(t.Context(), "eipalloc-stale")
+		return getErr == nil && entry.Lease.IP.String() == "192.0.2.100"
+	}, time.Second, 10*time.Millisecond, "the re-acquired address must be persisted")
+	assert.Equal(t, 1, fake.ReleaseCount(),
+		"the superseded address must be returned upstream once the re-DORA lands elsewhere")
+}
+
+// captureLogs redirects the default logger for the test and returns an accessor
+// for what has been written so far.
+func captureLogs(t *testing.T) func() string {
+	t.Helper()
+	var mu sync.Mutex
+	buf := &bytes.Buffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&lockedWriter{mu: &mu, w: buf}, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.String()
+	}
+}
+
+// lockedWriter serialises writes from the lease loops, which log concurrently.
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// A stale lease with no raw packets cannot be released, and the address then
+// stays bound upstream with nothing renewing it. Silence there is what made a
+// live leak untraceable, so the skip must be logged.
+func TestManagerStaleReleaseWithoutRawPacketsIsLogged(t *testing.T) {
+	fake := dhcp.NewFake()
+	fixed := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
+	mgr, store, _ := newTestManager(t, "az1", fake, func() time.Time { return fixed })
+
+	hw, _ := net.ParseMAC("02:00:00:aa:bb:cc")
+	lease, err := fake.Acquire(context.Background(), dhcp.AcquireRequest{
+		Bridge: "br-wan", ClientID: "eipalloc-nopackets", HWAddr: hw,
+	})
+	require.NoError(t, err)
+	lease.IP = net.IPv4(192, 0, 2, 50)
+	lease.AcquiredAt = fixed.Add(-2 * time.Hour)
+	lease.LeaseDuration = time.Hour
+	lease.RawOffer, lease.RawACK = nil, nil
+	require.NoError(t, store.Put(t.Context(), dhcp.Entry{Purpose: "eip", PoolName: "wan", Lease: lease}))
+
+	logs := captureLogs(t)
+	require.NoError(t, mgr.Start(context.Background()))
+
+	require.Eventually(t, func() bool { return fake.AcquireCount() == 2 }, time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		return strings.Contains(logs(), "cannot release, address stays bound upstream")
+	}, time.Second, 10*time.Millisecond)
+	assert.Zero(t, fake.ReleaseCount(), "a lease with no raw packets cannot be released")
+	assert.Contains(t, logs(), "192.0.2.50")
+}
+
+// A release that reached the server records the chaddr it used, so an address
+// still bound afterwards can be traced to a chaddr the server did not match.
+func TestManagerStaleReleaseLogsChaddr(t *testing.T) {
+	fake := dhcp.NewFake()
+	fixed := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
+	mgr, store, _ := newTestManager(t, "az1", fake, func() time.Time { return fixed })
+
+	hw, _ := net.ParseMAC("02:00:00:aa:bb:cc")
+	lease, err := fake.Acquire(context.Background(), dhcp.AcquireRequest{
+		Bridge: "br-wan", ClientID: "eipalloc-chaddr", HWAddr: hw,
+	})
+	require.NoError(t, err)
+	lease.IP = net.IPv4(192, 0, 2, 50)
+	lease.AcquiredAt = fixed.Add(-2 * time.Hour)
+	lease.LeaseDuration = time.Hour
+	require.NoError(t, store.Put(t.Context(), dhcp.Entry{Purpose: "eip", PoolName: "wan", Lease: lease}))
+
+	logs := captureLogs(t)
+	require.NoError(t, mgr.Start(context.Background()))
+
+	require.Eventually(t, func() bool { return fake.ReleaseCount() == 1 }, time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return strings.Contains(logs(), "released stale lease upstream") },
+		time.Second, 10*time.Millisecond)
+	assert.Contains(t, logs(), "02:00:00:aa:bb:cc")
+}
+
+// An expired lease that comes back on the same address needs no release and no
+// rebind — the datapath is already correct.
+func TestManagerStartReacquireOntoSameIPDoesNotRelease(t *testing.T) {
+	fake := dhcp.NewFake()
+	fixed := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
+	mgr, store, _ := newTestManager(t, "az1", fake, func() time.Time { return fixed })
+
+	hw, _ := net.ParseMAC("02:00:00:aa:bb:cc")
+	lease, err := fake.Acquire(context.Background(), dhcp.AcquireRequest{
+		Bridge: "br-wan", ClientID: "eipalloc-same", HWAddr: hw,
+	})
+	require.NoError(t, err)
+	lease.AcquiredAt = fixed.Add(-2 * time.Hour)
+	lease.LeaseDuration = time.Hour
+	require.NoError(t, store.Put(t.Context(), dhcp.Entry{Purpose: "eip", PoolName: "wan", Lease: lease}))
+
+	hookCalls := 0
+	mgr.SetIPChangeHook(func(context.Context, dhcp.Entry, net.IP) error {
+		hookCalls++
+		return nil
+	})
+	require.NoError(t, mgr.Start(context.Background()))
+
+	require.Eventually(t, func() bool { return fake.AcquireCount() == 2 }, time.Second, 10*time.Millisecond)
+	assert.Zero(t, fake.ReleaseCount())
+	assert.Zero(t, hookCalls)
+}
+
+// seedLiveLease puts a BOUND lease for clientID in the store and returns it.
+func seedLiveLease(t *testing.T, fake *dhcp.Fake, store *dhcp.Store, clientID, purpose, vpcID string) *dhcp.Lease {
+	t.Helper()
+	hw, _ := net.ParseMAC("02:00:00:aa:bb:cc")
+	lease, err := fake.Acquire(context.Background(), dhcp.AcquireRequest{
+		Bridge: "br-wan", ClientID: clientID, HWAddr: hw,
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.Put(t.Context(), dhcp.Entry{
+		Purpose: purpose, PoolName: "wan", VPCID: vpcID, Lease: lease,
+	}))
+	return lease
+}
+
+// renewOnto makes Renew answer with the same lease moved to ip — what a server
+// does when it NAKs the renew and the rebind lands elsewhere in the pool.
+func renewOnto(fake *dhcp.Fake, ip net.IP) {
+	fake.RenewHook = func(l *dhcp.Lease) (*dhcp.Lease, error) {
+		moved := *l
+		moved.IP = ip
+		moved.AcquiredAt = time.Now()
+		return &moved, nil
+	}
+}
+
+// A lease that comes back on a different IP must hand the old address back and
+// tell the datapath, or the old one is squatted with nothing renewing it.
+func TestManagerRenewOntoNewIPReleasesOldAndFiresHook(t *testing.T) {
+	fake := dhcp.NewFake()
+	mgr, store, _ := newTestManager(t, "az1", fake, time.Now)
+	old := seedLiveLease(t, fake, store, "dhcp-gw-lrp-vpc-1", dhcp.PurposeGatewayLRP, "vpc-1")
+	oldIP := old.IP
+	newIP := net.IPv4(192, 0, 2, 200)
+	renewOnto(fake, newIP)
+
+	var mu sync.Mutex
+	var gotOld, gotNew net.IP
+	var gotVPC string
+	mgr.SetIPChangeHook(func(_ context.Context, e dhcp.Entry, prev net.IP) error {
+		mu.Lock()
+		defer mu.Unlock()
+		gotOld, gotNew, gotVPC = prev, e.Lease.IP, e.VPCID
+		return nil
+	})
+
+	require.NoError(t, mgr.Start(context.Background()))
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return gotNew != nil
+	}, 5*time.Second, 10*time.Millisecond, "hook never fired for the moved lease")
+
+	mu.Lock()
+	assert.Equal(t, oldIP.String(), gotOld.String())
+	assert.Equal(t, newIP.String(), gotNew.String())
+	assert.Equal(t, "vpc-1", gotVPC)
+	mu.Unlock()
+	assert.Equal(t, 1, fake.ReleaseCount(), "the superseded address must be released upstream")
+
+	require.Eventually(t, func() bool {
+		entry, getErr := store.Get(t.Context(), "dhcp-gw-lrp-vpc-1")
+		return getErr == nil && entry.Lease.IP.String() == newIP.String()
+	}, time.Second, 10*time.Millisecond, "KV must hold the new address")
+}
+
+// The common case: a renewal that keeps its address must not release anything
+// or churn the datapath.
+func TestManagerRenewSameIPDoesNotReleaseOrFireHook(t *testing.T) {
+	fake := dhcp.NewFake()
+	mgr, store, _ := newTestManager(t, "az1", fake, time.Now)
+	seedLiveLease(t, fake, store, "dhcp-gw-lrp-vpc-1", dhcp.PurposeGatewayLRP, "vpc-1")
+
+	var hookCalls atomic.Int32
+	mgr.SetIPChangeHook(func(context.Context, dhcp.Entry, net.IP) error {
+		hookCalls.Add(1)
+		return nil
+	})
+
+	require.NoError(t, mgr.Start(context.Background()))
+	require.Eventually(t, func() bool { return fake.RenewCount() >= 1 }, 5*time.Second, 10*time.Millisecond)
+	assert.Equal(t, 0, fake.ReleaseCount())
+	assert.Equal(t, int32(0), hookCalls.Load())
+}
+
+// A failing rebind must not cost the new lease as well — the manager holds it
+// either way, so dropping it here would strand both addresses.
+func TestManagerRenewOntoNewIPKeepsLeaseWhenHookFails(t *testing.T) {
+	fake := dhcp.NewFake()
+	mgr, store, _ := newTestManager(t, "az1", fake, time.Now)
+	seedLiveLease(t, fake, store, "dhcp-gw-lrp-vpc-1", dhcp.PurposeGatewayLRP, "vpc-1")
+	newIP := net.IPv4(192, 0, 2, 200)
+	renewOnto(fake, newIP)
+
+	var called atomic.Bool
+	mgr.SetIPChangeHook(func(context.Context, dhcp.Entry, net.IP) error {
+		called.Store(true)
+		return errors.New("ovn unreachable")
+	})
+
+	require.NoError(t, mgr.Start(context.Background()))
+	require.Eventually(t, func() bool { return called.Load() }, 5*time.Second, 10*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		entry, getErr := store.Get(t.Context(), "dhcp-gw-lrp-vpc-1")
+		return getErr == nil && entry.Lease.IP.String() == newIP.String()
+	}, time.Second, 10*time.Millisecond)
+	assert.Equal(t, 1, mgr.LoopCount(), "the lease loop must survive a failed rebind")
+}
+
+// No registered hook still releases the superseded address: the leak half must
+// not depend on a datapath owner being wired up.
+func TestManagerRenewOntoNewIPReleasesOldWithoutHook(t *testing.T) {
+	fake := dhcp.NewFake()
+	mgr, store, _ := newTestManager(t, "az1", fake, time.Now)
+	seedLiveLease(t, fake, store, "eipalloc-1", dhcp.PurposeEIP, "")
+	renewOnto(fake, net.IPv4(192, 0, 2, 201))
+
+	require.NoError(t, mgr.Start(context.Background()))
+	require.Eventually(t, func() bool { return fake.ReleaseCount() == 1 }, 5*time.Second, 10*time.Millisecond,
+		"superseded address must be released even with no hook registered")
+
+	require.Eventually(t, func() bool {
+		entry, getErr := store.Get(t.Context(), "eipalloc-1")
+		return getErr == nil && entry.Lease.IP.String() == "192.0.2.201"
+	}, time.Second, 10*time.Millisecond)
+}
+
+// The release of the superseded address is best-effort: failing it must not cost
+// the new lease, which is the only address the resource now has.
+func TestManagerStartKeepsNewLeaseWhenStaleReleaseFails(t *testing.T) {
+	fake := dhcp.NewFake()
+	fixed := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
+	mgr, store, _ := newTestManager(t, "az1", fake, func() time.Time { return fixed })
+
+	hw, _ := net.ParseMAC("02:00:00:aa:bb:cc")
+	lease, err := fake.Acquire(context.Background(), dhcp.AcquireRequest{
+		Bridge: "br-wan", ClientID: "eipalloc-stale", HWAddr: hw,
+	})
+	require.NoError(t, err)
+	lease.IP = net.IPv4(192, 0, 2, 50)
+	lease.AcquiredAt = fixed.Add(-2 * time.Hour)
+	lease.LeaseDuration = time.Hour
+	require.NoError(t, store.Put(t.Context(), dhcp.Entry{Purpose: "eip", PoolName: "wan", Lease: lease}))
+	fake.ReleaseHook = func(*dhcp.Lease) error { return errors.New("upstream unreachable") }
+
+	require.NoError(t, mgr.Start(context.Background()))
+
+	require.Eventually(t, func() bool {
+		entry, getErr := store.Get(t.Context(), "eipalloc-stale")
+		return getErr == nil && entry.Lease.IP.String() == "192.0.2.100"
+	}, time.Second, 10*time.Millisecond, "the re-acquired address must be persisted despite the failed release")
 }
 
 func TestManagerStartTwiceErrors(t *testing.T) {
@@ -113,15 +422,15 @@ func TestNATSClientAcquireReleaseRoundtrip(t *testing.T) {
 	assert.Equal(t, "eipalloc-A", lease.ClientID)
 	assert.NotNil(t, lease.IP)
 
-	got, err := store.Get("eipalloc-A")
+	got, err := store.Get(t.Context(), "eipalloc-A")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "eip", got.Purpose)
 	assert.Equal(t, "default", got.PoolName)
 
 	require.NoError(t, client.RequestRelease(context.Background(), "eipalloc-A"))
-	_, err = store.Get("eipalloc-A")
-	assert.ErrorIs(t, err, nats.ErrKeyNotFound)
+	_, err = store.Get(t.Context(), "eipalloc-A")
+	assert.ErrorIs(t, err, jetstream.ErrKeyNotFound)
 	assert.Equal(t, 1, fake.ReleaseCount())
 }
 
@@ -137,7 +446,7 @@ func seedLeases(t *testing.T, store *dhcp.Store, ids []string) {
 			AcquiredAt:    time.Now(),
 			LeaseDuration: time.Hour,
 		}
-		require.NoError(t, store.Put(dhcp.Entry{Purpose: "eip", PoolName: "default", Lease: lease}))
+		require.NoError(t, store.Put(t.Context(), dhcp.Entry{Purpose: "eip", PoolName: "default", Lease: lease}))
 	}
 }
 
@@ -157,7 +466,7 @@ func TestManagerDrainAll(t *testing.T) {
 	assert.Equal(t, len(ids), n)
 	assert.Equal(t, len(ids), fake.ReleaseCount())
 
-	entries, err := store.List()
+	entries, err := store.List(t.Context())
 	require.NoError(t, err)
 	assert.Empty(t, entries)
 	assert.Equal(t, 0, mgr.LoopCount())
@@ -182,7 +491,7 @@ func TestManagerDrainAllBestEffortOnReleaseError(t *testing.T) {
 	assert.Equal(t, len(ids), n)
 	assert.Equal(t, len(ids), fake.ReleaseCount())
 
-	entries, err := store.List()
+	entries, err := store.List(t.Context())
 	require.NoError(t, err)
 	assert.Empty(t, entries)
 }
@@ -207,7 +516,7 @@ func TestManagerDrainMsgWithoutReplyIsDropped(t *testing.T) {
 	require.NoError(t, nc.Flush())
 	time.Sleep(100 * time.Millisecond)
 
-	entries, err := store.List()
+	entries, err := store.List(t.Context())
 	require.NoError(t, err)
 	assert.Len(t, entries, 1)
 	assert.Equal(t, 0, fake.ReleaseCount())
@@ -237,7 +546,7 @@ func TestManagerDrainRPCRoundtrip(t *testing.T) {
 	assert.Empty(t, reply.Error)
 	assert.Equal(t, 2, reply.Released)
 
-	entries, err := store.List()
+	entries, err := store.List(t.Context())
 	require.NoError(t, err)
 	assert.Empty(t, entries)
 }
@@ -395,8 +704,9 @@ func TestManagerAcquireRetriesUnderBackoff(t *testing.T) {
 	}
 
 	// Compress the schedule to keep the test sub-second.
-	_, nc, js := testutil.StartTestJetStream(t)
-	store, err := dhcp.NewStore(js, "az1")
+	_, nc, _ := testutil.StartTestJetStream(t)
+	js := testutil.NewJetStream(t, nc)
+	store, err := dhcp.NewStore(t.Context(), js, "az1")
 	require.NoError(t, err)
 	mgr, err := dhcp.NewManager(dhcp.ManagerConfig{
 		Client:          fake,
@@ -430,8 +740,9 @@ func TestManagerAcquireRetriesUnderBackoff(t *testing.T) {
 // Managers against a shared NATS conn. Each acquire must fire exactly one
 // handler (queue-group semantics) — Bug 3 regression.
 func TestManagerSubscribeIsQueueGroup_ExactlyOneHandlerFires(t *testing.T) {
-	_, nc, js := testutil.StartTestJetStream(t)
-	store, err := dhcp.NewStore(js, "az1")
+	_, nc, _ := testutil.StartTestJetStream(t)
+	js := testutil.NewJetStream(t, nc)
+	store, err := dhcp.NewStore(t.Context(), js, "az1")
 	require.NoError(t, err)
 
 	fakeA := dhcp.NewFake()

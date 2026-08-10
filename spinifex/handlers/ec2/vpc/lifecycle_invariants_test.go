@@ -1,6 +1,7 @@
 package handlers_ec2_vpc
 
 import (
+	"context"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -9,6 +10,38 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// TestRLC5_NoOrphanedRouteTableAfterSubnetThenVpcTeardown enforces Common
+// Resource Lifecycle Contract rule #5 (no-orphan completeness) for the one
+// teardown ordering that used to defeat it: delete the subnet, then the VPC.
+// Deleting the route table before the subnet never exercises the leak, which
+// is why unit tests on each operation individually all passed while it
+// existed — this asserts the end state across the ordering that matters.
+func TestRLC5_NoOrphanedRouteTableAfterSubnetThenVpcTeardown(t *testing.T) {
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.70.0.0/16")
+	subnetID := createTestSubnet(t, svc, vpcID, "10.70.1.0/24")
+	rtbID, _ := putTestNonMainRouteTable(t, svc, testAccountID, vpcID, subnetID)
+
+	_, err := svc.DeleteSubnet(context.Background(), &ec2.DeleteSubnetInput{SubnetId: aws.String(subnetID)}, testAccountID)
+	require.NoError(t, err, "DeleteSubnet must succeed and clear the association naming it")
+
+	// The non-main route table still exists, so DeleteVpc must reject rather
+	// than deleting the VPC out from under it.
+	_, err = svc.DeleteVpc(context.Background(), &ec2.DeleteVpcInput{VpcId: aws.String(vpcID)}, testAccountID)
+	require.Errorf(t, err, "rule #5: DeleteVpc must not remove the VPC while a non-main route table survives")
+	assert.ErrorContains(t, err, awserrors.ErrorDependencyViolation)
+
+	// Deleting the now-unassociated route table, then the VPC, must leave
+	// nothing referencing a nonexistent VPC — the invariant this whole
+	// regression exists to protect.
+	require.NoError(t, svc.rtbKV.Delete(t.Context(), testAccountID+"."+rtbID))
+	_, err = svc.DeleteVpc(context.Background(), &ec2.DeleteVpcInput{VpcId: aws.String(vpcID)}, testAccountID)
+	require.NoError(t, err)
+
+	_, err = svc.rtbKV.Get(t.Context(), testAccountID+"."+rtbID)
+	assert.Error(t, err, "rule #5: no route table may survive referencing a VPC that no longer exists")
+}
 
 // TestRLC1_VPCDeleteNotFoundOnAbsent enforces the Common Resource Lifecycle
 // Contract rule #1 (AWS-faithful delete, per-service): the EC2/VPC delete API
@@ -24,16 +57,16 @@ func TestRLC1_VPCDeleteNotFoundOnAbsent(t *testing.T) {
 		call    func(svc *VPCServiceImpl) (any, error)
 	}{
 		{"DeleteVpc", awserrors.ErrorInvalidVpcIDNotFound, func(svc *VPCServiceImpl) (any, error) {
-			return svc.DeleteVpc(&ec2.DeleteVpcInput{VpcId: aws.String("vpc-absent00000000")}, testAccountID)
+			return svc.DeleteVpc(context.Background(), &ec2.DeleteVpcInput{VpcId: aws.String("vpc-absent00000000")}, testAccountID)
 		}},
 		{"DeleteSubnet", awserrors.ErrorInvalidSubnetIDNotFound, func(svc *VPCServiceImpl) (any, error) {
-			return svc.DeleteSubnet(&ec2.DeleteSubnetInput{SubnetId: aws.String("subnet-absent0000")}, testAccountID)
+			return svc.DeleteSubnet(context.Background(), &ec2.DeleteSubnetInput{SubnetId: aws.String("subnet-absent0000")}, testAccountID)
 		}},
 		{"DeleteSecurityGroup", awserrors.ErrorInvalidGroupNotFound, func(svc *VPCServiceImpl) (any, error) {
-			return svc.DeleteSecurityGroup(&ec2.DeleteSecurityGroupInput{GroupId: aws.String("sg-absent000000000")}, testAccountID)
+			return svc.DeleteSecurityGroup(context.Background(), &ec2.DeleteSecurityGroupInput{GroupId: aws.String("sg-absent000000000")}, testAccountID)
 		}},
 		{"DeleteNetworkInterface", awserrors.ErrorInvalidNetworkInterfaceIDNotFound, func(svc *VPCServiceImpl) (any, error) {
-			return svc.DeleteNetworkInterface(&ec2.DeleteNetworkInterfaceInput{NetworkInterfaceId: aws.String("eni-absent00000000")}, testAccountID)
+			return svc.DeleteNetworkInterface(context.Background(), &ec2.DeleteNetworkInterfaceInput{NetworkInterfaceId: aws.String("eni-absent00000000")}, testAccountID)
 		}},
 	}
 
@@ -66,23 +99,23 @@ func TestRLC_ENINonDeadlock(t *testing.T) {
 	require.NoError(t, err)
 
 	// The guard stays intact: a plain delete of an in-use ENI is still rejected.
-	_, err = svc.DeleteNetworkInterface(&ec2.DeleteNetworkInterfaceInput{
+	_, err = svc.DeleteNetworkInterface(context.Background(), &ec2.DeleteNetworkInterfaceInput{
 		NetworkInterfaceId: aws.String(eniId),
 	}, testAccountID)
 	assert.ErrorContainsf(t, err, "InvalidNetworkInterface.InUse",
 		"ADR-0003 §2: the in-use guard must still protect an ENI held by a different live instance")
 
 	// The owning instance's force teardown must break the deadlock.
-	require.NoErrorf(t, svc.ForceDeleteInstanceENI(testAccountID, eniId),
+	require.NoErrorf(t, svc.ForceDeleteInstanceENI(context.Background(), testAccountID, eniId),
 		"ADR-0003 §2: ForceDeleteInstanceENI must delete the owning instance's in-use ENI to break the un-terminable-ENI deadlock")
 
-	_, err = svc.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{
+	_, err = svc.DescribeNetworkInterfaces(context.Background(), &ec2.DescribeNetworkInterfacesInput{
 		NetworkInterfaceIds: []*string{aws.String(eniId)},
 	}, testAccountID)
 	assert.ErrorContains(t, err, "InvalidNetworkInterfaceID.NotFound")
 
 	// Idempotent: forcing teardown of an already-gone ENI is success.
-	require.NoErrorf(t, svc.ForceDeleteInstanceENI(testAccountID, eniId),
+	require.NoErrorf(t, svc.ForceDeleteInstanceENI(context.Background(), testAccountID, eniId),
 		"ADR-0003 §2 / RLC rule #1: ForceDeleteInstanceENI on an absent ENI must be idempotent success")
 }
 
@@ -100,7 +133,7 @@ func TestRLC3_VPCFamilyDeleteGuardsLiveDependents(t *testing.T) {
 		_, err := svc.AttachENI(testAccountID, eniId, "i-resident000000", 0)
 		require.NoError(t, err)
 
-		_, err = svc.DeleteSubnet(&ec2.DeleteSubnetInput{SubnetId: aws.String(subnetId)}, testAccountID)
+		_, err = svc.DeleteSubnet(context.Background(), &ec2.DeleteSubnetInput{SubnetId: aws.String(subnetId)}, testAccountID)
 		assert.ErrorContainsf(t, err, awserrors.ErrorDependencyViolation,
 			"ADR-0004 §2: DeleteSubnet must return DependencyViolation while a live ENI attachment (a resident instance) remains (rule #3)")
 	})
@@ -111,7 +144,7 @@ func TestRLC3_VPCFamilyDeleteGuardsLiveDependents(t *testing.T) {
 		subnetId := createTestSubnet(t, svc, vpcId, "10.0.1.0/24")
 		_ = createTestENI(t, svc, subnetId) // available, never attached
 
-		_, err := svc.DeleteSubnet(&ec2.DeleteSubnetInput{SubnetId: aws.String(subnetId)}, testAccountID)
+		_, err := svc.DeleteSubnet(context.Background(), &ec2.DeleteSubnetInput{SubnetId: aws.String(subnetId)}, testAccountID)
 		require.NoErrorf(t, err,
 			"ADR-0004 §2/rule #3: an available (orphan) ENI must not pin its subnet — it is itself deletable and GC-reaped")
 	})
@@ -124,7 +157,7 @@ func TestRLC3_VPCFamilyDeleteGuardsLiveDependents(t *testing.T) {
 		_, err := svc.AttachENI(testAccountID, eniId, "i-live0000000000", 0)
 		require.NoError(t, err)
 
-		_, err = svc.DeleteNetworkInterface(&ec2.DeleteNetworkInterfaceInput{NetworkInterfaceId: aws.String(eniId)}, testAccountID)
+		_, err = svc.DeleteNetworkInterface(context.Background(), &ec2.DeleteNetworkInterfaceInput{NetworkInterfaceId: aws.String(eniId)}, testAccountID)
 		assert.ErrorContainsf(t, err, awserrors.ErrorInvalidNetworkInterfaceInUse,
 			"ADR-0004 §2: a plain DeleteNetworkInterface must reject an ENI attached to a live instance")
 	})
@@ -136,9 +169,9 @@ func TestRLC3_VPCFamilyDeleteGuardsLiveDependents(t *testing.T) {
 		eniId := createTestENI(t, svc, subnetId)
 		_, err := svc.AttachENI(testAccountID, eniId, "i-gone0000000000", 0)
 		require.NoError(t, err)
-		require.NoError(t, svc.DetachENI(testAccountID, eniId))
+		require.NoError(t, svc.DetachENI(context.Background(), testAccountID, eniId))
 
-		_, err = svc.DeleteNetworkInterface(&ec2.DeleteNetworkInterfaceInput{NetworkInterfaceId: aws.String(eniId)}, testAccountID)
+		_, err = svc.DeleteNetworkInterface(context.Background(), &ec2.DeleteNetworkInterfaceInput{NetworkInterfaceId: aws.String(eniId)}, testAccountID)
 		require.NoErrorf(t, err,
 			"ADR-0004 §2/rule #3: an ENI whose instance is gone (detached) must be deletable")
 	})

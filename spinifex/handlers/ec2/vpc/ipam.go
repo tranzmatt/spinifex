@@ -1,16 +1,16 @@
 package handlers_ec2_vpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/big"
-	"net"
+	"net/netip"
 
+	"github.com/mulgadc/spinifex/spinifex/kvutil"
 	"github.com/mulgadc/spinifex/spinifex/migrate"
-	"github.com/mulgadc/spinifex/spinifex/utils"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 const (
@@ -35,32 +35,32 @@ type IPAMRecord struct {
 
 // IPAM manages IP address allocation for VPC subnets using NATS KV with CAS.
 type IPAM struct {
-	kv nats.KeyValue
+	kv jetstream.KeyValue
 }
 
 // NewIPAM creates a new IPAM instance backed by NATS JetStream KV.
-func NewIPAM(js nats.JetStreamContext) (*IPAM, error) {
-	kv, err := utils.GetOrCreateKVBucket(js, KVBucketIPAM, 5)
+func NewIPAM(ctx context.Context, js jetstream.JetStream) (*IPAM, error) {
+	kv, err := kvutil.GetOrCreateBucket(ctx, js, KVBucketIPAM, 5)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create IPAM KV bucket: %w", err)
 	}
-	if err := migrate.DefaultRegistry.RunKVWithJetStream(KVBucketIPAM, kv, js, KVBucketIPAMVersion); err != nil {
+	if err := migrate.DefaultRegistry.RunKVWithJetStream(ctx, KVBucketIPAM, kv, js, KVBucketIPAMVersion); err != nil {
 		return nil, fmt.Errorf("migrate %s: %w", KVBucketIPAM, err)
 	}
 	return &IPAM{kv: kv}, nil
 }
 
 // NewIPAMWithKV creates an IPAM with an existing KV bucket (for testing).
-func NewIPAMWithKV(kv nats.KeyValue) *IPAM {
+func NewIPAMWithKV(kv jetstream.KeyValue) *IPAM {
 	return &IPAM{kv: kv}
 }
 
 // AllocateIP allocates an IP from the subnet, reserving the first 4 and last
 // addresses per AWS convention. Uses CAS for conflict-free multi-node allocation.
-func (m *IPAM) AllocateIP(subnetId, cidrBlock, purpose, ownerID string) (string, error) {
+func (m *IPAM) AllocateIP(ctx context.Context, subnetId, cidrBlock, purpose, ownerID string) (string, error) {
 	for attempt := range 5 {
-		record, revision, err := m.getRecord(subnetId)
-		if err != nil && !errors.Is(err, nats.ErrKeyNotFound) {
+		record, revision, err := m.getRecord(ctx, subnetId)
+		if err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
 			return "", fmt.Errorf("get IPAM record: %w", err)
 		}
 
@@ -86,9 +86,9 @@ func (m *IPAM) AllocateIP(subnetId, cidrBlock, purpose, ownerID string) (string,
 		}
 
 		if revision == 0 {
-			_, err = m.kv.Create(subnetId, data)
+			_, err = m.kv.Create(ctx, subnetId, data)
 		} else {
-			_, err = m.kv.Update(subnetId, data, revision)
+			_, err = m.kv.Update(ctx, subnetId, data, revision)
 		}
 
 		if err != nil {
@@ -104,9 +104,9 @@ func (m *IPAM) AllocateIP(subnetId, cidrBlock, purpose, ownerID string) (string,
 }
 
 // ReleaseIP releases a previously allocated IP address back to the subnet pool.
-func (m *IPAM) ReleaseIP(subnetId, ip string) error {
+func (m *IPAM) ReleaseIP(ctx context.Context, subnetId, ip string) error {
 	for attempt := range 5 {
-		record, revision, err := m.getRecord(subnetId)
+		record, revision, err := m.getRecord(ctx, subnetId)
 		if err != nil {
 			return fmt.Errorf("get IPAM record for release: %w", err)
 		}
@@ -131,7 +131,7 @@ func (m *IPAM) ReleaseIP(subnetId, ip string) error {
 			return fmt.Errorf("marshal IPAM record: %w", err)
 		}
 
-		if _, err := m.kv.Update(subnetId, data, revision); err != nil {
+		if _, err := m.kv.Update(ctx, subnetId, data, revision); err != nil {
 			slog.Debug("IPAM release CAS conflict, retrying", "subnet", subnetId, "attempt", attempt)
 			continue
 		}
@@ -144,10 +144,10 @@ func (m *IPAM) ReleaseIP(subnetId, ip string) error {
 }
 
 // AllocatedIPs returns the list of allocated IP entries for a subnet.
-func (m *IPAM) AllocatedIPs(subnetId string) ([]IPEntry, error) {
-	record, _, err := m.getRecord(subnetId)
+func (m *IPAM) AllocatedIPs(ctx context.Context, subnetId string) ([]IPEntry, error) {
+	record, _, err := m.getRecord(ctx, subnetId)
 	if err != nil {
-		if errors.Is(err, nats.ErrKeyNotFound) {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			return nil, nil
 		}
 		return nil, err
@@ -158,11 +158,11 @@ func (m *IPAM) AllocatedIPs(subnetId string) ([]IPEntry, error) {
 	return record.Allocated, nil
 }
 
-func (m *IPAM) getRecord(subnetId string) (*IPAMRecord, uint64, error) {
-	entry, err := m.kv.Get(subnetId)
+func (m *IPAM) getRecord(ctx context.Context, subnetId string) (*IPAMRecord, uint64, error) {
+	entry, err := m.kv.Get(ctx, subnetId)
 	if err != nil {
-		if errors.Is(err, nats.ErrKeyNotFound) {
-			return nil, 0, nats.ErrKeyNotFound
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			return nil, 0, jetstream.ErrKeyNotFound
 		}
 		return nil, 0, err
 	}
@@ -177,7 +177,7 @@ func (m *IPAM) getRecord(subnetId string) (*IPAMRecord, uint64, error) {
 
 // nextAvailableIP finds the next available IP in the subnet, skipping reserved addresses.
 func (m *IPAM) nextAvailableIP(record *IPAMRecord) (string, error) {
-	_, ipNet, err := net.ParseCIDR(record.CidrBlock)
+	prefix, err := netip.ParsePrefix(record.CidrBlock)
 	if err != nil {
 		return "", fmt.Errorf("parse CIDR %q: %w", record.CidrBlock, err)
 	}
@@ -187,39 +187,22 @@ func (m *IPAM) nextAvailableIP(record *IPAMRecord) (string, error) {
 		allocated[entry.IP] = true
 	}
 
-	ones, bits := ipNet.Mask.Size()
-	hostBits := bits - ones                                     // always 0-32 for IPv4 CIDRs, safe for uint conversion
-	totalIPs := new(big.Int).Lsh(big.NewInt(1), uint(hostBits)) //#nosec G115 - hostBits is 0-32 for IPv4
+	// Start at offset 4 (.0=network, .1=gateway, .2=DNS, .3=reserved). Masked()
+	// normalises a CIDR written with host bits set, e.g. 10.0.1.7/24.
+	addr := prefix.Masked().Addr()
+	for range 4 {
+		addr = addr.Next()
+	}
 
-	// Start at offset 4 (.0=network, .1=gateway, .2=DNS, .3=reserved)
-	networkIP := ipToInt(ipNet.IP)
-
-	for offset := int64(4); offset < totalIPs.Int64()-1; offset++ { // -1 for broadcast
-		candidateInt := new(big.Int).Add(networkIP, big.NewInt(offset))
-		candidate := intToIP(candidateInt).String()
-
+	// Walk until the successor leaves the prefix, which reserves the broadcast
+	// address. Subnets too small to hold the reserved head (/30 and narrower)
+	// start already outside the prefix and fall straight through to exhausted.
+	for ; prefix.Contains(addr.Next()); addr = addr.Next() {
+		candidate := addr.String()
 		if !allocated[candidate] {
 			return candidate, nil
 		}
 	}
 
 	return "", fmt.Errorf("subnet %s exhausted, no IPs available", record.CidrBlock)
-}
-
-// ipToInt converts a net.IP to a big.Int.
-func ipToInt(ip net.IP) *big.Int {
-	ip = ip.To4()
-	if ip == nil {
-		return big.NewInt(0)
-	}
-	return new(big.Int).SetBytes(ip)
-}
-
-// intToIP converts a big.Int back to a net.IP (IPv4).
-func intToIP(n *big.Int) net.IP {
-	b := n.Bytes()
-	// Pad to 4 bytes for IPv4
-	ip := make(net.IP, 4)
-	copy(ip[4-len(b):], b)
-	return ip
 }

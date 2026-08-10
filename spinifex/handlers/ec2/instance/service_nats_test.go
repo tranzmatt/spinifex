@@ -1,6 +1,7 @@
 package handlers_ec2_instance
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -17,7 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// startTestNATSServer starts an embedded NATS server for testing
+// startTestNATSServer starts an embedded NATS server for testing.
 func startTestNATSServer(t *testing.T) (*server.Server, string) {
 	t.Helper()
 	ns, nc := testutil.StartTestNATS(t)
@@ -25,7 +26,7 @@ func startTestNATSServer(t *testing.T) (*server.Server, string) {
 	return ns, ns.ClientURL()
 }
 
-// createValidRunInstancesInput creates a valid RunInstancesInput for testing
+// createValidRunInstancesInput creates a valid RunInstancesInput for testing.
 func createValidRunInstancesInput() *ec2.RunInstancesInput {
 	return &ec2.RunInstancesInput{
 		ImageId:      aws.String("ami-0abcdef1234567890"),
@@ -41,7 +42,7 @@ func createValidRunInstancesInput() *ec2.RunInstancesInput {
 	}
 }
 
-// createValidReservation creates a valid ec2.Reservation response for testing
+// createValidReservation creates a valid ec2.Reservation response for testing.
 func createValidReservation() *ec2.Reservation {
 	return &ec2.Reservation{
 		ReservationId: aws.String("r-0123456789abcdef0"),
@@ -62,7 +63,7 @@ func createValidReservation() *ec2.Reservation {
 	}
 }
 
-// TestNATSInstanceService_RunInstances_Success tests successful RunInstances operation
+// TestNATSInstanceService_RunInstances_Success tests successful RunInstances operation.
 func TestNATSInstanceService_RunInstances_Success(t *testing.T) {
 	// Skip if LOG_IGNORE is set
 	if os.Getenv("LOG_IGNORE") != "" {
@@ -104,7 +105,7 @@ func TestNATSInstanceService_RunInstances_Success(t *testing.T) {
 	input := createValidRunInstancesInput()
 
 	// Call RunInstances
-	reservation, err := service.RunInstances(input, "123456789012")
+	reservation, err := service.RunInstances(context.Background(), input, "123456789012")
 
 	// Verify success
 	require.NoError(t, err, "RunInstances should succeed")
@@ -122,7 +123,7 @@ func TestNATSInstanceService_RunInstances_Success(t *testing.T) {
 	assert.Equal(t, "pending", *instance.State.Name)
 }
 
-// TestNATSInstanceService_RunInstances_DaemonError tests error handling when daemon returns error
+// TestNATSInstanceService_RunInstances_DaemonError tests error handling when daemon returns error.
 func TestNATSInstanceService_RunInstances_DaemonError(t *testing.T) {
 	if os.Getenv("LOG_IGNORE") != "" {
 		t.Setenv("LOG_IGNORE", "1")
@@ -154,7 +155,7 @@ func TestNATSInstanceService_RunInstances_DaemonError(t *testing.T) {
 	}
 
 	// Call RunInstances
-	reservation, err := service.RunInstances(input, "123456789012")
+	reservation, err := service.RunInstances(context.Background(), input, "123456789012")
 
 	// Verify error handling - error should be just the AWS error code for gateway lookup
 	require.Error(t, err, "Should return error when daemon returns error")
@@ -162,7 +163,7 @@ func TestNATSInstanceService_RunInstances_DaemonError(t *testing.T) {
 	assert.Equal(t, "InvalidInstanceType", err.Error(), "Error should be the AWS error code")
 }
 
-// TestNATSInstanceService_RunInstances_NoSubscriber tests behavior when no daemon is subscribed
+// TestNATSInstanceService_RunInstances_NoSubscriber tests behavior when no daemon is subscribed.
 func TestNATSInstanceService_RunInstances_NoSubscriber(t *testing.T) {
 	if os.Getenv("LOG_IGNORE") != "" {
 		t.Setenv("LOG_IGNORE", "1")
@@ -182,7 +183,7 @@ func TestNATSInstanceService_RunInstances_NoSubscriber(t *testing.T) {
 
 	// Call RunInstances
 	start := time.Now()
-	reservation, err := service.RunInstances(input, "123456789012")
+	reservation, err := service.RunInstances(context.Background(), input, "123456789012")
 	duration := time.Since(start)
 
 	// Verify error behavior
@@ -195,7 +196,7 @@ func TestNATSInstanceService_RunInstances_NoSubscriber(t *testing.T) {
 	assert.Less(t, duration.Seconds(), 1.0, "Should fail immediately when no responders")
 }
 
-// TestNATSInstanceService_RunInstances_InvalidResponse tests handling of malformed responses
+// TestNATSInstanceService_RunInstances_InvalidResponse tests handling of malformed responses.
 func TestNATSInstanceService_RunInstances_InvalidResponse(t *testing.T) {
 	if os.Getenv("LOG_IGNORE") != "" {
 		t.Setenv("LOG_IGNORE", "1")
@@ -219,7 +220,7 @@ func TestNATSInstanceService_RunInstances_InvalidResponse(t *testing.T) {
 	input := createValidRunInstancesInput()
 
 	// Call RunInstances
-	reservation, err := service.RunInstances(input, "123456789012")
+	reservation, err := service.RunInstances(context.Background(), input, "123456789012")
 
 	// Verify error handling
 	require.Error(t, err, "Should return error for invalid JSON")
@@ -227,7 +228,7 @@ func TestNATSInstanceService_RunInstances_InvalidResponse(t *testing.T) {
 	assert.Contains(t, err.Error(), "failed to unmarshal", "Error should indicate unmarshal failure")
 }
 
-// TestNATSInstanceService_RunInstances_MarshalError tests handling when input marshaling fails
+// TestNATSInstanceService_RunInstances_MarshalError tests handling when input marshaling fails.
 func TestNATSInstanceService_RunInstances_MarshalError(t *testing.T) {
 	if os.Getenv("LOG_IGNORE") != "" {
 		t.Setenv("LOG_IGNORE", "1")
@@ -243,13 +244,13 @@ func TestNATSInstanceService_RunInstances_MarshalError(t *testing.T) {
 	service := NewNATSInstanceService(nc)
 
 	// Nil input should be rejected before hitting NATS
-	reservation, err := service.RunInstances(nil, "123456789012")
+	reservation, err := service.RunInstances(context.Background(), nil, "123456789012")
 	require.Error(t, err, "Should handle nil input")
 	assert.Nil(t, reservation)
 	assert.Contains(t, err.Error(), "instance type is required")
 }
 
-// TestNATSInstanceService_RunInstances_MultipleInstances tests launching multiple instances
+// TestNATSInstanceService_RunInstances_MultipleInstances tests launching multiple instances.
 func TestNATSInstanceService_RunInstances_MultipleInstances(t *testing.T) {
 	if os.Getenv("LOG_IGNORE") != "" {
 		t.Setenv("LOG_IGNORE", "1")
@@ -300,7 +301,7 @@ func TestNATSInstanceService_RunInstances_MultipleInstances(t *testing.T) {
 	input.MinCount = aws.Int64(3)
 	input.MaxCount = aws.Int64(3)
 
-	reservation, err := service.RunInstances(input, "123456789012")
+	reservation, err := service.RunInstances(context.Background(), input, "123456789012")
 
 	// Verify multiple instances returned
 	require.NoError(t, err)
@@ -308,7 +309,7 @@ func TestNATSInstanceService_RunInstances_MultipleInstances(t *testing.T) {
 	assert.Len(t, reservation.Instances, 3, "Should have 3 instances")
 }
 
-// TestNATSInstanceService_RunInstances_QueueGroup tests load balancing with queue groups
+// TestNATSInstanceService_RunInstances_QueueGroup tests load balancing with queue groups.
 func TestNATSInstanceService_RunInstances_QueueGroup(t *testing.T) {
 	if os.Getenv("LOG_IGNORE") != "" {
 		t.Setenv("LOG_IGNORE", "1")
@@ -347,7 +348,7 @@ func TestNATSInstanceService_RunInstances_QueueGroup(t *testing.T) {
 	// Send multiple requests
 	requestCount := 10
 	for range requestCount {
-		reservation, err := service.RunInstances(input, "123456789012")
+		reservation, err := service.RunInstances(context.Background(), input, "123456789012")
 		require.NoError(t, err)
 		require.NotNil(t, reservation)
 	}
@@ -357,7 +358,7 @@ func TestNATSInstanceService_RunInstances_QueueGroup(t *testing.T) {
 	t.Logf("Worker 1 handled: %d requests", worker1Count)
 	t.Logf("Worker 2 handled: %d requests", worker2Count)
 
-	assert.Greater(t, worker1Count, 0, "Worker 1 should handle some requests")
-	assert.Greater(t, worker2Count, 0, "Worker 2 should handle some requests")
+	assert.Positive(t, worker1Count, "Worker 1 should handle some requests")
+	assert.Positive(t, worker2Count, "Worker 2 should handle some requests")
 	assert.Equal(t, requestCount, worker1Count+worker2Count, "All requests should be handled")
 }
