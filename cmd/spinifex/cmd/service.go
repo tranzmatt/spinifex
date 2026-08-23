@@ -9,15 +9,16 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mulgadc/bluebottle/pkg/otelsetup"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	handlers_dns "github.com/mulgadc/spinifex/spinifex/handlers/dns"
 	"github.com/mulgadc/spinifex/spinifex/network/external"
-	"github.com/mulgadc/spinifex/spinifex/otelsetup"
 	"github.com/mulgadc/spinifex/spinifex/service"
 	"github.com/mulgadc/spinifex/spinifex/services/awsgw"
 	"github.com/mulgadc/spinifex/spinifex/services/nats"
 	"github.com/mulgadc/spinifex/spinifex/services/northstar"
 	"github.com/mulgadc/spinifex/spinifex/services/predastore"
+	"github.com/mulgadc/spinifex/spinifex/services/qemunbdd"
 	"github.com/mulgadc/spinifex/spinifex/services/qmpcollector"
 	"github.com/mulgadc/spinifex/spinifex/services/spinifexui"
 	"github.com/mulgadc/spinifex/spinifex/services/viperblockd"
@@ -39,9 +40,10 @@ func initTelemetry(serviceName string, debug bool) func() {
 	if debug {
 		level = slog.LevelDebug
 	}
-	otelsetup.SetDefaultJSONLogger(level)
+	otelsetup.SetDefaultJSONLogger(serviceName, level)
 
-	shutdown, err := otelsetup.Init(context.Background(), serviceName)
+	shutdown, err := otelsetup.Init(context.Background(), serviceName,
+		otelsetup.WithEnvironmentFallback("SPINIFEX_CI_ENV"))
 	if err != nil {
 		slog.Warn("otel init", "service", serviceName, "error", err)
 		return func() {}
@@ -128,9 +130,11 @@ func derivePredastoreBind(clusterConfig *config.ClusterConfig) (predastoreBind, 
 }
 
 var predastoreStartCmd = &cobra.Command{
-	Use:   "start",
-	Short: "Start the predastore service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "start",
+	Short:         "Start the predastore service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		// Add your start logic here
 		fmt.Println("Starting predastore service...")
 
@@ -146,13 +150,11 @@ var predastoreStartCmd = &cobra.Command{
 		if cfgFile := viper.GetString("config"); cfgFile != "" {
 			clusterConfig, err := config.LoadConfig(cfgFile)
 			if err != nil {
-				fmt.Println("Error loading cluster config file:", err)
-				return
+				return fmt.Errorf("load cluster config file: %w", err)
 			}
 			bind, err := derivePredastoreBind(clusterConfig)
 			if err != nil {
-				fmt.Println("Error deriving predastore bind config:", err)
-				return
+				return fmt.Errorf("derive predastore bind config: %w", err)
 			}
 			if !viper.IsSet("predastore-host") {
 				host = bind.Host
@@ -168,36 +170,31 @@ var predastoreStartCmd = &cobra.Command{
 		// Required, no default: the host id selects the [[host]] of the
 		// predastore topology this process runs, and nothing can guess it.
 		if hostID <= 0 {
-			fmt.Println("Host ID is not set (--host-id, SPINIFEX_PREDASTORE_HOST_ID or host_id in spinifex.toml)")
-			return
+			return fmt.Errorf("host id is not set (--host-id, SPINIFEX_PREDASTORE_HOST_ID or host_id in spinifex.toml)")
 		}
 
 		configPath := viper.GetString("predastore-config-path")
 
 		if configPath == "" {
-			fmt.Println("Config path is not set")
-			return
+			return fmt.Errorf("config path is not set")
 		}
 
 		tlsCert := viper.GetString("predastore-tls-cert")
 
 		if tlsCert == "" {
-			fmt.Println("TLS cert is not set")
-			return
+			return fmt.Errorf("TLS cert is not set")
 		}
 
 		tlsKey := viper.GetString("predastore-tls-key")
 
 		if tlsKey == "" {
-			fmt.Println("TLS key is not set")
-			return
+			return fmt.Errorf("TLS key is not set")
 		}
 
 		encryptionKeyFile := viper.GetString("predastore-encryption-key-file")
 
 		if encryptionKeyFile == "" {
-			fmt.Println("Encryption key file is not set")
-			return
+			return fmt.Errorf("encryption key file is not set")
 		}
 
 		defer initTelemetry("predastore", false)()
@@ -216,23 +213,24 @@ var predastoreStartCmd = &cobra.Command{
 		})
 
 		if err != nil {
-			fmt.Println("Error starting predastore service:", err)
-			return
+			return fmt.Errorf("create predastore service: %w", err)
 		}
 
 		if _, err := service.Start(); err != nil {
-			fmt.Println("Error starting predastore service:", err)
-			os.Exit(1)
+			return fmt.Errorf("start predastore service: %w", err)
 		}
 
 		fmt.Println("Predastore service started", service)
+		return nil
 	},
 }
 
 var predastoreStopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop the predastore service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "stop",
+	Short:         "Stop the predastore service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Stopping predastore service...")
 
 		// Only the pid directory matters here: Stop finds the running process
@@ -242,17 +240,15 @@ var predastoreStopCmd = &cobra.Command{
 		})
 
 		if err != nil {
-			fmt.Println("Error stopping predastore service:", err)
-			return
+			return fmt.Errorf("create predastore service: %w", err)
 		}
 
 		if err = service.Stop(); err != nil {
-			fmt.Println("Error stopping predastore service:", err)
-			os.Exit(1)
+			return fmt.Errorf("stop predastore service: %w", err)
 		}
 
 		fmt.Println("Predastore service stopped")
-
+		return nil
 	},
 }
 
@@ -267,16 +263,17 @@ var predastoreStatusCmd = &cobra.Command{
 
 // Repeat for viperblock.
 var viperblockStartCmd = &cobra.Command{
-	Use:   "start",
-	Short: "Start the viperblock service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "start",
+	Short:         "Start the viperblock service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Starting viperblock service...")
 
 		cfgFile := viper.GetString("config")
 
 		if cfgFile == "" {
-			fmt.Println("Config file is not set")
-			return
+			return fmt.Errorf("config file is not set")
 		}
 
 		fmt.Println("Loading config from:", cfgFile)
@@ -284,8 +281,7 @@ var viperblockStartCmd = &cobra.Command{
 		// TODO: Support ENV vars, CLI, otherwise revert to config.LoadConfig()
 		clusterConfig, err := config.LoadConfig(cfgFile)
 		if err != nil {
-			fmt.Println("Error loading config file:", err)
-			return
+			return fmt.Errorf("load config file: %w", err)
 		}
 		nodeConfig := clusterConfig.Nodes[clusterConfig.Node]
 
@@ -343,14 +339,14 @@ var viperblockStartCmd = &cobra.Command{
 		if pluginPath == "" {
 			err := fmt.Errorf("plugin-path must be defined")
 			slog.Error(err.Error())
-			os.Exit(1)
+			return err
 		}
 
 		// Check plugin path exists
 		if _, err := os.Stat(pluginPath); os.IsNotExist(err) {
 			err := fmt.Errorf("plugin-path does not exist: %s", pluginPath)
 			slog.Error(err.Error())
-			os.Exit(1)
+			return err
 		}
 
 		// Resolve sharded WAL setting: default false unless explicitly set to true
@@ -372,7 +368,9 @@ var viperblockStartCmd = &cobra.Command{
 			encryptionKeyFile = envKey
 		}
 
-		defer initTelemetry("viperblockd", false)()
+		debug := viper.GetBool("viperblock-debug")
+
+		defer initTelemetry("viperblockd", debug)()
 
 		service, err := service.New("viperblock", &viperblockd.Config{
 			NatsHost:          nodeConfig.NATS.Host,
@@ -389,44 +387,51 @@ var viperblockStartCmd = &cobra.Command{
 			ShardWAL:          shardWAL,
 			GCEnabled:         gcEnabled,
 			EncryptionKeyFile: encryptionKeyFile,
+			Threads:           nodeConfig.EBS.ResolvedThreads(),
+			CacheSizeMB:       nodeConfig.EBS.ResolvedCacheSizeMB(),
+			Debug:             debug,
 		})
 
+		// Exit non-zero, or systemd records a clean stop and Restart=on-failure
+		// never fires. Startup here can fail for reasons that clear on their own —
+		// during formation the JetStream bucket has no leader yet — and a node that
+		// silently keeps a dead EBS provider fails every volume request with "no
+		// responders" until someone restarts it by hand.
 		if err != nil {
-			fmt.Println("Error starting viperblock service:", err)
-			return
+			return fmt.Errorf("create viperblock service: %w", err)
 		}
 
 		_, err = service.Start()
 
 		if err != nil {
-			fmt.Println("Error starting viperblock service:", err)
-			return
+			return fmt.Errorf("start viperblock service: %w", err)
 		}
 
 		fmt.Println("Viperblock service started")
+		return nil
 	},
 }
 
 var viperblockStopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop the viperblock service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "stop",
+	Short:         "Stop the viperblock service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Stopping viperblock service...")
 
 		service, err := service.New("viperblock", &viperblockd.Config{})
 
 		if err != nil {
-			fmt.Println("Error stopping viperblock service:", err)
-			return
+			return fmt.Errorf("create viperblock service: %w", err)
 		}
 
 		if err = service.Stop(); err != nil {
-			fmt.Println("Error stopping viperblock service:", err)
-			os.Exit(1)
+			return fmt.Errorf("stop viperblock service: %w", err)
 		}
 
 		fmt.Println("Viperblock service stopped")
-
+		return nil
 	},
 }
 
@@ -438,11 +443,118 @@ var viperblockStatusCmd = &cobra.Command{
 	},
 }
 
+var qemunbdCmd = &cobra.Command{
+	Use:   "qemunbd",
+	Short: "Manage the qemunbd service",
+}
+
+// Repeat for qemunbd. It answers the same ebs.provider.v1.* subjects as
+// viperblock, so the two must never run against the same NATS cluster
+// together.
+var qemunbdStartCmd = &cobra.Command{
+	Use:           "start",
+	Short:         "Start the qemunbd service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		fmt.Println("Starting qemunbd service...")
+
+		cfgFile := viper.GetString("config")
+
+		if cfgFile == "" {
+			return fmt.Errorf("config file is not set")
+		}
+
+		fmt.Println("Loading config from:", cfgFile)
+
+		clusterConfig, err := config.LoadConfig(cfgFile)
+		if err != nil {
+			return fmt.Errorf("load config file: %w", err)
+		}
+		nodeConfig := clusterConfig.Nodes[clusterConfig.Node]
+
+		natsHost := viper.GetString("nats-host")
+
+		if natsHost != "" {
+			fmt.Println("Overwriting natsHost:", natsHost)
+			nodeConfig.NATS.Host = natsHost
+		}
+
+		baseDir := viper.GetString("base-dir")
+		if baseDir != "" {
+			fmt.Println("Overwriting base-dir:", baseDir)
+			nodeConfig.Predastore.BaseDir = baseDir
+		}
+
+		// Apply changes back to cluster config
+		clusterConfig.Nodes[clusterConfig.Node] = nodeConfig
+
+		debug := viper.GetBool("qemunbd-debug")
+
+		defer initTelemetry("qemunbdd", debug)()
+
+		service, err := service.New("qemunbd", &qemunbdd.Config{
+			NatsHost:   nodeConfig.NATS.Host,
+			NatsToken:  nodeConfig.NATS.ACL.Token,
+			NatsCACert: nodeConfig.NATS.CACert,
+			BaseDir:    nodeConfig.Predastore.BaseDir,
+			NodeName:   clusterConfig.Node,
+			Debug:      debug,
+		})
+
+		if err != nil {
+			return fmt.Errorf("create qemunbd service: %w", err)
+		}
+
+		_, err = service.Start()
+
+		if err != nil {
+			return fmt.Errorf("start qemunbd service: %w", err)
+		}
+
+		fmt.Println("qemunbd service started")
+		return nil
+	},
+}
+
+var qemunbdStopCmd = &cobra.Command{
+	Use:           "stop",
+	Short:         "Stop the qemunbd service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		fmt.Println("Stopping qemunbd service...")
+
+		service, err := service.New("qemunbd", &qemunbdd.Config{})
+
+		if err != nil {
+			return fmt.Errorf("create qemunbd service: %w", err)
+		}
+
+		if err = service.Stop(); err != nil {
+			return fmt.Errorf("stop qemunbd service: %w", err)
+		}
+
+		fmt.Println("qemunbd service stopped")
+		return nil
+	},
+}
+
+var qemunbdStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Get status of the qemunbd service",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Println("qemunbd service status: ...")
+	},
+}
+
 // Repeat for nats.
 var natsStartCmd = &cobra.Command{
-	Use:   "start",
-	Short: "Start the nats service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "start",
+	Short:         "Start the nats service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Starting nats service...")
 
 		port := viper.GetInt("nats-port")
@@ -465,37 +577,37 @@ var natsStartCmd = &cobra.Command{
 		})
 
 		if err != nil {
-			fmt.Println("Error starting nats service:", err)
-			return
+			return fmt.Errorf("create nats service: %w", err)
 		}
 
 		if _, err = service.Start(); err != nil {
-			fmt.Println("Error starting nats service:", err)
-			os.Exit(1)
+			return fmt.Errorf("start nats service: %w", err)
 		}
 		fmt.Println("NATS service started")
+		return nil
 	},
 }
 
 var natsStopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop the nats service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "stop",
+	Short:         "Stop the nats service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Stopping nats service...")
 
 		service, err := service.New("nats", &nats.Config{})
 
 		if err != nil {
-			fmt.Println("Error stopping nats service:", err)
-			return
+			return fmt.Errorf("create nats service: %w", err)
 		}
 
 		if err = service.Stop(); err != nil {
-			fmt.Println("Error stopping nats service:", err)
-			os.Exit(1)
+			return fmt.Errorf("stop nats service: %w", err)
 		}
 
 		fmt.Println("Nats service stopped")
+		return nil
 	},
 }
 
@@ -509,23 +621,23 @@ var natsStatusCmd = &cobra.Command{
 
 // Repeat for spinifex.
 var spinifexStartCmd = &cobra.Command{
-	Use:   "start",
-	Short: "Start the spinifex service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "start",
+	Short:         "Start the spinifex service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Starting spinifex service...")
 
 		cfgFile := viper.GetString("config")
 
 		if cfgFile == "" {
-			fmt.Println("Config file is not set")
-			return
+			return fmt.Errorf("config file is not set")
 		}
 
 		// TODO: Support ENV vars, CLI, otherwise revert to config.LoadConfig()
 		clusterConfig, err := config.LoadConfig(cfgFile)
 		if err != nil {
-			fmt.Println("Error loading config file:", err)
-			return
+			return fmt.Errorf("load config file: %w", err)
 		}
 		nodeConfig := clusterConfig.Nodes[clusterConfig.Node]
 
@@ -553,8 +665,7 @@ var spinifexStartCmd = &cobra.Command{
 		svc, err := service.New("spinifex", clusterConfig)
 
 		if err != nil {
-			fmt.Println("Error starting spinifex service:", err)
-			return
+			return fmt.Errorf("create spinifex service: %w", err)
 		}
 
 		// Set config path for cluster manager
@@ -563,32 +674,33 @@ var spinifexStartCmd = &cobra.Command{
 		}
 
 		if _, err = svc.Start(); err != nil {
-			fmt.Println("Error starting spinifex service:", err)
-			os.Exit(1)
+			return fmt.Errorf("start spinifex service: %w", err)
 		}
 		fmt.Println("Spinifex service started")
+		return nil
 	},
 }
 
 var spinifexStopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop the spinifex service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "stop",
+	Short:         "Stop the spinifex service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Stopping spinifex service...")
 
 		service, err := service.New("spinifex", &config.ClusterConfig{})
 
 		if err != nil {
-			fmt.Println("Error stopping spinifex service:", err)
-			return
+			return fmt.Errorf("create spinifex service: %w", err)
 		}
 
 		if err = service.Stop(); err != nil {
-			fmt.Println("Error stopping spinifex service:", err)
-			os.Exit(1)
+			return fmt.Errorf("stop spinifex service: %w", err)
 		}
 
 		fmt.Println("Spinifex service stopped")
+		return nil
 	},
 }
 
@@ -603,16 +715,17 @@ var spinifexStatusCmd = &cobra.Command{
 // AWS GW
 
 var awsgwStartCmd = &cobra.Command{
-	Use:   "start",
-	Short: "Start the awsgw service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "start",
+	Short:         "Start the awsgw service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Starting awsgw service...")
 
 		cfgFile := viper.GetString("config")
 
 		if cfgFile == "" {
-			fmt.Println("Config file is not set")
-			return
+			return fmt.Errorf("config file is not set")
 		}
 
 		fmt.Println("Loading config from:", cfgFile)
@@ -620,8 +733,7 @@ var awsgwStartCmd = &cobra.Command{
 		// TODO: Support ENV vars, CLI, otherwise revert to config.LoadConfig()
 		clusterConfig, err := config.LoadConfig(cfgFile)
 		if err != nil {
-			fmt.Println("Error loading config file:", err)
-			return
+			return fmt.Errorf("load config file: %w", err)
 		}
 		nodeConfig := clusterConfig.Nodes[clusterConfig.Node]
 
@@ -661,37 +773,37 @@ var awsgwStartCmd = &cobra.Command{
 		service, err := service.New("awsgw", clusterConfig)
 
 		if err != nil {
-			fmt.Println("Error starting awsgw service:", err)
-			return
+			return fmt.Errorf("create awsgw service: %w", err)
 		}
 
 		if _, err = service.Start(); err != nil {
-			fmt.Println("Error starting awsgw service:", err)
-			os.Exit(1)
+			return fmt.Errorf("start awsgw service: %w", err)
 		}
 		fmt.Println("AWSGW service started")
+		return nil
 	},
 }
 
 var awsgwStopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop the awsgw service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "stop",
+	Short:         "Stop the awsgw service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Stopping awsgw service...")
 
 		service, err := service.New("awsgw", &config.ClusterConfig{})
 
 		if err != nil {
-			fmt.Println("Error stopping awsgw service:", err)
-			return
+			return fmt.Errorf("create awsgw service: %w", err)
 		}
 
 		if err = service.Stop(); err != nil {
-			fmt.Println("Error stopping awsgw service:", err)
-			os.Exit(1)
+			return fmt.Errorf("stop awsgw service: %w", err)
 		}
 
 		fmt.Println("AWSGW service stopped")
+		return nil
 	},
 }
 
@@ -703,10 +815,24 @@ var awsgwStatusCmd = &cobra.Command{
 	},
 }
 
+// consoleRegion is the region the console signs with. awsgw pins signature
+// verification to this same node field, so reading it from anywhere else —
+// including the cluster-wide [aws] region — would let the two drift and fail
+// authentication with an opaque credential error.
+func consoleRegion(clusterConfig *config.ClusterConfig) (string, error) {
+	region := clusterConfig.Nodes[clusterConfig.Node].Region
+	if region == "" {
+		return "", fmt.Errorf("node %q has no region configured; the console cannot sign requests", clusterConfig.Node)
+	}
+	return region, nil
+}
+
 var spinifexUIStartCmd = &cobra.Command{
-	Use:   "start",
-	Short: "Start the spinifex-ui service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "start",
+	Short:         "Start the spinifex-ui service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Starting spinifex-ui service...")
 
 		port := viper.GetInt("spinifex-ui-port")
@@ -714,6 +840,15 @@ var spinifexUIStartCmd = &cobra.Command{
 		tlsCert := viper.GetString("spinifex-ui-tls-cert")
 		tlsKey := viper.GetString("spinifex-ui-tls-key")
 		baseDir := viper.GetString("spinifex-ui-base-dir")
+
+		cfg, err := loadLocalConfig()
+		if err != nil {
+			return fmt.Errorf("load config for spinifex-ui service: %w", err)
+		}
+		region, err := consoleRegion(cfg)
+		if err != nil {
+			return err
+		}
 
 		defer initTelemetry("spinifex-ui", false)()
 
@@ -723,60 +858,62 @@ var spinifexUIStartCmd = &cobra.Command{
 			TLSCert: tlsCert,
 			TLSKey:  tlsKey,
 			BaseDir: baseDir,
+			Region:  region,
 		})
 
 		if err != nil {
-			fmt.Println("Error starting spinifex-ui service:", err)
-			return
+			return fmt.Errorf("create spinifex-ui service: %w", err)
 		}
 
 		if _, err = svc.Start(); err != nil {
-			fmt.Println("Error starting spinifex-ui service:", err)
-			os.Exit(1)
+			return fmt.Errorf("start spinifex-ui service: %w", err)
 		}
 		fmt.Println("spinifex-ui service started")
+		return nil
 	},
 }
 
 var spinifexUIStopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop the spinifex-ui service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "stop",
+	Short:         "Stop the spinifex-ui service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Stopping spinifex-ui service...")
 
 		svc, err := service.New("spinifex-ui", &spinifexui.Config{})
 
 		if err != nil {
-			fmt.Println("Error stopping spinifex-ui service:", err)
-			return
+			return fmt.Errorf("create spinifex-ui service: %w", err)
 		}
 
 		if err = svc.Stop(); err != nil {
-			fmt.Println("Error stopping spinifex-ui service:", err)
-			os.Exit(1)
+			return fmt.Errorf("stop spinifex-ui service: %w", err)
 		}
 		fmt.Println("spinifex-ui service stopped")
+		return nil
 	},
 }
 
 var spinifexUIStatusCmd = &cobra.Command{
-	Use:   "status",
-	Short: "Get status of the spinifex-ui service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "status",
+	Short:         "Get status of the spinifex-ui service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		svc, err := service.New("spinifex-ui", &spinifexui.Config{})
 
 		if err != nil {
-			fmt.Println("Error getting spinifex-ui service status:", err)
-			return
+			return fmt.Errorf("create spinifex-ui service: %w", err)
 		}
 
 		status, err := svc.Status()
 		if err != nil {
-			fmt.Println("Error getting spinifex-ui service status:", err)
-			return
+			return fmt.Errorf("get spinifex-ui service status: %w", err)
 		}
 
 		fmt.Println("spinifex-ui service status:", status)
+		return nil
 	},
 }
 
@@ -802,26 +939,26 @@ func checkLegacyWanBridgeKey(node, cfgFile string) error {
 }
 
 var vpcdStartCmd = &cobra.Command{
-	Use:   "start",
-	Short: "Start the vpcd service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "start",
+	Short:         "Start the vpcd service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Starting vpcd service...")
 
 		cfgFile := viper.GetString("config")
 		if cfgFile == "" {
-			fmt.Println("Config file is not set")
-			return
+			return fmt.Errorf("config file is not set")
 		}
 
 		clusterConfig, err := config.LoadConfig(cfgFile)
 		if err != nil {
-			fmt.Println("Error loading config file:", err)
-			return
+			return fmt.Errorf("load config file: %w", err)
 		}
 
 		if err := checkLegacyWanBridgeKey(clusterConfig.Node, cfgFile); err != nil {
 			slog.Error(err.Error())
-			os.Exit(1)
+			return err
 		}
 
 		nodeConfig := clusterConfig.Nodes[clusterConfig.Node]
@@ -871,6 +1008,7 @@ var vpcdStartCmd = &cobra.Command{
 			NatsHost:                nodeConfig.NATS.Host,
 			NatsToken:               nodeConfig.NATS.ACL.Token,
 			NatsCACert:              nodeConfig.NATS.CACert,
+			CACert:                  nodeConfig.NATS.CACert,
 			OVNNBAddr:               nodeConfig.VPCD.OVNNBAddr,
 			OVNSBAddr:               nodeConfig.VPCD.OVNSBAddr,
 			BaseDir:                 nodeConfig.BaseDir,
@@ -885,37 +1023,39 @@ var vpcdStartCmd = &cobra.Command{
 			NorthstarInternalDomain: handlers_dns.ResolveInternalDomain(&nodeConfig),
 			ResolverNameservers:     handlers_dns.ResolverNameserverIPs(clusterConfig),
 			NATExemptCIDRs:          clusterConfig.Network.NATExemptCIDRs,
+			IPSecEnabled:            clusterConfig.Network.IPSecEnabled,
+			UnderlayMTU:             clusterConfig.Network.UnderlayMTU,
 		})
 		if err != nil {
-			fmt.Println("Error starting vpcd service:", err)
-			return
+			return fmt.Errorf("create vpcd service: %w", err)
 		}
 
 		if _, err = svc.Start(); err != nil {
-			fmt.Println("Error starting vpcd service:", err)
-			os.Exit(1)
+			return fmt.Errorf("start vpcd service: %w", err)
 		}
 		fmt.Println("vpcd service started")
+		return nil
 	},
 }
 
 var vpcdStopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop the vpcd service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "stop",
+	Short:         "Stop the vpcd service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Stopping vpcd service...")
 
 		svc, err := service.New("vpcd", &vpcd.Config{})
 		if err != nil {
-			fmt.Println("Error stopping vpcd service:", err)
-			return
+			return fmt.Errorf("create vpcd service: %w", err)
 		}
 
 		if err = svc.Stop(); err != nil {
-			fmt.Println("Error stopping vpcd service:", err)
-			os.Exit(1)
+			return fmt.Errorf("stop vpcd service: %w", err)
 		}
 		fmt.Println("vpcd service stopped")
+		return nil
 	},
 }
 
@@ -1050,22 +1190,23 @@ func resolveNorthstarConfigPath(nodePath, override string) string {
 }
 
 var northstarStopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop the northstar service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "stop",
+	Short:         "Stop the northstar service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Stopping northstar service...")
 
 		svc, err := service.New("northstar", &northstar.Config{})
 		if err != nil {
-			fmt.Println("Error stopping northstar service:", err)
-			return
+			return fmt.Errorf("create northstar service: %w", err)
 		}
 
 		if err = svc.Stop(); err != nil {
-			fmt.Println("Error stopping northstar service:", err)
-			os.Exit(1)
+			return fmt.Errorf("stop northstar service: %w", err)
 		}
 		fmt.Println("northstar service stopped")
+		return nil
 	},
 }
 
@@ -1083,20 +1224,20 @@ var qmpCollectorCmd = &cobra.Command{
 }
 
 var qmpCollectorStartCmd = &cobra.Command{
-	Use:   "start",
-	Short: "Start the qmp-collector service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "start",
+	Short:         "Start the qmp-collector service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Starting qmp-collector service...")
 
 		cfgFile := viper.GetString("config")
 		if cfgFile == "" {
-			fmt.Println("Config file is not set")
-			return
+			return fmt.Errorf("config file is not set")
 		}
 		clusterConfig, err := config.LoadConfig(cfgFile)
 		if err != nil {
-			fmt.Println("Error loading config file:", err)
-			return
+			return fmt.Errorf("load config file: %w", err)
 		}
 		nodeConfig := clusterConfig.Nodes[clusterConfig.Node]
 
@@ -1110,33 +1251,33 @@ var qmpCollectorStartCmd = &cobra.Command{
 			NodeName:   clusterConfig.Node,
 		})
 		if err != nil {
-			fmt.Println("Error starting qmp-collector service:", err)
-			return
+			return fmt.Errorf("create qmp-collector service: %w", err)
 		}
 		if _, err = svc.Start(); err != nil {
-			fmt.Println("Error starting qmp-collector service:", err)
-			os.Exit(1)
+			return fmt.Errorf("start qmp-collector service: %w", err)
 		}
 		fmt.Println("qmp-collector service started")
+		return nil
 	},
 }
 
 var qmpCollectorStopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop the qmp-collector service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "stop",
+	Short:         "Stop the qmp-collector service",
+	SilenceErrors: true,
+	SilenceUsage:  true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Stopping qmp-collector service...")
 
 		svc, err := service.New("qmp-collector", &qmpcollector.Config{})
 		if err != nil {
-			fmt.Println("Error stopping qmp-collector service:", err)
-			return
+			return fmt.Errorf("create qmp-collector service: %w", err)
 		}
 		if err = svc.Stop(); err != nil {
-			fmt.Println("Error stopping qmp-collector service:", err)
-			os.Exit(1)
+			return fmt.Errorf("stop qmp-collector service: %w", err)
 		}
 		fmt.Println("qmp-collector service stopped")
+		return nil
 	},
 }
 
@@ -1299,9 +1440,23 @@ func init() {
 	viper.BindEnv("viperblock-encryption-key-file", "SPINIFEX_VIPERBLOCK_ENCRYPTION_KEY_FILE")
 	viper.BindPFlag("viperblock-encryption-key-file", viperblockCmd.PersistentFlags().Lookup("encryption-key-file"))
 
+	viperblockCmd.PersistentFlags().Bool("debug", false, "Viperblock (EBS) debug logging")
+	viper.BindEnv("viperblock-debug", "SPINIFEX_VIPERBLOCK_DEBUG")
+	viper.BindPFlag("viperblock-debug", viperblockCmd.PersistentFlags().Lookup("debug"))
+
 	viperblockCmd.AddCommand(viperblockStartCmd)
 	viperblockCmd.AddCommand(viperblockStopCmd)
 	viperblockCmd.AddCommand(viperblockStatusCmd)
+
+	serviceCmd.AddCommand(qemunbdCmd)
+
+	qemunbdCmd.PersistentFlags().Bool("debug", false, "qemunbd (EBS) debug logging")
+	viper.BindEnv("qemunbd-debug", "SPINIFEX_QEMUNBD_DEBUG")
+	viper.BindPFlag("qemunbd-debug", qemunbdCmd.PersistentFlags().Lookup("debug"))
+
+	qemunbdCmd.AddCommand(qemunbdStartCmd)
+	qemunbdCmd.AddCommand(qemunbdStopCmd)
+	qemunbdCmd.AddCommand(qemunbdStatusCmd)
 
 	// Nats
 	serviceCmd.AddCommand(natsCmd)

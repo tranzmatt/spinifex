@@ -20,9 +20,7 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/tags"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/mulgadc/spinifex/spinifex/vm"
-	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -265,7 +263,7 @@ func TestBuildNICNetdevs_SingleNIC(t *testing.T) {
 			{MAC: "02:aa:bb:cc:dd:01", IsDefault: true},
 		},
 	}
-	res := buildNICNetdevs("i-test", input, microvmMachineType())
+	res := buildNICNetdevs("i-test", input, microvmMachineType(), 0)
 	require.Len(t, res.netdevs, 1)
 	require.Len(t, res.devices, 1)
 	assert.Contains(t, res.netdevs[0].Value, "tap,id=net0,")
@@ -282,7 +280,7 @@ func TestBuildNICNetdevs_TwoNICs(t *testing.T) {
 			{MAC: "02:aa:bb:cc:dd:02", IsDefault: false},
 		},
 	}
-	res := buildNICNetdevs("i-test2", input, microvmMachineType())
+	res := buildNICNetdevs("i-test2", input, microvmMachineType(), 0)
 	require.Len(t, res.netdevs, 2)
 	require.Len(t, res.devices, 2)
 	assert.Contains(t, res.netdevs[0].Value, "id=net0,")
@@ -293,7 +291,7 @@ func TestBuildNICNetdevs_TwoNICs(t *testing.T) {
 
 func TestBuildNICNetdevs_EmptyNICs(t *testing.T) {
 	input := &handlers_elbv2.SystemInstanceInput{ENIID: "eni-empty"}
-	res := buildNICNetdevs("i-empty", input, microvmMachineType())
+	res := buildNICNetdevs("i-empty", input, microvmMachineType(), 0)
 	assert.Empty(t, res.netdevs)
 	assert.Empty(t, res.devices)
 }
@@ -307,7 +305,7 @@ func TestBuildNICNetdevs_UnprovisionedMgmtNIC_Skipped(t *testing.T) {
 			{MAC: ""},
 		},
 	}
-	res := buildNICNetdevs("i-test3", input, microvmMachineType())
+	res := buildNICNetdevs("i-test3", input, microvmMachineType(), 0)
 	require.Len(t, res.netdevs, 1)
 	require.Len(t, res.devices, 1)
 	assert.Contains(t, res.netdevs[0].Value, "id=net0,")
@@ -323,7 +321,7 @@ func TestBuildNICNetdevs_ProvisionedMgmtNIC_Included(t *testing.T) {
 			{MAC: "02:aa:bb:cc:dd:02"},
 		},
 	}
-	res := buildNICNetdevs("i-test4", input, microvmMachineType())
+	res := buildNICNetdevs("i-test4", input, microvmMachineType(), 0)
 	require.Len(t, res.netdevs, 2)
 	require.Len(t, res.devices, 2)
 	assert.Contains(t, res.netdevs[0].Value, "id=net0,")
@@ -346,7 +344,7 @@ func TestBuildNICNetdevs_UnprovisionedMgmtNIC_ExtraENIUnaffected(t *testing.T) {
 			{MAC: "02:aa:bb:cc:dd:03"},
 		},
 	}
-	res := buildNICNetdevs("i-test5", input, microvmMachineType())
+	res := buildNICNetdevs("i-test5", input, microvmMachineType(), 0)
 	require.Len(t, res.netdevs, 2)
 	require.Len(t, res.devices, 2)
 	assert.Contains(t, res.netdevs[0].Value, "id=net0,")
@@ -734,25 +732,8 @@ func TestLaunchSystemInstance_NATFailureRollsBackPublicIP(t *testing.T) {
 
 	// Wire an ExternalIPAM against a fresh JS server. The pool gives us a
 	// known IP that the rollback must release back.
-	jsNS, err := server.NewServer(&server.Options{
-		Host:      "127.0.0.1",
-		Port:      -1,
-		JetStream: true,
-		StoreDir:  t.TempDir(),
-		NoLog:     true,
-		NoSigs:    true,
-	})
-	require.NoError(t, err)
-	go jsNS.Start()
-	require.True(t, jsNS.ReadyForConnections(5*time.Second))
-	t.Cleanup(func() { jsNS.Shutdown() })
+	_, _, js := testutil.StartTestJetStream(t)
 
-	jsNC, err := nats.Connect(jsNS.ClientURL())
-	require.NoError(t, err)
-	t.Cleanup(func() { jsNC.Close() })
-
-	js, err := jetstream.New(jsNC)
-	require.NoError(t, err)
 	ipam, err := handlers_ec2_vpc.NewExternalIPAM(t.Context(), js, []external.ExternalPoolConfig{
 		{Name: "wan-test", RangeStart: "203.0.113.10", RangeEnd: "203.0.113.20", Gateway: "203.0.113.1", PrefixLen: 24},
 	})
@@ -856,25 +837,8 @@ func TestLaunchSystemInstance_NATFailureRollsBackPublicIP(t *testing.T) {
 func TestReleaseSystemInstanceEIP_ReleasesEipServiceAllocation(t *testing.T) {
 	d := createVPCTestDaemon(t)
 
-	jsNS, err := server.NewServer(&server.Options{
-		Host:      "127.0.0.1",
-		Port:      -1,
-		JetStream: true,
-		StoreDir:  t.TempDir(),
-		NoLog:     true,
-		NoSigs:    true,
-	})
-	require.NoError(t, err)
-	go jsNS.Start()
-	require.True(t, jsNS.ReadyForConnections(5*time.Second))
-	t.Cleanup(func() { jsNS.Shutdown() })
+	_, jsNC, js := testutil.StartTestJetStream(t)
 
-	jsNC, err := nats.Connect(jsNS.ClientURL())
-	require.NoError(t, err)
-	t.Cleanup(func() { jsNC.Close() })
-
-	js, err := jetstream.New(jsNC)
-	require.NoError(t, err)
 	ipam, err := handlers_ec2_vpc.NewExternalIPAM(t.Context(), js, []external.ExternalPoolConfig{
 		{Name: "wan-test", RangeStart: "203.0.113.10", RangeEnd: "203.0.113.20", Gateway: "203.0.113.1", PrefixLen: 24},
 	})

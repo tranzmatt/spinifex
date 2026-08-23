@@ -30,6 +30,37 @@ const partStyles: Record<CommandPartType, string> = {
   variable: "text-tactical-green font-semibold",
 }
 
+// Stands in for a value the form has not been given yet, so the panel shows the
+// shape of the command rather than one missing a flag's argument.
+export function cliPlaceholder(value: string, name: string): string {
+  return value.length > 0 ? value : `<${name}>`
+}
+
+export function commandFlag(
+  flag: string,
+  value: string | number,
+): CommandPart[] {
+  return [
+    { type: "flag", value: ` ${flag}` },
+    { type: "value", value: ` ${value}` },
+  ]
+}
+
+// A flag the form leaves unset is omitted rather than sent empty. A boolean is
+// the bare flag, so `true` emits it and `false` emits nothing.
+export function optionalFlag(
+  flag: string,
+  value: string | number | boolean | undefined,
+): CommandPart[] {
+  if (value === undefined || value === "" || value === false) {
+    return []
+  }
+  if (value === true) {
+    return [{ type: "flag", value: ` ${flag}` }]
+  }
+  return commandFlag(flag, value)
+}
+
 export function partsToText(commands: CliCommand[]): string {
   return commands
     .map((cmd) => cmd.parts.map((p) => p.value).join(""))
@@ -92,7 +123,6 @@ export function CliCommandPanel({ commands }: CliCommandPanelProps) {
                 <pre className="font-mono text-xs/relaxed">
                   <code>
                     {cmd.parts.map((part, j) => (
-                      // oxlint-disable-next-line react/no-array-index-key -- positional inline spans with no stable id
                       <span key={j} className={partStyles[part.type]}>
                         {part.value}
                       </span>

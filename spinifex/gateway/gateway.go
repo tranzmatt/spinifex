@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -11,21 +12,25 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
-	"github.com/mulgadc/predastore/pkg/auth"
-	"github.com/mulgadc/predastore/pkg/iampolicy"
-	"github.com/mulgadc/predastore/pkg/ratelimit"
-	"github.com/mulgadc/predastore/pkg/sigv4"
+	"github.com/mulgadc/bluebottle/pkg/auth"
+	"github.com/mulgadc/bluebottle/pkg/iampolicy"
+	bbotel "github.com/mulgadc/bluebottle/pkg/otelsetup"
+	"github.com/mulgadc/bluebottle/pkg/ratelimit"
+	"github.com/mulgadc/bluebottle/pkg/sigv4"
+	"github.com/mulgadc/spinifex/spinifex/accountteardown"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	gateway_bedrock "github.com/mulgadc/spinifex/spinifex/gateway/bedrock"
 	gateway_ecr "github.com/mulgadc/spinifex/spinifex/gateway/ecr"
 	gateway_ecrauth "github.com/mulgadc/spinifex/spinifex/gateway/ecrauth"
 	"github.com/mulgadc/spinifex/spinifex/gateway/policy"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
+	handlers_ochrevector "github.com/mulgadc/spinifex/spinifex/handlers/ochrevector"
 	handlers_quota "github.com/mulgadc/spinifex/spinifex/handlers/quota"
 	handlers_sts "github.com/mulgadc/spinifex/spinifex/handlers/sts"
 	"github.com/mulgadc/spinifex/spinifex/otelsetup"
@@ -86,9 +91,20 @@ type GatewayConfig struct {
 	DisableLogging bool       `json:"disable_logging"`
 	NATSConn       *nats.Conn // Shared NATS connection for service communication
 	Config         string     // Shared AWS Gateway config for S3 auth
-	ExpectedNodes  int        // Number of expected spinifex nodes for multi-node operations
-	Region         string     // Region this gateway is running in
-	InternalSuffix string     // Internal DNS suffix for AWS-parity endpoints (e.g. spinifex.internal)
+	// RootCAs is the cluster CA pool, used to verify predastore meta nodes
+	// dialed directly for GetStorageStatus. Nil disables that verification,
+	// so admin storage status reports every meta node unreachable rather than
+	// dialing with no trust root.
+	RootCAs       *x509.CertPool
+	ExpectedNodes int    // Number of expected spinifex nodes for multi-node operations
+	Region        string // Region this gateway is running in
+	// The last discovered node count and when it was discovered, so the
+	// discovery fan-out runs once per activeNodesTTL rather than once per
+	// request that needs to know how many nodes to wait for.
+	activeNodesMu    sync.RWMutex
+	activeNodesCount int
+	activeNodesAt    time.Time
+	InternalSuffix   string // Internal DNS suffix for AWS-parity endpoints (e.g. spinifex.internal)
 	// RegistryPort is the gateway's advertised port, appended to the ECR
 	// registry host so docker login/tag/push dial the right port. Empty or
 	// "443" renders a port-less host (standard HTTPS parity).
@@ -100,9 +116,17 @@ type GatewayConfig struct {
 	RegistryHost string
 	AZ           string // Availability zone this gateway is running in
 	IAMService   handlers_iam.IAMService
-	STSService   handlers_sts.STSService
-	RateLimiter  *AuthRateLimiter     // Per-IP auth failure rate limiter
-	Throttler    *ratelimit.Throttler // Per-account+action API request throttler
+	// BucketStore reaps a tenant's S3 buckets during account teardown. It
+	// signs with the config service credential, which predastore already
+	// trusts to reach any bucket, so this grants enumeration, not access.
+	// Nil makes DeleteAccount refuse rather than tear down around the data.
+	BucketStore accountteardown.BucketStore
+	STSService  handlers_sts.STSService
+	RateLimiter *AuthRateLimiter     // Per-IP auth failure rate limiter
+	Throttler   *ratelimit.Throttler // Per-account+action API request throttler
+	// accountStatus caches which accounts are ACTIVE, so enforcing account
+	// status does not add a KV read to every authenticated request.
+	accountStatus *accountStatusCache
 	// Quota enforces per-account service quotas. Built unconditionally; a disabled
 	// config yields a no-op Service whose Exempt always returns true. Nil only in
 	// unit tests of unrelated routes, where no handler reaches the quota checks.
@@ -155,22 +179,43 @@ type GatewayConfig struct {
 	// and friends). Nil falls back to an unconfigured store, under which
 	// reads/writes error rather than panic.
 	BedrockGuardrails *gateway_bedrock.GuardrailStore
+
+	// SignupMaxAccounts caps how many accounts /admin/CreateAccount will allow
+	// to exist. Zero means uncapped, which is the behaviour of every cluster
+	// that has not opted into self-service signup.
+	SignupMaxAccounts int
+
+	// BedrockAgentKB and BedrockAgentDataSources persist bedrock-agent
+	// knowledge-base and data-source resource metadata (D-arch: gateway-owned,
+	// not the daemon-owned vector engine). Nil for either fails
+	// BedrockAgent_Request with ServerInternal rather than panicking, the same
+	// as an unconfigured gw.NATSConn does for every other service.
+	BedrockAgentKB          *handlers_ochrevector.KBStore
+	BedrockAgentDataSources *handlers_ochrevector.DataSourceStore
+	// BedrockAgentVector forwards CreateIndex/DeleteIndex/Ingest/DescribeJob/
+	// ListJobs calls to .9's daemon-side VectorService over NATS
+	// (handlers_ochrevector.NewNATSVectorService). It is the interface, not
+	// the concrete client, so a test can inject a fake without a live NATS
+	// connection.
+	BedrockAgentVector handlers_ochrevector.VectorService
 }
 
 var supportedServices = map[string]bool{
-	"ec2":                  true,
-	"iam":                  true,
-	"sts":                  true,
-	"elasticloadbalancing": true,
-	"eks":                  true,
-	"ecs":                  true,
-	"ecr":                  true,
-	"acm":                  true,
-	"rds":                  true,
-	"tagging":              true,
-	"spinifex":             true,
-	"bedrock":              true,
-	"bedrock-runtime":      true,
+	"ec2":                   true,
+	"iam":                   true,
+	"sts":                   true,
+	"elasticloadbalancing":  true,
+	"eks":                   true,
+	"ecs":                   true,
+	"ecr":                   true,
+	"acm":                   true,
+	"rds":                   true,
+	"tagging":               true,
+	"spinifex":              true,
+	"bedrock":               true,
+	"bedrock-runtime":       true,
+	"bedrock-agent":         true,
+	"bedrock-agent-runtime": true,
 }
 
 // EC2ErrorResponse is the EC2 query-API error envelope.
@@ -204,7 +249,7 @@ func (gw *GatewayConfig) SetupRoutes() http.Handler {
 
 	// Adjust the level only. Reinstalling the default logger here would drop the OTLP
 	// bridge Init fanned on at startup, blinding the sink to every line after this.
-	otelsetup.SetLevel(logLevel)
+	bbotel.SetLevel(logLevel)
 
 	if gw.RateLimiter == nil {
 		gw.RateLimiter = NewAuthRateLimiter()
@@ -213,6 +258,7 @@ func (gw *GatewayConfig) SetupRoutes() http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(otelsetup.HTTPMiddleware("awsgw"))
+	r.Use(requestAuditMiddleware)
 
 	if !gw.DisableLogging {
 		r.Use(slogRequestLogger)
@@ -244,6 +290,11 @@ func (gw *GatewayConfig) SetupRoutes() http.Handler {
 				gw.writeThrottleError,
 			))
 		}
+
+		// Private super-admin surface. A distinct path prefix rather than an
+		// Action on the spinifex namespace, so the edge proxy can restrict it
+		// by location without parsing a signed request body.
+		auth.HandleFunc("/admin/{method}", gw.Admin_Request)
 
 		auth.HandleFunc("/*", gw.Request)
 	})
@@ -395,6 +446,10 @@ func (gw *GatewayConfig) Request(w http.ResponseWriter, r *http.Request) {
 		err = gw.Bedrock_Request(w, r)
 	case "bedrock-runtime":
 		err = gw.BedrockRuntime_Request(w, r)
+	case "bedrock-agent":
+		err = gw.BedrockAgent_Request(w, r)
+	case "bedrock-agent-runtime":
+		err = gw.BedrockAgentRuntime_Request(w, r)
 	case "ecs":
 		err = gw.ECS_Request(w, r)
 	case "ecr":
@@ -424,14 +479,25 @@ func (gw *GatewayConfig) GetService(r *http.Request) (string, error) {
 	if !ok {
 		return "", errors.New(awserrors.ErrorAuthFailure)
 	}
-	// bedrock and bedrock-runtime share the SigV4 signing name "bedrock", so the
-	// credential scope alone cannot tell the control plane from the data plane —
+	// The whole Bedrock family (bedrock, bedrock-runtime, bedrock-agent,
+	// bedrock-agent-runtime) shares the SigV4 signing name "bedrock" -- real
 	// AWS separates them by endpoint hostname, but the gateway serves one
-	// endpoint. The request path is the discriminator: /model/... and singular
-	// /guardrail/... are exclusive to the data plane; control-plane guardrail
-	// CRUD uses the plural /guardrails, so the prefixes never collide.
-	if svc == "bedrock" && (strings.HasPrefix(r.URL.Path, "/model/") || strings.HasPrefix(r.URL.Path, "/guardrail/")) {
-		svc = "bedrock-runtime"
+	// endpoint, so the request path is the only discriminator available here.
+	// /model/... and singular /guardrail/... are exclusive to bedrock-runtime;
+	// control-plane guardrail CRUD uses the plural /guardrails, so the
+	// prefixes never collide. Retrieve's /knowledgebases/{id}/retrieve and
+	// RetrieveAndGenerate's /retrieveAndGenerate are checked ahead of the
+	// bedrock-agent /knowledgebases/... prefix, since Retrieve's own path is
+	// itself a /knowledgebases/... path.
+	if svc == "bedrock" {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/model/") || strings.HasPrefix(r.URL.Path, "/guardrail/"):
+			svc = "bedrock-runtime"
+		case r.URL.Path == "/retrieveAndGenerate" || (strings.HasPrefix(r.URL.Path, "/knowledgebases/") && strings.HasSuffix(r.URL.Path, "/retrieve")):
+			svc = "bedrock-agent-runtime"
+		case strings.HasPrefix(r.URL.Path, "/knowledgebases/"):
+			svc = "bedrock-agent"
+		}
 	}
 	if !supportedServices[svc] {
 		slog.Debug("Unsupported service", "service", svc)
@@ -609,9 +675,10 @@ func (gw *GatewayConfig) ErrorHandler(w http.ResponseWriter, r *http.Request, er
 		errorMsg.HTTPCode = 500
 	}
 
-	// EKS, ECR, ACM, ECS, tagging, and bedrock/bedrock-runtime use AWS JSON 1.1;
-	// query/XML services fall through.
-	if svc == "eks" || svc == "ecr" || svc == "acm" || svc == "ecs" || svc == "tagging" || svc == "bedrock" || svc == "bedrock-runtime" {
+	// EKS, ECR, ACM, ECS, tagging, and the bedrock/bedrock-runtime/bedrock-agent/
+	// bedrock-agent-runtime family use AWS JSON 1.1; query/XML services fall
+	// through.
+	if svc == "eks" || svc == "ecr" || svc == "acm" || svc == "ecs" || svc == "tagging" || svc == "bedrock" || svc == "bedrock-runtime" || svc == "bedrock-agent" || svc == "bedrock-agent-runtime" {
 		body := GenerateEKSErrorResponse(code, errorMsg.Message, requestId)
 		slog.Debug("Generated JSON error response", "service", svc, "error", err, "code", code, "json", string(body), "requestId", requestId)
 		w.Header().Set("Content-Type", eksJSONContentType)
@@ -731,14 +798,28 @@ func GenerateIAMErrorResponse(code, message, requestID string) (output []byte) {
 	return output
 }
 
+// How long a discovered node count is reused before it is gathered again.
+// Membership does not change per request, and re-deriving it on every call put
+// the discovery fan-out's whole timeout in front of every API call it fronts.
+const activeNodesTTL = 5 * time.Second
+
 // DiscoverActiveNodes discovers the number of active spinifex daemon nodes in the
 // cluster by publishing a discovery request and counting unique responses. It
 // carries the request context so the discovery fan-out joins the caller's trace.
 // Returns the number of active nodes (minimum 1 if fallback is needed).
+//
+// The result is cached for activeNodesTTL. The gather itself stays unbounded:
+// it counts whoever answers, which may legitimately exceed the configured node
+// count during a grow, and bounding it by that count would stop early and drop
+// a live node's resources from every fan-out that follows.
 func (gw *GatewayConfig) DiscoverActiveNodes(ctx context.Context) int {
 	if gw.NATSConn == nil {
 		slog.WarnContext(ctx, "DiscoverActiveNodes: NATS connection not available, using ExpectedNodes fallback", "fallback", gw.ExpectedNodes)
 		return gw.ExpectedNodes
+	}
+
+	if count, ok := gw.cachedActiveNodes(); ok {
+		return count
 	}
 
 	frames, _, err := utils.Gather(ctx, gw.NATSConn, "spinifex.nodes.discover", []byte("{}"),
@@ -764,8 +845,28 @@ func (gw *GatewayConfig) DiscoverActiveNodes(ctx context.Context) int {
 		return gw.ExpectedNodes
 	}
 
+	gw.rememberActiveNodes(activeNodes)
 	slog.DebugContext(ctx, "DiscoverActiveNodes: Discovered active nodes", "count", activeNodes)
 	return activeNodes
+}
+
+// cachedActiveNodes returns a count discovered within the TTL. Only a real
+// discovery is cached: a fallback is not evidence of anything and caching one
+// would make a momentary NATS problem outlive itself.
+func (gw *GatewayConfig) cachedActiveNodes() (int, bool) {
+	gw.activeNodesMu.RLock()
+	defer gw.activeNodesMu.RUnlock()
+	if gw.activeNodesCount == 0 || time.Since(gw.activeNodesAt) > activeNodesTTL {
+		return 0, false
+	}
+	return gw.activeNodesCount, true
+}
+
+func (gw *GatewayConfig) rememberActiveNodes(count int) {
+	gw.activeNodesMu.Lock()
+	defer gw.activeNodesMu.Unlock()
+	gw.activeNodesCount = count
+	gw.activeNodesAt = time.Now()
 }
 
 // recordResolvedAction renames the current span to service.action, tags it
@@ -787,6 +888,7 @@ func recordResolvedAction(ctx context.Context, service, action string) {
 	span.SetName(name)
 	span.SetAttributes(attribute.String("aws.action", action))
 	otelsetup.SetRequestAction(ctx, name)
+	auditFrom(ctx).setAction(service, action)
 }
 
 // traceActionEnricher renames the server span to the resolved SigV4
@@ -812,12 +914,14 @@ func traceActionEnricher(next http.Handler) http.Handler {
 	})
 }
 
-// slogRequestLogger is a middleware that logs each request via slog.
+// slogRequestLogger is a middleware that logs each request via slog. The audit
+// record carries the caller and the auth verdict onto the same line, so a
+// failing request is answerable without joining it to a separate auth log.
 func slogRequestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		next.ServeHTTP(ww, r)
-		slog.InfoContext(r.Context(), "request", "method", r.Method, "path", r.URL.Path, "status", ww.Status(), "duration", time.Since(start))
+		logRequest(r, ww.Status(), time.Since(start))
 	})
 }

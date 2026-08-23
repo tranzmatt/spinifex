@@ -1,5 +1,5 @@
 import type { SecurityGroup } from "@aws-sdk/client-ec2"
-import { useMemo, useState } from "react"
+import { useState } from "react"
 
 import { Button } from "@/components/ui/button"
 
@@ -30,7 +30,7 @@ export function SecurityGroupsEditor({
   error,
   isSuccess,
 }: SecurityGroupsEditorProps) {
-  const initial = useMemo(() => [...current], [current])
+  const initial = [...current]
   const [selected, setSelected] = useState<string[]>(initial)
 
   const toggle = (id: string) => {
@@ -43,6 +43,7 @@ export function SecurityGroupsEditor({
   const dirty = !sameSet(selected, initial)
   // AWS requires at least one security group on an ALB.
   const isEmpty = selected.length === 0
+  const selectedIds = new Set(selected)
 
   return (
     <form
@@ -84,7 +85,7 @@ export function SecurityGroupsEditor({
               >
                 <input
                   aria-label={`Security group ${sg.GroupId} (${sg.GroupName})`}
-                  checked={selected.includes(sg.GroupId ?? "")}
+                  checked={selectedIds.has(sg.GroupId ?? "")}
                   onChange={() => toggle(sg.GroupId ?? "")}
                   type="checkbox"
                 />

@@ -28,9 +28,9 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
-	awss3 "github.com/aws/aws-sdk-go/service/s3"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/config"
+	"github.com/mulgadc/spinifex/spinifex/ebsmetadata"
 	"github.com/mulgadc/spinifex/spinifex/gpu"
 	handlers_ec2_account "github.com/mulgadc/spinifex/spinifex/handlers/ec2/account"
 	handlers_ec2_eigw "github.com/mulgadc/spinifex/spinifex/handlers/ec2/eigw"
@@ -52,7 +52,7 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/spinifex/spinifex/vm"
-	"github.com/mulgadc/viperblock/viperblock"
+	vmmock "github.com/mulgadc/spinifex/spinifex/vm/mock"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
@@ -171,18 +171,15 @@ func getTestInstanceType(t *testing.T) string {
 	return "t3.micro" // Default fallback
 }
 
-// seedTestAMI creates a minimal AMI config in the memory store so that
+// seedTestAMI creates a minimal AMI document in the memory store so that
 // handleEC2RunInstances AMI validation passes.
 func seedTestAMI(t *testing.T, store *objectstore.MemoryObjectStore, bucket, imageID string) {
 	t.Helper()
-	amiConfig := `{"VolumeConfig":{"AMIMetadata":{"ImageID":"` + imageID + `","Name":"test"}}}`
-	_, err := store.PutObject(t.Context(), &awss3.PutObjectInput{
-		Bucket:      aws.String(bucket),
-		Key:         aws.String(imageID + "/config.json"),
-		Body:        strings.NewReader(amiConfig),
-		ContentType: aws.String("application/json"),
-	})
-	require.NoError(t, err)
+	require.NoError(t, ebsmetadata.NewStore(store, bucket).PutAMI(t.Context(), ebsmetadata.AMI{
+		ImageID: imageID,
+		Name:    "test",
+		State:   "available",
+	}))
 }
 
 // TestResourceManager tests resource manager functionality.
@@ -387,7 +384,7 @@ func TestHandleEC2DescribeInstanceTypes(t *testing.T) {
 	daemon := createTestDaemon(t, natsURL)
 
 	// Subscribe to DescribeInstanceTypes (no queue group for fan-out)
-	sub, err := daemon.natsConn.Subscribe("ec2.DescribeInstanceTypes", handleNATSRequest(daemon.instanceService.DescribeInstanceTypes))
+	sub, err := daemon.natsConn.Subscribe("ec2.DescribeInstanceTypes", asMsgHandler(handleNATSRequest(daemon.instanceService.DescribeInstanceTypes)))
 	require.NoError(t, err, "Failed to subscribe to ec2.DescribeInstanceTypes")
 	defer sub.Unsubscribe()
 
@@ -1034,7 +1031,7 @@ func TestRunInstances_CountValidation(t *testing.T) {
 	seedTestAMI(t, memStore, daemon.config.Predastore.Bucket, "ami-test")
 
 	// Subscribe to the per-instance-type topic (matches production routing)
-	sub, err := daemon.natsConn.QueueSubscribe(topic, "spinifex-workers", daemon.handleEC2RunInstances)
+	sub, err := daemon.natsConn.QueueSubscribe(topic, "spinifex-workers", asMsgHandler(daemon.handleEC2RunInstances))
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
@@ -1127,7 +1124,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		require.NoError(t, err)
 		defer nc.Close()
 
-		handler := func(msg *nats.Msg) {}
+		handler := func(msg *nats.Msg) string { return outcomeSuccess }
 		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		// Count how many types actually fit on this machine (excluding system types)
@@ -1161,7 +1158,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		require.NoError(t, err)
 		defer nc.Close()
 
-		handler := func(msg *nats.Msg) {}
+		handler := func(msg *nats.Msg) string { return outcomeSuccess }
 		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		initialCount := len(rm.instanceSubs)
@@ -1193,7 +1190,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		require.NoError(t, err)
 		defer nc.Close()
 
-		handler := func(msg *nats.Msg) {}
+		handler := func(msg *nats.Msg) string { return outcomeSuccess }
 		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		expectedCount := len(rm.instanceSubs)
@@ -1226,7 +1223,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		require.NoError(t, err)
 		defer nc.Close()
 
-		handler := func(msg *nats.Msg) {}
+		handler := func(msg *nats.Msg) string { return outcomeSuccess }
 		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		// Leave only 2 vCPUs and 2.5 GB schedulable — enough for a nano/micro plus
@@ -1256,7 +1253,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		require.NoError(t, err)
 		defer nc.Close()
 
-		handler := func(msg *nats.Msg) {}
+		handler := func(msg *nats.Msg) string { return outcomeSuccess }
 		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		initialCount := len(rm.instanceSubs)
@@ -1300,7 +1297,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		require.NoError(t, err)
 		defer nc.Close()
 
-		handler := func(msg *nats.Msg) {}
+		handler := func(msg *nats.Msg) string { return outcomeSuccess }
 		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		// Fill the node completely
@@ -1333,7 +1330,7 @@ func TestInstanceTypeSubscriptions(t *testing.T) {
 		require.NoError(t, err)
 		defer nc.Close()
 
-		handler := func(msg *nats.Msg) {}
+		handler := func(msg *nats.Msg) string { return outcomeSuccess }
 		rm.initSubscriptions(nc, handler, nil, "test-node")
 
 		// Pick a type that fits at init so it gets both a queue and a
@@ -1573,12 +1570,13 @@ func TestInstanceCleanerAdapter_DeleteVolumes_BootVolumeDeletedAfterAttachmentCl
 	})
 	require.NoError(t, err)
 	daemon.volumeService = handlers_ec2_volume.NewVolumeServiceImplWithStore(daemon.config, store, daemon.natsConn, snapKV)
+	daemon.volumeService.SetEBSProvider(daemon.ebsProvider)
 
 	volumeID := "vol-root-attached"
-	seedVolumeConfig(t, store, volumeID, viperblock.VolumeMetadata{
+	seedVolumeConfig(t, daemon, store, ebsmetadata.Volume{
 		VolumeID:         volumeID,
 		TenantID:         testAccountID,
-		SizeGiB:          10,
+		CapacityGiB:      10,
 		State:            "available",
 		AttachedInstance: "i-test-boot-delete", // stale: never cleared by Stop/shutdownAndUnmount's Boot carve-out
 	})
@@ -1597,7 +1595,7 @@ func TestInstanceCleanerAdapter_DeleteVolumes_BootVolumeDeletedAfterAttachmentCl
 	err = cleaner.DeleteVolumes(instance)
 	require.NoError(t, err, "the still-attached boot volume must be deleted, not rejected as VolumeInUse")
 
-	_, err = daemon.volumeService.GetVolumeConfig(volumeID)
+	_, err = daemon.volumeService.GetVolumeMetadata(volumeID)
 	require.Error(t, err, "the volume must actually be deleted")
 	assert.Contains(t, err.Error(), awserrors.ErrorInvalidVolumeNotFound)
 }
@@ -1613,10 +1611,10 @@ func TestInstanceCleanerAdapter_DeleteVolumes_NonDoTBootVolumeDetachedNotDeleted
 	daemon, store := createFullTestDaemonWithStore(t, sharedNATSURL)
 
 	volumeID := "vol-root-nondot-attached"
-	seedVolumeConfig(t, store, volumeID, viperblock.VolumeMetadata{
+	seedVolumeConfig(t, daemon, store, ebsmetadata.Volume{
 		VolumeID:         volumeID,
 		TenantID:         testAccountID,
-		SizeGiB:          10,
+		CapacityGiB:      10,
 		State:            "available",
 		AttachedInstance: "i-test-boot-detach", // stale: never cleared by Unmount's Boot carve-out
 	})
@@ -1635,10 +1633,10 @@ func TestInstanceCleanerAdapter_DeleteVolumes_NonDoTBootVolumeDetachedNotDeleted
 	err := cleaner.DeleteVolumes(instance)
 	require.NoError(t, err)
 
-	cfg, err := daemon.volumeService.GetVolumeConfig(volumeID)
+	meta, err := daemon.volumeService.GetVolumeMetadata(volumeID)
 	require.NoError(t, err, "a DeleteOnTermination=false volume must survive terminate")
-	assert.Equal(t, "available", cfg.VolumeMetadata.State)
-	assert.Empty(t, cfg.VolumeMetadata.AttachedInstance, "terminate must still detach it")
+	assert.Equal(t, "available", meta.State)
+	assert.Empty(t, meta.AttachedInstance, "terminate must still detach it")
 }
 
 // TestInstanceCleanerAdapter_DeleteVolumes_NonBootNonDoTVolumeDetachedNotDeleted
@@ -1653,10 +1651,10 @@ func TestInstanceCleanerAdapter_DeleteVolumes_NonBootNonDoTVolumeDetachedNotDele
 	daemon, store := createFullTestDaemonWithStore(t, sharedNATSURL)
 
 	volumeID := "vol-data-nondot-attached"
-	seedVolumeConfig(t, store, volumeID, viperblock.VolumeMetadata{
+	seedVolumeConfig(t, daemon, store, ebsmetadata.Volume{
 		VolumeID:         volumeID,
 		TenantID:         testAccountID,
-		SizeGiB:          10,
+		CapacityGiB:      10,
 		State:            "in-use",
 		AttachedInstance: "i-test-data-detach", // stale: Unmount's seal failed or never ran
 	})
@@ -1675,10 +1673,10 @@ func TestInstanceCleanerAdapter_DeleteVolumes_NonBootNonDoTVolumeDetachedNotDele
 	err := cleaner.DeleteVolumes(instance)
 	require.NoError(t, err)
 
-	cfg, err := daemon.volumeService.GetVolumeConfig(volumeID)
+	meta, err := daemon.volumeService.GetVolumeMetadata(volumeID)
 	require.NoError(t, err, "a DeleteOnTermination=false volume must survive terminate")
-	assert.Equal(t, "available", cfg.VolumeMetadata.State)
-	assert.Empty(t, cfg.VolumeMetadata.AttachedInstance, "terminate must still detach it")
+	assert.Equal(t, "available", meta.State)
+	assert.Empty(t, meta.AttachedInstance, "terminate must still detach it")
 }
 
 // TestTerminatedTeardownReaper_SelfHealsFailedVolumeTeardown proves the
@@ -1707,13 +1705,14 @@ func TestTerminatedTeardownReaper_SelfHealsFailedVolumeTeardown(t *testing.T) {
 	})
 	require.NoError(t, err)
 	daemon.volumeService = handlers_ec2_volume.NewVolumeServiceImplWithStore(daemon.config, store, daemon.natsConn, snapKV)
+	daemon.volumeService.SetEBSProvider(daemon.ebsProvider)
 
 	volumeID := "vol-root-self-heal"
 	instanceID := "i-self-heal"
-	seedVolumeConfig(t, store, volumeID, viperblock.VolumeMetadata{
+	seedVolumeConfig(t, daemon, store, ebsmetadata.Volume{
 		VolumeID:         volumeID,
 		TenantID:         testAccountID,
-		SizeGiB:          10,
+		CapacityGiB:      10,
 		State:            "available",
 		AttachedInstance: instanceID, // stale, left by the earlier failed terminate
 	})
@@ -1744,7 +1743,7 @@ func TestTerminatedTeardownReaper_SelfHealsFailedVolumeTeardown(t *testing.T) {
 	_, err = reaper.Sweep(context.Background())
 	require.NoError(t, err)
 
-	_, err = daemon.volumeService.GetVolumeConfig(volumeID)
+	_, err = daemon.volumeService.GetVolumeMetadata(volumeID)
 	require.Error(t, err, "the retried delete must actually remove the volume")
 	assert.Contains(t, err.Error(), awserrors.ErrorInvalidVolumeNotFound)
 
@@ -1766,15 +1765,15 @@ func TestTerminatedTeardownReaper_SelfHealsFailedVolumeTeardown(t *testing.T) {
 func TestTerminatedTeardownReaper_SelfHealsFailedVolumeDetach(t *testing.T) {
 	daemon, store := createFullTestDaemonWithStore(t, sharedNATSURL)
 
-	fakeStore := newFakeStateStore()
+	fakeStore := vmmock.New()
 	daemon.stateStore = fakeStore
 
 	volumeID := "vol-data-self-heal"
 	instanceID := "i-self-heal-detach"
-	seedVolumeConfig(t, store, volumeID, viperblock.VolumeMetadata{
+	seedVolumeConfig(t, daemon, store, ebsmetadata.Volume{
 		VolumeID:         volumeID,
 		TenantID:         testAccountID,
-		SizeGiB:          10,
+		CapacityGiB:      10,
 		State:            "in-use",
 		AttachedInstance: instanceID, // stale, left by the earlier failed terminate
 	})
@@ -1805,10 +1804,10 @@ func TestTerminatedTeardownReaper_SelfHealsFailedVolumeDetach(t *testing.T) {
 	_, err := reaper.Sweep(context.Background())
 	require.NoError(t, err)
 
-	cfg, err := daemon.volumeService.GetVolumeConfig(volumeID)
+	meta, err := daemon.volumeService.GetVolumeMetadata(volumeID)
 	require.NoError(t, err, "the volume must survive: DeleteOnTermination=false")
-	assert.Equal(t, "available", cfg.VolumeMetadata.State)
-	assert.Empty(t, cfg.VolumeMetadata.AttachedInstance, "the retry must clear the stale attachment")
+	assert.Equal(t, "available", meta.State)
+	assert.Empty(t, meta.AttachedInstance, "the retry must clear the stale attachment")
 
 	remaining, err := fakeStore.ListTerminatedInstances()
 	require.NoError(t, err)
@@ -1832,15 +1831,15 @@ func TestStuckTerminateReaper_DetachesNonDoTVolumeWithoutUnmount(t *testing.T) {
 
 	const instanceID = "i-wedged-terminate"
 	volumeID := "vol-data-wedged"
-	seedVolumeConfig(t, store, volumeID, viperblock.VolumeMetadata{
+	seedVolumeConfig(t, daemon, store, ebsmetadata.Volume{
 		VolumeID:         volumeID,
 		TenantID:         testAccountID,
-		SizeGiB:          10,
+		CapacityGiB:      10,
 		State:            "in-use",
 		AttachedInstance: instanceID, // never cleared: Unmount never ran on this path
 	})
 
-	fakeStore := newFakeStateStore()
+	fakeStore := vmmock.New()
 	mgr := vm.NewManagerWithDeps(vm.Deps{
 		NodeID:          daemon.node,
 		StateStore:      fakeStore,
@@ -1863,11 +1862,11 @@ func TestStuckTerminateReaper_DetachesNonDoTVolumeWithoutUnmount(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, reaped, "the wedged terminate must be force-completed")
 
-	cfg, err := daemon.volumeService.GetVolumeConfig(volumeID)
+	meta, err := daemon.volumeService.GetVolumeMetadata(volumeID)
 	require.NoError(t, err)
-	assert.Equal(t, "available", cfg.VolumeMetadata.State,
+	assert.Equal(t, "available", meta.State,
 		"the force-complete path must still detach a non-Boot DeleteOnTermination=false volume")
-	assert.Empty(t, cfg.VolumeMetadata.AttachedInstance)
+	assert.Empty(t, meta.AttachedInstance)
 }
 
 // TestHandleEC2Events_AttachVolume tests the attach-volume handler in handleEC2Events.
@@ -3311,7 +3310,7 @@ func TestVolumeMounterAdapter_UnmountOne_Success(t *testing.T) {
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
-	adapter.UnmountOne(types.EBSRequest{
+	adapter.UnmountOne(t.Context(), "", types.EBSRequest{
 		Name:       "vol-rollback-test",
 		DeviceName: "/dev/sdf",
 	})
@@ -3341,7 +3340,7 @@ func TestVolumeMounterAdapter_UnmountOne_UnmountError(t *testing.T) {
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
-	require.Error(t, adapter.UnmountOne(types.EBSRequest{Name: "vol-rollback-err"}),
+	require.Error(t, adapter.UnmountOne(t.Context(), "", types.EBSRequest{Name: "vol-rollback-err"}),
 		"an ebs.unmount error response must propagate so DetachVolume can keep the volume attached")
 }
 
@@ -3361,7 +3360,7 @@ func TestVolumeMounterAdapter_UnmountOne_StillMounted(t *testing.T) {
 	require.NoError(t, err)
 	defer sub.Unsubscribe()
 
-	require.Error(t, adapter.UnmountOne(types.EBSRequest{Name: "vol-still-mounted"}),
+	require.Error(t, adapter.UnmountOne(t.Context(), "", types.EBSRequest{Name: "vol-still-mounted"}),
 		"a still-mounted response must propagate as an error")
 }
 
@@ -3375,7 +3374,7 @@ func TestVolumeMounterAdapter_UnmountOne_RequestFailure(t *testing.T) {
 	nc.Close()
 
 	adapter := newVolumeMounterAdapter(nc, "node-1", nil)
-	require.Error(t, adapter.UnmountOne(types.EBSRequest{Name: "vol-timeout"}),
+	require.Error(t, adapter.UnmountOne(t.Context(), "", types.EBSRequest{Name: "vol-timeout"}),
 		"a failed ebs.unmount request must propagate as an error")
 }
 
@@ -3430,7 +3429,7 @@ func TestVolumeMounterAdapter_Unmount_SealFailureSkipsAvailable(t *testing.T) {
 			Requests: []types.EBSRequest{{Name: "vol-fail"}, {Name: "vol-ok"}},
 		},
 	}
-	require.NoError(t, adapter.Unmount(inst),
+	require.NoError(t, adapter.Unmount(t.Context(), inst),
 		"bulk Unmount must tolerate a per-volume seal failure so terminate stays idempotent")
 
 	calls := volState.snapshot()
@@ -3473,7 +3472,7 @@ func TestVolumeMounterAdapter_Unmount_NotFoundFlipsToAvailable(t *testing.T) {
 			},
 		},
 	}
-	require.NoError(t, adapter.Unmount(inst))
+	require.NoError(t, adapter.Unmount(t.Context(), inst))
 
 	calls := volState.snapshot()
 	assert.Contains(t, calls, "vol-data-retry:available",
@@ -3583,7 +3582,7 @@ func TestVolumeMounterAdapter_Mount_PartialFailureRollback(t *testing.T) {
 				},
 			}
 
-			err = adapter.Mount(instance)
+			err = adapter.Mount(t.Context(), instance)
 			require.Error(t, err, "Mount should propagate the vol-2 failure")
 			assert.Contains(t, err.Error(), tt.wantErrSub)
 
@@ -3641,7 +3640,7 @@ func TestVolumeMounterAdapter_Mount_RollbackFailurePropagates(t *testing.T) {
 		},
 	}
 
-	err = adapter.Mount(instance)
+	err = adapter.Mount(t.Context(), instance)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "primary mount failure",
 		"original mount error must be preserved")
@@ -4448,7 +4447,7 @@ func TestReloadGPUTypes_CallsUpdateInstanceSubscriptions(t *testing.T) {
 		natsConn:      nc,
 		nodeID:        "test-node",
 		instanceSubs:  make(map[string]*nats.Subscription),
-		handler:       func(*nats.Msg) {},
+		handler:       func(*nats.Msg) string { return outcomeSuccess },
 	}
 
 	rm.reloadGPUTypes([]instancetypes.GPUModel{instancetypes.NVIDIAt4}, nil, gpuMgr)
@@ -4500,4 +4499,62 @@ func TestAssertNoClusterServicesInitialised_PerField(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.wantMsg)
 		})
 	}
+}
+
+// --- configureEBSProvider ---
+
+// newEBSProviderTestDaemon builds a daemon with real (constructor-built, not
+// zero-valued) EBS services, so configureEBSProvider has something to wire the
+// provider into rather than a set of zero values that would accept anything.
+func newEBSProviderTestDaemon(t *testing.T, provider string) *Daemon {
+	t.Helper()
+	nc, err := nats.Connect(sharedJSNATSURL)
+	require.NoError(t, err)
+	t.Cleanup(nc.Close)
+
+	jsManager, err := NewJetStreamManager(nc, 1)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	cfg := &config.Config{
+		EBS:        config.EBSConfig{Provider: provider},
+		Predastore: config.PredastoreConfig{Bucket: "test-bucket"},
+	}
+	store := objectstore.NewMemoryObjectStore()
+
+	return &Daemon{
+		ctx:             ctx,
+		config:          cfg,
+		natsConn:        nc,
+		jsManager:       jsManager,
+		instanceService: &handlers_ec2_instance.InstanceServiceImpl{},
+		imageService:    handlers_ec2_image.NewImageServiceImplWithStore(store, cfg.Predastore.Bucket),
+		snapshotService: handlers_ec2_snapshot.NewSnapshotServiceImplWithStore(cfg, store, nc),
+		volumeService:   handlers_ec2_volume.NewVolumeServiceImplWithStore(cfg, store, nc),
+	}
+}
+
+// An unset provider must still wire viperblockd everywhere: there is no
+// second provider to fall back to, so leaving it nil would silently strand
+// every EBS call on a node whose spinifex.toml predates the key.
+func TestConfigureEBSProvider_UnsetInjectsProviderEverywhere(t *testing.T) {
+	d := newEBSProviderTestDaemon(t, "")
+	require.NoError(t, d.configureEBSProvider())
+
+	require.NotNil(t, d.ebsProvider)
+	assert.Same(t, d.ebsProvider, d.instanceService.EBSProvider())
+	assert.Same(t, d.ebsProvider, d.imageService.EBSProvider())
+	assert.Same(t, d.ebsProvider, d.snapshotService.EBSProvider())
+	assert.Same(t, d.ebsProvider, d.volumeService.EBSProvider())
+}
+
+func TestConfigureEBSProvider_ViperblockdInjectsSameInstanceEverywhere(t *testing.T) {
+	d := newEBSProviderTestDaemon(t, config.EBSProviderViperblockd)
+	require.NoError(t, d.configureEBSProvider())
+
+	require.NotNil(t, d.ebsProvider, "daemon must retain the provider it constructed")
+	assert.Same(t, d.ebsProvider, d.instanceService.EBSProvider())
+	assert.Same(t, d.ebsProvider, d.imageService.EBSProvider())
+	assert.Same(t, d.ebsProvider, d.snapshotService.EBSProvider())
+	assert.Same(t, d.ebsProvider, d.volumeService.EBSProvider())
 }

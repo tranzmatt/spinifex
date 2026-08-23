@@ -43,11 +43,20 @@ const (
 	OvnExternalBridge = "br-ext"
 )
 
+// newFlowsBarrier binds the barrier to the same NB cluster the rest of vpcd
+// writes through. Without the address `ovn-nbctl` uses the local unix socket,
+// so a node that is not a member of the configured cluster confirms against a
+// database that never saw the write — slowly, then not at all.
+func newFlowsBarrier(nbAddr string) func() error {
+	return func() error { return waitForFlowsHV(nbAddr) }
+}
+
 // waitForFlowsHV runs `ovn-nbctl --wait=hv sync`, blocking until all chassis acknowledge the new NB sequence.
 // Bounded at 30 s; overruns log a Warn and return nil. Declared as a var so tests can stub it.
-var waitForFlowsHV = func() error {
+var waitForFlowsHV = func(nbAddr string) error {
 	start := time.Now()
 	cmd := sudoCommand("ovn-nbctl",
+		"--db="+nbAddr,
 		"--no-leader-only",
 		"--timeout=30",
 		"--wait=hv",
@@ -97,6 +106,9 @@ type Config struct {
 	NatsToken string
 	// NatsCACert is the path to the CA certificate for NATS TLS.
 	NatsCACert string
+	// CACert is the path to the deployment CA. IMDS serves it at
+	// /spinifex/ca.pem so a guest can install it into its own trust store.
+	CACert string
 	// OVNNBAddr is the OVN Northbound DB address (e.g., "tcp:127.0.0.1:6641").
 	OVNNBAddr string
 	// OVNSBAddr is the OVN Southbound DB address (e.g., "tcp:127.0.0.1:6642"), used for monitoring.
@@ -138,6 +150,12 @@ type Config struct {
 	// NATExemptCIDRs are extra destinations that skip routed-mode SNAT,
 	// appended to the transit /24 in the spinifex_nat_exempt set. nat mode only.
 	NATExemptCIDRs []string
+	// IPSecEnabled mirrors network.ipsec_enabled, so the DHCP MTU can drop the
+	// 34-byte ESP allowance on a cluster running the overlay in plaintext.
+	IPSecEnabled bool
+	// UnderlayMTU is the fabric MTU between nodes; the advertised guest MTU is
+	// derived from it.
+	UnderlayMTU int
 }
 
 // Service implements the Spinifex service interface for vpcd.
@@ -415,6 +433,8 @@ func launchService(cfg *Config) error {
 	defer liveClient.Close()
 	slog.Info("Connected to OVN NB DB", "endpoint", cfg.OVNNBAddr)
 
+	flowsBarrier := newFlowsBarrier(cfg.OVNNBAddr)
+
 	bridgeMode, wanBridge := resolveBridgeConfig(cfg.BridgeMode, cfg.ExternalInterface)
 	slog.Info("External bridge mode", "mode", bridgeMode, "wan_bridge", wanBridge)
 	if err := verifyBridgeMode(bridgeMode, cfg.ExternalInterface, wanBridge); err != nil {
@@ -468,13 +488,14 @@ func launchService(cfg *Config) error {
 	if dns := resolverDNSServer(cfg); dns != "" {
 		topoOpts = append(topoOpts, topology.WithDNSServer(func() string { return dns }))
 	}
+	topoOpts = append(topoOpts, topology.WithIPSec(cfg.IPSecEnabled), topology.WithUnderlayMTU(cfg.UnderlayMTU))
 	topoMgr := topology.NewLiveManager(liveClient, topoOpts...)
 
 	igwPool, publicPool := selectExternalPools(cfg.ExternalMode, cfg.ExternalPools)
 
 	sgMgr := policy.NewSecurityGroupManager(liveClient)
 	natOpts := []policy.Option{
-		policy.WithFlowsBarrier(waitForFlowsHV),
+		policy.WithFlowsBarrier(flowsBarrier),
 		policy.WithNeighFlusher(neighFlusher(wanBridge)),
 		policy.WithNeighPrimer(neighPrimer(wanBridge)),
 	}
@@ -522,6 +543,7 @@ func launchService(cfg *Config) error {
 		listTaps,
 		cfg.NorthstarBaseDomain,
 		cfg.NorthstarInternalDomain,
+		cfg.CACert,
 		cfg.ResolverNameservers,
 	)
 	if err != nil {
@@ -594,10 +616,10 @@ func launchService(cfg *Config) error {
 		Allocator:     gwAllocator,
 		Chassis:       chassisNames,
 		NATMode:       natMode,
-		FlowsBarrier:  waitForFlowsHV,
+		FlowsBarrier:  flowsBarrier,
 		RoutedIngress: routedIngress,
 		NexthopSeed: func(ctx context.Context, lrpName, nexthopIP string) error {
-			return host.SeedNexthopMAC(ctx, host.NewExecRunner(), lrpName, nexthopIP)
+			return host.SeedNexthopMAC(ctx, host.NewExecRunner(), cfg.OVNNBAddr, lrpName, nexthopIP)
 		},
 	})
 	if err != nil {
@@ -616,7 +638,7 @@ func launchService(cfg *Config) error {
 		// starts, and no lease event will ever fire to correct them.
 		reconcileGatewayLeases(ctx, dhcpMgr, igwMgr)
 	}
-	eipMgr, err := external.NewEIPManager(natMgr, waitForFlowsHV)
+	eipMgr, err := external.NewEIPManager(natMgr, flowsBarrier)
 	if err != nil {
 		return fmt.Errorf("construct EIP manager: %w", err)
 	}
@@ -653,17 +675,19 @@ func launchService(cfg *Config) error {
 	}()
 
 	rec, err := reconcile.New(reconcile.Config{
-		OVN:          liveClient,
-		SG:           sgMgr,
-		NAT:          natMgr,
-		Routes:       routeMgr,
-		IGW:          igwMgr,
-		Topology:     topoMgr,
-		LocalAZ:      cfg.AZ,
-		NodeHostname: holder,
-		Chassis:      chassisNames,
-		GatewayClaim: host.NewGatewayClaimProber(cfg.OVNSBAddr),
-		DNSServer:    resolverDNSServer(cfg),
+		OVN:           liveClient,
+		SG:            sgMgr,
+		NAT:           natMgr,
+		Routes:        routeMgr,
+		IGW:           igwMgr,
+		Topology:      topoMgr,
+		LocalAZ:       cfg.AZ,
+		NodeHostname:  holder,
+		Chassis:       chassisNames,
+		GatewayClaim:  host.NewGatewayClaimProber(cfg.OVNSBAddr),
+		DNSServer:     resolverDNSServer(cfg),
+		IPSecDisabled: !cfg.IPSecEnabled,
+		UnderlayMTU:   cfg.UnderlayMTU,
 		// Re-read intent at prune time so a guest launched during a long apply
 		// phase is not mistaken for an orphan and its dnat_and_snat swept.
 		FreshIntent: func(ctx context.Context) (reconcile.IntentState, error) {

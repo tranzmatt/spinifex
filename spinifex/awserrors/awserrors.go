@@ -3,6 +3,7 @@ package awserrors
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 )
 
@@ -12,6 +13,7 @@ type ErrorMessage struct {
 }
 
 var (
+	ErrorAccountAlreadyExists                                  = "AccountAlreadyExists"
 	ErrorAccountDisabled                                       = "AccountDisabled"
 	ErrorActiveVpcPeeringConnectionPerVpcLimitExceeded         = "ActiveVpcPeeringConnectionPerVpcLimitExceeded"
 	ErrorAddressLimitExceeded                                  = "AddressLimitExceeded"
@@ -327,6 +329,7 @@ var (
 	ErrorLogDestinationNotFound                               = "LogDestinationNotFound"
 	ErrorLogDestinationPermissionIssue                        = "LogDestinationPermissionIssue"
 	ErrorMalformedQueryString                                 = "MalformedQueryString"
+	ErrorMethodNotAllowed                                     = "MethodNotAllowed"
 	ErrorMaxConfigLimitExceededException                      = "MaxConfigLimitExceededException"
 	ErrorMaxIOPSLimitExceeded                                 = "MaxIOPSLimitExceeded"
 	ErrorMaxScheduledInstanceCapacityExceeded                 = "MaxScheduledInstanceCapacityExceeded"
@@ -352,6 +355,7 @@ var (
 	ErrorNonEBSInstance                                       = "NonEBSInstance"
 	ErrorNotExportable                                        = "NotExportable"
 	ErrorNotImplemented                                       = "NotImplemented"
+	ErrorOperationInProgress                                  = "OperationInProgress"
 	ErrorOperationNotPermitted                                = "OperationNotPermitted"
 	ErrorOptInRequired                                        = "OptInRequired"
 	ErrorOutstandingVpcPeeringConnectionLimitExceeded         = "OutstandingVpcPeeringConnectionLimitExceeded"
@@ -547,6 +551,9 @@ var (
 	ErrorModelNotReadyException      = "ModelNotReadyException"
 	ErrorServiceUnavailableException = "ServiceUnavailableException"
 	ErrorModelErrorException         = "ModelErrorException"
+	// ErrorConflictException is bedrock-agent's wire code for an id already
+	// claimed by another resource (CreateKnowledgeBase/CreateDataSource).
+	ErrorConflictException = "ConflictException"
 	// ErrorServiceQuotaExceededException is for genuine per-account limits
 	// (e.g. Ochre's tokens-per-month cap) — unlike ErrorModelNotReadyException,
 	// which is reserved for transient capacity conditions that breach no quota.
@@ -644,6 +651,19 @@ var errorLookupByService = map[string]map[string]ErrorMessage{
 	"bedrock-runtime": {
 		ErrorResourceNotFoundException: {HTTPCode: 404, Message: bedrockResourceNotFoundMessage},
 	},
+	// bedrock-agent addresses knowledge bases/data sources/ingestion jobs, not
+	// foundation models, so it needs its own wording rather than either the
+	// EKS default or bedrockResourceNotFoundMessage above.
+	"bedrock-agent": {
+		ErrorResourceNotFoundException: {HTTPCode: 404, Message: bedrockAgentResourceNotFoundMessage},
+	},
+	// bedrock-agent-runtime addresses the same knowledge-base resources as
+	// bedrock-agent (Retrieve/RetrieveAndGenerate resolve a knowledgeBaseId),
+	// so it shares bedrock-agent's wording rather than either the EKS default
+	// or bedrockResourceNotFoundMessage.
+	"bedrock-agent-runtime": {
+		ErrorResourceNotFoundException: {HTTPCode: 404, Message: bedrockAgentResourceNotFoundMessage},
+	},
 	"rds": {
 		ErrorOperationNotSupported: {HTTPCode: 400, Message: "The specified RDS action is not supported in the RDS v1 API."},
 	},
@@ -653,6 +673,11 @@ var errorLookupByService = map[string]map[string]ErrorMessage{
 // for the shared ResourceNotFoundException wire code, which otherwise tells a
 // Bedrock caller to go and list EKS clusters.
 const bedrockResourceNotFoundMessage = "Could not resolve the foundation model from the provided model identifier."
+
+// bedrockAgentResourceNotFoundMessage overrides the EKS wording ErrorLookup
+// carries for the shared ResourceNotFoundException wire code, which
+// otherwise tells a bedrock-agent caller to go and list EKS clusters.
+const bedrockAgentResourceNotFoundMessage = "The specified knowledge base, data source, or ingestion job resource could not be found."
 
 // LookupErrorMessage returns the ErrorMessage for code, scoped to service
 // where errorLookupByService has an override, otherwise ErrorLookup's global
@@ -672,6 +697,16 @@ func ValidErrorCodeFromError(err error) string {
 		return code
 	}
 	return ErrorServerInternal
+}
+
+// HTTPStatusForError returns the HTTP status err's AWS code maps to, or 500
+// for an error carrying no recognised code. It lets a caller off the HTTP path
+// classify a failure the same way the gateway would have.
+func HTTPStatusForError(err error) int {
+	if status := ErrorLookup[ValidErrorCodeFromError(err)].HTTPCode; status != 0 {
+		return status
+	}
+	return http.StatusInternalServerError
 }
 
 // HasErrorCode reports whether s is exactly a registered AWS error code.
@@ -698,7 +733,8 @@ func IsNotFound(err error) bool {
 }
 
 var ErrorLookup = map[string]ErrorMessage{
-	ErrorAccountDisabled: {HTTPCode: 400, Message: "The functionality you have requested has been administratively disabled for this account."},
+	ErrorAccountAlreadyExists:                                  {HTTPCode: 409, Message: "An account already exists for that name."},
+	ErrorAccountDisabled:                                       {HTTPCode: 400, Message: "The functionality you have requested has been administratively disabled for this account."},
 	ErrorActiveVpcPeeringConnectionPerVpcLimitExceeded:         {HTTPCode: 400, Message: "You've reached the limit on the number of active VPC peering connections you can have for the specified VPC."},
 	ErrorAddressLimitExceeded:                                  {HTTPCode: 400, Message: "You've reached the limit on the number of Elastic IP addresses that you can allocate. For more information, see Elastic IP address limit."},
 	ErrorAsnConflict:                                           {HTTPCode: 400, Message: "The Autonomous System Numbers (ASNs) of the specified customer gateway and the specified virtual private gateway are the same."},
@@ -769,7 +805,7 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorInsufficientVolumeCapacity:                            {HTTPCode: 503, Message: "There is not enough capacity to fulfill your EBS volume provision request. You can try to provision a different volume type, EBS volume in a different availability zone, or you can wait for additional capacity to become available."},
 	ErrorInterfaceInUseByTrafficMirrorSession:                  {HTTPCode: 409, Message: "The Traffic Mirror source that you are trying to create uses an interface that is already associated with a session. An interface can only be associated with a session, or with a target, but not both."},
 	ErrorInterfaceInUseByTrafficMirrorTarget:                   {HTTPCode: 409, Message: "The Traffic Mirror source that you are trying to create uses an interface that is already associated with a target. An interface can only be associated with a session, or with a target, but not both. If the interface is associated with a target, it cannot be associated with another target."},
-	ErrorInternalError:                                         {HTTPCode: 500, Message: "An internal error has occurred. Retry your request, but if the problem persists, contact us with details. "},
+	ErrorInternalError:                                         {HTTPCode: 500, Message: "An internal error has occurred. Retry your request, and if the problem persists, contact Mulga support with the details."},
 	ErrorInternalFailure:                                       {HTTPCode: 404, Message: "The request processing has failed because of an unknown error, exception, or failure."},
 	ErrorInternetGatewayLimitExceeded:                          {HTTPCode: 400, Message: "You've reached the limit on the number of internet gateways that you can create. For more information, see Amazon VPC quotas."},
 	ErrorInvalidAMIAttributeItemValue:                          {HTTPCode: 400, Message: "The value of an item added to, or removed from, an image attribute is not valid. If you are specifying a userId, check that it is in the form of an AWS account ID, without hyphens."},
@@ -1013,6 +1049,7 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorLogDestinationNotFound:                                {HTTPCode: 404, Message: "The specified Amazon S3 bucket does not exist. Ensure that you have specified the ARN for an existing Amazon S3 bucket, and that the ARN is in the correct format."},
 	ErrorLogDestinationPermissionIssue:                         {HTTPCode: 400, Message: "You do not have sufficient permissions to publish flow logs to the specific Amazon S3 bucket."},
 	ErrorMalformedQueryString:                                  {HTTPCode: 400, Message: "The query string contains a syntax error."},
+	ErrorMethodNotAllowed:                                      {HTTPCode: 405, Message: "The HTTP method is not allowed for this endpoint."},
 	ErrorMaxConfigLimitExceededException:                       {HTTPCode: 400, Message: "You\u2019ve exceeded your maximum allowed Spot placement configurations. You can retry configurations that you used within the last 24 hours, or wait for 24 hours before specifying a new configuration. For more information, see Spot placement score."},
 	ErrorMaxIOPSLimitExceeded:                                  {HTTPCode: 400, Message: "You've reached the limit on your IOPS usage for the AWS Region. For more information, see Quotas for Amazon EBS."},
 	ErrorMaxScheduledInstanceCapacityExceeded:                  {HTTPCode: 400, Message: "You've attempted to launch more instances than you purchased."},
@@ -1038,6 +1075,7 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorNonEBSInstance:                                        {HTTPCode: 400, Message: "The specified instance does not support Amazon EBS. Restart the instance and try again, to ensure that the code is run on an instance with updated code."},
 	ErrorNotExportable:                                         {HTTPCode: 400, Message: "The specified instance cannot be exported. You can only export certain instances. For more information, see Considerations for instance export."},
 	ErrorNotImplemented:                                        {HTTPCode: 501, Message: "Operation not implemented"},
+	ErrorOperationInProgress:                                   {HTTPCode: 409, Message: "An operation for this request is already in progress. Retry with the same client token."},
 	ErrorOperationNotPermitted:                                 {HTTPCode: 400, Message: "The specified operation is not allowed. This error can occur for a number of reasons; for example, you might be trying to terminate an instance that has termination protection enabled, or trying to detach the primary network interface (eth0) from an instance."},
 	ErrorOptInRequired:                                         {HTTPCode: 403, Message: "You are not authorized to use the requested service. Ensure that you have subscribed to the service you are trying to use. If you are new to AWS, your account might take some time to be activated while your credit card details are being verified."},
 	ErrorOutstandingVpcPeeringConnectionLimitExceeded:          {HTTPCode: 400, Message: "You've reached the limit on the number of VPC peering connection requests that you can create for the specified VPC."},
@@ -1080,7 +1118,7 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorSecurityGroupsPerInstanceLimitExceeded:                {HTTPCode: 400, Message: "You've reached the limit on the number of security groups that you can assign to an instance. For more information, see Amazon EC2 security groups."},
 	ErrorSecurityGroupsPerInterfaceLimitExceeded:               {HTTPCode: 400, Message: "You've reached the limit on the number of security groups you can associate with the specified network interface. For more information, see Amazon VPC quotas."},
 	ErrorSerialConsoleSessionUnavailable:                       {HTTPCode: 403, Message: "The serial console access is not enabled for this account. Use EnableSerialConsoleAccess to enable access."},
-	ErrorServerInternal:                                        {HTTPCode: 500, Message: "An internal error has occurred. Retry your request, but if the problem persists, contact us with details by posting a message on AWS re:Post."},
+	ErrorServerInternal:                                        {HTTPCode: 500, Message: "An internal error has occurred. Retry your request, and if the problem persists, contact Mulga support with the details."},
 	ErrorServiceUnavailable:                                    {HTTPCode: 503, Message: "The request has failed due to a temporary failure of the server."},
 	ErrorSignatureDoesNotMatch:                                 {HTTPCode: 403, Message: "The request signature that Amazon has does not match the signature that you provided. Check your AWS credentials and signing method."},
 	ErrorSnapshotCopyUnsupportedInterRegion:                    {HTTPCode: 400, Message: "Inter-region snapshot copy is not supported for this AWS Region."},
@@ -1214,4 +1252,5 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorServiceUnavailableException:   {HTTPCode: 503, Message: "The service isn't currently available. Try again later."},
 	ErrorModelErrorException:           {HTTPCode: 424, Message: "The request failed because of an error while running the model."},
 	ErrorServiceQuotaExceededException: {HTTPCode: 400, Message: "The number of requests exceeds the service quota. Resubmit your request later."},
+	ErrorConflictException:             {HTTPCode: 409, Message: "There was a conflict performing an operation."},
 }

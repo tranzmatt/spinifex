@@ -26,22 +26,22 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/iam"
+	"github.com/google/uuid"
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/config"
+	"github.com/mulgadc/spinifex/spinifex/ebsmetadata"
+	"github.com/mulgadc/spinifex/spinifex/ebsprovider"
 	"github.com/mulgadc/spinifex/spinifex/formation"
 	"github.com/mulgadc/spinifex/spinifex/gpu"
+	handlers_ec2_snapshot "github.com/mulgadc/spinifex/spinifex/handlers/ec2/snapshot"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	"github.com/mulgadc/spinifex/spinifex/hostdns"
 	"github.com/mulgadc/spinifex/spinifex/network/host"
 	"github.com/mulgadc/spinifex/spinifex/objectstore"
 	"github.com/mulgadc/spinifex/spinifex/utils"
-	"github.com/mulgadc/viperblock/viperblock"
-	"github.com/mulgadc/viperblock/viperblock/backends/s3"
-	"github.com/mulgadc/viperblock/viperblock/v_utils"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 )
@@ -118,8 +118,9 @@ var nodeDrainCmd = &cobra.Command{
 its guests via QMP and unmount their volumes (flushing the viperblock WAL) while
 every service is still running. STORAGE/PERSIST/INFRA are left to systemd's
 ordered unit teardown. This is what spinifex-shutdown.service's ExecStop runs,
-with --only-if-host-stopping so it only drains on a genuine host
-shutdown/reboot -- not on a plain "systemctl restart/stop spinifex.target".
+with --unless-restarting so it drains on a genuine host shutdown/reboot and on
+a plain "systemctl stop spinifex.target", but skips the drain when a restart
+of the stack (e.g. "systemctl restart spinifex.target") is already queued.
 Run by hand without that flag, it always drains unconditionally.`,
 	Run: runNodeDrainLocal,
 }
@@ -195,6 +196,25 @@ imported via 'spx admin images import'.
 No data is copied — only the config.json owner field is updated. The change
 takes effect immediately. Prompts for confirmation unless --yes is passed.`,
 	Run: runimagesPromoteCmd,
+}
+
+var volumesCmd = &cobra.Command{
+	Use:   "volumes",
+	Short: "Inspect block storage volumes",
+	Long:  `Inspect the volumes the storage provider holds, independently of the EC2 API.`,
+}
+
+var volumesOrphansCmd = &cobra.Command{
+	Use:   "orphans",
+	Short: "Report volumes the provider holds with no control-plane record",
+	Long: `List volumes the storage provider holds that the control plane has no record
+of. Their blocks are consuming space but they have no API handle, so they
+cannot be described or deleted through the EC2 API.
+
+This command only reports. It never deletes: the evidence that an orphan is
+still wanted is the record that went missing, so removal is an operator
+decision made per volume.`,
+	Run: runVolumesOrphansCmd,
 }
 
 var accountCmd = &cobra.Command{
@@ -283,7 +303,9 @@ func init() {
 	nodeCmd.AddCommand(nodeDrainCmd)
 	nodeDrainCmd.Flags().Bool("local", false, "Drain the local node only (required)")
 	nodeDrainCmd.Flags().Duration("timeout", 120*time.Second, "Maximum time to wait per phase")
-	nodeDrainCmd.Flags().Bool("only-if-host-stopping", false, "Skip the drain unless systemd is unwinding into shutdown.target (real reboot/poweroff); unset, always drains")
+	nodeDrainCmd.Flags().Bool("unless-restarting", false, "Drain on a real host shutdown or a plain target stop; skip only when a restart of the stack is already queued. Unset, always drains")
+	nodeDrainCmd.Flags().Bool("only-if-host-stopping", false, "Deprecated: use --unless-restarting")
+	_ = nodeDrainCmd.Flags().MarkDeprecated("only-if-host-stopping", "use --unless-restarting instead")
 	nodeCmd.AddCommand(nodeJSProbeCmd)
 	nodeJSProbeCmd.Flags().Duration("timeout", 10*time.Second, "Maximum time to wait for the canary round-trip")
 
@@ -292,6 +314,9 @@ func init() {
 	imagesCmd.AddCommand(imagesListCmd)
 	imagesCmd.AddCommand(imagesRemoveCmd)
 	imagesCmd.AddCommand(imagesPromoteCmd)
+
+	adminCmd.AddCommand(volumesCmd)
+	volumesCmd.AddCommand(volumesOrphansCmd)
 
 	adminCmd.AddCommand(accountCmd)
 	accountCmd.AddCommand(accountCreateCmd)
@@ -305,6 +330,9 @@ func init() {
 
 	adminCmd.AddCommand(upgradeCmd)
 	upgradeCmd.Flags().Bool("yes", false, "Apply migrations without prompting")
+	upgradeCmd.Flags().Bool("dry-run", false, "Report pending config and unit changes without applying them")
+	upgradeCmd.Flags().Bool("units-only", false, "Reconcile systemd units only, skip config migrations")
+	upgradeCmd.Flags().Bool("skip-units", false, "Apply config migrations only, skip systemd unit reconciliation")
 	certRenewCmd.Flags().StringSlice("extra-ip", nil, "Additional IP addresses to include in SANs")
 	certRenewCmd.Flags().StringSlice("extra-dns", nil, "Additional DNS names to include in SANs")
 	accountCreateCmd.Flags().String("name", "", "Account name (required)")
@@ -400,6 +428,10 @@ func init() {
 
 const bytesPerGiB = 1024 * 1024 * 1024
 
+// imageImportTimeout bounds each provider call the import makes. Generous
+// because the snapshot at the end runs over the whole imported volume.
+const imageImportTimeout = 30 * time.Minute
+
 // amiVolumeSizeGiB returns the smallest whole GiB that still holds sizeBytes.
 //
 // Rounding up is load-bearing. The image is copied into a root volume of
@@ -427,15 +459,9 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 	var imageStat os.FileInfo
 	var err error
 
-	cfgFile, _ := cmd.Flags().GetString("config")
 	forceCmd, _ := cmd.Flags().GetBool("force")
 	skipVerify, _ := cmd.Flags().GetBool("skip-verify")
 	ostmpDir, _ := cmd.Flags().GetString("tmp-dir")
-
-	// Use default config path
-	if cfgFile == "" {
-		cfgFile = DefaultConfigFile()
-	}
 
 	//configDir, _ := cmd.Flags().GetString("config-dir")
 	baseDir, _ := cmd.Flags().GetString("spinifex-dir")
@@ -543,9 +569,11 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 	// Create the specified image directory
 	imagePath := fmt.Sprintf("%s/%s/%s/%s", imageDir, image.Distro, image.Version, image.Arch)
 
-	// Create config directory
-	if err := os.MkdirAll(imagePath, 0700); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating config directory: %v\n", err)
+	// 0770, matching the root:spinifex convention setup.sh gives the shared data
+	// dirs. At 0700 the first sudo import leaves a directory no group member can
+	// descend into, so every later import without sudo fails on mkdir.
+	if err := os.MkdirAll(imagePath, 0770); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating image directory %s: %v\n", imagePath, err)
 		os.Exit(1)
 	}
 
@@ -607,57 +635,46 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Create the specified manifest file to describe the image/AMI
-	manifest := viperblock.VolumeConfig{}
-
-	// Calculate the size
-
-	manifest.AMIMetadata.Name = fmt.Sprintf("ami-%s-%s-%s", image.Distro, image.Version, image.Arch)
-	if amiNameOverride != "" {
-		manifest.AMIMetadata.Name = amiNameOverride
-	}
+	// Describe the image/AMI as the control-plane document it will become.
 	volumeId := utils.GenerateResourceID("ami")
-	manifest.AMIMetadata.ImageID = volumeId
+	amiName := fmt.Sprintf("ami-%s-%s-%s", image.Distro, image.Version, image.Arch)
+	if amiNameOverride != "" {
+		amiName = amiNameOverride
+	}
 
-	manifest.AMIMetadata.Description = fmt.Sprintf("%s cloud image prepared for Spinifex", manifest.AMIMetadata.Name)
-	manifest.AMIMetadata.Architecture = image.Arch
-	manifest.AMIMetadata.PlatformDetails = image.Platform
-	manifest.AMIMetadata.CreationDate = time.Now()
-	manifest.AMIMetadata.RootDeviceType = "ebs"
-	manifest.AMIMetadata.Virtualization = "hvm"
-	manifest.AMIMetadata.ImageOwnerAlias = "system"
-	manifest.AMIMetadata.VolumeSizeGiB = amiVolumeSizeGiB(imageStat.Size())
-	manifest.AMIMetadata.BootMode = image.BootMode
-	manifest.AMIMetadata.Distro = image.Distro
-	manifest.AMIMetadata.DistroFamily = utils.DistroFamily(image.Distro)
+	ami := ebsmetadata.AMI{
+		ImageID:         volumeId,
+		Name:            amiName,
+		Description:     fmt.Sprintf("%s cloud image prepared for Spinifex", amiName),
+		Architecture:    image.Arch,
+		PlatformDetails: image.Platform,
+		CreationDate:    time.Now(),
+		RootDeviceType:  "ebs",
+		Virtualization:  "hvm",
+		ImageOwnerAlias: "system",
+		VolumeSizeGiB:   amiVolumeSizeGiB(imageStat.Size()),
+		SnapshotID:      admin.SnapPrefix(volumeId),
+		BootMode:        image.BootMode,
+		Distro:          image.Distro,
+		DistroFamily:    utils.DistroFamily(image.Distro),
+	}
 
 	// Copy catalog-provided tags (e.g. spinifex:managed-by for system AMIs)
 	// onto the imported AMI so the UI can filter them out.
 	if len(image.Tags) > 0 {
-		manifest.AMIMetadata.Tags = make(map[string]string, len(image.Tags))
-		maps.Copy(manifest.AMIMetadata.Tags, image.Tags)
+		ami.Tags = make(map[string]string, len(image.Tags))
+		maps.Copy(ami.Tags, image.Tags)
 	}
-
-	// Volume Data
-	manifest.VolumeMetadata.VolumeID = volumeId // TODO: Confirm if unique, e.g vol-, if ami- used
-	manifest.VolumeMetadata.VolumeName = manifest.AMIMetadata.Name
-	manifest.VolumeMetadata.TenantID = "system"
-	manifest.VolumeMetadata.SizeGiB = manifest.AMIMetadata.VolumeSizeGiB
-	manifest.VolumeMetadata.State = "available"
-	manifest.VolumeMetadata.AvailabilityZone = "" // TODO: Confirm
-	manifest.VolumeMetadata.CreatedAt = time.Now()
-	manifest.VolumeMetadata.VolumeType = "gp3"
-	manifest.VolumeMetadata.IOPS = 1000
 
 	// Write the manifest to disk
 	// Save as JSON
-	jsonData, err := json.Marshal(manifest)
+	jsonData, err := json.Marshal(ami)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Could not marshal manifest: %v\n", err)
 		os.Exit(1)
 	}
 
-	manifestFilename := fmt.Sprintf("%s/%s.json", imagePath, manifest.AMIMetadata.Name)
+	manifestFilename := fmt.Sprintf("%s/%s.json", imagePath, ami.Name)
 	// Write to file
 	err = os.WriteFile(manifestFilename, jsonData, 0600)
 	if err != nil {
@@ -665,145 +682,118 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Upload the image to S3 (predastore)
-
-	appConfig, err := config.LoadConfig(cfgFile)
-
-	if err != nil {
-		fmt.Println("Error loading config file:", err)
-		return
-	}
-
-	s3Config := s3.S3Config{
-		VolumeName: volumeId,
-		VolumeSize: utils.SafeInt64ToUint64(imageStat.Size()),
-		Bucket:     appConfig.Nodes[appConfig.Node].Predastore.Bucket,
-		Region:     appConfig.Nodes[appConfig.Node].Predastore.Region,
-		AccessKey:  appConfig.Nodes[appConfig.Node].Predastore.AccessKey,
-		SecretKey:  appConfig.Nodes[appConfig.Node].Predastore.SecretKey,
-		Host:       appConfig.Nodes[appConfig.Node].Predastore.Host,
-	}
-
-	mkey, err := utils.LoadViperblockMasterKey(appConfig.Nodes[appConfig.Node].Viperblock.EncryptionKeyFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Could not load viperblock encryption key: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Import is an interactive command whose output is a progress bar, so the
-	// volume's routine mount chatter is noise here: a fresh import has no prior
-	// state, making the "no state found" / 404 lines expected rather than
-	// notable. Scoping the logger to this VB (New copies it onto the backend
-	// too) keeps it off the process-wide default. Errors still surface, both
-	// through this logger and as the returned error the caller prints.
-	vbConfig := viperblock.VB{
-		VolumeName: volumeId,
-		VolumeSize: utils.SafeInt64ToUint64(imageStat.Size()),
-		BaseDir:    tmpDir,
-		Cache: viperblock.Cache{
-			Config: viperblock.CacheConfig{
-				Size: 0,
-			},
-		},
-		VolumeConfig:      manifest,
-		MasterKey:         mkey,
-		EncryptionEnabled: mkey != nil,
-		Logger:            slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
-	}
-
-	// Bake the deployment CA into the image trust store so a stock cloud image
-	// trusts the gateway from first boot. Best-effort: never fails the import.
-	// The CA path derives from the --spinifex-dir data root (its config/ symlink
-	// holds ca.pem), not NodeBaseDir(): node.BaseDir is unset in the import
-	// command, which would collapse the path to a relative config/ca.pem.
-	bakeCACertIntoImage(extractedImagePath, filepath.Join(baseDir, "config", "ca.pem"))
-
-	// Render the flush bar here rather than inside viperblock, which stays a
-	// pure storage library. The bar is built lazily on the first update so it is
-	// never drawn if the import fails before any bytes flush; viperblock
-	// throttles the callback to ≤101 invocations, so the human-readable title
-	// renders without the per-block render-frequency regression.
-	var flushBar *pterm.ProgressbarPrinter
-	var flushUpdate func(current uint64)
-	progress := func(current, total uint64) {
-		if flushBar == nil {
-			flushBar, flushUpdate = utils.NewByteProgressBar("Flushing image to storage", total)
-		}
-		flushUpdate(current)
-	}
-
-	err = v_utils.ImportDiskImage(&s3Config, &vbConfig, extractedImagePath, progress)
-
-	if flushBar != nil {
-		_, _ = flushBar.Stop()
-	}
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Could not import image to predastore: %v\n", err)
-		os.Exit(1)
-	}
-
 	defer os.RemoveAll(tmpDir)
+
+	appConfig, nc, err := loadConfigAndConnect()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Could not connect to the cluster: %v\n", err)
+		os.Exit(1)
+	}
+	defer nc.Close()
+	node := appConfig.Nodes[appConfig.Node]
+
+	fmt.Println("Writing image to storage ...")
+	provider := ebsprovider.NewNATSProvider(nc, imageImportTimeout)
+	err = admin.ImportImage(context.Background(), provider, admin.ImportOpts{
+		VolumeID:         volumeId,
+		NodeID:           appConfig.Node,
+		SizeBytes:        utils.SafeUint64ToInt64(ami.VolumeSizeGiB * bytesPerGiB),
+		AvailabilityZone: node.AZ,
+		SourcePath:       extractedImagePath,
+		Snapshot:         true,
+		Progress:         os.Stdout,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Could not import image: %v\n", err)
+		os.Exit(1)
+	}
+
+	// admin.ImportImage only wrote the provider's half of the snapshot (its
+	// blocks); this writes the EC2 control plane's, without which
+	// DescribeSnapshots and GetAMISourceVolumeID cannot resolve the import.
+	metaStore := objectstore.NewS3ObjectStoreFromConfig(node.Predastore.Host, node.Predastore.Region, node.Predastore.AccessKey, node.Predastore.SecretKey)
+	if err := registerImportedAMISnapshot(metaStore, node.Predastore.Bucket, ami, node.AZ, node.Viperblock.EncryptionKeyFile != ""); err != nil {
+		fmt.Fprintf(os.Stderr, "Imported %s but could not register its snapshot: %v\n", volumeId, err)
+		os.Exit(1)
+	}
+
+	// The document is what DescribeImages enumerates, so it is written last:
+	// until it exists the AMI is not launchable, and an import that failed
+	// partway leaves no half-registered image behind.
+	ami.State = "available"
+	if err := ebsmetadata.NewStore(metaStore, node.Predastore.Bucket).PutAMI(context.Background(), ami); err != nil {
+		fmt.Fprintf(os.Stderr, "Imported %s but could not register it: %v\n", volumeId, err)
+		os.Exit(1)
+	}
 
 	fmt.Printf("✅ Image import complete. Image-ID (AMI): %s\n", volumeId)
 }
 
-// caBakeRunCommand installs the uploaded CA into the guest trust store across
-// the distro families, then removes the staged copy. Each branch is gated on its
-// updater existing so only the matching distro's branch writes anything (install
-// -D creates the anchor dir on minimal images). Debian/Ubuntu use
-// update-ca-certificates, RHEL/Rocky use update-ca-trust, and stock Alpine ships
-// only ca-certificates-bundle (no updater, no anchor dir) so it falls back to
-// appending the PEM to the static bundle. The install chain's exit code is
-// preserved past the cleanup rm so a failure surfaces instead of a false success.
-// The RHEL branch restorecon's only the trust-store paths it touched so the cert
-// is correctly labelled without the image-wide --no-selinux-relabel (below)
-// leaving an unlabelled bundle; restorecon is best-effort and never fails the bake.
-const caBakeRunCommand = `( { command -v update-ca-certificates >/dev/null && install -D -m644 /tmp/spinifex-ca.pem /usr/local/share/ca-certificates/spinifex.crt && update-ca-certificates; } || ` +
-	`{ command -v update-ca-trust >/dev/null && install -D -m644 /tmp/spinifex-ca.pem /etc/pki/ca-trust/source/anchors/spinifex.crt && update-ca-trust && ` +
-	`{ command -v restorecon >/dev/null 2>&1 && restorecon -RF /etc/pki/ca-trust/source/anchors/spinifex.crt /etc/pki/ca-trust/extracted >/dev/null 2>&1; true; }; } || ` +
-	`{ cat /tmp/spinifex-ca.pem >> /etc/ssl/certs/ca-certificates.crt; } ); ` +
-	`rc=$?; rm -f /tmp/spinifex-ca.pem; exit $rc`
-
-// caBakeTimeout bounds the virt-customize run so a stalled libguestfs appliance
-// cannot hang the import indefinitely; on timeout the bake degrades to a skip.
-const caBakeTimeout = 5 * time.Minute
-
-// caBakeCmd builds the virt-customize invocation that uploads the deployment CA
-// into the disk image at imagePath and installs it into the guest trust store.
-// --no-selinux-relabel stops virt-customize flagging the image for a first-boot
-// SELinux autorelabel: that relabel+reboot corrupts XFS roots (RHEL/Rocky) on the
-// reboot, so the run-command relabels only the touched trust paths instead.
-func caBakeCmd(ctx context.Context, imagePath, caCertPath string) *exec.Cmd {
-	return exec.CommandContext(ctx, "virt-customize", "-a", imagePath,
-		"--no-selinux-relabel",
-		"--upload", caCertPath+":/tmp/spinifex-ca.pem",
-		"--run-command", caBakeRunCommand)
+// registerImportedAMISnapshot writes the EC2 control plane's snapshot document
+// for a catalog-imported AMI. The provider-backed import path only writes the
+// storage backend's blocks under ami.SnapshotID, so without this a launch or
+// DescribeSnapshots call cannot resolve it. The volume ID matches ami.ImageID:
+// admin.ImportImage creates the volume under the AMI's own ID.
+func registerImportedAMISnapshot(store objectstore.ObjectStore, bucket string, ami ebsmetadata.AMI, az string, encrypted bool) error {
+	cfg := &handlers_ec2_snapshot.SnapshotConfig{
+		SnapshotID:       ami.SnapshotID,
+		VolumeID:         ami.ImageID,
+		VolumeSize:       utils.SafeUint64ToInt64(ami.VolumeSizeGiB),
+		State:            "completed",
+		Progress:         "100%",
+		StartTime:        time.Now(),
+		Description:      fmt.Sprintf("Imported AMI volume for %s", ami.Name),
+		Encrypted:        encrypted,
+		OwnerID:          utils.GlobalAccountID,
+		AvailabilityZone: az,
+	}
+	if err := handlers_ec2_snapshot.WriteSnapshotConfig(store, bucket, ami.SnapshotID, cfg); err != nil {
+		return fmt.Errorf("register snapshot metadata: %w", err)
+	}
+	return nil
 }
 
-// caBakeRunner resolves virt-customize and runs the CA bake; overridable in tests.
-var caBakeRunner = func(imagePath, caCertPath string) ([]byte, error) {
-	if _, err := exec.LookPath("virt-customize"); err != nil {
-		return nil, fmt.Errorf("virt-customize not found: %w", err)
+func runVolumesOrphansCmd(_ *cobra.Command, _ []string) {
+	appConfig, nc, err := loadConfigAndConnect()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Could not connect to the cluster: %v\n", err)
+		os.Exit(1)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), caBakeTimeout)
-	defer cancel()
-	return caBakeCmd(ctx, imagePath, caCertPath).CombinedOutput()
-}
+	defer nc.Close()
 
-// bakeCACertIntoImage uploads the deployment CA into the image's trust store via
-// virt-customize so an imported stock image trusts the gateway from first boot.
-// Best-effort: a missing CA, an absent virt-customize, or an image libguestfs
-// cannot inspect logs and continues — image import never fails on the CA.
-func bakeCACertIntoImage(imagePath, caCertPath string) {
-	if _, err := os.Stat(caCertPath); err != nil {
-		slog.Warn("CA bake skipped: deployment CA not found; imported image will not auto-trust the gateway", "ca", caCertPath, "err", err)
+	node := appConfig.Nodes[appConfig.Node]
+	store := objectstore.NewS3ObjectStoreFromConfig(
+		node.Predastore.Host,
+		node.Predastore.Region,
+		node.Predastore.AccessKey,
+		node.Predastore.SecretKey,
+	)
+
+	orphans, err := admin.FindOrphanVolumes(
+		context.Background(),
+		ebsprovider.NewNATSProvider(nc, imageImportTimeout),
+		ebsmetadata.NewStore(store, node.Predastore.Bucket),
+	)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Orphan scan failed:", err)
+		os.Exit(1)
+	}
+	if len(orphans) == 0 {
+		fmt.Println("No orphaned volumes: every volume the provider holds has a control-plane record.")
 		return
 	}
-	if out, err := caBakeRunner(imagePath, caCertPath); err != nil {
-		slog.Warn("CA bake skipped: virt-customize could not customize image; imported image will not auto-trust the gateway", "err", err, "output", string(out))
-		return
+
+	fmt.Printf("%d orphaned volume(s) — held by the provider, unknown to the control plane:\n\n", len(orphans))
+	for _, orphan := range orphans {
+		fmt.Printf("  %s\n", orphan.VolumeID)
+		fmt.Printf("    handle:  %s\n", orphan.Handle)
+		if orphan.Derived {
+			fmt.Println("    note:    derived volume; its base volume is also unknown")
+		}
 	}
+	fmt.Println()
+	fmt.Println("Nothing was deleted. Each of these holds data that cannot be reached")
+	fmt.Println("through the EC2 API; removing one is a per-volume operator decision.")
 }
 
 func runimagesRemoveCmd(cmd *cobra.Command, args []string) {
@@ -1342,18 +1332,32 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 	if masterKeyExisted {
 		// Preserve path: reuse the existing identity. The system credentials must
 		// match what seeded the NATS KV `system` secret, so load them rather than
-		// mint new ones. The admin credentials are not recovered: bootstrap.json is
-		// consumed and deleted by awsgw after first boot, and the operator's copy
-		// already lives in ~/.aws/credentials. Leaving them empty makes
-		// finalizeNodeSetup refresh only ~/.aws/config (endpoint/CA for a changed
-		// bind IP), not the credentials.
+		// mint new ones.
 		accessKey, secretKey, err = loadSystemCredentials(configDir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading preserved system credentials: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("\n🔐 Preserved existing identity (master key, credentials and CA unchanged)")
+
+		// The admin pair is minted afresh rather than preserved, because it cannot
+		// be read back: bootstrap.json is consumed and deleted by awsgw on first
+		// start. The half of the identity that survives a re-init is on local disk,
+		// but the IAM store lives in NATS and predastore — so forming a cluster out
+		// of already-initialized nodes rebuilds it and the old access key stops
+		// existing. Carrying an empty pair through instead is worse than useless:
+		// it reaches every joiner's bootstrap.json, where seeding rejects the empty
+		// key ID and awsgw fails to start on every restart, forever.
+		bootstrapResult, err := writeBootstrapFiles(configDir, bootstrapDir, masterKey, accessKey, secretKey, accountID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing bootstrap files: %v\n", err)
+			os.Exit(1)
+		}
+		adminAccessKey = bootstrapResult.AdminAccessKey
+		adminSecretKey = bootstrapResult.AdminSecretKey
+
+		fmt.Println("\n🔐 Preserved existing identity (master key and CA unchanged)")
 		fmt.Printf("   Master key: %s\n", filepath.Join(configDir, "master.key"))
+		fmt.Printf("   Admin credentials reissued in %s\n", filepath.Join(bootstrapDir, "bootstrap.json"))
 	} else {
 		// Fresh install: mint system + admin credentials and seed the bootstrap files.
 		accessKey, err = admin.GenerateAWSAccessKey()
@@ -1808,6 +1812,10 @@ func runAdminInitMultiNode(cmd *cobra.Command, accessKey, secretKey, accountID, 
 		os.Exit(1)
 	}
 
+	// The host firewall scopes this port to known peers, and a node joining is
+	// not one yet. Closed again on every exit below.
+	closeFormationPort := openFormationPort(port)
+
 	fmt.Printf("\n📡 Formation server started on %s\n", formationAddr)
 	fmt.Printf("   Waiting for %d more node(s) to join...\n", expectedNodes-1)
 	fmt.Printf("   Token expires in %s\n\n", tokenTTL)
@@ -1818,6 +1826,7 @@ func runAdminInitMultiNode(cmd *cobra.Command, accessKey, secretKey, accountID, 
 	if err := fs.WaitForCompletion(formationTimeout); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 		fs.Shutdown(context.Background())
+		closeFormationPort()
 		os.Remove(tokenPath)
 		os.Exit(1)
 	}
@@ -1936,6 +1945,7 @@ func runAdminInitMultiNode(cmd *cobra.Command, accessKey, secretKey, accountID, 
 
 	// Shutdown formation server
 	fs.Shutdown(context.Background())
+	closeFormationPort()
 	if err := os.Remove(tokenPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		slog.Warn("Failed to remove join token file", "path", tokenPath, "error", err)
 	}
@@ -2589,12 +2599,23 @@ func initIAMServiceFromConfig() (*handlers_iam.IAMServiceImpl, *config.ClusterCo
 	return svc, cfg, nc, func() { nc.Close() }, nil
 }
 
-// adminAccessPolicyDocument is the AdministratorAccess policy document that
-// grants full access to all actions and resources.
-const adminAccessPolicyDocument = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`
+// openAccountNameIndex opens the account-name reservation index over an
+// existing NATS connection.
+func openAccountNameIndex(ctx context.Context, nc *nats.Conn) (*handlers_iam.AccountNameIndex, error) {
+	js, err := jetstream.New(nc)
+	if err != nil {
+		return nil, fmt.Errorf("get JetStream context: %w", err)
+	}
+	return handlers_iam.NewAccountNameIndex(ctx, js)
+}
 
 func runAccountCreate(cmd *cobra.Command, args []string) {
 	name, _ := cmd.Flags().GetString("name")
+
+	if remote, _ := cmd.Flags().GetBool("remote"); remote {
+		runAccountCreateRemote(cmd, name)
+		return
+	}
 
 	svc, cfg, nc, cleanup, err := initIAMServiceFromConfig()
 	if err != nil {
@@ -2603,60 +2624,73 @@ func runAccountCreate(cmd *cobra.Command, args []string) {
 	}
 	defer cleanup()
 
-	// 1. Create the account
-	account, err := svc.CreateAccount(name)
+	ctx := context.Background()
+
+	// Reject a duplicate before allocating an account ID. CreateAccount does not
+	// check names, so without this two runs of the same command silently produce
+	// two accounts that differ only by ID.
+	existing, err := handlers_iam.FindAccountByName(svc, name)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error checking existing accounts: %v\n", err)
+		os.Exit(1)
+	}
+	if existing != nil {
+		fmt.Fprintf(os.Stderr, "Error: account %q already exists (account ID %s)\n",
+			existing.AccountName, existing.AccountID)
+		os.Exit(1)
+	}
+
+	// Reserve the name so a concurrent create — including one through
+	// /admin/CreateAccount — cannot take it between the check above and the
+	// create below. The CLI has no client token, so it owns the reservation by
+	// a per-invocation identifier.
+	names, err := openAccountNameIndex(ctx, nc)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	reservationOwner := "spx-cli-" + uuid.NewString()
+	switch err := names.Reserve(ctx, name, reservationOwner); {
+	case errors.Is(err, handlers_iam.ErrNameTaken):
+		fmt.Fprintf(os.Stderr, "Error: account %q already exists\n", name)
+		os.Exit(1)
+	case errors.Is(err, handlers_iam.ErrNameInFlight):
+		fmt.Fprintf(os.Stderr, "Error: another account creation for %q is in progress\n", name)
+		os.Exit(1)
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "Error reserving account name: %v\n", err)
+		os.Exit(1)
+	}
+
+	account, err := svc.CreateAccount(handlers_iam.NormalizeAccountName(name))
+	if err != nil {
+		if relErr := names.Release(ctx, name, reservationOwner); relErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not release name reservation: %v\n", relErr)
+		}
 		fmt.Fprintf(os.Stderr, "Error creating account: %v\n", err)
 		os.Exit(1)
 	}
 	accountID := account.AccountID
 
+	if err := names.Commit(ctx, name, accountID, reservationOwner); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not index account name: %v\n", err)
+	}
+
 	// Create default VPC for the new account (belt-and-suspenders: daemon also
 	// does this via iam.account.created event, but daemon may not be running).
 	nodeConfig := cfg.Nodes[cfg.Node]
-	vpcSvc, vpcErr := handlers_ec2_vpc.NewVPCServiceImplWithNATS(context.Background(), &nodeConfig, nc)
+	vpcSvc, vpcErr := handlers_ec2_vpc.NewVPCServiceImplWithNATS(ctx, &nodeConfig, nc)
 	if vpcErr != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not create default VPC service: %v\n", vpcErr)
 	} else if _, vpcErr = vpcSvc.EnsureDefaultVPC(accountID); vpcErr != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not create default VPC: %v\n", vpcErr)
 	}
 
-	// 2. Create admin user
-	_, err = svc.CreateUser(accountID, &iam.CreateUserInput{
-		UserName: aws.String("admin"),
-	})
+	// Shared with /admin/CreateAccount so the CLI and the remote endpoint cannot
+	// drift in what an account is made of.
+	provisioned, err := handlers_iam.ProvisionAccount(svc, accountID, account.AccountName)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating admin user: %v\n", err)
-		os.Exit(1)
-	}
-
-	// 3. Create access key for admin user
-	akOut, err := svc.CreateAccessKey(accountID, &iam.CreateAccessKeyInput{
-		UserName: aws.String("admin"),
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating access key: %v\n", err)
-		os.Exit(1)
-	}
-
-	// 4. Create AdministratorAccess policy scoped to this account
-	policyARN := fmt.Sprintf("arn:aws:iam::%s:policy/AdministratorAccess", accountID)
-	_, err = svc.CreatePolicy(accountID, &iam.CreatePolicyInput{
-		PolicyName:     aws.String("AdministratorAccess"),
-		PolicyDocument: aws.String(adminAccessPolicyDocument),
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating admin policy: %v\n", err)
-		os.Exit(1)
-	}
-
-	// 5. Attach policy to admin user
-	_, err = svc.AttachUserPolicy(accountID, &iam.AttachUserPolicyInput{
-		UserName:  aws.String("admin"),
-		PolicyArn: aws.String(policyARN),
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error attaching policy: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error provisioning account: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -2678,8 +2712,8 @@ func runAccountCreate(cmd *cobra.Command, args []string) {
 	configPath := filepath.Join(homeDir, ".aws", "config")
 
 	if err := admin.UpdateAWSINIFile(credPath, profileName, map[string]string{
-		"aws_access_key_id":     *akOut.AccessKey.AccessKeyId,
-		"aws_secret_access_key": *akOut.AccessKey.SecretAccessKey,
+		"aws_access_key_id":     provisioned.AccessKeyID,
+		"aws_secret_access_key": provisioned.SecretAccessKey,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not update AWS credentials: %v\n", err)
 	}
@@ -2699,16 +2733,24 @@ func runAccountCreate(cmd *cobra.Command, args []string) {
 	// Print credentials
 	fmt.Println("\nAccount created successfully!")
 	fmt.Printf("  Account ID:        %s\n", accountID)
-	fmt.Printf("  Account Name:      %s\n", name)
-	fmt.Printf("  Admin User:        admin\n")
-	fmt.Printf("  Access Key ID:     %s\n", *akOut.AccessKey.AccessKeyId)
-	fmt.Printf("  Secret Access Key: %s\n", *akOut.AccessKey.SecretAccessKey)
+	fmt.Printf("  Account Name:      %s\n", provisioned.AccountName)
+	fmt.Printf("  Admin User:        %s\n", provisioned.AdminUser)
+	fmt.Printf("  Access Key ID:     %s\n", provisioned.AccessKeyID)
+	fmt.Printf("  Secret Access Key: %s\n", provisioned.SecretAccessKey)
 	fmt.Printf("  AWS Profile:       %s\n", profileName)
 	fmt.Println("\nUse with:")
 	fmt.Printf("  AWS_PROFILE=%s aws ec2 describe-instances\n", profileName)
 }
 
 func runAccountList(cmd *cobra.Command, args []string) {
+	if remote, _ := cmd.Flags().GetBool("remote"); remote {
+		if err := runAccountListRemote(cmd); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	svc, _, _, cleanup, err := initIAMServiceFromConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -2722,20 +2764,7 @@ func runAccountList(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	if len(accounts) == 0 {
-		fmt.Println("No accounts found.")
-		return
-	}
-
-	fmt.Printf("%-14s %-20s %-10s %s\n", "ACCOUNT ID", "NAME", "STATUS", "CREATED")
-	fmt.Printf("%-14s %-20s %-10s %s\n", "----------", "----", "------", "-------")
-	for _, a := range accounts {
-		created := a.CreatedAt
-		if t, err := time.Parse(time.RFC3339, a.CreatedAt); err == nil {
-			created = t.Format("2006-01-02 15:04")
-		}
-		fmt.Printf("%-14s %-20s %-10s %s\n", a.AccountID, a.AccountName, a.Status, created)
-	}
+	printAccountTable(accountSummaries(accounts))
 }
 
 func runCertRenew(cmd *cobra.Command, _ []string) {

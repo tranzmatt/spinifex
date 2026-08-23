@@ -99,6 +99,7 @@ export function CreateClusterPage() {
 
   const selectedVpc = useWatch({ control, name: "vpcId" })
   const selectedSubnets = useWatch({ control, name: "subnetIds" })
+  const selectedSubnetSet = new Set(selectedSubnets)
   const publicAccess = useWatch({ control, name: "endpointPublicAccess" })
   const publicCidrs = useWatch({ control, name: "publicAccessCidrs" })
 
@@ -310,7 +311,7 @@ export function CreateClusterPage() {
                 >
                   <input
                     aria-label={`Subnet ${subnetLabel(subnet)}`}
-                    checked={selectedSubnets.includes(subnet.SubnetId ?? "")}
+                    checked={selectedSubnetSet.has(subnet.SubnetId ?? "")}
                     onChange={() => toggleSubnet(subnet.SubnetId ?? "")}
                     type="checkbox"
                   />
@@ -368,7 +369,6 @@ export function CreateClusterPage() {
                 <span className="font-mono">0.0.0.0/0</span>.
               </p>
               {publicCidrs.map((cidr, index) => (
-                // eslint-disable-next-line react/no-array-index-key
                 <div className="flex items-center gap-2" key={index}>
                   <Input
                     aria-label={`Public access CIDR ${index + 1}`}

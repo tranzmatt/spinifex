@@ -3,6 +3,7 @@ package awsgw
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mulgadc/predastore/pkg/ratelimit"
+	"github.com/mulgadc/bluebottle/pkg/ratelimit"
 	"github.com/mulgadc/spinifex/internal/tlsconfig"
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/config"
@@ -24,6 +25,7 @@ import (
 	handlers_bedrock "github.com/mulgadc/spinifex/spinifex/handlers/bedrock"
 	"github.com/mulgadc/spinifex/spinifex/handlers/ecr"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
+	handlers_ochrevector "github.com/mulgadc/spinifex/spinifex/handlers/ochrevector"
 	handlers_quota "github.com/mulgadc/spinifex/spinifex/handlers/quota"
 	handlers_sts "github.com/mulgadc/spinifex/spinifex/handlers/sts"
 	"github.com/mulgadc/spinifex/spinifex/network/reconcile"
@@ -99,6 +101,28 @@ func (svc *Service) Reload() (err error) {
 type awsgwTOML struct {
 	Ratelimit ratelimit.Config      `toml:"ratelimit"`
 	Quota     handlers_quota.Limits `toml:"quota"`
+	Signup    signupConfig          `toml:"signup"`
+}
+
+// signupConfig is the [signup] section governing /admin/CreateAccount.
+// MaxAccounts is a pointer so an absent key can take the default while an
+// explicit 0 still means uncapped.
+type signupConfig struct {
+	MaxAccounts *int `toml:"max_accounts"`
+}
+
+// defaultSignupMaxAccounts caps self-service account creation when [signup] is
+// absent. A cluster that never opted in is unreachable anyway — the endpoint
+// needs a principal — so the default costs nothing and bounds the damage a
+// leaked signup key can do.
+const defaultSignupMaxAccounts = 128
+
+// resolveSignupMaxAccounts applies the default to an absent key.
+func resolveSignupMaxAccounts(cfg signupConfig) int {
+	if cfg.MaxAccounts == nil {
+		return defaultSignupMaxAccounts
+	}
+	return *cfg.MaxAccounts
 }
 
 // loadAWSGWConfig reads and parses awsgw.toml once, returning the [ratelimit] and
@@ -150,6 +174,16 @@ func launchService(config *config.ClusterConfig) error {
 		return err
 	}
 	defer natsConn.Close()
+
+	// The same cluster CA verifies predastore meta nodes GetStorageStatus
+	// dials directly, across every host in the cluster.
+	var rootCAs *x509.CertPool
+	if nodeConfig.NATS.CACert != "" {
+		rootCAs, err = utils.LoadCertPool(nodeConfig.NATS.CACert)
+		if err != nil {
+			return fmt.Errorf("load cluster CA: %w", err)
+		}
+	}
 
 	// Append Base dir if config has no leading path
 	if nodeConfig.BaseDir != "" && !strings.HasPrefix(nodeConfig.AWSGW.Config, "/") {
@@ -241,6 +275,7 @@ func launchService(config *config.ClusterConfig) error {
 	}
 	throttleCfg := awsgwCfg.Ratelimit
 	quotaCfg := awsgwCfg.Quota
+	signupMaxAccounts := resolveSignupMaxAccounts(awsgwCfg.Signup)
 
 	// OCI Distribution v2 registry: blob/manifest bytes stream straight to
 	// predastore from the gateway; repo/tag/manifest metadata and in-progress
@@ -355,6 +390,15 @@ func launchService(config *config.ClusterConfig) error {
 	// inference enforcement can read it back, but nothing enforces it yet.
 	bedrockGuardrails := gateway_bedrock.NewGuardrailStore(js, len(config.Nodes), nodeConfig.Region)
 
+	// bedrock-agent knowledge-base + data-source resource metadata: gateway-
+	// owned (D-arch), opened directly against JetStream the same way the
+	// bedrock stores above are, rather than a second NATS hop through the
+	// daemon. bedrockAgentVector forwards CreateIndex/Ingest/DescribeJob/
+	// ListJobs/etc to .9's daemon-side VectorService over NATS.
+	bedrockAgentKB := handlers_ochrevector.NewKBStore(js)
+	bedrockAgentDataSources := handlers_ochrevector.NewDataSourceStore(js)
+	bedrockAgentVector := handlers_ochrevector.NewNATSVectorService(natsConn)
+
 	// Bedrock invocation records: every Converse/InvokeModel call (streaming
 	// or not) is published to the invocation stream, then fanned out by
 	// deliveryConsumer to any account with a configured destination bucket
@@ -388,6 +432,7 @@ func launchService(config *config.ClusterConfig) error {
 		Debug:                   nodeConfig.AWSGW.Debug,
 		DisableLogging:          false,
 		NATSConn:                natsConn,
+		RootCAs:                 rootCAs,
 		Config:                  nodeConfig.AWSGW.Config,
 		ExpectedNodes:           len(config.Nodes),
 		Region:                  nodeConfig.Region,
@@ -396,6 +441,7 @@ func launchService(config *config.ClusterConfig) error {
 		RegistryHost:            registryHost,
 		AZ:                      nodeConfig.AZ,
 		IAMService:              iamService,
+		BucketStore:             objStore,
 		STSService:              stsService,
 		Version:                 version,
 		Commit:                  commit,
@@ -411,6 +457,10 @@ func launchService(config *config.ClusterConfig) error {
 		BedrockAccessAdmin:      bedrockAccess,
 		BedrockProvisioned:      bedrockProvisioned,
 		BedrockGuardrails:       bedrockGuardrails,
+		SignupMaxAccounts:       signupMaxAccounts,
+		BedrockAgentKB:          bedrockAgentKB,
+		BedrockAgentDataSources: bedrockAgentDataSources,
+		BedrockAgentVector:      bedrockAgentVector,
 	}
 
 	// Rotate the ECR signing key on a 30-day cadence, retaining the previous keys
@@ -469,6 +519,9 @@ func launchService(config *config.ClusterConfig) error {
 		return fmt.Errorf("load TLS cert: %w", err)
 	}
 
+	// WriteTimeout is deliberately absent: it is a total deadline rather than an
+	// idle one, so any value below the RDS command channel's 20s long poll kills
+	// every poll mid-flight and strands agents on a channel no command reaches.
 	server := &http.Server{
 		Addr:              nodeConfig.AWSGW.Host,
 		Handler:           handler,

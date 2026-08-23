@@ -33,17 +33,17 @@ export default defineConfig({
         allowArrowFunctions: true,
       },
     ],
-    "eslint/no-await-in-loop": "off",
     "eslint/no-console": "error",
     "eslint/no-plusplus": ["error", { allowForLoopAfterthoughts: true }],
     "eslint/no-use-before-define": "off",
-    "eslint/no-void": "off",
-    "eslint/prefer-destructuring": "off",
     "eslint/require-unicode-regexp": "off",
     "eslint/sort-keys": "off",
     "import/consistent-type-specifier-style": "off",
     "jsx-a11y/prefer-tag-over-role": "off",
-    "react/function-component-definition": "off",
+    "react/function-component-definition": [
+      "error",
+      { namedComponents: "function-declaration" },
+    ],
     "react/jsx-handler-names": "off",
     "react-you-might-not-need-an-effect/no-adjust-state-on-prop-change":
       "error",
@@ -82,6 +82,10 @@ export default defineConfig({
         ],
       },
     ],
+    "typescript/prefer-nullish-coalescing": [
+      "error",
+      { ignorePrimitives: { string: true }, ignoreBooleanCoercion: true },
+    ],
     "typescript/strict-boolean-expressions": "off",
     "typescript/strict-void-return": "off",
     "unicorn/filename-case": [
@@ -98,6 +102,7 @@ export default defineConfig({
       ],
       plugins: ["vitest"],
       rules: {
+        "eslint/prefer-destructuring": "off",
         "eslint/require-await": "off",
         "import/first": "off",
         "typescript/consistent-type-imports": "off",

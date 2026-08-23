@@ -21,7 +21,6 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/qmp"
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
-	"github.com/mulgadc/viperblock/viperblock"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -153,7 +152,7 @@ func (m *Manager) launch(ctx context.Context, instance *VM) (err error) {
 	}
 
 	_, mountSpan := otel.Tracer(vmTracerName).Start(ctx, "vm.launch.mount_volumes")
-	mountErr := m.deps.VolumeMounter.Mount(instance)
+	mountErr := m.deps.VolumeMounter.Mount(ctx, instance)
 	endSpanWithError(mountSpan, mountErr)
 	if mountErr != nil {
 		slog.ErrorContext(ctx, "Failed to mount volumes", "err", mountErr)
@@ -170,7 +169,7 @@ func (m *Manager) launch(ctx context.Context, instance *VM) (err error) {
 	// fails, unmounting seals the untouched backend and keeps the launch from
 	// exposing a writer that snapshots would classify as available.
 	if stateErr := m.markAttachedVolumesInUse(instance); stateErr != nil {
-		if unmountErr := m.deps.VolumeMounter.Unmount(instance); unmountErr != nil {
+		if unmountErr := m.deps.VolumeMounter.Unmount(ctx, instance); unmountErr != nil {
 			return errors.Join(
 				fmt.Errorf("persist attached volume state: %w", stateErr),
 				fmt.Errorf("rollback mounted volumes: %w", unmountErr),
@@ -323,7 +322,10 @@ func (m *Manager) startQEMU(instance *VM) error {
 				slog.Error("Failed to ensure IMDS bridge (direct-boot)", "eni", instance.ENIId, "err", err)
 				return fmt.Errorf("ensure IMDS bridge: %w", err)
 			}
-			tapSpec := IMDSPrimaryTapSpec(instance.ENIId)
+			// Single-queue: the pre-built Config's netdevs come from the
+			// launcher, and a tap with more queues than its netdev asks for
+			// would leave the extra queues unopened.
+			tapSpec := IMDSPrimaryTapSpec(instance.ENIId, 1, m.deps.GuestMTU)
 			if err := m.deps.NetworkPlumber.SetupTap(tapSpec); err != nil {
 				slog.Error("Failed to set up tap device (direct-boot)", "eni", instance.ENIId, "err", err)
 				return fmt.Errorf("setup tap device: %w", err)
@@ -333,7 +335,7 @@ func (m *Manager) startQEMU(instance *VM) error {
 				return err
 			}
 			for _, extra := range instance.ExtraENIs {
-				extraSpec := VPCTapSpec(extra.ENIID, extra.ENIMac)
+				extraSpec := VPCTapSpec(extra.ENIID, extra.ENIMac, 1, m.deps.GuestMTU)
 				if err := m.deps.NetworkPlumber.SetupTap(extraSpec); err != nil {
 					slog.Error("Failed to set up extra ENI tap (direct-boot)", "eni", extra.ENIID, "err", err)
 					return fmt.Errorf("setup tap device for extra ENI %s: %w", extra.ENIID, err)
@@ -357,18 +359,17 @@ func (m *Manager) startQEMU(instance *VM) error {
 				slog.Error("Failed to ensure IMDS bridge", "eni", instance.ENIId, "err", err)
 				return fmt.Errorf("ensure IMDS bridge: %w", err)
 			}
-			spec := IMDSPrimaryTapSpec(instance.ENIId)
+			queues := NICQueues(instance.Config.CPUCount, m.deps.MultiqueueNICs)
+			spec := IMDSPrimaryTapSpec(instance.ENIId, queues, m.deps.GuestMTU)
 			if err := m.deps.NetworkPlumber.SetupTap(spec); err != nil {
 				slog.Error("Failed to set up tap device", "eni", instance.ENIId, "err", err)
 				return fmt.Errorf("setup tap device: %w", err)
 			}
 			tapName := spec.Name
 
-			instance.Config.NetDevs = append(instance.Config.NetDevs, NetDev{
-				Value: fmt.Sprintf("tap,id=net0,ifname=%s,script=no,downscript=no", tapName),
-			})
-			instance.Config.Devices = append(instance.Config.Devices, NetDevice(instance.Config.MachineType, "net0", instance.ENIMac))
-			slog.Info("VPC networking configured", "tap", tapName, "bridge", spec.Bridge, "eni", instance.ENIId, "mac", instance.ENIMac)
+			instance.Config.NetDevs = append(instance.Config.NetDevs, TapNetDev("net0", tapName, queues))
+			instance.Config.Devices = append(instance.Config.Devices, NetDevice(instance.Config.MachineType, "net0", instance.ENIMac, queues, m.deps.GuestMTU))
+			slog.Info("VPC networking configured", "tap", tapName, "bridge", spec.Bridge, "eni", instance.ENIId, "mac", instance.ENIMac, "queues", queues)
 			if err := m.attachPrimaryIMDSDatapath(instance); err != nil {
 				return err
 			}
@@ -381,7 +382,7 @@ func (m *Manager) startQEMU(instance *VM) error {
 				m.appendDevHostfwdNIC(instance)
 			}
 		} else {
-			sshDebugAddr, err := viperblock.FindFreePort()
+			sshDebugAddr, err := findFreePort()
 			if err != nil {
 				slog.Error("Failed to find free port", "err", err)
 				return err
@@ -399,7 +400,7 @@ func (m *Manager) startQEMU(instance *VM) error {
 			instance.Config.NetDevs = append(instance.Config.NetDevs, NetDev{
 				Value: fmt.Sprintf("user,id=net0,hostfwd=tcp:%s:%s-:22", bindIP, sshDebugPort),
 			})
-			instance.Config.Devices = append(instance.Config.Devices, NetDevice(instance.Config.MachineType, "net0", ""))
+			instance.Config.Devices = append(instance.Config.Devices, NetDevice(instance.Config.MachineType, "net0", "", 0, m.deps.GuestMTU))
 		}
 
 		if instance.MgmtMAC != "" {
@@ -415,10 +416,10 @@ func (m *Manager) startQEMU(instance *VM) error {
 					return fmt.Errorf("setup mgmt tap: %w", err)
 				}
 			}
-			instance.Config.NetDevs = append(instance.Config.NetDevs, NetDev{
-				Value: fmt.Sprintf("tap,id=mgmt0,ifname=%s,script=no,downscript=no", mgmtTap),
-			})
-			instance.Config.Devices = append(instance.Config.Devices, NetDevice(instance.Config.MachineType, "mgmt0", instance.MgmtMAC))
+			// Single-queue: the mgmt NIC carries control-plane traffic only, so
+			// it takes vhost but not the per-queue kernel threads.
+			instance.Config.NetDevs = append(instance.Config.NetDevs, TapNetDev("mgmt0", mgmtTap, 1))
+			instance.Config.Devices = append(instance.Config.Devices, NetDevice(instance.Config.MachineType, "mgmt0", instance.MgmtMAC, 1, 0))
 			if err := m.appendSystemNetcfgFwCfg(instance); err != nil {
 				return fmt.Errorf("attach system netcfg: %w", err)
 			}
@@ -609,9 +610,21 @@ func (m *Manager) startQEMU(instance *VM) error {
 	return nil
 }
 
-// findFreePort is a var so tests can swap in a stub to reach appendDevHostfwdNIC's
-// failure paths (viperblock.FindFreePort always succeeds in production).
-var findFreePort = viperblock.FindFreePort
+// findFreePort is a var so tests can swap in a stub to reach callers' failure
+// paths without depending on the OS allocator.
+var findFreePort = allocateFreePort
+
+// allocateFreePort asks the OS for an available loopback TCP port. The listener
+// is closed before returning, so callers must still handle a subsequent bind
+// race in the usual way.
+func allocateFreePort() (string, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", err
+	}
+	defer listener.Close()
+	return listener.Addr().String(), nil
+}
 
 // appendDevHostfwdNIC adds a user-mode NIC with SSH hostfwd for dev access.
 func (m *Manager) appendDevHostfwdNIC(instance *VM) {
@@ -657,7 +670,7 @@ func (m *Manager) appendDevHostfwdNIC(instance *VM) {
 
 	instance.Config.NetDevs = append(instance.Config.NetDevs, NetDev{Value: nb.String()})
 	devMac := GenerateDevMAC(instance.ID)
-	instance.Config.Devices = append(instance.Config.Devices, NetDevice(instance.Config.MachineType, "dev0", devMac))
+	instance.Config.Devices = append(instance.Config.Devices, NetDevice(instance.Config.MachineType, "dev0", devMac, 0, 0))
 	slog.Info("DEV_NETWORKING: added dev NIC with SSH hostfwd",
 		"bindIP", bindIP, "port", sshDebugPort, "mac", devMac, "instanceId", instance.ID)
 }

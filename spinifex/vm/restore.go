@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -18,6 +19,26 @@ import (
 
 // maxConcurrentRecovery bounds the recovery fan-out; cold-AMI clones are I/O-heavy.
 const maxConcurrentRecovery = 2
+
+// relaunchMaxAttempts bounds the retry loop a recovery relaunch runs against
+// ErrMountRetryable. relaunchBackoffBase/relaunchBackoffCap are package vars
+// (not consts) so tests can shrink them to avoid sleeping real seconds.
+const relaunchMaxAttempts = 5
+
+var (
+	relaunchBackoffBase = 2 * time.Second
+	relaunchBackoffCap  = 30 * time.Second
+)
+
+// errRelaunchAborted signals relaunchWithRetry stopped because the daemon
+// began shutting down, not because attempts were exhausted or the failure
+// was permanent. The caller must not mark the instance terminal.
+var errRelaunchAborted = errors.New("relaunch retry aborted by shutdown")
+
+// runForRelaunch is a test seam over (*Manager).Run, mirroring
+// attachQMPForReconnect below: it lets tests stub a full launch attempt
+// (success or failure) without spinning up a real QEMU process.
+var runForRelaunch = (*Manager).Run
 
 // Restore loads persisted VM state and re-launches instances that are neither
 // terminated nor user-stopped. Terminated/stopped instances migrate to shared KV;
@@ -149,14 +170,26 @@ func (m *Manager) classifyRestoredInstances() []*VM {
 		}
 
 		if isInstanceProcessRunning(instance) {
-			if !AreVolumeSocketsValid(instance) {
+			socketsValid := AreVolumeSocketsValid(instance)
+			if !socketsValid && m.backingStoreReady() {
+				// Sockets are genuinely stale under a healthy store: a real
+				// orphan, so reap it and relaunch below.
 				slog.Warn("QEMU alive but NBD sockets are stale, killing orphaned process for relaunch",
 					"instance", instance.ID)
 				if !killOrphanedQEMU(instance) {
 					continue
 				}
 			} else {
-				slog.Info("Instance QEMU process still alive, reconnecting", "instance", instance.ID)
+				// Sockets valid, or the backing store is not yet ready. The
+				// latter makes an unreachable socket a transient dependency
+				// gap, never grounds to destroy a running VM: keep it and
+				// reconnect QMP, which needs neither predastore nor viperblock.
+				if socketsValid {
+					slog.Info("Instance QEMU process still alive, reconnecting", "instance", instance.ID)
+				} else {
+					slog.Warn("NBD sockets unreachable but backing store not ready; reconnecting instead of killing running QEMU",
+						"instance", instance.ID)
+				}
 				if err := m.reconnectInstance(instance); err != nil {
 					slog.Error("Failed to reconnect to running instance, marking recovery-failed to preserve user data",
 						"instanceId", instance.ID, "err", err)
@@ -301,7 +334,17 @@ func (m *Manager) relaunchAll(toLaunch []*VM) {
 			slog.Info("Launching instance (recovery)",
 				"instance", inst.ID, "managedBy", inst.ManagedBy, "instanceType", inst.InstanceType)
 			// Restore runs at daemon start with no request context.
-			if err := m.Run(context.Background(), inst); err != nil {
+			if err := m.relaunchWithRetry(context.Background(), inst); err != nil {
+				if errors.Is(err, errRelaunchAborted) {
+					slog.Info("Recovery relaunch aborted by shutdown signal", "instanceId", inst.ID)
+					return
+				}
+				if errors.Is(err, ErrMountRetryable) {
+					slog.Error("Recovery relaunch exhausted retries against a not-yet-ready backing store",
+						"instanceId", inst.ID, "managedBy", inst.ManagedBy, "instanceType", inst.InstanceType, "err", err)
+					m.MarkRecoveryFailed(inst, "recovery_mount_state_unavailable")
+					return
+				}
 				slog.Error("Failed to launch instance during recovery",
 					"instanceId", inst.ID, "managedBy", inst.ManagedBy, "instanceType", inst.InstanceType, "err", err)
 				m.MarkRecoveryFailed(inst, "recovery_launch_failed")
@@ -309,6 +352,45 @@ func (m *Manager) relaunchAll(toLaunch []*VM) {
 		}(instance)
 	}
 	wg.Wait()
+}
+
+// relaunchWithRetry calls m.Run, retrying only when the failure is
+// ErrMountRetryable (the backing store is not yet ready). Any other error
+// returns immediately after a single attempt. Bounded by relaunchMaxAttempts
+// with exponential backoff (relaunchBackoffBase, capped at
+// relaunchBackoffCap). Checks the shutdown signal before every attempt and
+// before every sleep so a coordinated shutdown is never delayed by backoff.
+func (m *Manager) relaunchWithRetry(ctx context.Context, inst *VM) error {
+	var err error
+	delay := relaunchBackoffBase
+
+	for attempt := 1; attempt <= relaunchMaxAttempts; attempt++ {
+		if m.deps.ShutdownSignal != nil && m.deps.ShutdownSignal() {
+			return errRelaunchAborted
+		}
+
+		err = runForRelaunch(m, ctx, inst)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, ErrMountRetryable) {
+			return err
+		}
+		if attempt == relaunchMaxAttempts {
+			break
+		}
+
+		slog.Warn("Recovery relaunch mount not ready, retrying",
+			"instanceId", inst.ID, "attempt", attempt, "err", err)
+
+		if m.deps.ShutdownSignal != nil && m.deps.ShutdownSignal() {
+			return errRelaunchAborted
+		}
+		time.Sleep(delay)
+		delay = min(delay*2, relaunchBackoffCap)
+	}
+
+	return err
 }
 
 // attachQMPForReconnect is a test seam over (*Manager).AttachQMP so tests can

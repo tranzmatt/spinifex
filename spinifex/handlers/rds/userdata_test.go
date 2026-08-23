@@ -14,12 +14,14 @@ func testAgentUserDataInput() agentUserDataInput {
 		GatewayCACert:        "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
 		Region:               testRegion,
 		DBInstanceIdentifier: testDBID,
+		Engine:               enginePostgres.Name,
 		EngineVersion:        "18",
 		EnginePort:           5432,
 	}
 }
 
 func TestBuildAgentUserData(t *testing.T) {
+	t.Parallel()
 	out := buildAgentUserData(testAgentUserDataInput())
 
 	require.True(t, strings.HasPrefix(out, "#cloud-config\n"), "cloud-init only parses a document with the header")
@@ -29,6 +31,9 @@ func TestBuildAgentUserData(t *testing.T) {
 	assert.Contains(t, out, "RDS_GATEWAY_CA="+agentGatewayCAPath)
 	assert.Contains(t, out, "RDS_REGION="+testRegion)
 	assert.Contains(t, out, "RDS_DB_INSTANCE_IDENTIFIER="+testDBID)
+	// The agent checks this against the engine its own image bakes and refuses
+	// to bootstrap when the two disagree.
+	assert.Contains(t, out, "RDS_ENGINE=postgres")
 	assert.Contains(t, out, "RDS_ENGINE_VERSION=18")
 	assert.Contains(t, out, "RDS_ENGINE_PORT=5432")
 
@@ -47,6 +52,7 @@ func TestBuildAgentUserData(t *testing.T) {
 // the agent's gateway credentials come from IMDS — so nothing secret is written
 // to a data source any process on the VM can read.
 func TestBuildAgentUserDataCarriesNoCredentials(t *testing.T) {
+	t.Parallel()
 	in := testAgentUserDataInput()
 	out := buildAgentUserData(in)
 
@@ -59,6 +65,7 @@ func TestBuildAgentUserDataCarriesNoCredentials(t *testing.T) {
 // fails the pin in a way that looks like a certificate problem rather than a
 // missing configuration.
 func TestBuildAgentUserDataOmitsAnAbsentCA(t *testing.T) {
+	t.Parallel()
 	in := testAgentUserDataInput()
 	in.GatewayCACert = ""
 

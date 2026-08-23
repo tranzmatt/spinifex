@@ -44,7 +44,32 @@ type NBDKitConfig struct {
 	// plugin's gc_enabled param, gating chunk garbage collection on the VB
 	// this nbdkit process constructs. Default false, matching ShardWAL.
 	GCEnabled bool `json:"gc_enabled"`
+
+	// ReadOnly serves the export read-only via nbdkit -r, which both sets the
+	// NBD read-only transmission flag and passes readonly=true to the plugin's
+	// Open. The plugin refuses writes on that flag.
+	ReadOnly bool `json:"read_only"`
+
+	// Threads is nbdkit's -t, the worker threads served per NBD connection.
+	// It only takes effect because the Go plugin binding declares
+	// thread_model=parallel. QEMU opens one connection per volume, so this
+	// bounds in-flight requests for the whole volume. 0 omits the flag and
+	// leaves nbdkit on its own default.
+	Threads int `json:"threads"`
 }
+
+// Block size constraints advertised to clients through nbdkit's
+// blocksize-policy filter. The plugin itself has no way to advertise them:
+// the nbdkit Go binding has no block-size callback.
+//
+// The minimum is 1 because viperblock's WriteAt handles unaligned requests
+// with a read-modify-write; the preferred size is its 4KB block, which is the
+// size that avoids that cycle. The maximum matches what qemu-nbd advertises.
+const (
+	blockSizeMinimum   = 1
+	blockSizePreferred = 4096
+	blockSizeMaximum   = 32 << 20
+)
 
 // buildArgs constructs the nbdkit command-line arguments from the config.
 func (cfg *NBDKitConfig) buildArgs() ([]string, error) {
@@ -52,6 +77,17 @@ func (cfg *NBDKitConfig) buildArgs() ([]string, error) {
 		"-f", // foreground required for Golang plugin via nbdkit
 		"--pidfile", cfg.PidFile,
 	}
+
+	if cfg.ReadOnly {
+		args = append(args, "-r")
+	}
+
+	// Server option, so it has to precede the plugin path below.
+	if cfg.Threads > 0 {
+		args = append(args, "-t", strconv.Itoa(cfg.Threads))
+	}
+
+	args = append(args, "--filter=blocksize-policy")
 
 	// Add transport-specific arguments
 	if cfg.UseTCP {
@@ -75,6 +111,9 @@ func (cfg *NBDKitConfig) buildArgs() ([]string, error) {
 	// they are passed via cmd.Env in Execute so they never appear in argv,
 	// which is world-readable via /proc/<pid>/cmdline.
 	pluginArgs := []string{
+		fmt.Sprintf("blocksize-minimum=%d", blockSizeMinimum),
+		fmt.Sprintf("blocksize-preferred=%d", blockSizePreferred),
+		fmt.Sprintf("blocksize-maximum=%d", blockSizeMaximum),
 		fmt.Sprintf("size=%d", cfg.Size),
 		fmt.Sprintf("volume=%s", cfg.Volume),
 		fmt.Sprintf("bucket=%s", cfg.Bucket),

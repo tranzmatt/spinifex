@@ -18,6 +18,7 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/formation"
 	"github.com/mulgadc/spinifex/spinifex/gpu"
 	"github.com/mulgadc/spinifex/spinifex/network/host"
+	"github.com/mulgadc/spinifex/spinifex/otelsetup"
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/spinifex/spinifex/vm"
@@ -65,6 +66,20 @@ func respondWithServiceError(msg *nats.Msg, err error) {
 	}
 }
 
+// respondErrorOutcome answers with errCode and reports the outcome that code
+// implies, so a handler classifies its failure by the code it already chose
+// rather than by a second judgement that could disagree with it.
+func respondErrorOutcome(msg *nats.Msg, errCode string) string {
+	respondWithError(msg, errCode)
+	return outcomeForCode(errCode)
+}
+
+// respondServiceErrorOutcome is respondErrorOutcome for an error value.
+func respondServiceErrorOutcome(msg *nats.Msg, err error) string {
+	respondWithServiceError(msg, err)
+	return outcomeForError(err)
+}
+
 // respondWithJSON marshals data to JSON and sends it as a NATS response.
 // On marshal failure it responds with an internal server error.
 func respondWithJSON(msg *nats.Msg, data any) {
@@ -83,8 +98,8 @@ func respondWithJSON(msg *nats.Msg, data any) {
 // marshal → respond pattern. Per message the handler opens a consumer span joining the
 // producer's trace, extracts the account ID from the NATS message header, and passes
 // both to the service function.
-func handleNATSRequest[I any, O any](serviceFn func(context.Context, *I, string) (*O, error)) nats.MsgHandler {
-	return func(msg *nats.Msg) {
+func handleNATSRequest[I any, O any](serviceFn func(context.Context, *I, string) (*O, error)) natsHandler {
+	return func(msg *nats.Msg) string {
 		ctx, span := utils.StartConsumerSpan(msg)
 		defer span.End()
 
@@ -98,19 +113,22 @@ func handleNATSRequest[I any, O any](serviceFn func(context.Context, *I, string)
 			if err := msg.Respond(errResp); err != nil {
 				slog.ErrorContext(ctx, "Failed to respond to NATS request", "err", err)
 			}
-			return
+			// A payload the daemon cannot parse is the caller's mistake, not a
+			// fault of its own.
+			return outcomeClientError
 		}
 		output, err := serviceFn(ctx, input, accountID)
 		if err != nil {
 			// The error was otherwise only recorded on the OTel span, invisible
-			// without a trace backend. Log at Error so handler failures show up
-			// in the journal too.
-			slog.ErrorContext(ctx, "handleNATSRequest: service call failed", "subject", msg.Subject, "err", err)
+			// without a trace backend, so it is logged here too — at a level
+			// that says whether the daemon or its caller was at fault.
+			logHandlerError(ctx, "handleNATSRequest: service call failed", msg.Subject, err)
 			utils.MarkSpanError(span, err)
 			respondWithServiceError(msg, err)
-			return
+			return outcomeForError(err)
 		}
 		respondWithJSON(msg, output)
+		return outcomeSuccess
 	}
 }
 
@@ -118,8 +136,8 @@ func handleNATSRequest[I any, O any](serviceFn func(context.Context, *I, string)
 // also need the caller's IAM principal ARN (X-Principal-ARN header) — e.g. EKS
 // CreateCluster, which mints the bootstrap-creator-admin AccessEntry for the
 // caller.
-func handleNATSRequestWithPrincipal[I any, O any](serviceFn func(context.Context, *I, string, string) (*O, error)) nats.MsgHandler {
-	return func(msg *nats.Msg) {
+func handleNATSRequestWithPrincipal[I any, O any](serviceFn func(context.Context, *I, string, string) (*O, error)) natsHandler {
+	return func(msg *nats.Msg) string {
 		ctx, span := utils.StartConsumerSpan(msg)
 		defer span.End()
 
@@ -131,20 +149,37 @@ func handleNATSRequestWithPrincipal[I any, O any](serviceFn func(context.Context
 			if err := msg.Respond(errResp); err != nil {
 				slog.ErrorContext(ctx, "Failed to respond to NATS request", "err", err)
 			}
-			return
+			return outcomeClientError
 		}
 		output, err := serviceFn(ctx, input, accountID, principalARN)
 		if err != nil {
+			logHandlerError(ctx, "handleNATSRequestWithPrincipal: service call failed", msg.Subject, err)
 			utils.MarkSpanError(span, err)
 			respondWithServiceError(msg, err)
-			return
+			return outcomeForError(err)
 		}
 		respondWithJSON(msg, output)
+		return outcomeSuccess
 	}
 }
 
 // handleEC2Events processes incoming EC2 instance events (start, stop, terminate, attach-volume).
+// It reports its own action and outcome rather than returning them, because one
+// subject carries a dozen different commands and the wrapper cannot name which
+// one ran.
 func (d *Daemon) handleEC2Events(msg *nats.Msg) {
+	start := time.Now()
+	action, outcome := d.dispatchEC2Command(msg)
+	if outcome == outcomeDeferred {
+		return
+	}
+	otelsetup.RecordRequest(context.Background(), ec2CmdAction(action), outcome, time.Since(start))
+}
+
+// dispatchEC2Command runs one per-instance command and returns the command's
+// name and how it answered. A command that reaches no case is named rather than
+// dropped, so an attribute nothing handles is visible in the metric.
+func (d *Daemon) dispatchEC2Command(msg *nats.Msg) (string, string) {
 	ctx, span := utils.StartConsumerSpan(msg)
 	defer span.End()
 
@@ -154,69 +189,78 @@ func (d *Daemon) handleEC2Events(msg *nats.Msg) {
 		slog.ErrorContext(ctx, "Error unmarshaling EC2 instance command", "err", err)
 		utils.MarkSpanError(span, err)
 		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
+		return "unknown", outcomeError
 	}
 
 	slog.DebugContext(ctx, "Received message", "subject", msg.Subject, "data", string(msg.Data))
 
+	name := ec2CommandName(command)
+
 	instance, ok := d.vmMgr.Get(command.ID)
 	if !ok {
 		slog.WarnContext(ctx, "Instance is not running on this node", "id", command.ID)
-		respondWithError(msg, awserrors.ErrorInvalidInstanceIDNotFound)
-		return
+		return name, respondErrorOutcome(msg, awserrors.ErrorInvalidInstanceIDNotFound)
 	}
 
 	// Verify the caller owns this instance
 	if !checkInstanceOwnership(msg, command.ID, instance.AccountID) {
-		return
+		return name, outcomeClientError
 	}
 
 	switch {
 	case command.Attributes.AttachVolume:
-		d.handleAttachVolume(ctx, msg, command, instance)
+		return name, d.handleAttachVolume(ctx, msg, command, instance)
 	case command.Attributes.DetachVolume:
-		d.handleDetachVolume(ctx, msg, command, instance)
+		return name, d.handleDetachVolume(ctx, msg, command, instance)
 	case command.Attributes.DrainVolume:
 		// A drain flushes the volume's whole dirty set to S3, so it is bounded by
 		// the dirty set rather than by a unit of work. nats.go delivers a
 		// subscription's messages serially, so running it inline would stall
 		// every other command for this instance — stop, terminate, hot-plug —
 		// for the duration. It touches no VM state, so it is safe off-thread.
-		go d.handleDrainVolume(ctx, msg, command, instance)
+		//
+		// It therefore records its own point: timing the dispatch would call
+		// every drain an instant success.
+		started := time.Now()
+		go func() {
+			outcome := d.handleDrainVolume(ctx, msg, command, instance)
+			otelsetup.RecordRequest(context.Background(), ec2CmdAction(name), outcome, time.Since(started))
+		}()
+		return name, outcomeDeferred
 	case command.Attributes.AttachENI:
-		d.handleAttachNetworkInterface(ctx, msg, command, instance)
+		return name, d.handleAttachNetworkInterface(ctx, msg, command, instance)
 	case command.Attributes.DetachENI:
-		d.handleDetachNetworkInterface(ctx, msg, command, instance)
+		return name, d.handleDetachNetworkInterface(ctx, msg, command, instance)
 	case command.Attributes.AssociateIamInstanceProfile:
-		d.handleAssociateIamInstanceProfile(ctx, msg, command, instance)
+		return name, d.handleAssociateIamInstanceProfile(ctx, msg, command, instance)
 	case command.Attributes.SetSpotLineage:
-		d.handleSetSpotLineage(ctx, msg, command)
+		return name, d.handleSetSpotLineage(ctx, msg, command)
 	case command.Attributes.SetInstanceTags, command.Attributes.RemoveInstanceTags:
-		d.handleSetInstanceTags(ctx, msg, command, instance)
+		return name, d.handleSetInstanceTags(ctx, msg, command, instance)
 	case command.Attributes.StartInstance:
 		opCtx, opSpan := startOpSpan(ctx, "ec2.StartInstance", instance.ID)
 		err := d.instanceService.StartInstance(opCtx, instance, command)
 		endOpSpan(opSpan, err)
 		if err != nil {
 			utils.MarkSpanError(span, err)
-			respondWithServiceError(msg, err)
-			return
+			return name, respondServiceErrorOutcome(msg, err)
 		}
 		if err := msg.Respond(fmt.Appendf(nil, `{"status":"running","instanceId":"%s"}`, instance.ID)); err != nil {
 			slog.ErrorContext(ctx, "Failed to respond to NATS request", "err", err)
 		}
+		return name, outcomeSuccess
 	case command.Attributes.RebootInstance:
 		opCtx, opSpan := startOpSpan(ctx, "ec2.RebootInstance", instance.ID)
 		err := d.instanceService.RebootInstance(opCtx, instance, command)
 		endOpSpan(opSpan, err)
 		if err != nil {
 			utils.MarkSpanError(span, err)
-			respondWithServiceError(msg, err)
-			return
+			return name, respondServiceErrorOutcome(msg, err)
 		}
 		if err := msg.Respond([]byte(`{}`)); err != nil {
 			slog.ErrorContext(ctx, "Failed to respond to NATS request", "err", err)
 		}
+		return name, outcomeSuccess
 	case command.Attributes.StopInstance, command.Attributes.TerminateInstance:
 		opName := "ec2.StopInstance"
 		if command.Attributes.TerminateInstance {
@@ -227,22 +271,57 @@ func (d *Daemon) handleEC2Events(msg *nats.Msg) {
 		endOpSpan(opSpan, err)
 		if err != nil {
 			utils.MarkSpanError(span, err)
-			respondWithServiceError(msg, err)
-			return
+			return name, respondServiceErrorOutcome(msg, err)
 		}
 		if err := msg.Respond([]byte(`{}`)); err != nil {
 			slog.ErrorContext(ctx, "Failed to respond to NATS request", "err", err)
 		}
+		return name, outcomeSuccess
 	default:
 		slog.WarnContext(ctx, "Unhandled EC2 instance command", "id", command.ID, "attributes", command.Attributes)
-		respondWithError(msg, awserrors.ErrorServerInternal)
+		return name, respondErrorOutcome(msg, awserrors.ErrorServerInternal)
+	}
+}
+
+// ec2CommandName names the command an EC2InstanceCommand carries, for the
+// metric action. Order matches the dispatch switch.
+func ec2CommandName(command types.EC2InstanceCommand) string {
+	switch {
+	case command.Attributes.AttachVolume:
+		return "AttachVolume"
+	case command.Attributes.DetachVolume:
+		return "DetachVolume"
+	case command.Attributes.DrainVolume:
+		return "DrainVolume"
+	case command.Attributes.AttachENI:
+		return "AttachNetworkInterface"
+	case command.Attributes.DetachENI:
+		return "DetachNetworkInterface"
+	case command.Attributes.AssociateIamInstanceProfile:
+		return "AssociateIamInstanceProfile"
+	case command.Attributes.SetSpotLineage:
+		return "SetSpotLineage"
+	case command.Attributes.SetInstanceTags:
+		return "SetInstanceTags"
+	case command.Attributes.RemoveInstanceTags:
+		return "RemoveInstanceTags"
+	case command.Attributes.StartInstance:
+		return "StartInstance"
+	case command.Attributes.RebootInstance:
+		return "RebootInstance"
+	case command.Attributes.TerminateInstance:
+		return "TerminateInstance"
+	case command.Attributes.StopInstance:
+		return "StopInstance"
+	default:
+		return "unknown"
 	}
 }
 
 // --- Admin / node management handlers ---
 
 // handleHealthCheck processes NATS health check requests.
-func (d *Daemon) handleHealthCheck(msg *nats.Msg) {
+func (d *Daemon) handleHealthCheck(msg *nats.Msg) string {
 	configHash, err := d.computeConfigHash()
 	if err != nil {
 		slog.Error("Failed to compute config hash for health check", "error", err)
@@ -264,17 +343,19 @@ func (d *Daemon) handleHealthCheck(msg *nats.Msg) {
 
 	respondWithJSON(msg, response)
 	slog.Debug("Health check responded", "node", d.node, "epoch", d.clusterConfig.Epoch)
+	return outcomeSuccess
 }
 
 // handleNodeDiscover responds to node discovery requests with this node's ID
 // Used by the gateway to dynamically discover active spinifex nodes in the cluster.
-func (d *Daemon) handleNodeDiscover(msg *nats.Msg) {
+func (d *Daemon) handleNodeDiscover(msg *nats.Msg) string {
 	response := types.NodeDiscoverResponse{
 		Node: d.node,
 	}
 
 	respondWithJSON(msg, response)
 	slog.Debug("Node discovery responded", "node", d.node)
+	return outcomeSuccess
 }
 
 // daemonIP extracts the IP portion from the daemon host (host:port format).
@@ -293,7 +374,7 @@ func (d *Daemon) daemonIP() string {
 
 // handleNodeStatus responds with this node's status and resource stats.
 // Used by the CLI: spx get nodes, spx top nodes.
-func (d *Daemon) handleNodeStatus(msg *nats.Msg) {
+func (d *Daemon) handleNodeStatus(msg *nats.Msg) string {
 	totalVCPU, totalMemGB, reservedVCPU, reservedMemGB, allocVCPU, allocMemGB, caps := d.resourceMgr.GetResourceStats()
 
 	vmCount := 0
@@ -355,6 +436,7 @@ func (d *Daemon) handleNodeStatus(msg *nats.Msg) {
 	wg.Wait()
 
 	respondWithJSON(msg, resp)
+	return outcomeSuccess
 }
 
 const (
@@ -509,7 +591,7 @@ func resolveVMGPU(att gpu.GPUAttachment, byMdev, byPCI map[string]gpu.PoolEntry)
 
 // handleNodeVMs responds with the list of VMs running on this node.
 // Used by the CLI: spx get vms.
-func (d *Daemon) handleNodeVMs(msg *nats.Msg) {
+func (d *Daemon) handleNodeVMs(msg *nats.Msg) string {
 	poolByMdev, poolByPCI := buildPoolLookup(d.gpuManager)
 
 	vms := make([]types.VMInfo, 0, d.vmMgr.Count())
@@ -542,6 +624,7 @@ func (d *Daemon) handleNodeVMs(msg *nats.Msg) {
 	}
 
 	respondWithJSON(msg, resp)
+	return outcomeSuccess
 }
 
 // vmHealthLabel derives the display health for spx get vms. Only running VMs

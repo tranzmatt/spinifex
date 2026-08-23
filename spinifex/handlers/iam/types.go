@@ -3,7 +3,7 @@ package handlers_iam
 import (
 	"encoding/json"
 
-	"github.com/mulgadc/predastore/pkg/iampolicy"
+	"github.com/mulgadc/bluebottle/pkg/iampolicy"
 )
 
 const (
@@ -12,6 +12,11 @@ const (
 
 	AccountStatusActive    = "ACTIVE"
 	AccountStatusSuspended = "SUSPENDED"
+
+	// AccountStatusTerminating marks an account whose teardown has started.
+	// There is no path back from it: a half-torn-down account that resumes
+	// service is worse than one that stays down.
+	AccountStatusTerminating = "TERMINATING"
 
 	PolicyEffectAllow = iampolicy.EffectAllow
 	PolicyEffectDeny  = iampolicy.EffectDeny
@@ -163,6 +168,6 @@ type AdminBootstrapData struct {
 type Account struct {
 	AccountID   string `json:"account_id"`   // 12-digit zero-padded, sequential
 	AccountName string `json:"account_name"` // Friendly name
-	Status      string `json:"status"`       // "ACTIVE" or "SUSPENDED"
+	Status      string `json:"status"`       // ACTIVE, SUSPENDED or TERMINATING
 	CreatedAt   string `json:"created_at"`   // RFC3339
 }

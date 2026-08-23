@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/mulgadc/predastore/pkg/auth"
+	"github.com/mulgadc/bluebottle/pkg/auth"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	gateway_rds "github.com/mulgadc/spinifex/spinifex/gateway/rds"
 )
@@ -54,7 +54,8 @@ func (gw *GatewayConfig) RDS_Request(w http.ResponseWriter, r *http.Request) err
 		return errors.New(awserrors.ErrorServerInternal)
 	}
 
-	xmlOutput, err := gateway_rds.Dispatch(r.Context(), action, queryArgs, gw.NATSConn, caller)
+	xmlOutput, err := gateway_rds.Dispatch(r.Context(), action, queryArgs, gw.NATSConn, caller,
+		gateway_rds.Env{ExpectedNodes: gw.ExpectedNodes})
 	if err != nil {
 		return err
 	}

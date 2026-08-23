@@ -5,12 +5,12 @@ import { ECSClient } from "@aws-sdk/client-ecs"
 import { EKSClient } from "@aws-sdk/client-eks"
 import { ElasticLoadBalancingV2Client } from "@aws-sdk/client-elastic-load-balancing-v2"
 import { IAMClient } from "@aws-sdk/client-iam"
+import { RDSClient } from "@aws-sdk/client-rds"
 import { S3Client } from "@aws-sdk/client-s3"
 import { HttpRequest } from "@smithy/protocol-http"
 
 import { getCredentials } from "./auth"
-
-const AWS_REGION = "ap-southeast-2"
+import { getRegion } from "./cluster-config"
 
 // SDK signs against the real backend host so the SigV4 signature includes
 // the correct Host header value. Middleware rewrites the outgoing URL
@@ -27,6 +27,7 @@ let iamClient: IAMClient | null = null
 let s3Client: S3Client | null = null
 let ecrClient: ECRClient | null = null
 let ecsClient: ECSClient | null = null
+let rdsClient: RDSClient | null = null
 
 export function getEc2Client(): EC2Client {
   if (!ec2Client) {
@@ -36,7 +37,7 @@ export function getEc2Client(): EC2Client {
     }
     ec2Client = new EC2Client({
       endpoint: AWSGW_SIGN_ENDPOINT,
-      region: AWS_REGION,
+      region: getRegion(),
       credentials: {
         accessKeyId: credentials.accessKeyId,
         secretAccessKey: credentials.secretAccessKey,
@@ -66,7 +67,7 @@ export function getEksClient(): EKSClient {
     }
     eksClient = new EKSClient({
       endpoint: AWSGW_SIGN_ENDPOINT,
-      region: AWS_REGION,
+      region: getRegion(),
       credentials: {
         accessKeyId: credentials.accessKeyId,
         secretAccessKey: credentials.secretAccessKey,
@@ -96,7 +97,7 @@ export function getElbv2Client(): ElasticLoadBalancingV2Client {
     }
     elbv2Client = new ElasticLoadBalancingV2Client({
       endpoint: AWSGW_SIGN_ENDPOINT,
-      region: AWS_REGION,
+      region: getRegion(),
       credentials: {
         accessKeyId: credentials.accessKeyId,
         secretAccessKey: credentials.secretAccessKey,
@@ -126,7 +127,7 @@ export function getAcmClient(): ACMClient {
     }
     acmClient = new ACMClient({
       endpoint: AWSGW_SIGN_ENDPOINT,
-      region: AWS_REGION,
+      region: getRegion(),
       credentials: {
         accessKeyId: credentials.accessKeyId,
         secretAccessKey: credentials.secretAccessKey,
@@ -156,7 +157,7 @@ export function getIamClient(): IAMClient {
     }
     iamClient = new IAMClient({
       endpoint: AWSGW_SIGN_ENDPOINT,
-      region: AWS_REGION,
+      region: getRegion(),
       credentials: {
         accessKeyId: credentials.accessKeyId,
         secretAccessKey: credentials.secretAccessKey,
@@ -186,7 +187,7 @@ export function getEcrClient(): ECRClient {
     }
     ecrClient = new ECRClient({
       endpoint: AWSGW_SIGN_ENDPOINT,
-      region: AWS_REGION,
+      region: getRegion(),
       credentials: {
         accessKeyId: credentials.accessKeyId,
         secretAccessKey: credentials.secretAccessKey,
@@ -216,7 +217,7 @@ export function getEcsClient(): ECSClient {
     }
     ecsClient = new ECSClient({
       endpoint: AWSGW_SIGN_ENDPOINT,
-      region: AWS_REGION,
+      region: getRegion(),
       credentials: {
         accessKeyId: credentials.accessKeyId,
         secretAccessKey: credentials.secretAccessKey,
@@ -238,6 +239,36 @@ export function getEcsClient(): ECSClient {
   return ecsClient
 }
 
+export function getRdsClient(): RDSClient {
+  if (!rdsClient) {
+    const credentials = getCredentials()
+    if (!credentials) {
+      throw new Error("AWS credentials not configured")
+    }
+    rdsClient = new RDSClient({
+      endpoint: AWSGW_SIGN_ENDPOINT,
+      region: getRegion(),
+      credentials: {
+        accessKeyId: credentials.accessKeyId,
+        secretAccessKey: credentials.secretAccessKey,
+        sessionToken: credentials.sessionToken,
+      },
+    })
+    rdsClient.middlewareStack.add(
+      (next) => async (args) => {
+        if (HttpRequest.isInstance(args.request)) {
+          args.request.hostname = window.location.hostname
+          args.request.port = Number(window.location.port) || 443
+          args.request.path = `/proxy/awsgw${args.request.path}`
+        }
+        return await next(args)
+      },
+      { step: "finalizeRequest", name: "proxyRewrite", override: true },
+    )
+  }
+  return rdsClient
+}
+
 export function getS3Client(): S3Client {
   if (!s3Client) {
     const credentials = getCredentials()
@@ -246,7 +277,7 @@ export function getS3Client(): S3Client {
     }
     s3Client = new S3Client({
       endpoint: S3_SIGN_ENDPOINT,
-      region: AWS_REGION,
+      region: getRegion(),
       credentials: {
         accessKeyId: credentials.accessKeyId,
         secretAccessKey: credentials.secretAccessKey,
@@ -295,4 +326,5 @@ export function clearClients(): void {
   s3Client = null
   ecrClient = null
   ecsClient = null
+  rdsClient = null
 }

@@ -10,6 +10,7 @@ import (
 )
 
 func TestLookupEngine(t *testing.T) {
+	t.Parallel()
 	_, err := LookupEngine("PostgreSQL")
 	require.Error(t, err, "the AWS engine identifier is 'postgres', not the product name")
 
@@ -22,12 +23,13 @@ func TestLookupEngine(t *testing.T) {
 	_, err = LookupEngine("mysql")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), awserrors.ErrorInvalidParameterValue)
-	assert.Equal(t, []string{"postgres"}, SupportedEngines())
+	assert.Equal(t, []string{"mariadb", "postgres"}, SupportedEngines())
 }
 
 // A version other than the pinned one would be served by an image that is
 // not the one asked for, so it is rejected rather than quietly substituted.
 func TestEngineValidateVersion(t *testing.T) {
+	t.Parallel()
 	engine, err := LookupEngine("postgres")
 	require.NoError(t, err)
 
@@ -54,7 +56,7 @@ func TestEngineValidateMasterUsername(t *testing.T) {
 		"empty":          "",
 		"leading digit":  "1user",
 		"hyphen":         "app-user",
-		"too long":       strings.Repeat("a", maxMasterUsernameLen+1),
+		"too long":       strings.Repeat("a", enginePostgres.maxUsernameLen+1),
 		"reserved":       "rdsadmin",
 		"reserved cased": "RDSAdmin",
 		// The cluster superuser and the group role the master's administrative
@@ -75,7 +77,41 @@ func TestEngineValidateMasterUsername(t *testing.T) {
 	}
 }
 
+// The name is interpolated into a CREATE DATABASE in the guest, so the rule is
+// narrower than the engine's own: it is what makes the interpolation safe.
+func TestEngineValidateDBName(t *testing.T) {
+	engine, err := LookupEngine("postgres")
+	require.NoError(t, err)
+
+	// Empty is not a rejection: AWS creates no initial database when none is named.
+	for _, name := range []string{"", "orders", "order_db1", "Orders"} {
+		assert.NoError(t, engine.ValidateDBName(name), "DBName %q", name)
+	}
+
+	cases := map[string]string{
+		"hyphen":        "my-db",
+		"leading digit": "1db",
+		"space":         "my db",
+		"dot":           "my.db",
+		// MariaDB maps a database name onto a directory name, so these are
+		// structurally dangerous there rather than merely awkward.
+		"slash":          "my/db",
+		"backslash":      `my\db`,
+		"trailing space": "orders ",
+		"quote":          "orders'",
+		"too long":       strings.Repeat("a", 64),
+	}
+	for name, dbName := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := engine.ValidateDBName(dbName)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), awserrors.ErrorInvalidParameterValue)
+		})
+	}
+}
+
 func TestValidateMasterUserPassword(t *testing.T) {
+	t.Parallel()
 	assert.NoError(t, ValidateMasterUserPassword("Sup3rSecret!"))
 	assert.NoError(t, ValidateMasterUserPassword(strings.Repeat("x", maxMasterPasswordLen)))
 

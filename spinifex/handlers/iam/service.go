@@ -128,6 +128,7 @@ type IAMService interface {
 	// Auth (internal — used by SigV4 middleware and bootstrap, not exposed via gateway)
 	LookupAccessKey(accessKeyID string) (*AccessKey, error)
 	DecryptSecret(ciphertext string) (string, error)
+	EncryptSecret(plaintext string) (string, error)
 	SeedBootstrap(data *BootstrapData) error
 	IsEmpty() (bool, error)
 
@@ -135,6 +136,8 @@ type IAMService interface {
 	CreateAccount(name string) (*Account, error)
 	GetAccount(accountID string) (*Account, error)
 	ListAccounts() ([]*Account, error)
+	SetAccountStatus(accountID, status string) (*Account, error)
+	DeleteAccount(accountID string) error
 
 	// GetAccountSummary returns account-wide IAM usage counts plus AWS-parity
 	// quota values as a SummaryMap. Read-only and account-scoped.

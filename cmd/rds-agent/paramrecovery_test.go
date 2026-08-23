@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -50,7 +49,7 @@ func TestPostgresEngine_ApplyParametersRollsBackAValueTheEngineRejects(t *testin
 		t.Fatal("ApplyParameters succeeded against a config the engine rejected")
 	}
 
-	installed, err := os.ReadFile(engine.parametersPath())
+	installed, err := os.ReadFile(engine.params.installedPath())
 	if err != nil {
 		t.Fatalf("read the installed parameters: %v", err)
 	}
@@ -69,7 +68,7 @@ func TestPostgresEngine_ApplyParametersWithdrawsTheFirstRejectedSet(t *testing.T
 		[]handlers_rds.Parameter{{Name: "work_mem", Value: "0"}}); err == nil {
 		t.Fatal("ApplyParameters succeeded against a config the engine rejected")
 	}
-	if _, err := os.Stat(engine.parametersPath()); !os.IsNotExist(err) {
+	if _, err := os.Stat(engine.params.installedPath()); !os.IsNotExist(err) {
 		t.Errorf("the rejected include is still installed (stat err = %v)", err)
 	}
 }
@@ -97,7 +96,7 @@ func TestPostgresEngine_ApplyBeforeFirstHeartbeatSeedsLastKnownGood(t *testing.T
 	runner := &pendingAfterReloadRunner{}
 	engine := newTestEngine(t, runner.run)
 	first := []byte("shared_buffers = '32768'\n")
-	if err := os.WriteFile(engine.parametersPath(), first, 0o600); err != nil {
+	if err := os.WriteFile(engine.params.installedPath(), first, 0o600); err != nil {
 		t.Fatalf("write serving parameter set: %v", err)
 	}
 
@@ -108,7 +107,7 @@ func TestPostgresEngine_ApplyBeforeFirstHeartbeatSeedsLastKnownGood(t *testing.T
 	if !slices.Equal(pending, []string{"shared_buffers"}) {
 		t.Errorf("pending = %v, want shared_buffers", pending)
 	}
-	lastGood, err := os.ReadFile(engine.lastGoodPath())
+	lastGood, err := os.ReadFile(engine.params.lastGoodPath())
 	if err != nil {
 		t.Fatalf("read last known good: %v", err)
 	}
@@ -153,10 +152,10 @@ func TestPostgresEngine_ServingSnapshotWaitsForParameterApply(t *testing.T) {
 	}
 	engine := newTestEngine(t, runner.run)
 	first := []byte("shared_buffers = '32768'\n")
-	if err := os.WriteFile(engine.parametersPath(), first, 0o600); err != nil {
+	if err := os.WriteFile(engine.params.installedPath(), first, 0o600); err != nil {
 		t.Fatalf("write serving parameter set: %v", err)
 	}
-	if err := os.WriteFile(engine.lastGoodPath(), first, 0o600); err != nil {
+	if err := os.WriteFile(engine.params.lastGoodPath(), first, 0o600); err != nil {
 		t.Fatalf("write last known good: %v", err)
 	}
 
@@ -192,7 +191,7 @@ func TestPostgresEngine_ServingSnapshotWaitsForParameterApply(t *testing.T) {
 		t.Error("serving snapshot completed while the parameter apply held its transaction")
 	}
 
-	lastGood, err := os.ReadFile(engine.lastGoodPath())
+	lastGood, err := os.ReadFile(engine.params.lastGoodPath())
 	if err != nil {
 		t.Fatalf("read last known good: %v", err)
 	}
@@ -216,7 +215,7 @@ func TestPostgresEngine_LastKnownGoodTracksTheServingSet(t *testing.T) {
 	}
 	assertLastGood := func(value string) {
 		t.Helper()
-		lastGood, err := os.ReadFile(engine.lastGoodPath())
+		lastGood, err := os.ReadFile(engine.params.lastGoodPath())
 		if err != nil {
 			t.Fatalf("read the last known good parameters: %v", err)
 		}
@@ -240,8 +239,8 @@ func TestPostgresEngine_LastKnownGoodTracksTheServingSet(t *testing.T) {
 	apply("16384")
 	assertLastGood("8192")
 
-	if strings.HasSuffix(engine.lastGoodPath(), ".conf") {
-		t.Errorf("the rollback copy at %s would be included by the engine", engine.lastGoodPath())
+	if strings.HasSuffix(engine.params.lastGoodPath(), ".conf") {
+		t.Errorf("the rollback copy at %s would be included by the engine", engine.params.lastGoodPath())
 	}
 }
 
@@ -249,7 +248,7 @@ func TestPostgresEngine_RecordServingParametersSkipsPendingRestart(t *testing.T)
 	runner := &recordingRunner{}
 	engine := newTestEngine(t, runner.run)
 	first := []byte("shared_buffers = '32768'\n")
-	if err := os.WriteFile(engine.parametersPath(), first, 0o600); err != nil {
+	if err := os.WriteFile(engine.params.installedPath(), first, 0o600); err != nil {
 		t.Fatalf("write first parameter set: %v", err)
 	}
 	if err := engine.RecordServingParameters(t.Context()); err != nil {
@@ -257,14 +256,14 @@ func TestPostgresEngine_RecordServingParametersSkipsPendingRestart(t *testing.T)
 	}
 
 	second := []byte("shared_buffers = '65536'\n")
-	if err := os.WriteFile(engine.parametersPath(), second, 0o600); err != nil {
+	if err := os.WriteFile(engine.params.installedPath(), second, 0o600); err != nil {
 		t.Fatalf("write pending parameter set: %v", err)
 	}
 	runner.out = "shared_buffers\n"
 	if err := engine.RecordServingParameters(t.Context()); err != nil {
 		t.Fatalf("record with a pending restart: %v", err)
 	}
-	lastGood, err := os.ReadFile(engine.lastGoodPath())
+	lastGood, err := os.ReadFile(engine.params.lastGoodPath())
 	if err != nil {
 		t.Fatalf("read last known good: %v", err)
 	}
@@ -278,7 +277,7 @@ func TestPostgresEngine_RecordServingParametersSkipsPendingRestart(t *testing.T)
 	if err := engine.RecordServingParameters(t.Context()); err != nil {
 		t.Fatalf("record the restarted parameter set: %v", err)
 	}
-	lastGood, err = os.ReadFile(engine.lastGoodPath())
+	lastGood, err = os.ReadFile(engine.params.lastGoodPath())
 	if err != nil {
 		t.Fatalf("read advanced last known good: %v", err)
 	}
@@ -330,7 +329,7 @@ func TestPostgresEngine_RestoreLastKnownGoodParameters(t *testing.T) {
 	if !restored {
 		t.Fatal("did not restore a set that differs from the last known good")
 	}
-	installed, err := os.ReadFile(engine.parametersPath())
+	installed, err := os.ReadFile(engine.params.installedPath())
 	if err != nil {
 		t.Fatalf("read the installed parameters: %v", err)
 	}
@@ -369,9 +368,9 @@ func (f *fakeRecovery) Restart(context.Context) error {
 // A probe whose result the test drives directly, standing in for pg_isready.
 func stubProbe(t *testing.T, code int, err error) *engineProbe {
 	t.Helper()
-	cfg := loadConfig(filepath.Join(t.TempDir(), "absent.env"))
-	return newEngineProbe(cfg, func(context.Context, string, ...string) (int, error) {
-		return code, err
+	cfg := testLoadConfig(t, enginePostgres)
+	return newPostgresProbe(cfg, func(context.Context, string, ...string) (int, string, error) {
+		return code, "", err
 	})
 }
 
@@ -402,6 +401,47 @@ func TestParamGuard_RollsBackReportsAndRestartsWhenTheEngineNeverComesUp(t *test
 	}
 	if states[0].health != handlers_rds.EngineHealthUnhealthy || states[0].message != handlers_rds.ParameterRollbackMessage {
 		t.Errorf("rollback state = %+v, want the unhealthy rollback report", states[0])
+	}
+}
+
+// PostgreSQL re-derives TLS enforcement from the set it has just put back, so
+// the file can be replaced and the call still fail. The rollback has happened
+// either way, and the worse outcome is an instance left down and unreported.
+func TestParamGuard_ReportsAndRestartsWhenOnlyTheEnforcementFailed(t *testing.T) {
+	engine := &fakeRecovery{restored: true, restoreErr: errors.New("write the TLS enforcement rule: read-only file system")}
+	cp := newFakeControlPlane()
+	guard := newParamGuard(engine, stubProbe(t, 2, nil), cp)
+	guard.id = identity{DBInstanceIdentifier: "db-1"}
+	guard.after, guard.poll = 20*time.Millisecond, time.Millisecond
+	guard.Run(t.Context())
+
+	if engine.restarts != 1 {
+		t.Errorf("restarts = %d, want the engine restarted on the set already put back", engine.restarts)
+	}
+	states := cp.snapshotStates()
+	if len(states) != 1 {
+		t.Fatalf("submitted states = %d, want the rollback still reported", len(states))
+	}
+	if states[0].health != handlers_rds.EngineHealthUnhealthy || states[0].message != handlers_rds.ParameterRollbackMessage {
+		t.Errorf("rollback state = %+v, want the unhealthy rollback report", states[0])
+	}
+}
+
+// The other half of the same contract: a restore that replaced nothing leaves
+// the instance on the set it is already failing under, so restarting it would
+// only churn a cluster that is down for a reason the rollback cannot fix.
+func TestParamGuard_DoesNotRestartWhenTheRestoreReplacedNothing(t *testing.T) {
+	engine := &fakeRecovery{restored: false, restoreErr: errors.New("read the last known good parameters: input/output error")}
+	cp := newFakeControlPlane()
+	guard := newParamGuard(engine, stubProbe(t, 2, nil), cp)
+	guard.after, guard.poll = 20*time.Millisecond, time.Millisecond
+	guard.Run(t.Context())
+
+	if engine.restarts != 0 {
+		t.Errorf("restarts = %d, want none when nothing was rolled back", engine.restarts)
+	}
+	if states := cp.snapshotStates(); len(states) != 0 {
+		t.Errorf("submitted states = %d, want no rollback report", len(states))
 	}
 }
 

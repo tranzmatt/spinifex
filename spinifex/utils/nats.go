@@ -25,6 +25,28 @@ var (
 // ErrClusterUnavailable is returned when the NATS connection is not currently connected.
 var ErrClusterUnavailable = errors.New("cluster unavailable: NATS disconnected")
 
+// SubjectEnsureDefaultVpc is the request/reply subject on which the daemon
+// builds an account's default VPC and acknowledges. It lives here rather than
+// beside either party so the gateway does not import the daemon, nor the
+// reverse.
+const SubjectEnsureDefaultVpc = "ec2.EnsureDefaultVpc"
+
+// LoadCertPool reads a PEM CA certificate from path and returns a pool
+// trusting exactly it. Shared by every caller that verifies a peer against
+// the cluster CA (e.g. /etc/spinifex/ca.pem) rather than the system trust
+// store.
+func LoadCertPool(path string) (*x509.CertPool, error) {
+	caCert, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("%w %s: %w", ErrCACertRead, path, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("%w from %s", ErrCACertParse, path)
+	}
+	return pool, nil
+}
+
 // natsRetryEscalateAttempt is the threshold at which retry logs escalate from Warn to Error (rate-limited to 1/min).
 // ~30 attempts at the 60 s backoff cap ≈ ~30 min disconnected, suggesting config error not transient restart.
 const natsRetryEscalateAttempt = 30
@@ -59,13 +81,9 @@ func ConnectNATS(host, token, caCertPath string, opts ...RetryOption) (*nats.Con
 	}
 
 	if caCertPath != "" {
-		caCert, err := os.ReadFile(caCertPath)
+		pool, err := LoadCertPool(caCertPath)
 		if err != nil {
-			return nil, fmt.Errorf("%w %s: %w", ErrCACertRead, caCertPath, err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("%w from %s", ErrCACertParse, caCertPath)
+			return nil, err
 		}
 		natsOpts = append(natsOpts, nats.Secure(&tls.Config{
 			RootCAs:          pool,
@@ -244,7 +262,7 @@ func NATSRequest[Out any](ctx context.Context, conn *nats.Conn, subject string, 
 		return nil, ErrClusterUnavailable
 	}
 
-	ctx, span := startProducerSpan(ctx, subject)
+	ctx, span := startProducerSpan(ctx, subject, accountID)
 	defer func() { endSpanWithError(span, err) }()
 
 	jsonData, err := json.Marshal(input)
@@ -293,13 +311,15 @@ func NATSRequest[Out any](ctx context.Context, conn *nats.Conn, subject string, 
 
 // ServeNATSRequest unmarshals the request into *I, invokes fn, and replies with JSON or an awserrors envelope.
 // A consumer span joins the producer's trace when the message carries traceparent.
-func ServeNATSRequest[I any, O any](msg *nats.Msg, fn func(*I) (*O, error)) {
-	ServeNATSRequestCtx(msg, func(_ context.Context, in *I) (*O, error) { return fn(in) })
+// Reports whether the reply was a result rather than an error envelope, for
+// callers that record a request outcome; callers that do not may ignore it.
+func ServeNATSRequest[I any, O any](msg *nats.Msg, fn func(*I) (*O, error)) bool {
+	return ServeNATSRequestCtx(msg, func(_ context.Context, in *I) (*O, error) { return fn(in) })
 }
 
 // ServeNATSRequestCtx is ServeNATSRequest for handlers that take the consumer
 // span's context, so their logs and child spans correlate to the trace.
-func ServeNATSRequestCtx[I any, O any](msg *nats.Msg, fn func(context.Context, *I) (*O, error)) {
+func ServeNATSRequestCtx[I any, O any](msg *nats.Msg, fn func(context.Context, *I) (*O, error)) bool {
 	ctx, span := StartConsumerSpan(msg)
 	defer span.End()
 
@@ -307,21 +327,22 @@ func ServeNATSRequestCtx[I any, O any](msg *nats.Msg, fn func(context.Context, *
 	if errResp := UnmarshalJsonPayload(input, msg.Data); errResp != nil {
 		MarkSpanError(span, errors.New(awserrors.ErrorInvalidParameterValue))
 		respondNATS(msg, errResp)
-		return
+		return false
 	}
 	out, err := fn(ctx, input)
 	if err != nil {
 		MarkSpanError(span, err)
 		respondNATS(msg, GenerateErrorPayloadWithMessage(awserrors.ValidErrorCodeFromError(err), err.Error()))
-		return
+		return false
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
 		MarkSpanError(span, err)
 		respondNATS(msg, GenerateErrorPayload(awserrors.ErrorServerInternal))
-		return
+		return false
 	}
 	respondNATS(msg, data)
+	return true
 }
 
 func respondNATS(msg *nats.Msg, data []byte) {
@@ -367,7 +388,7 @@ func Gather(ctx context.Context, conn *nats.Conn, subject string, payload []byte
 		return nil, sum, ErrClusterUnavailable
 	}
 
-	ctx, span := startProducerSpan(ctx, subject)
+	ctx, span := startProducerSpan(ctx, subject, opts.AccountID)
 	defer func() { endSpanWithError(span, err) }()
 
 	inbox := nats.NewInbox()

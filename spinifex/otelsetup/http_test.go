@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	bbotel "github.com/mulgadc/bluebottle/pkg/otelsetup"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -103,10 +104,10 @@ func TestHTTPMiddleware5xxSetsErrorStatus(t *testing.T) {
 
 func TestHTTPMiddlewareExtractsTraceparent(t *testing.T) {
 	sr := withRecorder(t)
-	// Extraction needs the W3C propagator installed (Init does this even
-	// without an endpoint).
+	// Extraction needs the W3C propagator installed (the shared Init does this
+	// even without an endpoint).
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-	if _, err := Init(t.Context(), "test-svc"); err != nil {
+	if _, err := bbotel.Init(t.Context(), "test-svc"); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 
@@ -124,5 +125,51 @@ func TestHTTPMiddlewareExtractsTraceparent(t *testing.T) {
 	}
 	if got := spans[0].Parent().SpanID().String(); got != "0a0b0c0d0e0f0102" {
 		t.Errorf("parent span id = %s, want inbound span id", got)
+	}
+}
+
+// TestOutcomeForStatusSeparatesClientErrors guards the classification the
+// dashboards split on: 4xx must not be counted as success (which hid every
+// IMDS 401 and 404) and must not be folded into error, which is server fault.
+func TestOutcomeForStatusSeparatesClientErrors(t *testing.T) {
+	tests := []struct {
+		status int
+		want   string
+	}{
+		{status: http.StatusOK, want: "success"},
+		{status: http.StatusNoContent, want: "success"},
+		{status: http.StatusNotModified, want: "success"},
+		{status: http.StatusBadRequest, want: "client_error"},
+		{status: http.StatusUnauthorized, want: "client_error"},
+		{status: http.StatusForbidden, want: "client_error"},
+		{status: http.StatusNotFound, want: "client_error"},
+		{status: http.StatusInternalServerError, want: "error"},
+		{status: http.StatusBadGateway, want: "error"},
+	}
+
+	for _, tc := range tests {
+		if got := OutcomeForStatus(tc.status); got != tc.want {
+			t.Errorf("OutcomeForStatus(%d) = %q, want %q", tc.status, got, tc.want)
+		}
+	}
+}
+
+// TestHTTPMiddleware4xxIsNotSpanError pins the split between the two signals:
+// a client error is a distinct metric outcome but must not mark the span
+// failed, or every 404 would show as a broken request in the trace view.
+func TestHTTPMiddleware4xxIsNotSpanError(t *testing.T) {
+	sr := withRecorder(t)
+
+	h := HTTPMiddleware("test")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/latest/api/token", nil))
+
+	spans := sr.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	if got := spans[0].Status().Code; got == codes.Error {
+		t.Errorf("span status = %v, want not Error for a 4xx", got)
 	}
 }

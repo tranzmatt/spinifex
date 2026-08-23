@@ -14,6 +14,7 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	handlers_dns "github.com/mulgadc/spinifex/spinifex/handlers/dns"
 	"github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
+	iammock "github.com/mulgadc/spinifex/spinifex/handlers/iam/mock"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/spinifex/spinifex/vm"
@@ -122,7 +123,7 @@ type createHarness struct {
 	svc     *Service
 	launch  *launchHarness
 	network *fakeNetwork
-	iam     *fakeRDSEnsurer
+	iam     *iammock.SystemInstanceRoleEnsurer
 	nc      *nats.Conn
 
 	// dnsChanges collects what the endpoint publish put on the bus.
@@ -136,7 +137,7 @@ func newCreateHarness(t *testing.T, baseDomain string) *createHarness {
 	h := &createHarness{
 		launch:     newLaunchHarness(),
 		network:    newFakeNetwork(),
-		iam:        &fakeRDSEnsurer{},
+		iam:        iammock.New(),
 		nc:         nc,
 		dnsChanges: make(chan handlers_dns.ChangeBatch, 4),
 	}
@@ -224,6 +225,7 @@ func validCreateInput() *rds.CreateDBInstanceInput {
 }
 
 func TestCreateDBInstance_ProvisionsAndRecordsTheInstance(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, testBaseDomain)
 
 	out, err := h.svc.CreateDBInstance(t.Context(), validCreateInput(), testAccountID)
@@ -285,13 +287,14 @@ func TestCreateDBInstance_ProvisionsAndRecordsTheInstance(t *testing.T) {
 	assert.Equal(t, int64(firstVMGeneration), entry.VMGeneration)
 
 	require.NotNil(t, h.launch.launcher.input)
-	assert.Equal(t, h.iam.profileARN(utils.GlobalAccountID), h.launch.launcher.input.IamInstanceProfileArn)
+	assert.Equal(t, rdsInstanceProfileARN(utils.GlobalAccountID), h.launch.launcher.input.IamInstanceProfileArn)
 }
 
 func TestCreateDBInstance_IAMFailurePrecedesReservationAndLaunch(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, "")
 	iamErr := errors.New("IAM store unavailable")
-	h.iam.policyErr = iamErr
+	h.iam.PutRolePolicyErr = iamErr
 
 	_, err := h.svc.CreateDBInstance(t.Context(), validCreateInput(), testAccountID)
 
@@ -304,6 +307,7 @@ func TestCreateDBInstance_IAMFailurePrecedesReservationAndLaunch(t *testing.T) {
 }
 
 func TestCreateDBInstance_PublishesEndpointRecord(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, testBaseDomain)
 
 	_, err := h.svc.CreateDBInstance(t.Context(), validCreateInput(), testAccountID)
@@ -325,6 +329,7 @@ func TestCreateDBInstance_PublishesEndpointRecord(t *testing.T) {
 // Without northstar there is no name to resolve, so the endpoint has to be the
 // ENI IP itself rather than an empty host the client would dial.
 func TestCreateDBInstance_EndpointFallsBackToENIIPWithoutBaseDomain(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, "")
 
 	out, err := h.svc.CreateDBInstance(t.Context(), validCreateInput(), testAccountID)
@@ -345,6 +350,7 @@ func TestCreateDBInstance_EndpointFallsBackToENIIPWithoutBaseDomain(t *testing.T
 }
 
 func TestCreateDBInstance_DuplicateIdentifierIsRejected(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, "")
 
 	_, err := h.svc.CreateDBInstance(t.Context(), validCreateInput(), testAccountID)
@@ -364,6 +370,7 @@ func TestCreateDBInstance_DuplicateIdentifierIsRejected(t *testing.T) {
 // written must withdraw it — otherwise the name is permanently unusable while
 // naming an instance that was never provisioned.
 func TestCreateDBInstance_LaunchFailureWithdrawsTheReservation(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, "")
 	h.launch.launcher.err = errors.New("no host has capacity")
 
@@ -381,6 +388,7 @@ func TestCreateDBInstance_LaunchFailureWithdrawsTheReservation(t *testing.T) {
 // built. The deferred record delete removes the only thing naming the VM, its
 // two ENIs and the data volume, so anything left behind is unreclaimable.
 func TestCreateDBInstance_FailureAfterLaunchUnwindsEveryResource(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, "")
 
 	// Dropping the reserved record while the launch is in flight fails the
@@ -402,6 +410,7 @@ func TestCreateDBInstance_FailureAfterLaunchUnwindsEveryResource(t *testing.T) {
 }
 
 func TestCreateDBInstance_IndexFailureWithdrawsTheRecordedLaunch(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, "")
 	// This invalid KV key makes the instance-index write fail after recordLaunch
 	// has advanced the reservation revision.
@@ -417,6 +426,7 @@ func TestCreateDBInstance_IndexFailureWithdrawsTheRecordedLaunch(t *testing.T) {
 }
 
 func TestCreateDBInstance_RecordLaunchDoesNotOverwriteAConcurrentReplacement(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, "")
 	var replacement DBInstanceRecord
 	h.launch.launcher.onLaunch = func() {
@@ -430,6 +440,7 @@ func TestCreateDBInstance_RecordLaunchDoesNotOverwriteAConcurrentReplacement(t *
 }
 
 func TestCreateDBInstance_RollbackDoesNotDeleteAConcurrentReplacement(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, "")
 	h.launch.launcher.instanceID = "invalid instance id"
 	var replacement DBInstanceRecord
@@ -446,6 +457,7 @@ func TestCreateDBInstance_RollbackDoesNotDeleteAConcurrentReplacement(t *testing
 }
 
 func TestCreateDBInstance_RollbackFollowsSameOwnerUpdates(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, "")
 	h.launch.launcher.instanceID = "invalid instance id"
 	h.launch.launcher.onTerminate = func() {
@@ -469,6 +481,7 @@ func TestCreateDBInstance_RollbackFollowsSameOwnerUpdates(t *testing.T) {
 // The request may not be answered with an instance whose storage is
 // not actually encrypted, so an unencrypted volume fails the whole create.
 func TestCreateDBInstance_UnencryptedDataVolumeFailsTheCreate(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, "")
 	h.launch.volumes.encrypted = false
 
@@ -479,6 +492,7 @@ func TestCreateDBInstance_UnencryptedDataVolumeFailsTheCreate(t *testing.T) {
 }
 
 func TestCreateDBInstance_SecurityGroupsMustBeInThePlacementVPC(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, "")
 
 	input := validCreateInput()
@@ -499,6 +513,7 @@ func TestCreateDBInstance_SecurityGroupsMustBeInThePlacementVPC(t *testing.T) {
 }
 
 func TestCreateDBInstance_RequiresADefaultVPCWithASubnet(t *testing.T) {
+	t.Parallel()
 	h := newCreateHarness(t, "")
 	h.network.vpcs = nil
 
@@ -559,6 +574,7 @@ func TestValidateCreateRequest_RejectsUnimplementedParameters(t *testing.T) {
 // DeletionProtection is honoured, so it has to be accepted
 // at create and carried onto the record DeleteDBInstance checks.
 func TestValidateCreateRequest_AcceptsDeletionProtection(t *testing.T) {
+	t.Parallel()
 	input := validCreateInput()
 	input.DeletionProtection = aws.Bool(true)
 
@@ -594,6 +610,10 @@ func TestValidateCreateRequest_RejectsMalformedRequests(t *testing.T) {
 		{"PortTooLow", func(in *rds.CreateDBInstanceInput) { in.Port = aws.Int64(80) }, awserrors.ErrorInvalidParameterValue},
 		{"ReservedUsername", func(in *rds.CreateDBInstanceInput) { in.MasterUsername = aws.String("rdsadmin") }, awserrors.ErrorInvalidParameterValue},
 		{"ShortPassword", func(in *rds.CreateDBInstanceInput) { in.MasterUserPassword = aws.String("short") }, awserrors.ErrorInvalidParameterValue},
+		{"DBNameHyphen", func(in *rds.CreateDBInstanceInput) { in.DBName = aws.String("my-db") }, awserrors.ErrorInvalidParameterValue},
+		{"DBNameTooLong", func(in *rds.CreateDBInstanceInput) {
+			in.DBName = aws.String(strings.Repeat("a", 64))
+		}, awserrors.ErrorInvalidParameterValue},
 	}
 
 	for _, tc := range cases {
@@ -608,6 +628,7 @@ func TestValidateCreateRequest_RejectsMalformedRequests(t *testing.T) {
 }
 
 func TestValidateCreateRequest_AcceptsTheImplicitDefaultParameterGroup(t *testing.T) {
+	t.Parallel()
 	input := validCreateInput()
 	input.DBParameterGroupName = aws.String("default.postgres18")
 	input.Port = aws.Int64(6543)
@@ -623,6 +644,7 @@ func TestValidateCreateRequest_AcceptsTheImplicitDefaultParameterGroup(t *testin
 // The inert parameters are accepted as no-ops rather than rejected: omitting
 // them creates no false guarantee, so a Terraform config carrying them works.
 func TestValidateCreateRequest_AcceptsInertParameters(t *testing.T) {
+	t.Parallel()
 	input := validCreateInput()
 	input.AutoMinorVersionUpgrade = aws.Bool(true)
 	input.CopyTagsToSnapshot = aws.Bool(true)

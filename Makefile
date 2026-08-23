@@ -6,6 +6,11 @@ SHELL := /bin/bash
 # surface each other's issues. Scope it per worktree.
 export GOLANGCI_LINT_CACHE := $(CURDIR)/.cache/golangci-lint
 
+# GOFIPS140 is a global build-config change: it alters every package's action ID,
+# stdlib included, so a target that omits it shares no build-cache entry with one
+# that sets it. Exported once here rather than per-recipe so the two can't drift.
+export GOFIPS140 := v1.0.0
+
 # Detect architecture for cross-platform support
 ARCH := $(shell uname -m)
 ifeq ($(ARCH),x86_64)
@@ -63,19 +68,23 @@ LDFLAGS := -s -w -X github.com/mulgadc/spinifex/cmd/spinifex/cmd.Version=$(VERSI
 
 go_build:
 	@echo -e "\n....Building $(GO_PROJECT_NAME)"
-	GOFIPS140=v1.0.0 go build $(GO_BUILD_MOD) -ldflags "$(LDFLAGS)" -o ./bin/$(GO_PROJECT_NAME) cmd/spinifex/main.go
+	go build $(GO_BUILD_MOD) -ldflags "$(LDFLAGS)" -o ./bin/$(GO_PROJECT_NAME) cmd/spinifex/main.go
 
 build-installer:
 	@echo -e "\n....Building spinifex-installer"
-	GOFIPS140=v1.0.0 go build -ldflags "-s -w" -o ./bin/spinifex-installer cmd/installer/main.go
+	go build -ldflags "-s -w" -o ./bin/spinifex-installer cmd/installer/main.go
 
 build-lb-agent:
 	@echo -e "\n....Building lb-agent (static)"
-	CGO_ENABLED=0 GOFIPS140=v1.0.0 go build -ldflags "-s -w" -o ./bin/lb-agent cmd/lb-agent/main.go
+	CGO_ENABLED=0 go build -ldflags "-s -w" -o ./bin/lb-agent cmd/lb-agent/main.go
 
 build-ecs-agent: ## Build the ecs-agent (ships in the ECS-AMI guest; not in host `build`)
 	@echo -e "\n....Building ecs-agent (static)"
-	CGO_ENABLED=0 GOFIPS140=v1.0.0 go build -ldflags "-s -w -X main.version=$(VERSION)" -o ./bin/ecs-agent ./cmd/ecs-agent
+	CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$(VERSION)" -o ./bin/ecs-agent ./cmd/ecs-agent
+
+build-loadgen: ## Build spx-loadgen (drives the stress harness's measured load; not shipped to nodes)
+	@echo -e "\n....Building spx-loadgen"
+	GOFIPS140=v1.0.0 go build -ldflags "-s -w" -o ./bin/spx-loadgen ./cmd/spx-loadgen
 
 build-system-image: ## Build a system image from manifest (use IMAGE=lb or IMAGE=eks-node)
 ifndef IMAGE
@@ -111,6 +120,12 @@ build-rds-postgres-image: ## Build the spinifex-rds-postgres AMI (Alpine + Postg
 import-rds-postgres-image: ## Build + register the rds-postgres AMI (requires a running cluster)
 	$(MAKE) build-system-image IMAGE=rds-postgres IMPORT=1
 
+build-rds-mariadb-image: ## Build the spinifex-rds-mariadb AMI (Alpine + MariaDB 11.8 + rds-init; IMPORT=1 to register)
+	$(MAKE) build-system-image IMAGE=rds-mariadb
+
+import-rds-mariadb-image: ## Build + register the rds-mariadb AMI (requires a running cluster)
+	$(MAKE) build-system-image IMAGE=rds-mariadb IMPORT=1
+
 MICROVM_OUT_DIR := build/microvm
 MICROVM_ARTIFACTS := $(MICROVM_OUT_DIR)/vmlinuz $(MICROVM_OUT_DIR)/initramfs.cpio.gz
 MICROVM_INPUTS := scripts/build-microvm-image.sh $(MICROVM_OUT_DIR)/init.sh $(MICROVM_OUT_DIR)/inittab bin/lb-agent
@@ -134,8 +149,21 @@ install-microvm: $(MICROVM_ARTIFACTS) ## Install microVM artifacts to /usr/share
 # the pre-commit gate: manifest checks, lint, vuln, and the unit and e2e-harness tiers.
 # integration and race tests skipped to keep quick, they run in CI.
 preflight:
-	@$(MAKE) --no-print-directory QUIET=1 manifest-check manifest-lint lint govulncheck test-cover diff-coverage test-harness
+	@$(MAKE) --no-print-directory QUIET=1 manifest-check manifest-lint lint govulncheck test-cover diff-coverage test-package-check test-harness test-build-scripts
 	@echo -e "\n ✅ Preflight passed — safe to commit."
+
+# Shell suites + shellcheck for build/scripts/, the systemd-unit helpers that
+# ship on every node (unlike scripts/images/, kept in preflight: a wrong
+# restart decision here is an outage, not asset churn).
+test-build-scripts:
+	@echo -e "\n....Running build/scripts/**/*_test.sh...."
+	@for t in $$(find build/scripts -name '*_test.sh' | sort); do \
+		echo "-- $$t"; \
+		sh "$$t" || exit 1; \
+	done
+	@echo -e "\n....Running shellcheck over build/scripts/**/*.sh...."
+	shellcheck -S warning $$(find build/scripts -name '*.sh' | sort)
+	@echo "  test-build-scripts ok"
 
 # E2E harness unit tests. Build-tagged `e2e` so they're skipped by the
 # default `go test ./spinifex/...`. Runs with mocked AWS clients — no
@@ -149,9 +177,13 @@ test-harness:
 AWS_MODEL_CONFORMANCE_REPORT ?= $(CURDIR)/.cache/aws-model-conformance-report.txt
 AWS_MODEL_CONFORMANCE_MODE ?= fail
 AWS_MODEL_OPERATION_COVERAGE_REPORT ?= $(CURDIR)/docs/aws-model-operation-coverage.md
+# -count=1 is load-bearing: the conformance report is written by the test binary,
+# so a cached pass skips the run, leaves no report, and the cat below fails the
+# target. It also keeps the conformance gate honest — a cached result would mean
+# the check never ran against this commit.
 test-integration:
 	@echo -e "\n....Running in-process integration tests...."
-	$(_Q)LOG_IGNORE=1 AWS_MODEL_CONFORMANCE_MODE=$(AWS_MODEL_CONFORMANCE_MODE) AWS_MODEL_CONFORMANCE_REPORT=$(AWS_MODEL_CONFORMANCE_REPORT) go test -tags=integration -timeout 60s ./tests/integration/... $(_RACEQ)
+	$(_Q)LOG_IGNORE=1 AWS_MODEL_CONFORMANCE_MODE=$(AWS_MODEL_CONFORMANCE_MODE) AWS_MODEL_CONFORMANCE_REPORT=$(AWS_MODEL_CONFORMANCE_REPORT) go test -count=1 -tags=integration -timeout 60s ./tests/integration/... $(_RACEQ)
 	@cat $(AWS_MODEL_CONFORMANCE_REPORT)
 	@$(MAKE) --no-print-directory generate-aws-model-coverage
 	@echo "AWS operation coverage: $(AWS_MODEL_OPERATION_COVERAGE_REPORT)"
@@ -192,25 +224,30 @@ manifest-lint-update:
 # Run unit tests
 test:
 	@echo -e "\n....Running tests for $(GO_PROJECT_NAME)...."
-	GOFIPS140=v1.0.0 LOG_IGNORE=1 go test -timeout 180s ./spinifex/... ./cmd/... ./internal/...
+	LOG_IGNORE=1 go test -timeout 180s ./spinifex/... ./cmd/... ./internal/...
+
+# Empty locally, where reusing a cached result between runs is the point.
+# CI passes -count=1 so a green run means the suite executed against that commit
+# rather than replaying results the persisted build cache carried over.
+GOTESTFLAGS ?=
 
 # Run unit tests with coverage profile
 COVERPROFILE ?= coverage.out
 test-cover:
 	@echo -e "\n....Running tests with coverage for $(GO_PROJECT_NAME)...."
-	$(_Q)GOFIPS140=v1.0.0 LOG_IGNORE=1 go test -timeout 180s -coverprofile=$(COVERPROFILE) -covermode=atomic ./spinifex/... ./cmd/... ./internal/... $(_COVQ)
+	$(_Q)LOG_IGNORE=1 go test $(GOTESTFLAGS) -timeout 180s -coverprofile=$(COVERPROFILE) -covermode=atomic ./spinifex/... ./cmd/... ./internal/... $(_COVQ)
 	@scripts/check-coverage.sh $(COVERPROFILE) $(QUIET)
 
 # Run unit tests with race detector
 test-race:
 	@echo -e "\n....Running tests with race detector for $(GO_PROJECT_NAME)...."
-	$(_Q)GOFIPS140=v1.0.0 LOG_IGNORE=1 go test -race -timeout 300s ./spinifex/... ./cmd/... ./internal/... $(_RACEQ)
+	$(_Q)LOG_IGNORE=1 go test $(GOTESTFLAGS) -race -timeout 300s ./spinifex/... ./cmd/... ./internal/... $(_RACEQ)
 
 # Unit tests for in-repo GitHub Actions (e.g. .github/actions/e2e-analyze).
 # Kept out of `test-cover` so coverage % isn't diluted by CI-only tooling.
 test-actions:
 	@echo -e "\n....Running action tests...."
-	LOG_IGNORE=1 go test -timeout 60s ./.github/actions/...
+	LOG_IGNORE=1 go test $(GOTESTFLAGS) -timeout 60s ./.github/actions/...
 
 # Shell suites + shellcheck for scripts/images/ and images/mkosi.profiles/
 # helpers baked into system images. Kept out of `preflight` (a dedicated CI
@@ -248,6 +285,10 @@ test-images:
 # Check that new/changed code meets coverage threshold (runs tests first)
 diff-coverage: test-cover
 	@QUIET=$(QUIET) scripts/diff-coverage.sh $(COVERPROFILE)
+
+# Check that newly added test files use an external test package
+test-package-check:
+	@QUIET=$(QUIET) scripts/check-test-package.sh
 
 bench:
 	@echo -e "\n....Running benchmarks for $(GO_PROJECT_NAME)...."
@@ -303,9 +344,9 @@ install-system:
 		ovn-central ovn-host openvswitch-switch dhcpcd-base
 
 install-go:
-	@echo -e "\n....Installing Go 1.26.5 for $(ARCH) ($(GO_ARCH))...."
+	@echo -e "\n....Installing Go 1.26.6 for $(ARCH) ($(GO_ARCH))...."
 	@if [ ! -d "/usr/local/go" ]; then \
-		curl -L https://go.dev/dl/go1.26.5.linux-$(GO_ARCH).tar.gz | tar -C /usr/local -xz; \
+		curl -L https://go.dev/dl/go1.26.6.linux-$(GO_ARCH).tar.gz | tar -C /usr/local -xz; \
 	else \
 		echo "Go already installed in /usr/local/go"; \
 	fi
@@ -388,7 +429,7 @@ distro-arm64:
 distro-clean:
 	rm -rf dist/
 
-.PHONY: build build-ui build-installer build-lb-agent build-ecs-agent build-system-image build-eks-node-image import-eks-node-image publish-eks-node-image build-ecs-node-image import-ecs-node-image build-rds-postgres-image import-rds-postgres-image build-microvm-image install-microvm go_build preflight test test-cover test-race diff-coverage bench test-actions test-images test-harness test-integration generate-aws-model-coverage aws-model-coverage test-segscan-oracle manifest-check manifest-lint manifest-lint-update \
+.PHONY: test-package-check build build-ui build-installer build-lb-agent build-ecs-agent build-system-image build-eks-node-image import-eks-node-image publish-eks-node-image build-ecs-node-image import-ecs-node-image build-rds-postgres-image import-rds-postgres-image build-rds-mariadb-image import-rds-mariadb-image build-microvm-image install-microvm go_build preflight test test-cover test-race diff-coverage bench test-actions test-images test-build-scripts test-harness test-integration generate-aws-model-coverage aws-model-coverage test-segscan-oracle manifest-check manifest-lint manifest-lint-update \
 	deploy reinstall clean \
 	install-system install-go install-aws quickinstall \
 	lint fix govulncheck nilaway \

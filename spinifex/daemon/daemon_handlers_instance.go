@@ -31,12 +31,11 @@ var startStoppedForwardTimeout = 30 * time.Second
 // instance: central store first, then the record under the manager lock, so a
 // failed S3 write leaves both stores untouched, matching the stopped path.
 // Ownership is checked by checkInstanceOwnership before dispatch.
-func (d *Daemon) handleSetInstanceTags(ctx context.Context, msg *nats.Msg, command types.EC2InstanceCommand, instance *vm.VM) {
+func (d *Daemon) handleSetInstanceTags(ctx context.Context, msg *nats.Msg, command types.EC2InstanceCommand, instance *vm.VM) string {
 	remove := command.Attributes.RemoveInstanceTags
 	data := command.InstanceTagsData
 	if data == nil || (!remove && len(data.Tags) == 0) {
-		respondWithError(msg, awserrors.ErrorMissingParameter)
-		return
+		return respondErrorOutcome(msg, awserrors.ErrorMissingParameter)
 	}
 
 	var newTags []*ec2.Tag
@@ -49,16 +48,14 @@ func (d *Daemon) handleSetInstanceTags(ctx context.Context, msg *nats.Msg, comma
 		newTags = handlers_ec2_instance.ApplyInstanceTagMutation(v.Instance.Tags, data, remove)
 	})
 	if missingRecord {
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
+		return respondErrorOutcome(msg, awserrors.ErrorServerInternal)
 	}
 
 	accountID := utils.AccountIDFromMsg(msg)
 	if err := d.tagsService.PutResourceTags(ctx, accountID, instance.ID, handlers_ec2_instance.TagsToMap(newTags)); err != nil {
 		slog.ErrorContext(ctx, "SetInstanceTags: central tag store write failed",
 			"instanceId", instance.ID, "err", err)
-		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
+		return respondErrorOutcome(msg, awserrors.ErrorServerInternal)
 	}
 
 	found, err := d.vmMgr.UpdateAndPersist(instance.ID, func(v *vm.VM) bool {
@@ -69,17 +66,16 @@ func (d *Daemon) handleSetInstanceTags(ctx context.Context, msg *nats.Msg, comma
 		return true
 	})
 	if err != nil {
-		respondWithServiceError(msg, err)
-		return
+		return respondServiceErrorOutcome(msg, err)
 	}
 	if !found {
-		respondWithError(msg, awserrors.ErrorInvalidInstanceIDNotFound)
-		return
+		return respondErrorOutcome(msg, awserrors.ErrorInvalidInstanceIDNotFound)
 	}
 
 	if err := msg.Respond([]byte(`{}`)); err != nil {
 		slog.ErrorContext(ctx, "Failed to respond to NATS request", "err", err)
 	}
+	return outcomeSuccess
 }
 
 // handleEC2RunInstances orchestrates the RunInstances flow across
@@ -88,7 +84,7 @@ func (d *Daemon) handleSetInstanceTags(ctx context.Context, msg *nats.Msg, comma
 // InstanceService.LaunchRunInstances (volumes + GPU + vmMgr.Run). The split
 // preserves the original respond-then-launch timing — AWS gets a reservation
 // before the launch loop starts.
-func (d *Daemon) handleEC2RunInstances(msg *nats.Msg) {
+func (d *Daemon) handleEC2RunInstances(msg *nats.Msg) string {
 	ctx, span := utils.StartConsumerSpan(msg)
 	defer span.End()
 	slog.DebugContext(ctx, "Received message on subject", "subject", msg.Subject)
@@ -97,7 +93,7 @@ func (d *Daemon) handleEC2RunInstances(msg *nats.Msg) {
 	if accountID == "" {
 		slog.Error("handleEC2RunInstances: missing account ID in NATS header")
 		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
+		return outcomeError
 	}
 
 	input := &ec2.RunInstancesInput{}
@@ -106,7 +102,7 @@ func (d *Daemon) handleEC2RunInstances(msg *nats.Msg) {
 			slog.Error("Failed to respond to NATS request", "err", err)
 		}
 		slog.Error("Request does not match RunInstancesInput")
-		return
+		return outcomeError
 	}
 
 	// Targeted launch: the gateway routes only when an explicit reservation id is
@@ -118,7 +114,7 @@ func (d *Daemon) handleEC2RunInstances(msg *nats.Msg) {
 		if it, ok := d.resourceMgr.instanceTypes[aws.StringValue(input.InstanceType)]; ok {
 			if vErr := d.resourceMgr.ValidateReservationTarget(reservationID, accountID, it); vErr != nil {
 				respondWithServiceError(msg, vErr)
-				return
+				return outcomeError
 			}
 		}
 	}
@@ -128,7 +124,7 @@ func (d *Daemon) handleEC2RunInstances(msg *nats.Msg) {
 	endOpSpan(prepSpan, err)
 	if err != nil {
 		respondWithServiceError(msg, err)
-		return
+		return outcomeError
 	}
 
 	// PlacementGroupNode is daemon-local identity, set after prepare.
@@ -149,7 +145,7 @@ func (d *Daemon) handleEC2RunInstances(msg *nats.Msg) {
 				d.resourceMgr.ReleaseToReservation(reservationID, instanceType)
 			}
 		}
-		return
+		return outcomeError
 	}
 	if err := msg.Respond(jsonResponse); err != nil {
 		slog.Error("Failed to respond to NATS request", "err", err)
@@ -194,6 +190,7 @@ func (d *Daemon) handleEC2RunInstances(msg *nats.Msg) {
 		trace.WithAttributes(attribute.Int("instance.count", len(instances))))
 	d.instanceService.LaunchRunInstances(ctx, instances, input, instanceType)
 	launchSpan.End()
+	return outcomeSuccess
 }
 
 // capacityReservationTargetID returns the explicit targeted-launch reservation id
@@ -213,7 +210,7 @@ func capacityReservationTargetID(input *ec2.RunInstancesInput) string {
 // timeout — because StartStoppedInstance's ClaimStoppedInstance call is the
 // single cluster-wide serialization point, so a losing racer bails out
 // cleanly instead of double-starting.
-func (d *Daemon) handleEC2StartStoppedInstance(msg *nats.Msg) {
+func (d *Daemon) handleEC2StartStoppedInstance(msg *nats.Msg) string {
 	// Peek at the instance ID without full unmarshal — we only need it for the
 	// LastNode lookup. The full unmarshal happens inside StartStoppedInstance.
 	var peek struct {
@@ -222,8 +219,7 @@ func (d *Daemon) handleEC2StartStoppedInstance(msg *nats.Msg) {
 	if err := json.Unmarshal(msg.Data, &peek); err != nil || peek.InstanceID == "" {
 		// Can't determine target node — fall through to local start which will
 		// return the appropriate error (missing parameter / unmarshal failure).
-		handleNATSRequest(d.instanceService.StartStoppedInstance)(msg)
-		return
+		return handleNATSRequest(d.instanceService.StartStoppedInstance)(msg)
 	}
 
 	lastNode := d.instanceService.StoppedInstanceNode(peek.InstanceID)
@@ -249,8 +245,11 @@ func (d *Daemon) handleEC2StartStoppedInstance(msg *nats.Msg) {
 				if relayErr := msg.Respond(resp.Data); relayErr != nil {
 					slog.Error("ec2.start: failed to relay response from original node",
 						"instanceId", peek.InstanceID, "lastNode", lastNode, "err", relayErr)
+					return outcomeError
 				}
-				return
+				// The relayed payload carries the owning node's verdict, so the
+				// outcome recorded here is that node's, not ours.
+				return outcomeFor(isErrPayload == nil)
 			}
 			slog.Warn("ec2.start: original node at capacity, starting locally",
 				"instanceId", peek.InstanceID, "lastNode", lastNode)
@@ -268,5 +267,5 @@ func (d *Daemon) handleEC2StartStoppedInstance(msg *nats.Msg) {
 		}
 	}
 
-	handleNATSRequest(d.instanceService.StartStoppedInstance)(msg)
+	return handleNATSRequest(d.instanceService.StartStoppedInstance)(msg)
 }

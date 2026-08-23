@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
-	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -17,7 +16,6 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/vm"
-	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -326,7 +324,7 @@ func TestVolumeMounterAdapter_MountOne(t *testing.T) {
 				NBDURI:     tt.initialURI,
 			}
 
-			err := adapter.MountOne(req)
+			err := adapter.MountOne(t.Context(), "", req)
 			if tt.wantErr {
 				require.Error(t, err)
 				if tt.wantErrSub != "" {
@@ -560,21 +558,7 @@ func TestInstanceCleanerAdapter_DetachAndDeleteENI_AbsentPrimaryDoesNotLogFalseS
 func TestInstanceCleanerAdapter_ReleaseAttachedENIs_ListInstanceENIsErrorTolerated(t *testing.T) {
 	daemon := createTestDaemon(t, sharedNATSURL)
 
-	ns, err := server.NewServer(&server.Options{
-		Host:      "127.0.0.1",
-		Port:      -1,
-		JetStream: true,
-		StoreDir:  t.TempDir(),
-		NoLog:     true,
-		NoSigs:    true,
-	})
-	require.NoError(t, err)
-	go ns.Start()
-	require.True(t, ns.ReadyForConnections(5*time.Second))
-	t.Cleanup(func() { ns.Shutdown() })
-
-	nc, err := nats.Connect(ns.ClientURL())
-	require.NoError(t, err)
+	_, nc, _ := testutil.StartTestJetStream(t)
 	testutil.StubVpcdSGResponder(t, nc)
 
 	vpcSvc, err := handlers_ec2_vpc.NewVPCServiceImplWithNATS(t.Context(), daemon.config, nc)
@@ -587,4 +571,66 @@ func TestInstanceCleanerAdapter_ReleaseAttachedENIs_ListInstanceENIsErrorTolerat
 
 	require.NoError(t, cleaner.DetachAndDeleteENI(instance),
 		"an enumeration failure must not surface as a terminate error")
+}
+
+// TestVolumeMounterAdapter_Mount_WrapsErrMountRetryable verifies that a
+// viperblockd ebs.mount response with Retryable=true is wrapped so
+// vm.Manager's recovery-relaunch retry can match it with errors.Is. A
+// Retryable=false response must NOT match, so relaunchAll still fails fast
+// on permanent mount errors.
+func TestVolumeMounterAdapter_Mount_WrapsErrMountRetryable(t *testing.T) {
+	daemon := createTestDaemon(t, sharedNATSURL)
+	adapter := newVolumeMounterAdapter(daemon.natsConn, daemon.node, nil)
+
+	sub, err := daemon.natsConn.Subscribe("ebs."+daemon.node+".mount", func(msg *nats.Msg) {
+		resp := types.EBSMountResponse{Error: "state not found", Retryable: true}
+		data, _ := json.Marshal(resp)
+		_ = msg.Respond(data)
+	})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	instance := &vm.VM{ID: "i-mount-retryable"}
+	instance.EBSRequests.Requests = []types.EBSRequest{{Name: "vol-retryable"}}
+
+	err = adapter.Mount(t.Context(), instance)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, vm.ErrMountRetryable,
+		"a Retryable mount response must wrap vm.ErrMountRetryable so relaunchAll can retry it")
+}
+
+func TestVolumeMounterAdapter_Mount_PermanentErrorNotWrapped(t *testing.T) {
+	daemon := createTestDaemon(t, sharedNATSURL)
+	adapter := newVolumeMounterAdapter(daemon.natsConn, daemon.node, nil)
+
+	sub, err := daemon.natsConn.Subscribe("ebs."+daemon.node+".mount", func(msg *nats.Msg) {
+		resp := types.EBSMountResponse{Error: "volume vol-permanent is already mounted read_only=true on this node"}
+		data, _ := json.Marshal(resp)
+		_ = msg.Respond(data)
+	})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	instance := &vm.VM{ID: "i-mount-permanent"}
+	instance.EBSRequests.Requests = []types.EBSRequest{{Name: "vol-permanent"}}
+
+	err = adapter.Mount(t.Context(), instance)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, vm.ErrMountRetryable,
+		"a non-Retryable mount response must not be mistaken for a transient failure")
+}
+
+func TestVolumeMounterAdapter_Mount_NoResponderIsRetryable(t *testing.T) {
+	daemon := createTestDaemon(t, sharedNATSURL)
+	adapter := newVolumeMounterAdapter(daemon.natsConn, daemon.node, nil)
+
+	// No subscriber on the mount subject: viperblockd is still starting, so
+	// the request returns nats.ErrNoResponders, which must be retryable.
+	instance := &vm.VM{ID: "i-mount-noresponder"}
+	instance.EBSRequests.Requests = []types.EBSRequest{{Name: "vol-noresponder"}}
+
+	err := adapter.Mount(t.Context(), instance)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, vm.ErrMountRetryable,
+		"a mount request with no responder must wrap vm.ErrMountRetryable so relaunchAll can retry it")
 }

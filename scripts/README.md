@@ -29,7 +29,8 @@ Node installation, dev-environment lifecycle, guest image builds, and verificati
 | `check-coverage.sh` | Fails the build if total Go coverage falls below the minimum threshold, excluding packages exempt from the requirement. |
 | `diff-coverage.sh` | Coverage check scoped to changed lines only, against an auto-detected base ref (`HEAD~1` on main, `origin/main` on dev, otherwise `origin/dev`). |
 | `run-bench.sh` | Launches a benchmark against running Ubuntu instances, auto-detecting the AMI for the host architecture. Tracks nbdkit and perf alongside the run. |
-| `disk-performance.sh` | Runs an in-guest `fio` random 70/30 read-write benchmark. Installs fio and sysstat first. |
+| `disk-performance.sh` | Runs a `fio` random 70/30 read-write benchmark swept across 4k/16k/128k/1M. Writes JSON results to `/tmp/spinifex-disk-bench`; override with `BENCH_DIR`, `OUT_DIR`, `SIZE`, `JOBS`, `BLOCK_SIZES`. |
+| `network-performance.sh` | iperf throughput from several clients to one server, driven over SSH, writing a `summary.txt` of Gbit/s per client. `--server-ip` sets the address clients dial, so pointing it at instance private addresses measures the VPC overlay rather than the external pool. |
 | `workload-performance.sh` | In-guest memory, disk, CPU and network workload test. Installs Go and runs the Badger test suite with jemalloc disabled and reduced parallelism. |
 
 ## Guest images
@@ -55,6 +56,7 @@ Each subdirectory holds a `manifest.conf`, init scripts, and a `setup.sh` that `
 | `eks-node/` | The unified Alpine EKS node AMI (K3s server *or* agent, selected at first boot). `setup.sh` installs the pinned, SHA-verified K3s binary and the role init scripts. |
 | `eks-node-gpu/` | The Ubuntu EKS GPU worker AMI. Agent role only — GPU nodes never run the control plane — plus the NVIDIA GPU stack. |
 | `rds-postgres/` | The `spinifex-rds-postgres` AMI. `setup.sh` sets exec bits on the OpenRC services and creates the root-only directory cloud-init drops the agent env file and gateway CA into. |
+| `rds-mariadb/` | The `spinifex-rds-mariadb` AMI. Same layout as `rds-postgres/`, plus the `/etc/my.cnf.d` include drop-in and the `conf.d/mariadb` dependency that keeps the packaged service off an unbootstrapped datadir. |
 | `ubuntu-gpu-{amd,nvidia}-setup.sh` | Chroot setup for GPU-capable Ubuntu guest images: ROCm CLI tools and AMD firmware, or the DKMS-built headless NVIDIA driver. Guest-side only — host VFIO setup is `spx admin gpu setup`. |
 
 ### `images/eks-node/` — in-guest helpers

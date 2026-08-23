@@ -24,6 +24,22 @@ type EBSRequest struct {
 	HotplugPort int `json:"HotplugPort,omitempty"`
 }
 
+// VolumeTypeGP3 is the only EBS volume type this platform serves.
+const VolumeTypeGP3 = "gp3"
+
+const (
+	// gp3 IOPS envelope (AWS): 3000 baseline on any size, up to 500 IOPS/GiB,
+	// capped at 16000.
+	DefaultGP3IOPS = 3000
+	MaxGP3IOPS     = 16000
+	GP3IOPSPerGiB  = 500
+
+	// gp3 Throughput envelope (AWS): 125 MiB/s baseline, 1000 MiB/s ceiling,
+	// flat range independent of volume size.
+	DefaultGP3Throughput = 125
+	MaxGP3Throughput     = 1000
+)
+
 // NBDTransport defines the transport type for NBD connections.
 type NBDTransport string
 
@@ -38,6 +54,10 @@ type EBSMountResponse struct {
 	URI     string `json:"URI"`
 	Mounted bool   `json:"Mounted"`
 	Error   string `json:"Error"`
+	// Retryable marks a mount failure caused by a backing store that is not
+	// yet ready (e.g. a transient state-load gap), as opposed to a
+	// permanent failure the caller should not retry.
+	Retryable bool `json:"Retryable"`
 }
 
 type EBSUnMountResponse struct {

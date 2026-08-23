@@ -1,5 +1,5 @@
 import type { Subnet } from "@aws-sdk/client-ec2"
-import { useMemo, useState } from "react"
+import { useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import { getNameTag } from "@/lib/utils"
@@ -38,7 +38,7 @@ export function SubnetsEditor({
   error,
   isSuccess,
 }: SubnetsEditorProps) {
-  const initial = useMemo(() => [...current], [current])
+  const initial = [...current]
   const [selected, setSelected] = useState<string[]>(initial)
 
   const toggle = (id: string) => {
@@ -51,6 +51,7 @@ export function SubnetsEditor({
   const dirty = !sameSet(selected, initial)
   // A load balancer must front at least one subnet.
   const isEmpty = selected.length === 0
+  const selectedIds = new Set(selected)
 
   return (
     <form
@@ -100,7 +101,7 @@ export function SubnetsEditor({
               >
                 <input
                   aria-label={`Subnet ${subnet.SubnetId}`}
-                  checked={selected.includes(subnet.SubnetId ?? "")}
+                  checked={selectedIds.has(subnet.SubnetId ?? "")}
                   onChange={() => toggle(subnet.SubnetId ?? "")}
                   type="checkbox"
                 />

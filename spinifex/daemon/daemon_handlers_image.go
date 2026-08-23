@@ -14,7 +14,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-func (d *Daemon) handleSpinifexPromoteImage(msg *nats.Msg) {
+func (d *Daemon) handleSpinifexPromoteImage(msg *nats.Msg) string {
 	promoteImage := func(_ context.Context, input *admin.PromoteImageOpts, _ string) (*admin.PromoteImageResult, error) {
 		store := objectstore.NewS3ObjectStoreFromConfig(
 			admin.DialTarget(d.config.Predastore.Host),
@@ -24,12 +24,19 @@ func (d *Daemon) handleSpinifexPromoteImage(msg *nats.Msg) {
 		)
 		return admin.PromoteSystemImage(store, d.config.Predastore.Bucket, *input)
 	}
-	handleNATSRequest(promoteImage)(msg)
+	return handleNATSRequest(promoteImage)(msg)
+}
+
+// stoppedInstanceOwnerElector is implemented by state stores that can
+// atomically mutate a stopped instance record. Checked via assertion so
+// vm.StateStore itself need not widen for this one call site.
+type stoppedInstanceOwnerElector interface {
+	UpdateStoppedInstance(id string, mutate func(*vm.VM)) (*vm.VM, error)
 }
 
 // handleEC2CreateImage is a stateful handler that extracts instance context
 // (root volume ID, source AMI, running state) before delegating to the image service.
-func (d *Daemon) handleEC2CreateImage(msg *nats.Msg) {
+func (d *Daemon) handleEC2CreateImage(msg *nats.Msg) string {
 	slog.Debug("Received message", "subject", msg.Subject)
 
 	input := &ec2.CreateImageInput{}
@@ -37,14 +44,14 @@ func (d *Daemon) handleEC2CreateImage(msg *nats.Msg) {
 		if err := msg.Respond(errResp); err != nil {
 			slog.Error("Failed to respond to NATS request", "err", err)
 		}
-		return
+		return outcomeError
 	}
 
 	accountID := utils.AccountIDFromMsg(msg)
 
 	if input.InstanceId == nil || *input.InstanceId == "" {
 		respondWithError(msg, awserrors.ErrorMissingParameter)
-		return
+		return outcomeError
 	}
 
 	instanceID := *input.InstanceId
@@ -86,8 +93,42 @@ func (d *Daemon) handleEC2CreateImage(msg *nats.Msg) {
 		if stopped == nil {
 			slog.Warn("CreateImage: instance not found", "instanceId", instanceID)
 			respondWithError(msg, awserrors.ErrorInvalidInstanceIDNotFound)
-			return
+			return outcomeError
 		}
+
+		// The KV is cluster-shared, so every node's lookup above succeeds;
+		// only LastNode picks a single owner. Non-owners decline like the
+		// miss above — Gather only short-circuits on success, so this can't
+		// preempt the owner's reply, it just stops a duplicate AMI/snapshot.
+		if stopped.LastNode == "" {
+			// Pre-LastNode record from an older build. Elect an owner via
+			// CAS so exactly one node wins, instead of every node
+			// proceeding (the leak) or every node declining forever.
+			elector, canElect := d.stateStore.(stoppedInstanceOwnerElector)
+			if !canElect {
+				slog.Error("CreateImage: state store cannot elect owner for legacy stopped instance", "instanceId", instanceID)
+				respondWithError(msg, awserrors.ErrorInvalidInstanceIDNotFound)
+				return outcomeError
+			}
+			elected, uerr := elector.UpdateStoppedInstance(instanceID, func(v *vm.VM) {
+				if v.LastNode == "" {
+					v.LastNode = d.node
+				}
+			})
+			if uerr != nil || elected == nil || elected.LastNode == "" {
+				slog.Warn("CreateImage: failed to elect owner for legacy stopped instance", "instanceId", instanceID, "err", uerr)
+				respondWithError(msg, awserrors.ErrorInvalidInstanceIDNotFound)
+				return outcomeError
+			}
+			stopped.LastNode = elected.LastNode
+		}
+		if stopped.LastNode != d.node {
+			slog.Info("CreateImage: declining, instance owned by another node",
+				"instanceId", instanceID, "lastNode", stopped.LastNode)
+			respondWithError(msg, awserrors.ErrorInvalidInstanceIDNotFound)
+			return outcomeError
+		}
+
 		instance = stopped
 		status = stopped.Status
 		if stopped.Instance != nil {
@@ -105,19 +146,19 @@ func (d *Daemon) handleEC2CreateImage(msg *nats.Msg) {
 
 	// Verify the caller owns this instance
 	if !checkInstanceOwnership(msg, instanceID, instance.AccountID) {
-		return
+		return outcomeError
 	}
 
 	if status != vm.StateRunning && status != vm.StateStopped {
 		slog.Warn("CreateImage: instance not in valid state", "instanceId", instanceID, "status", status)
 		respondWithError(msg, awserrors.ErrorIncorrectInstanceState)
-		return
+		return outcomeError
 	}
 
 	if rootVolumeID == "" {
 		slog.Error("CreateImage: no root volume found", "instanceId", instanceID)
 		respondWithError(msg, awserrors.ErrorServerInternal)
-		return
+		return outcomeError
 	}
 
 	params := handlers_ec2_image.CreateImageParams{
@@ -131,9 +172,10 @@ func (d *Daemon) handleEC2CreateImage(msg *nats.Msg) {
 	if err != nil {
 		slog.Error("CreateImage: service failed", "instanceId", instanceID, "err", err)
 		respondWithServiceError(msg, err)
-		return
+		return outcomeError
 	}
 
 	respondWithJSON(msg, output)
 	slog.Info("CreateImage completed", "instanceId", instanceID, "imageId", *output.ImageId)
+	return outcomeSuccess
 }

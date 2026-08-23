@@ -19,7 +19,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
-	"github.com/mulgadc/predastore/pkg/masterkey"
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/kvutil"
@@ -709,6 +709,13 @@ func (s *IAMServiceImpl) DecryptSecret(ciphertext string) (string, error) {
 	return s.key.DecryptBase64(ciphertext)
 }
 
+// EncryptSecret encrypts plaintext to a base64-encoded AES-256-GCM ciphertext
+// using the same master key DecryptSecret reads, so a value it produces is
+// storable anywhere an access-key secret already is.
+func (s *IAMServiceImpl) EncryptSecret(plaintext string) (string, error) {
+	return s.key.EncryptBase64(plaintext)
+}
+
 // SeedBootstrap seeds the system root user and optional admin account into NATS KV.
 // Uses conditional create for multi-node safety; first node wins, others skip silently.
 func (s *IAMServiceImpl) SeedBootstrap(data *BootstrapData) error {
@@ -780,7 +787,16 @@ func (s *IAMServiceImpl) SeedBootstrap(data *BootstrapData) error {
 	}
 
 	// --- Seed admin account (000000000001) if present ---
-	if data.Admin != nil {
+	if data.Admin != nil && data.Admin.AccessKeyID == "" {
+		// An admin block carrying no access key cannot be seeded, and returning an
+		// error here takes the gateway down for as long as the file stays on disk —
+		// it is read again on every restart, so the node never recovers on its own.
+		// A node serving the API without the operator account is a problem someone
+		// can fix; one that will not start is not.
+		slog.Error("bootstrap admin block has no access key, skipping admin seeding",
+			"accountID", data.Admin.AccountID,
+			"hint", "re-run `spx admin init` on the first node to reissue admin credentials")
+	} else if data.Admin != nil {
 		if err := s.seedAdminAccount(ctx, data.Admin); err != nil {
 			return fmt.Errorf("seed admin account: %w", err)
 		}
@@ -1053,6 +1069,89 @@ func (s *IAMServiceImpl) ListAccounts() ([]*Account, error) {
 		accounts = append(accounts, &account)
 	}
 	return accounts, nil
+}
+
+// UndeletableAccountIDs are the two accounts no teardown may ever remove: the
+// internal system account and the super admin. Held here rather than only in
+// the caller so a new caller cannot bypass the rule by forgetting it.
+var UndeletableAccountIDs = map[string]string{
+	"000000000000": "system",
+	"000000000001": "super admin",
+}
+
+// ErrAccountUndeletable reports a refusal to delete a protected account. It is
+// deliberately distinct from a permissions error: no credential grants it.
+var ErrAccountUndeletable = errors.New("account is protected and cannot be deleted")
+
+// SetAccountStatus writes a new status and returns the updated account. It
+// refuses to move an account out of TERMINATING: teardown has already begun
+// destroying data, so restoring service would hand back a hollowed-out account.
+func (s *IAMServiceImpl) SetAccountStatus(accountID, status string) (*Account, error) {
+	switch status {
+	case AccountStatusActive, AccountStatusSuspended, AccountStatusTerminating:
+	default:
+		return nil, errors.New(awserrors.ErrorIAMInvalidInput)
+	}
+
+	account, err := s.GetAccount(accountID)
+	if err != nil {
+		return nil, err
+	}
+	if account.Status == AccountStatusTerminating && status != AccountStatusTerminating {
+		return nil, fmt.Errorf("account %s is terminating: %w", accountID, ErrAccountUndeletable)
+	}
+	if account.Status == status {
+		return account, nil
+	}
+
+	account.Status = status
+	data, err := json.Marshal(account)
+	if err != nil {
+		return nil, fmt.Errorf("marshal account: %w", err)
+	}
+	if _, err := s.accountsBucket.Put(context.Background(), accountID, data); err != nil {
+		return nil, fmt.Errorf("store account status: %w", err)
+	}
+
+	slog.Info("Account status changed", "accountID", accountID, "status", status)
+	return account, nil
+}
+
+// DeleteAccount removes the account record itself. It is the last step of a
+// teardown and does nothing about the account's resources — a caller that has
+// not emptied the account first strands every resource it owned, because the
+// ownership record is what attributes them.
+func (s *IAMServiceImpl) DeleteAccount(accountID string) error {
+	if reason, protected := UndeletableAccountIDs[accountID]; protected {
+		return fmt.Errorf("%s (%s): %w", accountID, reason, ErrAccountUndeletable)
+	}
+
+	account, err := s.GetAccount(accountID)
+	if err != nil {
+		return err
+	}
+	if account.Status != AccountStatusTerminating {
+		return fmt.Errorf("account %s is %s, not %s: %w",
+			accountID, account.Status, AccountStatusTerminating, ErrAccountUndeletable)
+	}
+
+	if err := s.accountsBucket.Delete(context.Background(), accountID); err != nil {
+		return fmt.Errorf("delete account: %w", err)
+	}
+	slog.Info("Account deleted", "accountID", accountID, "name", account.AccountName)
+
+	if s.natsConn != nil {
+		evt, err := json.Marshal(struct {
+			AccountID   string `json:"account_id"`
+			AccountName string `json:"account_name"`
+		}{AccountID: accountID, AccountName: account.AccountName})
+		if err != nil {
+			slog.Error("Failed to marshal account deletion event", "accountID", accountID, "error", err)
+		} else if err := s.natsConn.Publish("iam.account.deleted", evt); err != nil {
+			slog.Error("Failed to publish account deletion event", "accountID", accountID, "error", err)
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

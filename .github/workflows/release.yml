@@ -28,13 +28,25 @@ jobs:
           repository: mulgadc/viperblock
           path: viperblock
 
+      - name: Checkout Northstar
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/northstar
+          path: northstar
+
+      - name: Checkout Bluebottle
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/bluebottle
+          path: bluebottle
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: "1.26.5"
+          go-version: "1.26.6"
 
       - name: Build microVM artifacts (lb-agent + kernel + initramfs)
         run: cd spinifex && make build-microvm-image
@@ -72,6 +84,18 @@ jobs:
         with:
           repository: mulgadc/viperblock
           path: viperblock
+
+      - name: Checkout Northstar
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/northstar
+          path: northstar
+
+      - name: Checkout Bluebottle
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/bluebottle
+          path: bluebottle
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -207,6 +231,17 @@ jobs:
             echo "Release ${TAG} promoted to latest"
           fi
 
+  # Refresh the system AMIs on the R2 mirror only once the release is out of
+  # draft. Shares the ci-single runner with `iso`, so it queues behind it.
+  system-images:
+    needs: promote
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-system-ami.yml
+    with:
+      variant: all
+    secrets: inherit
+
   # Annotate the (still-draft) release if either gate failed.
   mark-failed:
     needs: [ verify, baremetal ]
@@ -268,6 +303,18 @@ jobs:
           repository: mulgadc/viperblock
           path: viperblock
 
+      - name: Checkout Northstar
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/northstar
+          path: northstar
+
+      - name: Checkout Bluebottle
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/bluebottle
+          path: bluebottle
+
       - name: Checkout Mulga iso-builder
         uses: actions/checkout@v7
         with:
@@ -286,7 +333,7 @@ jobs:
           cache: false
 
       - name: Configure Go workspace
-        run: go work init ./spinifex ./predastore ./viperblock
+        run: go work init ./spinifex ./predastore ./viperblock ./northstar ./bluebottle
 
       - name: Install ISO builder dependencies
         run: |

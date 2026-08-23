@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -37,6 +38,42 @@ type Config struct {
 	TLSKey  string `json:"tls_key"`
 	// BaseDir is the base directory for PID files and state.
 	BaseDir string `json:"base_dir"`
+	// Region is the cluster's AWS-parity region, served to the browser so the
+	// console can sign requests for the cluster it is actually talking to.
+	Region string `json:"region"`
+}
+
+// clusterConfig is the body of GET /api/config. It carries only non-secret
+// facts, matching the unauthenticated posture of /api/ca.pem.
+type clusterConfig struct {
+	Region string `json:"region"`
+}
+
+// namedRoute labels a route's request metrics with a fixed action, so
+// rpc_method carries the endpoint rather than the bare HTTP verb.
+func namedRoute(action string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		otelsetup.SetRequestAction(r.Context(), action)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// clusterConfigHandler serves the facts the SPA needs before it can sign
+// anything. no-store keeps a caching proxy in front of several clusters from
+// serving one the other's region.
+func clusterConfigHandler(region string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if region == "" {
+			slog.Error("Cluster region is not configured; the console cannot sign requests")
+			http.Error(w, "Cluster region is not configured", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		if err := json.NewEncoder(w).Encode(clusterConfig{Region: region}); err != nil {
+			slog.Error("Failed to write cluster config", "error", err)
+		}
+	}
 }
 
 // Service represents the spinifex-ui service.
@@ -172,6 +209,9 @@ func (svc *Service) launchService() error {
 		file, err := contentFS.Open(path)
 		if err == nil {
 			_ = file.Close()
+			// Asset filenames are content-hashed, so the action names the branch
+			// rather than the path — one series per build otherwise.
+			otelsetup.SetRequestAction(r.Context(), "ui.static")
 			// Use no-cache to force revalidation; http.FileServer sets ETags
 			// so browsers will get 304 Not Modified when files haven't changed
 			w.Header().Set("Cache-Control", "no-cache")
@@ -180,6 +220,7 @@ func (svc *Service) launchService() error {
 		}
 
 		// File doesn't exist, serve index.html for SPA routing
+		otelsetup.SetRequestAction(r.Context(), "ui.spa")
 		w.Header().Set("Cache-Control", "no-cache")
 		indexContent, err := fs.ReadFile(contentFS, "index.html")
 		if err != nil {
@@ -195,11 +236,12 @@ func (svc *Service) launchService() error {
 	mux := http.NewServeMux()
 
 	// Reverse proxy routes — must be registered before the SPA catch-all.
-	mux.Handle("/proxy/awsgw/", newReverseProxy("localhost:9999", "/proxy/awsgw", proxyTransport))
-	mux.Handle("/proxy/s3/", newReverseProxy("localhost:8443", "/proxy/s3", proxyTransport))
+	mux.Handle("/proxy/awsgw/", namedRoute("ui.proxy.awsgw", newReverseProxy("localhost:9999", "/proxy/awsgw", proxyTransport)))
+	mux.Handle("/proxy/s3/", namedRoute("ui.proxy.s3", newReverseProxy("localhost:8443", "/proxy/s3", proxyTransport)))
 
 	// CA certificate download.
 	mux.HandleFunc("/api/ca.pem", func(w http.ResponseWriter, r *http.Request) {
+		otelsetup.SetRequestAction(r.Context(), "ui.api.ca-cert")
 		if _, err := os.Stat(caCertPath); err != nil {
 			if os.IsNotExist(err) {
 				slog.Warn("CA certificate requested but not found", "path", caCertPath)
@@ -214,6 +256,8 @@ func (svc *Service) launchService() error {
 		w.Header().Set("Content-Disposition", `attachment; filename="spinifex-ca.pem"`)
 		http.ServeFile(w, r, caCertPath)
 	})
+
+	mux.Handle("/api/config", namedRoute("ui.api.config", clusterConfigHandler(svc.Config.Region)))
 
 	// SPA catch-all.
 	mux.Handle("/", spaHandler)

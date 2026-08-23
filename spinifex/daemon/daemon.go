@@ -32,6 +32,7 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/config"
+	"github.com/mulgadc/spinifex/spinifex/ebsprovider"
 	"github.com/mulgadc/spinifex/spinifex/gpu"
 	handlers_acm "github.com/mulgadc/spinifex/spinifex/handlers/acm"
 	handlers_bedrock "github.com/mulgadc/spinifex/spinifex/handlers/bedrock"
@@ -57,6 +58,7 @@ import (
 	handlers_eks "github.com/mulgadc/spinifex/spinifex/handlers/eks"
 	handlers_elbv2 "github.com/mulgadc/spinifex/spinifex/handlers/elbv2"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
+	handlers_ochrevector "github.com/mulgadc/spinifex/spinifex/handlers/ochrevector"
 	handlers_rds "github.com/mulgadc/spinifex/spinifex/handlers/rds"
 	"github.com/mulgadc/spinifex/spinifex/instancetypes"
 	"github.com/mulgadc/spinifex/spinifex/kvutil"
@@ -113,9 +115,9 @@ type ResourceManager struct {
 	subsMu        sync.Mutex
 	natsConn      *nats.Conn
 	instanceSubs  map[string]*nats.Subscription
-	handler       nats.MsgHandler
-	systemHandler nats.MsgHandler // handles system.LaunchInstance.* requests (ALB-VM fan-out)
-	nodeID        string          // node identifier for node-specific topic subscriptions
+	handler       natsHandler
+	systemHandler natsHandler // handles system.LaunchInstance.* requests (ALB-VM fan-out)
+	nodeID        string      // node identifier for node-specific topic subscriptions
 }
 
 // Compile-time guarantee that the RouteTable service satisfies the IGW
@@ -124,19 +126,21 @@ var _ handlers_ec2_igw.GatePublisher = (*handlers_ec2_routetable.RouteTableServi
 
 // Daemon represents the main daemon service.
 type Daemon struct {
-	node                  string
-	clusterConfig         *config.ClusterConfig
-	config                *config.Config
-	natsConn              *nats.Conn
-	resourceMgr           *ResourceManager
-	instanceService       *handlers_ec2_instance.InstanceServiceImpl
-	dnsWriter             *handlers_dns.Writer
-	dnsReconciler         *handlers_dns.Reconciler
-	dnsBaseDomain         string
-	dnsInternalDomain     string
-	keyService            *handlers_ec2_key.KeyServiceImpl
-	imageService          *handlers_ec2_image.ImageServiceImpl
-	volumeService         *handlers_ec2_volume.VolumeServiceImpl
+	node              string
+	clusterConfig     *config.ClusterConfig
+	config            *config.Config
+	natsConn          *nats.Conn
+	resourceMgr       *ResourceManager
+	instanceService   *handlers_ec2_instance.InstanceServiceImpl
+	dnsWriter         *handlers_dns.Writer
+	dnsReconciler     *handlers_dns.Reconciler
+	dnsBaseDomain     string
+	dnsInternalDomain string
+	keyService        *handlers_ec2_key.KeyServiceImpl
+	imageService      *handlers_ec2_image.ImageServiceImpl
+	volumeService     *handlers_ec2_volume.VolumeServiceImpl
+	// ebsProvider is the sole EBS backend, set once during startup.
+	ebsProvider           ebsprovider.EBSProvider
 	accountService        *handlers_ec2_account.AccountSettingsServiceImpl
 	snapshotService       *handlers_ec2_snapshot.SnapshotServiceImpl
 	tagsService           *handlers_ec2_tags.TagsServiceImpl
@@ -157,6 +161,8 @@ type Daemon struct {
 	bedrockReaper         *handlers_bedrock.Reaper
 	acmService            *handlers_acm.ACMServiceImpl
 	acmRenewalWorker      *handlers_acm.Worker
+	ochreVectorService    handlers_ochrevector.VectorService
+	ochreAppliance        *handlers_ochrevector.Appliance
 	ecrMetaService        *handlers_ecr.MetaServiceImpl
 	routeTableService     *handlers_ec2_routetable.RouteTableServiceImpl
 	natGatewayService     *handlers_ec2_natgw.NatGatewayServiceImpl
@@ -180,6 +186,9 @@ type Daemon struct {
 	clusterServer *http.Server
 	startTime     time.Time
 	configPath    string
+
+	// predastoreHealth caches the /health predastore probe's verdict; see health.go.
+	predastoreHealth predastoreHealthCache
 
 	// System credentials for ALB agent SigV4 auth (loaded from system-credentials.json)
 	systemAccessKey string
@@ -747,14 +756,87 @@ func NewDaemon(cfg *config.ClusterConfig) (*Daemon, error) {
 	return d, nil
 }
 
-// natsMetricsHandler wraps a NATS handler to record request count and
-// duration under the given action. Handler outcome is not observable at
-// this chokepoint, so the outcome attribute is omitted.
-func natsMetricsHandler(action string, h nats.MsgHandler) nats.MsgHandler {
+// Outcomes recorded on daemon request metrics. A handler that answered with an
+// error payload is outcomeError; anything else is outcomeSuccess.
+// A broadcast handler that declines because the request names another node is
+// outcomeSkipped: it neither served nor failed, and folding it into either one
+// hides a node that answered nothing.
+const (
+	outcomeSuccess = "success"
+	outcomeError   = "error"
+	outcomeSkipped = "skipped"
+
+	// outcomeClientError is a caller mistake — an unknown id, a bad parameter.
+	// Separate from outcomeError so a daemon error rate measures the daemon
+	// rather than the callers reaching it.
+	outcomeClientError = "client_error"
+
+	// outcomeDeferred tells natsMetricsHandler the handler records its own
+	// point. Handlers that answer from a goroutine must use it: timing the
+	// wrapper would measure the dispatch and call every launch an instant
+	// success.
+	outcomeDeferred = ""
+)
+
+// outcomeFor maps the reply-succeeded flag the utils serve helpers return onto
+// a metric outcome.
+func outcomeFor(replied bool) string {
+	if replied {
+		return outcomeSuccess
+	}
+	return outcomeError
+}
+
+// outcomeForError classifies a handler failure by the status its AWS code maps
+// to, through the same function the HTTP middleware uses. Anything carrying no
+// recognised code lands on 500, so an unclassifiable failure counts against the
+// daemon rather than being written off as the caller's fault.
+func outcomeForError(err error) string {
+	return otelsetup.OutcomeForStatus(awserrors.HTTPStatusForError(err))
+}
+
+// outcomeForCode classifies by an AWS error code a handler has already chosen,
+// for the paths that answer with a code rather than an error value.
+func outcomeForCode(errCode string) string {
+	return outcomeForError(errors.New(errCode))
+}
+
+// ec2CmdAction names the metric action for a per-instance command. The subject
+// carries the instance id, so the action is built from the command: an instance
+// id in a metric dimension would make one series per instance.
+func ec2CmdAction(command string) string {
+	return "ec2.cmd." + command
+}
+
+// logHandlerError reports a handler failure at a level matching its
+// classification: ERROR means the daemon failed. A client error is the caller's
+// and is logged at WARN, which is what stops an expected fan-out miss writing an
+// ERROR line on every node that was never going to answer.
+func logHandlerError(ctx context.Context, msg string, subject string, err error) {
+	code := awserrors.ValidErrorCodeFromError(err)
+	if outcomeForError(err) == outcomeClientError {
+		slog.WarnContext(ctx, msg, "subject", subject, "code", code, "err", err)
+		return
+	}
+	slog.ErrorContext(ctx, msg, "subject", subject, "code", code, "err", err)
+}
+
+// natsHandler is a NATS handler that reports how it answered. The type exists
+// so the outcome is observable at the metrics chokepoint: a plain MsgHandler
+// writes its own reply and returns nothing, which is why daemon request points
+// carried no outcome at all.
+type natsHandler func(*nats.Msg) string
+
+// natsMetricsHandler wraps a NATS handler to record request count, duration
+// and outcome under the given action.
+func natsMetricsHandler(action string, h natsHandler) nats.MsgHandler {
 	return func(msg *nats.Msg) {
 		start := time.Now()
-		h(msg)
-		otelsetup.RecordRequest(context.Background(), action, "", time.Since(start))
+		outcome := h(msg)
+		if outcome == outcomeDeferred {
+			return
+		}
+		otelsetup.RecordRequest(context.Background(), action, outcome, time.Since(start))
 	}
 }
 
@@ -782,7 +864,7 @@ func clusterCAKeyPath(caCertPath string) string {
 // natsSub defines a single NATS subscription entry for the table-driven setup.
 type natsSub struct {
 	topic      string
-	handler    nats.MsgHandler
+	handler    natsHandler
 	queueGroup string // empty = plain Subscribe (fan-out)
 }
 
@@ -808,6 +890,9 @@ func (d *Daemon) subscribeAll() error {
 		{"ec2.DescribeVolumes", handleNATSRequest(d.volumeService.DescribeVolumes), "spinifex-workers"},
 		{"ec2.ModifyVolume", d.handleEC2ModifyVolume, "spinifex-workers"},
 		{"ec2.DeleteVolume", handleNATSRequest(d.volumeService.DeleteVolume), "spinifex-workers"},
+		// Cluster-wide on purpose: the QMP detach is instance-scoped, so a
+		// volume held by an unreachable host has no other way out.
+		{"ec2.ForceDetachVolume", handleNATSRequest(d.volumeService.ForceDetachVolume), "spinifex-workers"},
 		{"ec2.DescribeVolumeStatus", handleNATSRequest(d.volumeService.DescribeVolumeStatus), "spinifex-workers"},
 		{"ec2.DescribeVolumesModifications", handleNATSRequest(d.volumeService.DescribeVolumesModifications), "spinifex-workers"},
 		{"ec2.CreateSnapshot", handleNATSRequest(d.snapshotService.CreateSnapshot), "spinifex-workers"},
@@ -918,6 +1003,7 @@ func (d *Daemon) subscribeAll() error {
 		{"spinifex.image.promote", d.handleSpinifexPromoteImage, "spinifex-workers"},
 		// Account creation → create default VPC for new account
 		{"iam.account.created", d.handleAccountCreated, "spinifex-workers"},
+		{utils.SubjectEnsureDefaultVpc, d.handleEnsureDefaultVpc, "spinifex-workers"},
 		// Coordinated cluster shutdown phases (fan-out, no queue group)
 		{"spinifex.cluster.shutdown.gate", d.handleShutdownGate, ""},
 		{"spinifex.cluster.shutdown.drain", d.handleShutdownDrain, ""},
@@ -1122,6 +1208,12 @@ func (d *Daemon) subscribeAll() error {
 		)
 	}
 
+	// Ochre vector store tenant surface is deliberately NOT registered here:
+	// its subjects only exist once the platform appliance has finished
+	// launching (startOchreVector, run in the background after this method
+	// returns), and registering them requires this same table-driven
+	// mechanism after the fact — see registerNatsSubs.
+
 	// ECR gateway → daemon subscriptions. The daemon owns the per-account
 	// JetStream KV metadata; blob/manifest bytes never traverse these subjects.
 	if d.ecrMetaService != nil {
@@ -1167,6 +1259,17 @@ func (d *Daemon) subscribeAll() error {
 		natsSub{dhcp.TopicOwnerCheck, d.handleDHCPOwnerCheck, "spinifex-workers"},
 	)
 
+	return d.registerNatsSubs(subs)
+}
+
+// registerNatsSubs turns each entry in subs into a live NATS subscription and
+// records it in d.natsSubscriptions. Shared by subscribeAll's boot-time table
+// and any subject registered later, off the main boot goroutine (e.g. Ochre's
+// VectorService, whose subjects only exist once its platform appliance has
+// finished launching) — the map write is mutex-guarded because that later
+// registration can race the shutdown path's unsubscribe-all sweep, unlike
+// subscribeAll's own single-goroutine, boot-time-only writes.
+func (d *Daemon) registerNatsSubs(subs []natsSub) error {
 	for _, s := range subs {
 		var sub *nats.Subscription
 		var err error
@@ -1179,7 +1282,9 @@ func (d *Daemon) subscribeAll() error {
 		if err != nil {
 			return fmt.Errorf("failed to subscribe to %s: %w", s.topic, err)
 		}
+		d.mu.Lock()
 		d.natsSubscriptions[s.topic] = sub
+		d.mu.Unlock()
 		slog.Info("Subscribed to NATS topic", "topic", s.topic, "queue", s.queueGroup)
 	}
 	return nil
@@ -1393,12 +1498,18 @@ func (d *Daemon) startCluster() error {
 		}
 	}
 
-	// Enable OVN native IPsec when configured (idempotent).
-	if d.clusterConfig != nil && d.clusterConfig.Network.IPSecEnabled {
-		if err := host.EnableOVNIPSec(d.configPath, d.clusterConfig); err != nil {
-			slog.Warn("Failed to enable OVN native IPsec; intra-AZ Geneve will be plaintext", "err", err)
-		}
+	// Reconcile OVN native IPsec both ways (idempotent): a node that does not
+	// use it should not be left running charon on 500/4500 either.
+	if err := host.ReconcileOVNIPSec(d.configPath, d.clusterConfig); err != nil {
+		slog.Warn("Failed to reconcile OVN native IPsec", "err", err)
 	}
+
+	// Keep the host firewall's peer sets in step with cluster membership. Every
+	// formation path reaches this, which none of the installers do. Runs in the
+	// background because the first attempt routinely loses the race with
+	// ovn-controller registering its chassis, and blocking startup on that would
+	// hold up every service below.
+	go host.MaintainFirewall(d.ctx, d.configPath, d.clusterConfig)
 
 	// Write service manifest so other nodes know what this node runs
 	if d.jsManager != nil {
@@ -1436,6 +1547,9 @@ func (d *Daemon) startCluster() error {
 	d.snapshotService = snap.svc
 
 	d.volumeService = handlers_ec2_volume.NewVolumeServiceImpl(d.config, d.natsConn, snap.kv)
+	if err := d.configureEBSProvider(); err != nil {
+		return fmt.Errorf("configure EBS provider: %w", err)
+	}
 	d.tagsService = handlers_ec2_tags.NewTagsServiceImpl(d.config)
 
 	d.eigwService, err = initServiceWithRetry("EIGW service", func() (*handlers_ec2_eigw.EgressOnlyIGWServiceImpl, error) {
@@ -1850,13 +1964,51 @@ func (d *Daemon) startCluster() error {
 		return fmt.Errorf("failed to subscribe to NATS topics: %w", err)
 	}
 
+	// Ochre vector store platform appliance + VectorService, backgrounded:
+	// launching the appliance can block on a cold RDS VM boot for minutes, and
+	// its own launch request needs the rds.* responders subscribeAll just
+	// registered above, so it cannot run any earlier. Gated on
+	// config.OchreVector.Enabled (default off); any failure along the way is
+	// logged and leaves the feature's subjects unregistered rather than
+	// failing startCluster or blocking daemon boot. Tracked on shutdownWg so
+	// shutdown waits for it to observe d.ctx cancellation and unwind instead
+	// of leaking; d.ctx is what bounds every NATS call it makes.
+	d.shutdownWg.Go(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("Ochre vector store startup goroutine panicked", "recover", r)
+			}
+		}()
+		d.startOchreVector()
+	})
+
+	// Remove this node's appliance-VPC host port on shutdown. Same config gate
+	// as startOchreVector, so a disabled daemon spawns nothing. d.ochreAppliance
+	// stays nil until the retry loop succeeds, so early shutdown tears down nothing.
+	if d.config.OchreVector.Enabled {
+		d.shutdownWg.Go(func() {
+			<-d.ctx.Done()
+			d.mu.Lock()
+			appliance := d.ochreAppliance
+			d.mu.Unlock()
+			if appliance == nil {
+				return
+			}
+			if err := appliance.TeardownHostPort(); err != nil {
+				slog.Warn("Ochre vector store: daemon host port teardown failed", "err", err)
+			}
+		})
+	}
+
 	// DNS record writer: a queue-group consumer of dns.recordset.change. Every
 	// node subscribes, so the writer locks each zone before its
 	// read-modify-write. No-op when northstar S3 is not configured.
 	if sub, err := d.dnsWriter.Subscribe(d.natsConn); err != nil {
 		return fmt.Errorf("failed to subscribe DNS record writer: %w", err)
 	} else if sub != nil {
+		d.mu.Lock()
 		d.natsSubscriptions[handlers_dns.SubjectRecordsetChange] = sub
+		d.mu.Unlock()
 		slog.Info("Subscribed DNS record writer", "subject", handlers_dns.SubjectRecordsetChange, "queue", handlers_dns.QueueGroup)
 	}
 
@@ -1887,6 +2039,9 @@ func (d *Daemon) startCluster() error {
 		}
 		if eniRec := d.newENIReconciler(); eniRec != nil {
 			reapers = append(reapers, eniRec)
+		}
+		if eniOrphan := d.newENIOrphanReaper(); eniOrphan != nil {
+			reapers = append(reapers, eniOrphan)
 		}
 		if gpuRec := d.newGPUPoolReconciler(); gpuRec != nil {
 			reapers = append(reapers, gpuRec)
@@ -1919,6 +2074,50 @@ func (d *Daemon) startCluster() error {
 	d.setupReload()
 
 	return nil
+}
+
+// ebsProviderRequestTimeout bounds each ebs.provider.v1.* NATS request/reply.
+// Passed explicitly rather than relying on NATSProvider's own 30s default so
+// the daemon's behavior doesn't silently drift if that default ever changes.
+const ebsProviderRequestTimeout = 30 * time.Second
+
+// ebsProviderProbeTimeout bounds the startup reachability check. Short because
+// a missing responder must be reported promptly, and the check is advisory.
+const ebsProviderProbeTimeout = 2 * time.Second
+
+// configureEBSProvider wires a single NATSProvider into every EBS-adjacent
+// service. The control plane never constructs a provider implementation
+// itself, so this always runs regardless of which daemon answers on the wire.
+func (d *Daemon) configureEBSProvider() error {
+	provider := ebsprovider.NewNATSProvider(d.natsConn, ebsProviderRequestTimeout)
+	d.ebsProvider = provider
+	d.instanceService.SetEBSProvider(provider)
+	d.imageService.SetEBSProvider(provider)
+	d.snapshotService.SetEBSProvider(provider)
+	d.volumeService.SetEBSProvider(provider)
+	slog.Info("EBS provider path active", "provider", d.config.EBS.ResolvedProvider())
+	d.probeEBSProvider(provider)
+	return nil
+}
+
+// probeEBSProvider reports whether anything is serving the provider contract.
+// Advisory rather than fatal: this daemon and viperblockd start independently,
+// so an unanswered probe here can simply mean viperblockd has not come up yet.
+func (d *Daemon) probeEBSProvider(provider ebsprovider.EBSProvider) {
+	// Own base context rather than the daemon's: the probe is bounded well
+	// below any shutdown deadline, and startCluster runs before d.ctx is set
+	// on some construction paths.
+	ctx, cancel := context.WithTimeout(context.Background(), ebsProviderProbeTimeout)
+	defer cancel()
+
+	capabilities, err := provider.GetCapabilities(ctx, ebsprovider.GetCapabilitiesRequest{Versioned: ebsprovider.NewVersioned()})
+	if err != nil {
+		slog.Warn("EBS provider did not answer the capability probe; EBS calls will fail until it does",
+			"provider", d.config.EBS.ResolvedProvider(), "err", err)
+		return
+	}
+	slog.Info("EBS provider reachable", "provider", d.config.EBS.ResolvedProvider(),
+		"capabilities", capabilities.Capabilities)
 }
 
 // clusterSweepLease gates the GC's cluster-wide reapers so exactly one node runs
@@ -2248,10 +2447,7 @@ func (d *Daemon) ClusterManager() error {
 			return
 		}
 
-		serviceHealth := make(map[string]string)
-		for _, svc := range d.config.GetServices() {
-			serviceHealth[svc] = "ok"
-		}
+		serviceHealth := d.probeServiceHealth(r.Context())
 		if !d.config.HasService("nats") {
 			if d.natsConn != nil && d.natsConn.IsConnected() {
 				serviceHealth["nats"] = "remote_ok"
@@ -2498,7 +2694,15 @@ func (d *Daemon) setupShutdown() {
 			d.eksService.Shutdown()
 		}
 
-		for _, sub := range d.natsSubscriptions {
+		// Snapshotted under d.mu rather than ranged over live: a background
+		// registration (e.g. Ochre's VectorService, registered off the boot
+		// goroutine once its appliance finishes launching) can still be
+		// writing to this map concurrently with shutdown.
+		d.mu.Lock()
+		subsSnapshot := make(map[string]*nats.Subscription, len(d.natsSubscriptions))
+		maps.Copy(subsSnapshot, d.natsSubscriptions)
+		d.mu.Unlock()
+		for _, sub := range subsSnapshot {
 			slog.Info("Unsubscribing from NATS", "subject", sub.Subject)
 			if err := sub.Unsubscribe(); err != nil {
 				if errors.Is(err, nats.ErrBadSubscription) {
@@ -2696,7 +2900,7 @@ func (rm *ResourceManager) reloadGPUTypes(models []instancetypes.GPUModel, migPr
 	rm.updateInstanceSubscriptions()
 }
 
-func (rm *ResourceManager) initSubscriptions(nc *nats.Conn, handler nats.MsgHandler, systemHandler nats.MsgHandler, nodeID string) {
+func (rm *ResourceManager) initSubscriptions(nc *nats.Conn, handler natsHandler, systemHandler natsHandler, nodeID string) {
 	rm.natsConn = nc
 	rm.handler = handler
 	rm.systemHandler = systemHandler
@@ -2734,10 +2938,10 @@ func (rm *ResourceManager) updateInstanceSubscriptions() {
 		}
 
 		queueTopic := fmt.Sprintf("%s.%s", subjectRoot, typeName)
-		handler = natsMetricsHandler(queueTopic, handler)
+		measured := natsMetricsHandler(queueTopic, handler)
 		_, subscribed := rm.instanceSubs[queueTopic]
 		if canFit && !subscribed {
-			sub, err := rm.natsConn.QueueSubscribe(queueTopic, queueGroup, handler)
+			sub, err := rm.natsConn.QueueSubscribe(queueTopic, queueGroup, measured)
 			if err != nil {
 				slog.Error("Failed to subscribe to instance type topic", "topic", queueTopic, "err", err)
 				continue
@@ -2758,7 +2962,7 @@ func (rm *ResourceManager) updateInstanceSubscriptions() {
 			// "no responders". Capacity is enforced at launch time by allocate().
 			nodeTopic := fmt.Sprintf("%s.%s.%s", subjectRoot, typeName, rm.nodeID)
 			if _, nodeSubscribed := rm.instanceSubs[nodeTopic]; canFit && !nodeSubscribed {
-				sub, err := rm.natsConn.Subscribe(nodeTopic, handler)
+				sub, err := rm.natsConn.Subscribe(nodeTopic, measured)
 				if err != nil {
 					slog.Error("Failed to subscribe to node-specific topic", "topic", nodeTopic, "err", err)
 					continue

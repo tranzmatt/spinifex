@@ -17,7 +17,7 @@ import (
 	awscreds "github.com/aws/aws-sdk-go/aws/credentials"
 	awssession "github.com/aws/aws-sdk-go/aws/session"
 	awsec2 "github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/mulgadc/predastore/pkg/ratelimit"
+	"github.com/mulgadc/bluebottle/pkg/ratelimit"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
@@ -782,6 +782,48 @@ func TestGetService(t *testing.T) {
 			ctxVal:  "bedrock",
 			path:    "/guardrails/gr-abc123",
 			wantSvc: "bedrock",
+		},
+		{
+			// bedrock-agent shares the same "bedrock" signing name as the rest
+			// of the family; CreateKnowledgeBase's /knowledgebases/ path must
+			// resolve to bedrock-agent, not stay "bedrock".
+			name:    "bedrock scope on CreateKnowledgeBase path resolves to bedrock-agent",
+			ctxVal:  "bedrock",
+			path:    "/knowledgebases/",
+			wantSvc: "bedrock-agent",
+		},
+		{
+			name:    "bedrock scope on GetKnowledgeBase path resolves to bedrock-agent",
+			ctxVal:  "bedrock",
+			path:    "/knowledgebases/kb-123",
+			wantSvc: "bedrock-agent",
+		},
+		{
+			name:    "bedrock scope on CreateDataSource path resolves to bedrock-agent",
+			ctxVal:  "bedrock",
+			path:    "/knowledgebases/kb-123/datasources/",
+			wantSvc: "bedrock-agent",
+		},
+		{
+			// Retrieve's own path is itself a /knowledgebases/... path, so it
+			// must be checked ahead of the bare bedrock-agent prefix check.
+			name:    "bedrock scope on Retrieve path resolves to bedrock-agent-runtime",
+			ctxVal:  "bedrock",
+			path:    "/knowledgebases/kb-123/retrieve",
+			wantSvc: "bedrock-agent-runtime",
+		},
+		{
+			name:    "bedrock scope on RetrieveAndGenerate path resolves to bedrock-agent-runtime",
+			ctxVal:  "bedrock",
+			path:    "/retrieveAndGenerate",
+			wantSvc: "bedrock-agent-runtime",
+		},
+		{
+			// A native bedrock-agent-runtime scope is left untouched.
+			name:    "bedrock-agent-runtime scope stays bedrock-agent-runtime",
+			ctxVal:  "bedrock-agent-runtime",
+			path:    "/retrieveAndGenerate",
+			wantSvc: "bedrock-agent-runtime",
 		},
 	}
 

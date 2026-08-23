@@ -12,7 +12,9 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/gpu"
 	handlers_ec2_placementgroup "github.com/mulgadc/spinifex/spinifex/handlers/ec2/placementgroup"
+	"github.com/mulgadc/spinifex/spinifex/network/external/dhcp"
 	"github.com/mulgadc/spinifex/spinifex/network/topology"
+	"github.com/mulgadc/spinifex/spinifex/otelsetup"
 	"github.com/mulgadc/spinifex/spinifex/tags"
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
@@ -110,19 +112,26 @@ func (a *volumeMounterAdapter) topic(action string) string {
 	return fmt.Sprintf("ebs.%s.%s", a.node, action)
 }
 
-// ebsRequestWithTrace sends an ebs.* NATS request, opening a client span and
-// injecting it into the message headers so viperblockd's consumer span
+// ebsRequestWithTrace sends an ebs.* NATS request, opening a client span under
+// ctx and injecting it into the message headers so viperblockd's consumer span
 // (utils.StartConsumerSpan) joins this trace instead of rooting a new one.
 //
-// VolumeMounter carries no caller context, so each call opens its own trace
-// here rather than threading one through the interface.
-func ebsRequestWithTrace(nc *nats.Conn, subject string, data []byte, timeout time.Duration) (msg *nats.Msg, err error) {
-	ctx, span := otel.Tracer(daemonTracerName).Start(context.Background(), "NATS "+subject,
+// accountID names the owner on the span and on the header viperblockd reads,
+// so block-storage work is attributable to a tenant. Empty is left off: a
+// sweep or a recovery belongs to nobody, and crediting it to whoever happens
+// to be admin would be worse than leaving it blank.
+func ebsRequestWithTrace(ctx context.Context, nc *nats.Conn, accountID, subject string, data []byte, timeout time.Duration) (msg *nats.Msg, err error) {
+	attrs := []attribute.KeyValue{
+		attribute.String("messaging.system", "nats"),
+		attribute.String("messaging.destination.name", subject),
+	}
+	if accountID != "" {
+		attrs = append(attrs, attribute.String(utils.AttrAccountID, accountID))
+	}
+
+	ctx, span := otel.Tracer(daemonTracerName).Start(ctx, "NATS "+subject,
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(
-			attribute.String("messaging.system", "nats"),
-			attribute.String("messaging.destination.name", subject),
-		))
+		trace.WithAttributes(attrs...))
 	defer func() {
 		if err != nil {
 			span.RecordError(err)
@@ -134,12 +143,15 @@ func ebsRequestWithTrace(nc *nats.Conn, subject string, data []byte, timeout tim
 	reqMsg := nats.NewMsg(subject)
 	reqMsg.Data = data
 	utils.InjectTraceContext(ctx, reqMsg.Header)
+	if accountID != "" {
+		reqMsg.Header.Set(utils.AccountIDHeader, accountID)
+	}
 
 	msg, err = nc.RequestMsg(reqMsg, timeout)
 	return msg, err
 }
 
-func (a *volumeMounterAdapter) Mount(instance *vm.VM) error {
+func (a *volumeMounterAdapter) Mount(ctx context.Context, instance *vm.VM) error {
 	instance.EBSRequests.Mu.Lock()
 	defer instance.EBSRequests.Mu.Unlock()
 
@@ -148,7 +160,7 @@ func (a *volumeMounterAdapter) Mount(instance *vm.VM) error {
 		var rbErrs []error
 		for _, idx := range mounted {
 			req := instance.EBSRequests.Requests[idx]
-			if err := a.unmountOne(req); err != nil {
+			if err := a.unmountOne(ctx, instance.AccountID, req); err != nil {
 				slog.Error("Mount rollback: unmount failed",
 					"volume", req.Name, "err", err)
 				rbErrs = append(rbErrs, fmt.Errorf("unmount %s: %w", req.Name, err))
@@ -167,12 +179,17 @@ func (a *volumeMounterAdapter) Mount(instance *vm.VM) error {
 			return rollback(err)
 		}
 
-		reply, err := ebsRequestWithTrace(a.nc, a.topic("mount"), ebsMountRequest, 30*time.Second)
+		reply, err := ebsRequestWithTrace(ctx, a.nc, instance.AccountID, a.topic("mount"), ebsMountRequest, 30*time.Second)
 
 		slog.Info("Mounting volume", "Vol", v.Name, "NBDURI", v.NBDURI)
 
 		if err != nil {
 			slog.Error("Failed to request EBS mount", "err", err)
+			// A missing responder means viperblockd has not finished starting;
+			// during recovery that is transient, so let the caller retry.
+			if errors.Is(err, nats.ErrNoResponders) {
+				return rollback(fmt.Errorf("ebs mount had no responder: %w", vm.ErrMountRetryable))
+			}
 			return rollback(err)
 		}
 
@@ -183,7 +200,10 @@ func (a *volumeMounterAdapter) Mount(instance *vm.VM) error {
 		}
 
 		if ebsMountResponse.Error != "" {
-			slog.Error("Failed to mount volume", "error", ebsMountResponse.Error)
+			slog.Error("Failed to mount volume", "error", ebsMountResponse.Error, "retryable", ebsMountResponse.Retryable)
+			if ebsMountResponse.Retryable {
+				return rollback(fmt.Errorf("failed to mount volume: %s: %w", ebsMountResponse.Error, vm.ErrMountRetryable))
+			}
 			return rollback(fmt.Errorf("failed to mount volume: %s", ebsMountResponse.Error))
 		}
 
@@ -195,7 +215,7 @@ func (a *volumeMounterAdapter) Mount(instance *vm.VM) error {
 	return nil
 }
 
-func (a *volumeMounterAdapter) Unmount(instance *vm.VM) error {
+func (a *volumeMounterAdapter) Unmount(ctx context.Context, instance *vm.VM) error {
 	instance.EBSRequests.Mu.Lock()
 	defer instance.EBSRequests.Mu.Unlock()
 
@@ -212,7 +232,7 @@ func (a *volumeMounterAdapter) Unmount(instance *vm.VM) error {
 		// local WAL would find no checkpoint (bad superblock). On terminate the
 		// volume is deleted regardless; on stop it stays attached/retryable.
 		sealed := true
-		msg, err := ebsRequestWithTrace(a.nc, a.topic("unmount"), ebsUnMountRequest, unmountSealTimeout)
+		msg, err := ebsRequestWithTrace(ctx, a.nc, instance.AccountID, a.topic("unmount"), ebsUnMountRequest, unmountSealTimeout)
 		if err != nil {
 			slog.Error("Failed to unmount volume",
 				"name", ebsRequest.Name, "instance", instance.ID, "err", err)
@@ -243,13 +263,13 @@ func (a *volumeMounterAdapter) Unmount(instance *vm.VM) error {
 
 // MountOne sends ebs.mount for a single request and writes the resolved
 // NBDURI back into req.NBDURI. Used by hot-attach (Manager.AttachVolume).
-func (a *volumeMounterAdapter) MountOne(req *types.EBSRequest) error {
+func (a *volumeMounterAdapter) MountOne(ctx context.Context, accountID string, req *types.EBSRequest) error {
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("marshal ebs.mount request: %w", err)
 	}
 
-	reply, err := ebsRequestWithTrace(a.nc, a.topic("mount"), payload, 30*time.Second)
+	reply, err := ebsRequestWithTrace(ctx, a.nc, accountID, a.topic("mount"), payload, 30*time.Second)
 	if err != nil {
 		return fmt.Errorf("ebs.mount NATS request: %w", err)
 	}
@@ -272,8 +292,8 @@ func (a *volumeMounterAdapter) MountOne(req *types.EBSRequest) error {
 // UnmountOne sends ebs.unmount and returns any error. The handler seals the
 // volume's block map to predastore, so the caller decides whether a failure
 // blocks the volume's available transition.
-func (a *volumeMounterAdapter) UnmountOne(req types.EBSRequest) error {
-	if err := a.unmountOne(req); err != nil {
+func (a *volumeMounterAdapter) UnmountOne(ctx context.Context, accountID string, req types.EBSRequest) error {
+	if err := a.unmountOne(ctx, accountID, req); err != nil {
 		slog.Error("UnmountOne failed", "volume", req.Name, "err", err)
 		return err
 	}
@@ -282,12 +302,12 @@ func (a *volumeMounterAdapter) UnmountOne(req types.EBSRequest) error {
 }
 
 // unmountOne sends ebs.unmount and returns any error.
-func (a *volumeMounterAdapter) unmountOne(req types.EBSRequest) error {
+func (a *volumeMounterAdapter) unmountOne(ctx context.Context, accountID string, req types.EBSRequest) error {
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("marshal unmount request: %w", err)
 	}
-	msg, err := ebsRequestWithTrace(a.nc, a.topic("unmount"), payload, unmountSealTimeout)
+	msg, err := ebsRequestWithTrace(ctx, a.nc, accountID, a.topic("unmount"), payload, unmountSealTimeout)
 	if err != nil {
 		return fmt.Errorf("ebs.unmount NATS request: %w", err)
 	}
@@ -615,11 +635,14 @@ func (d *Daemon) buildVMManagerDeps() vm.Deps {
 		ShutdownSignal:             d.shuttingDown.Load,
 		CrashHandler:               d.vmMgr.HandleCrash,
 		TransitionState:            d.TransitionState,
+		MultiqueueNICs:             d.clusterConfig != nil && !d.clusterConfig.Network.IPSecEnabled,
+		GuestMTU:                   d.guestOverlayMTU(),
 		DevNetworking:              d.config.Daemon.DevNetworking,
 		BindHost:                   d.config.Host,
 		DetachDelay:                d.detachDelay,
 		DeviceDeletedTimeout:       d.deviceDeletedTimeout,
 		ConsumeCleanShutdownMarker: d.consumeCleanShutdownMarker(),
+		BackingStoreReady:          func() bool { return d.checkPredastoreReady() && d.checkViperblockReady() },
 	}
 }
 
@@ -657,7 +680,11 @@ func (a *instanceCleanerAdapter) DeleteVolumes(instance *vm.VM) error {
 				firstErr = cmp.Or(firstErr, err)
 				continue
 			}
-			deleteMsg, err := ebsRequestWithTrace(a.d.natsConn, "ebs.delete", ebsDeleteData, 30*time.Second)
+			// Teardown runs from the reaper and from terminate cleanup, neither
+			// of which has a caller to inherit a trace from. The account still
+			// comes off the instance, so the work stays attributable.
+			deleteMsg, err := ebsRequestWithTrace(context.Background(), a.d.natsConn, instance.AccountID,
+				"ebs.delete", ebsDeleteData, 30*time.Second)
 			if err != nil {
 				slog.Warn("Failed to send ebs.delete for internal volume",
 					"name", ebsRequest.Name, "id", instance.ID, "err", err)
@@ -751,6 +778,18 @@ func (a *instanceCleanerAdapter) ReleasePublicIP(instance *vm.VM) error {
 	utils.PublishNATEvent(a.d.natsConn, "vpc.delete-nat", vpcId, instance.PublicIP, logicalIP, portName, "")
 
 	if err := a.d.externalIPAM.ReleaseIP(context.Background(), instance.PublicIPPool, instance.PublicIP, instance.ENIId); err != nil {
+		// An untracked lease is terminal: the local pool slot is already free and
+		// no retry can make a deleted lease reappear. Returning the error leaves
+		// this dependent permanently not-done, so the teardown reaper re-drives it
+		// every sweep and its KV write keeps refreshing the record's TTL. Record
+		// the strand and report success so teardown completes.
+		if errors.Is(err, dhcp.ErrLeaseNotTracked) {
+			otelsetup.RecordResourceLeak(context.Background(), "public_ip")
+			slog.Error("Public IP lease stranded; address will not be reclaimed automatically",
+				"ip", instance.PublicIP, "pool", instance.PublicIPPool,
+				"instanceId", instance.ID, "err", err)
+			return nil
+		}
 		slog.Warn("Failed to release public IP on termination",
 			"ip", instance.PublicIP, "pool", instance.PublicIPPool, "err", err)
 		return err
@@ -902,4 +941,13 @@ func (a *instanceCleanerAdapter) ReleaseGPU(instance *vm.VM) error {
 	}
 	slog.Info("GPU released", "gpus", instance.GPUAttachments, "instanceId", instance.ID)
 	return nil
+}
+
+// guestOverlayMTU is the MTU a guest NIC advertises via VIRTIO_NET_F_MTU. Same
+// derivation as the DHCP option, so the two cannot disagree.
+func (d *Daemon) guestOverlayMTU() int {
+	if d.clusterConfig == nil {
+		return 0
+	}
+	return topology.SubnetMTU(d.clusterConfig.Network.UnderlayMTU, d.clusterConfig.Network.IPSecEnabled)
 }
