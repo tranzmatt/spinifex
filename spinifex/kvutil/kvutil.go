@@ -13,9 +13,12 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"github.com/mulgadc/spinifex/spinifex/utils"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -33,7 +36,7 @@ func GetOrCreateBucket(ctx context.Context, js jetstream.KeyValueManager, bucket
 func GetOrCreateBucketWithTTL(ctx context.Context, js jetstream.KeyValueManager, bucket string, history int, ttl time.Duration) (jetstream.KeyValue, error) {
 	return getOrCreateBucket(ctx, js, jetstream.KeyValueConfig{
 		Bucket:   bucket,
-		History:  utils.SafeIntToUint8(history),
+		History:  safecast.IntToUint8(history),
 		Replicas: max(utils.DefaultKVReplicas(), 1),
 		TTL:      ttl,
 	})
@@ -46,10 +49,42 @@ func GetOrCreateBucketWithTTL(ctx context.Context, js jetstream.KeyValueManager,
 func GetOrCreateBucketWithReplicas(ctx context.Context, js jetstream.KeyValueManager, bucket string, history, replicas int) (jetstream.KeyValue, error) {
 	return getOrCreateBucket(ctx, js, jetstream.KeyValueConfig{
 		Bucket:   bucket,
-		History:  utils.SafeIntToUint8(history),
+		History:  safecast.IntToUint8(history),
 		Replicas: max(replicas, 1),
 	})
 }
+
+// BucketOptions is GetOrCreateBucket's full argument set, for callers needing a
+// combination the three named helpers do not cover. A zero Replicas means the
+// cluster default, matching those helpers.
+type BucketOptions struct {
+	Name        string
+	Description string
+	History     int
+	Replicas    int
+	TTL         time.Duration
+}
+
+// GetOrCreateBucketWithOptions creates or opens a KV bucket from opts. Like the
+// named helpers, every field but Name applies at creation only: an existing
+// bucket is opened with the config it already has.
+func GetOrCreateBucketWithOptions(ctx context.Context, js jetstream.KeyValueManager, opts BucketOptions) (jetstream.KeyValue, error) {
+	replicas := opts.Replicas
+	if replicas == 0 {
+		replicas = DefaultReplicas()
+	}
+	return getOrCreateBucket(ctx, js, jetstream.KeyValueConfig{
+		Bucket:      opts.Name,
+		Description: opts.Description,
+		History:     safecast.IntToUint8(opts.History),
+		Replicas:    max(replicas, 1),
+		TTL:         opts.TTL,
+	})
+}
+
+// DefaultReplicas is the cluster's default KV replica count, exposed so callers
+// building a BucketOptions can tell "unset" from a deliberate 1.
+func DefaultReplicas() int { return utils.DefaultKVReplicas() }
 
 func getOrCreateBucket(ctx context.Context, js jetstream.KeyValueManager, cfg jetstream.KeyValueConfig) (jetstream.KeyValue, error) {
 	bucket := cfg.Bucket
@@ -68,6 +103,28 @@ func getOrCreateBucket(ctx context.Context, js jetstream.KeyValueManager, cfg je
 		return nil, fmt.Errorf("open KV bucket %s: %w", bucket, err)
 	}
 	return kv, nil
+}
+
+// IsStreamUnavailable reports whether err means the KV bucket's underlying
+// JetStream stream was lost or is unreachable, which happens during NATS
+// cluster formation when a low-replication stream is disrupted by a node
+// joining or catching up. Each operation surfaces it differently:
+//
+//   - Get/Keys → ErrNoResponders ("no responders available for request")
+//   - Put/Delete → ErrNoStreamResponse ("no response from stream")
+//   - Direct stream queries → ErrStreamNotFound ("stream not found")
+func IsStreamUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, jetstream.ErrStreamNotFound) ||
+		errors.Is(err, jetstream.ErrNoStreamResponse) ||
+		errors.Is(err, nats.ErrNoResponders) {
+		return true
+	}
+	// Some paths wrap the condition as an untyped error, so the string is the
+	// only signal left. Narrow, but dropping it would lose real detections.
+	return strings.Contains(err.Error(), "stream not found")
 }
 
 // DeleteBucketIfExists deletes a KV bucket, treating an already-absent bucket

@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mulgadc/spinifex/spinifex/network/external"
 	"github.com/mulgadc/spinifex/spinifex/network/ovn/nbdb"
 	"github.com/mulgadc/spinifex/spinifex/network/policy"
 	"github.com/mulgadc/spinifex/spinifex/network/topology"
@@ -98,6 +100,18 @@ func (r *reconciler) clearPortBackoff(lspName string) bool {
 // the LSP name, which no operator can map back to a guest.
 func eniIDFromPort(lspName string) string {
 	return strings.TrimPrefix(lspName, "port-")
+}
+
+// reloadForPrune re-reads intent for an orphan sweep to compare against. Every
+// sweep matches live OVN rows against the start-of-pass snapshot, which the apply
+// phase can leave tens of seconds behind KV, so a resource created mid-pass looks
+// orphaned. Callers union the result into their keep set and skip the sweep on
+// error. A zero IntentState when no loader is wired unions nothing.
+func (r *reconciler) reloadForPrune(ctx context.Context) (IntentState, error) {
+	if r.reloadIntent == nil {
+		return IntentState{}, nil
+	}
+	return r.reloadIntent(ctx)
 }
 
 // applyVPCs ensures every intent VPC has a LogicalRouter. Stray OVN-only
@@ -250,8 +264,21 @@ func (r *reconciler) applySGs(ctx context.Context, intent IntentState, actual Ac
 		return
 	}
 
-	wantPGs := make(map[string]struct{}, len(intent.SGs))
+	// An SG created after this pass snapshotted its intent is live but absent from
+	// that snapshot, and sweeping its port group breaks every later ENI create in
+	// the VPC. Union a re-read into the keep set; skip the sweep if it fails.
+	fresh, err := r.reloadForPrune(ctx)
+	if err != nil {
+		slog.Warn("reconcile/apply: fresh intent re-read failed; skipping orphan port group prune", "err", err)
+		res.fail(classSG, "orphan-prune", err)
+		return
+	}
+
+	wantPGs := make(map[string]struct{}, len(intent.SGs)+len(fresh.SGs))
 	for groupID := range intent.SGs {
+		wantPGs[topology.SecurityGroupPortGroup(groupID)] = struct{}{}
+	}
+	for groupID := range fresh.SGs {
 		wantPGs[topology.SecurityGroupPortGroup(groupID)] = struct{}{}
 	}
 	for pgName := range actual.PortGroups {
@@ -271,6 +298,30 @@ func (r *reconciler) applySGs(ctx context.Context, intent IntentState, actual Ac
 	}
 }
 
+// desiredPortGroups maps an ENI's SGs to OVN port group names, erroring unless
+// every one of them exists. An empty result is never valid: a port in no port
+// group matches no SG ACL, including the per-group default-denies, so it would
+// come up unrestricted.
+func desiredPortGroups(spec topology.PortSpec, actual ActualState) ([]string, error) {
+	if len(spec.SGIDs) == 0 {
+		return nil, errors.New("ENI has no security groups")
+	}
+	pgNames := make([]string, 0, len(spec.SGIDs))
+	var missing []string
+	for _, sgID := range spec.SGIDs {
+		pgName := topology.SecurityGroupPortGroup(sgID)
+		if _, ok := actual.PortGroups[pgName]; !ok {
+			missing = append(missing, pgName)
+			continue
+		}
+		pgNames = append(pgNames, pgName)
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("security group port groups missing in OVN: %s", strings.Join(missing, ", "))
+	}
+	return pgNames, nil
+}
+
 // applyPorts ensures each intent ENI has an LSP with PG memberships matching its
 // SGIDs. Existing ports use diff-based UpdatePortGroupMemberships to avoid gaps.
 // When pruneOrphans is true, ENI LSPs with no matching intent ENI are torn down;
@@ -279,15 +330,13 @@ func (r *reconciler) applyPorts(ctx context.Context, intent IntentState, actual 
 	for portID, spec := range intent.Ports {
 		portName := topology.Port(portID)
 		switchName := topology.SubnetSwitch(spec.SubnetID)
-		desiredPGs := make([]string, 0, len(spec.SGIDs))
-		for _, sgID := range spec.SGIDs {
-			pgName := topology.SecurityGroupPortGroup(sgID)
-			if _, ok := actual.PortGroups[pgName]; !ok {
-				slog.Warn("reconcile/apply: skipping port SG membership — port group missing in OVN",
-					"port", portName, "sg", sgID, "pg", pgName)
-				continue
-			}
-			desiredPGs = append(desiredPGs, pgName)
+		desiredPGs, err := desiredPortGroups(spec, actual)
+		if err != nil {
+			// Fail closed. Every SG ACL, including the default-denies, hangs off
+			// a port group, so a port in none of them is unrestricted.
+			slog.Error("reconcile/apply: refusing port with unprogrammable policy", "port", portName, "err", err)
+			res.fail(classPort, portName, err)
+			continue
 		}
 
 		if _, err := r.ovn.GetLogicalSwitchPort(ctx, portName); err != nil {
@@ -340,10 +389,23 @@ func (r *reconciler) applyPorts(ctx context.Context, intent IntentState, actual 
 // intent ENI, closing the create-only gap that leaks ports across instance
 // terminate and host reinstall. DeletePort clears PG memberships then removes
 // the LSP (composed cascade).
+//
+// The listing is live but intent is the start-of-pass snapshot, so an ENI created
+// mid-pass looks orphaned against it. Re-read intent and union its ports into the
+// keep set, skipping the sweep when the re-read fails.
 func (r *reconciler) pruneOrphanPorts(ctx context.Context, intent IntentState, res *passResult) {
 	lsps, err := r.ovn.ListLogicalSwitchPorts(ctx)
 	if err != nil {
 		slog.Warn("reconcile/apply: list LSPs for orphan prune failed", "err", err)
+		res.fail(classPort, "orphan-prune", err)
+		return
+	}
+	// Re-read after the listing, never before: the create path writes KV before it
+	// creates the LSP, so intent read later than the listing covers every row in
+	// it. Reading first leaves a window where a new ENI is listed but unknown.
+	fresh, err := r.reloadForPrune(ctx)
+	if err != nil {
+		slog.Warn("reconcile/apply: fresh intent re-read failed; skipping orphan ENI port prune", "err", err)
 		res.fail(classPort, "orphan-prune", err)
 		return
 	}
@@ -353,6 +415,9 @@ func (r *reconciler) pruneOrphanPorts(ctx context.Context, intent IntentState, r
 			continue
 		}
 		if _, ok := intent.Ports[eniID]; ok {
+			continue
+		}
+		if _, ok := fresh.Ports[eniID]; ok {
 			continue
 		}
 		spec := topology.PortSpec{PortID: eniID, SubnetID: lsps[i].ExternalIDs["spinifex:subnet_id"]}
@@ -377,7 +442,34 @@ func (r *reconciler) applyIGWs(ctx context.Context, intent IntentState, actual A
 			continue
 		}
 		actual.ExternalSwch[vpcID] = struct{}{}
-		r.rebindGatewayChassis(ctx, vpcID, eipProbeIP(intent, vpcID), res)
+		// Confirmed only once the chassis rebind, the SB claim and the datapath
+		// probe all report converged: AttachIGW returning nil is not proof the
+		// gateway forwards, and the confirmation is one-way.
+		if r.rebindGatewayChassis(ctx, vpcID, eipProbeIP(intent, vpcID), res) {
+			r.reportIGWAttached(ctx, spec)
+		}
+	}
+}
+
+// reportIGWAttached confirms the attachment to the control plane so describes
+// stop reporting one before it exists. Not a pass failure: the gateway is up,
+// and a failed report is retried by the next pass rather than driving backoff.
+func (r *reconciler) reportIGWAttached(ctx context.Context, spec external.IGWSpec) {
+	// Steady state is every pass after the first, so a record already confirmed
+	// must not cost a KV round trip per pass.
+	if r.markAttached == nil || !spec.AttachPending {
+		return
+	}
+	// A spec built outside the store carries no address to report against, so
+	// its attachment would stay unconfirmed with no other signal.
+	if spec.RecordKey == "" {
+		slog.Warn("reconcile/apply: IGW spec has no record key; attachment cannot be confirmed",
+			"vpc_id", spec.VPCID, "igw_id", spec.InternetGatewayID)
+		return
+	}
+	if err := r.markAttached(ctx, spec.RecordKey, spec.VPCID); err != nil {
+		slog.Warn("reconcile/apply: marking IGW attached failed",
+			"vpc_id", spec.VPCID, "igw_id", spec.InternetGatewayID, "err", err)
 	}
 }
 
@@ -395,9 +487,11 @@ func eipProbeIP(intent IntentState, vpcID string) string {
 }
 
 // rebindGatewayChassis re-asserts chassis priority tuples on the gateway LRP.
-func (r *reconciler) rebindGatewayChassis(ctx context.Context, vpcID, eipIP string, res *passResult) {
+// Reports whether the gateway converged: no chassis to bind is not convergence,
+// it is a node with nothing to verify against.
+func (r *reconciler) rebindGatewayChassis(ctx context.Context, vpcID, eipIP string, res *passResult) bool {
 	if len(r.chassis) == 0 {
-		return
+		return false
 	}
 	gwPortName := topology.GatewayRouterPort(vpcID)
 	lrp, err := r.ovn.GetLogicalRouterPort(ctx, gwPortName)
@@ -405,17 +499,20 @@ func (r *reconciler) rebindGatewayChassis(ctx context.Context, vpcID, eipIP stri
 		slog.Warn("reconcile/apply: gateway LRP read failed; skipping chassis rebind and datapath gate",
 			"vpc_id", vpcID, "port", gwPortName, "err", err)
 		res.fail(classIGW, vpcID, err)
-		return
+		return false
 	}
+	bound := true
 	for i, chassis := range r.chassis {
 		priority := max(20-(i*5), 1)
 		if err := r.ovn.SetGatewayChassis(ctx, gwPortName, chassis, priority); err != nil {
 			slog.Warn("reconcile/apply: SetGatewayChassis failed", "vpc_id", vpcID, "chassis", chassis, "err", err)
 			res.fail(classIGW, vpcID, err)
+			bound = false
 		}
 	}
-	r.ensureGatewayClaimed(ctx, topology.GatewayChassisRedirectPort(vpcID))
-	r.ensureGatewayDatapath(ctx, vpcID, gatewayLRPIP(lrp), eipIP)
+	claimed := r.ensureGatewayClaimed(ctx, topology.GatewayChassisRedirectPort(vpcID))
+	forwarding := r.ensureGatewayDatapath(ctx, vpcID, gatewayLRPIP(lrp), eipIP)
+	return bound && claimed && forwarding
 }
 
 // gatewayLRPIP returns the bare IPv4 of the gateway router port, parsed from its
@@ -446,10 +543,11 @@ func gatewayLRPIP(lrp *nbdb.LogicalRouterPort) string {
 // without a guest dependency, whereas the gateway LRP IP OVN answers natively and
 // stays green even when the EIP datapath is dead. Fall back to the LRP IP when the
 // VPC has no EIP. On a miss repair the uplink + recompute, then re-probe until a
-// short deadline. No-op when no verifier is wired or no probe target resolved.
-func (r *reconciler) ensureGatewayDatapath(ctx context.Context, vpcID, gwIP, eipIP string) {
+// short deadline. Reports whether the datapath was observed forwarding; an
+// unwired verifier or unresolved probe target gates the check off and passes.
+func (r *reconciler) ensureGatewayDatapath(ctx context.Context, vpcID, gwIP, eipIP string) bool {
 	if r.gwClaim == nil || (gwIP == "" && eipIP == "") {
-		return
+		return true
 	}
 	target := eipIP
 	if target == "" {
@@ -467,13 +565,13 @@ func (r *reconciler) ensureGatewayDatapath(ctx context.Context, vpcID, gwIP, eip
 		reachable, err := probe()
 		if err != nil {
 			slog.Warn("reconcile/apply: gateway datapath probe failed", "vpc_id", vpcID, "target", target, "err", err)
-			return
+			return false
 		}
 		if reachable {
 			if repaired {
 				slog.Info("reconcile/apply: gateway datapath recovered after uplink repair", "vpc_id", vpcID, "target", target)
 			}
-			return
+			return true
 		}
 		if !repaired {
 			slog.Warn("reconcile/apply: gateway datapath unreachable despite SB claim; repairing uplink + forcing recompute",
@@ -486,11 +584,11 @@ func (r *reconciler) ensureGatewayDatapath(ctx context.Context, vpcID, gwIP, eip
 		if time.Now().After(deadline) {
 			slog.Error("reconcile/apply: gateway datapath did not recover after uplink repair; external connectivity degraded",
 				"vpc_id", vpcID, "target", target, "timeout_ms", otelsetup.Millis(gatewayDatapathTimeout))
-			return
+			return false
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-time.After(gatewayDatapathInterval):
 		}
 	}
@@ -524,10 +622,11 @@ func (r *reconciler) escalateSBReset(ctx context.Context, logKV ...any) bool {
 // every miss, not once: after a fresh-VPC bring-up or a chassis flap a single early
 // nudge fires before ovn-controller has processed the gateway_chassis update (or
 // before the flapped chassis re-registers), so it never binds. Mirrors
-// ensureGuestPortDatapath. No-op when no verifier is wired.
-func (r *reconciler) ensureGatewayClaimed(ctx context.Context, crPortName string) {
+// ensureGuestPortDatapath. Reports whether the binding is claimed; an unwired
+// verifier gates the check off and passes.
+func (r *reconciler) ensureGatewayClaimed(ctx context.Context, crPortName string) bool {
 	if r.gwClaim == nil {
-		return
+		return true
 	}
 	deadline := time.Now().Add(gatewayClaimTimeout)
 	nudged := false
@@ -537,13 +636,13 @@ func (r *reconciler) ensureGatewayClaimed(ctx context.Context, crPortName string
 		claimed, err := r.gwClaim.GatewayPortClaimed(ctx, crPortName)
 		if err != nil {
 			slog.Warn("reconcile/apply: gateway SB claim check failed", "port", crPortName, "err", err)
-			return
+			return false
 		}
 		if claimed {
 			if nudged {
 				slog.Info("reconcile/apply: gateway SB chassis claim converged after recompute", "port", crPortName)
 			}
-			return
+			return true
 		}
 		slog.Warn("reconcile/apply: gateway SB binding unclaimed; nudging ovn-controller recompute", "port", crPortName)
 		if err := r.gwClaim.NudgeRecompute(ctx); err != nil {
@@ -557,11 +656,11 @@ func (r *reconciler) ensureGatewayClaimed(ctx context.Context, crPortName string
 		if time.Now().After(deadline) {
 			slog.Error("reconcile/apply: gateway SB chassis claim did not converge; floating IPs may be unreachable",
 				"port", crPortName, "timeout_ms", otelsetup.Millis(gatewayClaimTimeout))
-			return
+			return false
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-time.After(gatewayClaimInterval):
 		}
 	}
@@ -633,15 +732,13 @@ func (r *reconciler) floatingIPSpecs(intent IntentState) []policy.EIPSpec {
 func (r *reconciler) pruneOrphanEIPs(ctx context.Context, intent IntentState, res *passResult) {
 	live := make(map[string]struct{}, len(intent.Ports)+len(intent.EIPs))
 	addLivePorts(live, intent)
-	if r.reloadIntent != nil {
-		fresh, err := r.reloadIntent(ctx)
-		if err != nil {
-			slog.Warn("reconcile/apply: fresh intent re-read failed; skipping orphan EIP prune", "err", err)
-			res.fail(classEIP, "orphan-prune", err)
-			return
-		}
-		addLivePorts(live, fresh)
+	fresh, err := r.reloadForPrune(ctx)
+	if err != nil {
+		slog.Warn("reconcile/apply: fresh intent re-read failed; skipping orphan EIP prune", "err", err)
+		res.fail(classEIP, "orphan-prune", err)
+		return
 	}
+	addLivePorts(live, fresh)
 	if pruned, err := r.nat.PruneOrphanEIPs(ctx, live); err != nil {
 		slog.Warn("reconcile/apply: orphan EIP prune failed", "err", err)
 		res.fail(classEIP, "orphan-prune", err)
@@ -737,6 +834,14 @@ func (r *reconciler) ensureGuestPortDatapath(ctx context.Context, spec policy.EI
 		slog.Debug("reconcile/apply: guest port still in convergence backoff; not re-probing",
 			"vpc_id", vpcID, "lsp", lspName, "eni_id", eniIDFromPort(lspName),
 			"retry_in_ms", otelsetup.Millis(time.Until(until)))
+		return
+	}
+	// No LSP, nothing to bind: a recompute cannot conjure one, so probing would
+	// burn the whole deadline. applyPorts refuses a port whose SG policy is
+	// unprogrammable, which lands here for every public-IP guest it skipped.
+	if _, err := r.ovn.GetLogicalSwitchPort(ctx, lspName); err != nil {
+		slog.Warn("reconcile/apply: guest LSP absent; skipping datapath probe",
+			"vpc_id", vpcID, "lsp", lspName, "eni_id", eniIDFromPort(lspName), "err", err)
 		return
 	}
 	deadline := time.Now().Add(guestPortDatapathTimeout)

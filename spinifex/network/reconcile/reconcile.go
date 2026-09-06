@@ -113,16 +113,21 @@ type Config struct {
 	// UnderlayMTU is the fabric MTU the advertised guest MTU is derived from.
 	// Zero falls back to the 1500 default, same as an unset config key.
 	UnderlayMTU int
-	// FreshIntent re-reads intent from the control-plane store on demand.
-	// pruneOrphanEIPs uses it to refresh its live-port view at prune time: a
-	// prune pass lists OVN NAT rows live but is otherwise driven by the intent
-	// snapshot captured at the start of the pass, and the apply phase can block
-	// for tens of seconds, so a guest launched mid-pass has a live dnat_and_snat
-	// row that the stale snapshot does not know about. Matching that live row
-	// against the snapshot alone sweeps it and blackholes the guest's public IP.
+	// FreshIntent re-reads intent from the control-plane store on demand. Every
+	// orphan sweep — NAT rows, SG port groups, guest LSPs — lists OVN live but is
+	// otherwise driven by the intent snapshot captured at the start of the pass,
+	// and the apply phase can block for tens of seconds. A resource created
+	// mid-pass is therefore live but absent from that snapshot, and matching
+	// against the snapshot alone sweeps it: a guest's public IP blackholes, or an
+	// SG port group vanishes and every later ENI create in the VPC fails.
 	// Optional: nil leaves the start-of-pass snapshot as the sole liveness source
 	// (unit tests, or callers with no store).
 	FreshIntent func(ctx context.Context) (IntentState, error)
+	// MarkIGWAttached reports a confirmed IGW attachment back to the control
+	// plane, so DescribeInternetGateways stops claiming an attachment exists
+	// before one does. Called with the record key and VPC carried on the IGW
+	// spec. Optional: nil leaves the record untouched.
+	MarkIGWAttached func(ctx context.Context, recordKey, vpcID string) error
 }
 
 type reconciler struct {
@@ -140,6 +145,7 @@ type reconciler struct {
 	ipsecEnabled bool
 	underlayMTU  int
 	reloadIntent func(ctx context.Context) (IntentState, error)
+	markAttached func(ctx context.Context, recordKey, vpcID string) error
 
 	// Guest ports that burned their convergence deadline, so a port whose guest
 	// is gone stops paying the full nudge sequence every cycle.
@@ -194,6 +200,7 @@ func New(cfg Config) (Reconciler, error) {
 		ipsecEnabled: !cfg.IPSecDisabled,
 		underlayMTU:  cfg.UnderlayMTU,
 		reloadIntent: cfg.FreshIntent,
+		markAttached: cfg.MarkIGWAttached,
 	}, nil
 }
 

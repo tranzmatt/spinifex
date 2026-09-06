@@ -1,10 +1,12 @@
 package vm
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,6 +50,22 @@ type ExtraENI struct {
 	Gateway       string `json:"gateway,omitempty"`
 }
 
+// DesiredState is the state an operator has asked an instance to be in. It is
+// deliberately narrower than InstanceState: only a settled state can be desired,
+// so "desired: stopping" cannot be expressed and the two enums cannot drift into
+// meaning the same thing.
+type DesiredState string
+
+const (
+	// DesiredRunning is the zero value, so an instance nobody has asked to stop
+	// is one that should be running.
+	DesiredRunning DesiredState = ""
+
+	// DesiredStopped means the instance must stay stopped across a restart,
+	// rather than being relaunched the way a drain-stopped one is.
+	DesiredStopped DesiredState = "stopped"
+)
+
 type VM struct {
 	ID           string        `json:"id"`
 	Status       InstanceState `json:"status"`
@@ -66,8 +84,19 @@ type VM struct {
 	// Manager hands out a stable *VM, so the lock is shared across calls.
 	attachMu sync.Mutex `json:"-"`
 
-	// User attributes (user initiated stop/delete)
-	Attributes types.EC2CommandAttributes `json:"attributes"`
+	// DesiredState is the state this instance has been asked to be in, as
+	// opposed to Status, which is the state it is observed to be in.
+	DesiredState DesiredState `json:"desired_state,omitempty"`
+
+	// DeletionTimestamp is stamped when a terminate is accepted, before the
+	// status transition lands. It is the marked-for-deletion signal a caller
+	// needs during the window where Status has not caught up yet.
+	DeletionTimestamp *time.Time `json:"deletion_timestamp,omitempty"`
+
+	// LegacyAttributes is the command last stamped onto records written before
+	// DesiredState existed. Read on decode to recover the operator-stop signal,
+	// then dropped; never written.
+	LegacyAttributes *types.EC2CommandAttributes `json:"attributes,omitempty"`
 
 	// EC2 API metadata stored for AWS API compatibility.
 	RunInstancesInput *ec2.RunInstancesInput `json:"run_instances_input,omitempty"`
@@ -119,10 +148,20 @@ type VM struct {
 	PlacementGroupName string `json:"placement_group_name,omitempty"`
 	PlacementGroupNode string `json:"placement_group_node,omitempty"`
 
-	// ExtraHostfwdPorts lists additional guest ports to forward from the host
-	// via the QEMU user-mode dev NIC. Used by ALB VMs to expose HTTP ports.
-	// Maps guest port → host port (host port filled in by StartInstance).
-	ExtraHostfwd map[int]int `json:"extra_hostfwd,omitempty"`
+	// HostfwdPorts lists the guest ports to forward from the host via the QEMU
+	// user-mode dev NIC. Requested at launch; used by ALB VMs to expose HTTP
+	// ports.
+	HostfwdPorts []int `json:"hostfwd_ports,omitempty"`
+
+	// HostfwdPortMap records which host port the launch actually bound for each
+	// guest port in HostfwdPorts. Observed rather than requested, so it is
+	// rebuilt on every launch and a port that could not be bound is absent.
+	HostfwdPortMap map[int]int `json:"hostfwd_port_map,omitempty"`
+
+	// LegacyExtraHostfwd is the single guest→host map records used before the
+	// request and the observation were separated. Read on decode to recover
+	// both halves, then dropped; never written.
+	LegacyExtraHostfwd map[int]int `json:"extra_hostfwd,omitempty"`
 
 	// ManagedBy identifies the Spinifex platform component that owns this
 	// VM (e.g. "elbv2"). Empty for customer-launched instances. The UI
@@ -178,6 +217,37 @@ type VM struct {
 	// tolerated by migrate.
 	InstanceLifecycle     string `json:"instance_lifecycle,omitempty"`
 	SpotInstanceRequestId string `json:"spot_instance_request_id,omitempty"`
+}
+
+// UnmarshalJSON folds the fields of legacy records that mixed a request with an
+// observation into the pair that separates them. Done on decode so every read
+// path inherits it and none has to remember, and so the legacy fields are
+// dropped rather than written back out.
+func (v *VM) UnmarshalJSON(data []byte) error {
+	type alias VM
+	if err := json.Unmarshal(data, (*alias)(v)); err != nil {
+		return err
+	}
+	if v.DesiredState == DesiredRunning && v.LegacyAttributes != nil && v.LegacyAttributes.StopInstance {
+		v.DesiredState = DesiredStopped
+	}
+	v.LegacyAttributes = nil
+
+	if len(v.HostfwdPorts) == 0 && len(v.LegacyExtraHostfwd) > 0 {
+		v.HostfwdPorts = make([]int, 0, len(v.LegacyExtraHostfwd))
+		for guest, host := range v.LegacyExtraHostfwd {
+			v.HostfwdPorts = append(v.HostfwdPorts, guest)
+			if host != 0 {
+				if v.HostfwdPortMap == nil {
+					v.HostfwdPortMap = make(map[int]int, len(v.LegacyExtraHostfwd))
+				}
+				v.HostfwdPortMap[guest] = host
+			}
+		}
+		slices.Sort(v.HostfwdPorts)
+	}
+	v.LegacyExtraHostfwd = nil
+	return nil
 }
 
 // ResetNodeLocalState zeroes node-specific fields after deserializing a VM

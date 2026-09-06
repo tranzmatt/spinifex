@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type ErrorMessage struct {
@@ -635,6 +636,46 @@ func Errorf(code, format string, args ...any) error {
 	return outer
 }
 
+// retryableError wraps a registered code with a suggested Retry-After
+// duration, for a 503 that a client can expect to clear on its own within a
+// bounded window (e.g. a warm-up race) rather than an open-ended outage.
+// Error() returns only the code, so code resolution is unaffected.
+type retryableError struct {
+	code       string
+	retryAfter time.Duration
+}
+
+func (e *retryableError) Error() string { return e.code }
+
+// RetryAfter wraps code (a registered ErrorLookup key) with a suggested
+// Retry-After duration for ErrorHandler to surface as a response header.
+func RetryAfter(code string, d time.Duration) error {
+	return &retryableError{code: code, retryAfter: d}
+}
+
+// ResolveRetryAfter returns the Retry-After duration attached to err via
+// RetryAfter, if any, walking the same unwrap tree resolveErrorDetail does.
+func ResolveRetryAfter(err error) (time.Duration, bool) {
+	if err == nil {
+		return 0, false
+	}
+	if re, ok := errors.AsType[*retryableError](err); ok {
+		return re.retryAfter, true
+	}
+	if joined, isJoined := err.(interface{ Unwrap() []error }); isJoined {
+		for _, inner := range joined.Unwrap() {
+			if d, found := ResolveRetryAfter(inner); found {
+				return d, true
+			}
+		}
+		return 0, false
+	}
+	if wrapped, isWrapped := err.(interface{ Unwrap() error }); isWrapped {
+		return ResolveRetryAfter(wrapped.Unwrap())
+	}
+	return 0, false
+}
+
 // errorLookupByService overrides ErrorLookup's message and HTTP status for a
 // (service, code) pair whose wire code is shared by services with different
 // canonical wording — e.g. ACM and EKS both use "ResourceInUseException".
@@ -798,7 +839,7 @@ var ErrorLookup = map[string]ErrorMessage{
 	ErrorInsufficientCapacityOnHost:                            {HTTPCode: 400, Message: "There is not enough capacity on the Dedicated Host to launch or start the instance."},
 	ErrorInsufficientFreeAddressesInSubnet:                     {HTTPCode: 503, Message: "The specified subnet does not contain enough free private IP addresses to fulfill your request. Use the DescribeSubnets request to view how many IP addresses are available (unused) in your subnet. IP addresses associated with stopped instances are considered unavailable."},
 	ErrorInsufficientHostCapacity:                              {HTTPCode: 503, Message: "There is not enough capacity to fulfill your Dedicated Host request. Reduce the number of Dedicated Hosts in your request, or wait for additional capacity to become available."},
-	ErrorInsufficientInstanceCapacity:                          {HTTPCode: 400, Message: "There is not enough capacity to fulfill your request. This error can occur if you launch a new instance, restart a stopped instance, create a new Capacity Reservation, or modify an existing Capacity Reservation. Reduce the number of instances in your request, or wait for additional capacity to become available. You can also try launching an instance by selecting different instance types (which you can resize at a later stage). The returned message might also give specific guidance about how to solve the problem."},
+	ErrorInsufficientInstanceCapacity:                          {HTTPCode: 503, Message: "There is not enough capacity to fulfill your request. This error can occur if you launch a new instance, restart a stopped instance, create a new Capacity Reservation, or modify an existing Capacity Reservation. Reduce the number of instances in your request, or wait for additional capacity to become available. You can also try launching an instance by selecting different instance types (which you can resize at a later stage). The returned message might also give specific guidance about how to solve the problem."},
 	ErrorInsufficientReservedInstanceCapacity:                  {HTTPCode: 503, Message: "Not enough available Reserved Instances to satisfy your minimum request. Reduce the number of Reserved Instances in your request or wait for additional capacity to become available."},
 	ErrorInsufficientReservedInstancesCapacity:                 {HTTPCode: 400, Message: "There is insufficient capacity for the requested Reserved Instances."},
 	ErrorInsufficientVolumeCapacity:                            {HTTPCode: 503, Message: "There is not enough capacity to fulfill your EBS volume provision request. You can try to provision a different volume type, EBS volume in a different availability zone, or you can wait for additional capacity to become available."},

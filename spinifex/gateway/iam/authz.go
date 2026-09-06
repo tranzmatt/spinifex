@@ -4,8 +4,10 @@ package gateway_iam
 import (
 	"errors"
 	"log/slog"
+	"maps"
 	"reflect"
-	"sort"
+	"slices"
+	"strings"
 
 	"github.com/mulgadc/spinifex/spinifex/arn"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
@@ -94,7 +96,7 @@ var iamScopes = map[string]resourceScope{
 	"DeleteGroupPolicy":         existingScope(arn.IAMGroup, "GroupName"),
 	"ListGroupPolicies":         existingScope(arn.IAMGroup, "GroupName"),
 
-	// Managed policies use the exact ARN the handler requires.
+	// Managed policies are normalized into the caller's trusted account.
 	"CreatePolicy":       createScope(arn.IAMPolicy, "PolicyName"),
 	"GetPolicy":          {source: sourcePolicyARN, nameField: "PolicyArn"},
 	"GetPolicyVersion":   {source: sourcePolicyARN, nameField: "PolicyArn"},
@@ -140,12 +142,7 @@ func HasScope(action string) bool {
 
 // ScopedActions returns every action represented in the IAM scope table.
 func ScopedActions() []string {
-	actions := make([]string, 0, len(iamScopes))
-	for action := range iamScopes {
-		actions = append(actions, action)
-	}
-	sort.Strings(actions)
-	return actions
+	return slices.Sorted(maps.Keys(iamScopes))
 }
 
 // ResourceARNs resolves the resource an IAM request authorizes against from
@@ -198,7 +195,13 @@ func (s resourceScope) resolve(action, accountID string, input any, svc handlers
 	case sourceExisting:
 		return canonicalARN(target, s.kind, svc)
 	case sourcePolicyARN:
-		return name, nil
+		pathAndName, err := policyPathNameFromARN(name)
+		if pathAndName == "" {
+			slog.Warn("IAM authz: policy ARN unresolvable, authorizing account-wide",
+				"action", action, "policy_arn", name, "account_id", accountID, "err", err)
+			return anyResource, nil
+		}
+		return arn.FormatIAMResource(arn.IAMPolicy, accountID, pathAndName), nil
 	case sourceOIDCCreate:
 		hostPath, err := handlers_iam.OIDCProviderHostPathFromURL(name)
 		if hostPath == "" {
@@ -233,6 +236,20 @@ func (s resourceScope) resolve(action, accountID string, input any, svc handlers
 			"action", action, "source", s.source)
 		return "", errors.New(awserrors.ErrorInternalError)
 	}
+}
+
+// policyPathNameFromARN extracts the path and name of a managed policy ARN.
+// The account segment is deliberately discarded: the caller supplies it, so it
+// is re-anchored onto the caller's own account before evaluation.
+func policyPathNameFromARN(policyARN string) (string, error) {
+	_, pathAndName, ok := strings.Cut(policyARN, ":"+string(arn.IAMPolicy)+"/")
+	if !ok {
+		return "", errors.New("not a policy ARN")
+	}
+	if pathAndName == "" {
+		return "", errors.New("policy ARN missing name")
+	}
+	return pathAndName, nil
 }
 
 // lookupTarget carries the identity of the object being authorized so every

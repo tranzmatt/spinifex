@@ -15,6 +15,7 @@ import (
 
 	awssdk "github.com/aws/aws-sdk-go/aws"
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/ebsprovider"
 	"github.com/mulgadc/spinifex/spinifex/nbd"
@@ -352,17 +353,10 @@ func handleListVolumes(ctx context.Context, cfg *Config, msg *nats.Msg) {
 	}
 
 	response := ebsprovider.ListVolumesResponse{Versioned: ebsprovider.NewVersioned()}
-	pageSize := int(req.PageSize())
-	for _, id := range ids {
-		if id <= req.StartingToken {
-			continue
-		}
-		if len(response.Volumes) == pageSize {
-			response.NextToken = response.Volumes[pageSize-1].ID
-			break
-		}
-		response.Volumes = append(response.Volumes, ebsprovider.VolumeRef{ID: id, Handle: volumeHandle(id)})
-	}
+	response.Volumes, response.NextToken = ebsprovider.Page(ids, req.StartingToken, int(req.PageSize()),
+		func(id string) ebsprovider.VolumeRef {
+			return ebsprovider.VolumeRef{ID: id, Handle: volumeHandle(id)}
+		})
 	respondProvider(ctx, msg, response)
 }
 
@@ -389,17 +383,10 @@ func handleListSnapshots(ctx context.Context, cfg *Config, msg *nats.Msg) {
 	}
 
 	response := ebsprovider.ListSnapshotsResponse{Versioned: ebsprovider.NewVersioned()}
-	pageSize := int(req.PageSize())
-	for _, id := range ids {
-		if id <= req.StartingToken {
-			continue
-		}
-		if len(response.Snapshots) == pageSize {
-			response.NextToken = response.Snapshots[pageSize-1].ID
-			break
-		}
-		response.Snapshots = append(response.Snapshots, ebsprovider.SnapshotRef{ID: id, Handle: snapshotHandle(id)})
-	}
+	response.Snapshots, response.NextToken = ebsprovider.Page(ids, req.StartingToken, int(req.PageSize()),
+		func(id string) ebsprovider.SnapshotRef {
+			return ebsprovider.SnapshotRef{ID: id, Handle: snapshotHandle(id)}
+		})
 	respondProvider(ctx, msg, response)
 }
 
@@ -489,7 +476,7 @@ func handleCreateVolume(ctx context.Context, cfg *Config, msg *nats.Msg) {
 		return
 	}
 
-	vbconfig := buildProviderVBConfig(cfg, req.VolumeID, utils.SafeInt64ToUint64(req.CapacityRange.RequiredBytes), req.SourceSnapshotID, req.SourceSnapshotVolumeID)
+	vbconfig := buildProviderVBConfig(cfg, req.VolumeID, safecast.Int64ToUint64(req.CapacityRange.RequiredBytes), req.SourceSnapshotID, req.SourceSnapshotVolumeID)
 	s3cfg := cfg.volumeS3Config(req.VolumeID)
 	vb, err := viperblock.New(vbconfig, "s3", s3cfg)
 	if err != nil {
@@ -607,7 +594,7 @@ func describeVolumeEngine(ctx context.Context, cfg *Config, volumeID string) (*e
 	if mv, ok := findMountedVolume(cfg, volumeID); ok && mv.VB != nil {
 		return &ebsprovider.Volume{
 			ID:            volumeID,
-			CapacityBytes: utils.SafeUint64ToInt64(mv.VB.GetVolumeSize()),
+			CapacityBytes: safecast.Uint64ToInt64(mv.VB.GetVolumeSize()),
 			State:         ebsprovider.VolumeStateInUse,
 			Handle:        volumeHandle(volumeID),
 		}, nil
@@ -619,7 +606,7 @@ func describeVolumeEngine(ctx context.Context, cfg *Config, volumeID string) (*e
 	}
 	return &ebsprovider.Volume{
 		ID:            volumeID,
-		CapacityBytes: utils.SafeUint64ToInt64(state.VolumeSize),
+		CapacityBytes: safecast.Uint64ToInt64(state.VolumeSize),
 		State:         ebsprovider.VolumeStateAvailable,
 		Handle:        volumeHandle(volumeID),
 	}, nil
@@ -700,14 +687,14 @@ func handleExpandVolume(ctx context.Context, cfg *Config, msg *nats.Msg) {
 		cfg.releaseVolumeLease(ctx, lease)
 	}()
 
-	currentBytes := utils.SafeUint64ToInt64(vb.GetVolumeSize())
+	currentBytes := safecast.Uint64ToInt64(vb.GetVolumeSize())
 	if req.CapacityRange.RequiredBytes < currentBytes {
 		respondProvider(ctx, msg, ebsprovider.ExpandVolumeResponse{Versioned: ebsprovider.NewVersioned(), Error: invalidArgumentError("volume expansion is grow-only")})
 		return
 	}
 
 	vc := vb.VolumeConfig
-	vc.VolumeMetadata.SizeGiB = utils.SafeInt64ToUint64(req.CapacityRange.RequiredBytes) / bytesPerGiB
+	vc.VolumeMetadata.SizeGiB = safecast.Int64ToUint64(req.CapacityRange.RequiredBytes) / bytesPerGiB
 	rawConfig, err := json.Marshal(vc)
 	if err != nil {
 		slog.Error("ebs.provider.volume.expand: marshal volume config failed", "volume", req.VolumeID, "err", err)
@@ -725,7 +712,7 @@ func handleExpandVolume(ctx context.Context, cfg *Config, msg *nats.Msg) {
 		Versioned: ebsprovider.NewVersioned(),
 		Volume: &ebsprovider.Volume{
 			ID:            req.VolumeID,
-			CapacityBytes: utils.SafeUint64ToInt64(vb.GetVolumeSize()),
+			CapacityBytes: safecast.Uint64ToInt64(vb.GetVolumeSize()),
 			State:         ebsprovider.VolumeStateAvailable,
 			Handle:        volumeHandle(req.VolumeID),
 		},
@@ -1000,7 +987,7 @@ func copySnapshotMetaWithVB(vb *viperblock.VB, volumeID, srcSnapshotID, dstSnaps
 	return &ebsprovider.Snapshot{
 		ID:             dstSnapshotID,
 		SourceVolumeID: volumeID,
-		SizeBytes:      utils.SafeUint64ToInt64(vb.GetVolumeSize()),
+		SizeBytes:      safecast.Uint64ToInt64(vb.GetVolumeSize()),
 		CreatedAt:      dst.CreatedAt.UTC(),
 		State:          ebsprovider.SnapshotStateCompleted,
 		Handle:         snapshotHandle(dstSnapshotID),
@@ -1079,14 +1066,7 @@ func completeCreateSnapshot(ctx context.Context, cfg *Config, nc *nats.Conn, req
 	snapshot, err := snapshotVolumeEngine(ctx, cfg, req.VolumeID, req.SnapshotID)
 	if err != nil {
 		slog.Error("ebs.provider.snapshot.create: snapshot failed", "volume", req.VolumeID, "snapshot", req.SnapshotID, "err", err)
-		code := ebsprovider.ErrorCodeInternal
-		switch {
-		case errors.Is(err, viperblock.ErrStateNotFound):
-			code = ebsprovider.ErrorCodeNotFound
-		case errors.Is(err, errSnapshotExistsElsewhere):
-			code = ebsprovider.ErrorCodeAlreadyExists
-		}
-		completion.Error = &ebsprovider.ProviderError{Code: code, Message: err.Error()}
+		completion.Error = &ebsprovider.ProviderError{Code: snapshotErrorCode(err), Message: err.Error()}
 	} else {
 		completion.Snapshot = snapshot
 	}
@@ -1098,6 +1078,25 @@ func completeCreateSnapshot(ctx context.Context, cfg *Config, nc *nats.Conn, req
 	}
 	if err := nc.Publish(completionSubject, data); err != nil {
 		slog.Error("ebs.provider.snapshot.create: failed to publish completion", "subject", completionSubject, "err", err)
+	}
+}
+
+// snapshotErrorCode classifies a failed snapshot for the caller. Only
+// ErrorCodeUnavailable invites a retry, so a refusal that will clear on its own
+// has to be told apart from one that will not.
+func snapshotErrorCode(err error) ebsprovider.ErrorCode {
+	switch {
+	case errors.Is(err, viperblock.ErrStateNotFound):
+		return ebsprovider.ErrorCodeNotFound
+	case errors.Is(err, errSnapshotExistsElsewhere):
+		return ebsprovider.ErrorCodeAlreadyExists
+	case errors.Is(err, errVolumeLeaseHeld), errors.Is(err, errNoVolumeLeaseStore):
+		// Exclusive access could not be established. The holder gives the
+		// volume up on detach, so this is worth repeating rather than the
+		// permanent failure an internal error reads as.
+		return ebsprovider.ErrorCodeUnavailable
+	default:
+		return ebsprovider.ErrorCodeInternal
 	}
 }
 
@@ -1122,48 +1121,30 @@ func checkSnapshotIDFree(vb *viperblock.VB, volumeID, snapshotID string) error {
 // preferring an already-mounted VB over opening a second engine on the same
 // volume. Draining the volume so the checkpoint is current is the caller's
 // responsibility (see handleCreateSnapshot).
+//
+// The unmounted branch opens through openVolumeVB, so it holds the volume's
+// cluster-wide lease for as long as the engine is open: a snapshot taken
+// beside a live writer on another node is two engines on one volume.
 func snapshotVolumeEngine(ctx context.Context, cfg *Config, volumeID, snapshotID string) (*ebsprovider.Snapshot, error) {
 	if mv, ok := findMountedVolume(cfg, volumeID); ok && mv.VB != nil {
-		if err := checkSnapshotIDFree(mv.VB, volumeID, snapshotID); err != nil {
-			return nil, err
-		}
-		if err := mv.VB.LoadLiveCheckpoint(); err != nil {
-			return nil, fmt.Errorf("load live checkpoint: %w", err)
-		}
-		if _, err := mv.VB.CreateSnapshot(snapshotID); err != nil {
-			return nil, fmt.Errorf("create snapshot: %w", err)
-		}
-		return &ebsprovider.Snapshot{
-			ID:             snapshotID,
-			SourceVolumeID: volumeID,
-			SizeBytes:      utils.SafeUint64ToInt64(mv.VB.GetVolumeSize()),
-			CreatedAt:      time.Now().UTC(),
-			State:          ebsprovider.SnapshotStateCompleted,
-			Handle:         snapshotHandle(snapshotID),
-		}, nil
+		return createSnapshotWithVB(mv.VB, volumeID, snapshotID)
 	}
 
-	s3cfg := cfg.volumeS3Config(volumeID)
-	vbconfig := &viperblock.VB{
-		VolumeName:        volumeID,
-		VolumeSize:        1, // Recalculated on LoadState.
-		BaseDir:           cfg.BaseDir,
-		Cache:             viperblock.Cache{Config: viperblock.CacheConfig{Size: 0}},
-		MasterKey:         cfg.masterKey,
-		EncryptionEnabled: cfg.masterKey != nil,
-		GCEnabled:         cfg.GCEnabled,
-	}
-	vb, err := viperblock.New(vbconfig, "s3", s3cfg)
+	vb, lease, err := openVolumeVB(ctx, cfg, volumeID)
 	if err != nil {
-		return nil, fmt.Errorf("new viperblock: %w", err)
+		return nil, err
 	}
-	defer vb.Detach()
-	if err := vb.Backend.InitCtx(ctx); err != nil {
-		return nil, fmt.Errorf("backend init: %w", err)
-	}
-	if err := loadStateWithRetry(ctx, cfg, vb, volumeID); err != nil {
-		return nil, fmt.Errorf("load state: %w", err)
-	}
+	defer func() {
+		vb.Detach()
+		cfg.releaseVolumeLease(ctx, lease)
+	}()
+	return createSnapshotWithVB(vb, volumeID, snapshotID)
+}
+
+// createSnapshotWithVB takes the snapshot against an already-resolved VB,
+// shared by snapshotVolumeEngine's mounted and freshly-opened branches so the
+// two cannot drift on what a snapshot of a volume means.
+func createSnapshotWithVB(vb *viperblock.VB, volumeID, snapshotID string) (*ebsprovider.Snapshot, error) {
 	if err := checkSnapshotIDFree(vb, volumeID, snapshotID); err != nil {
 		return nil, err
 	}
@@ -1176,7 +1157,7 @@ func snapshotVolumeEngine(ctx context.Context, cfg *Config, volumeID, snapshotID
 	return &ebsprovider.Snapshot{
 		ID:             snapshotID,
 		SourceVolumeID: volumeID,
-		SizeBytes:      utils.SafeUint64ToInt64(vb.GetVolumeSize()),
+		SizeBytes:      safecast.Uint64ToInt64(vb.GetVolumeSize()),
 		CreatedAt:      time.Now().UTC(),
 		State:          ebsprovider.SnapshotStateCompleted,
 		Handle:         snapshotHandle(snapshotID),
@@ -1381,7 +1362,7 @@ func mountVolume(ctx context.Context, cfg *Config, nc *nats.Conn, volumeName str
 		}
 	}()
 
-	mountSpan.SetAttributes(attribute.Int64("volume.size_bytes", utils.SafeUint64ToInt64(vb.GetVolumeSize())))
+	mountSpan.SetAttributes(attribute.Int64("volume.size_bytes", safecast.Uint64ToInt64(vb.GetVolumeSize())))
 
 	useTCP := cfg.NBDTransport == types.NBDTransportTCP
 
@@ -1437,7 +1418,7 @@ func mountVolume(ctx context.Context, cfg *Config, nc *nats.Conn, volumeName str
 		BaseDir:           cfg.BaseDir,
 		Host:              admin.DialTarget(cfg.S3Host),
 		Verbose:           false,
-		Size:              utils.SafeUint64ToInt64(vb.GetVolumeSize()),
+		Size:              safecast.Uint64ToInt64(vb.GetVolumeSize()),
 		Volume:            volumeName,
 		Bucket:            cfg.Bucket,
 		Region:            cfg.Region,

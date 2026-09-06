@@ -8,11 +8,12 @@ package mock
 
 import (
 	"errors"
+	"fmt"
 	"maps"
 	"sync"
 
+	"github.com/mulgadc/spinifex/spinifex/kvstore"
 	"github.com/mulgadc/spinifex/spinifex/vm"
-	"github.com/nats-io/nats.go/jetstream"
 )
 
 // StateStore is an in-memory vm.StateStore. Per-method error fields let a
@@ -97,13 +98,13 @@ func (s *StateStore) SaveRunningState(nodeID string, snap map[string]*vm.VM) err
 	return nil
 }
 
-func (s *StateStore) LoadRunningState(nodeID string) (map[string]*vm.VM, error) {
+func (s *StateStore) LoadRunningState(nodeID string) (map[string]*vm.VM, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if v, ok := s.Saved[nodeID]; ok {
-		return v, nil
+		return v, true, nil
 	}
-	return map[string]*vm.VM{}, nil
+	return map[string]*vm.VM{}, false, nil
 }
 
 func (s *StateStore) WriteStoppedInstance(id string, v *vm.VM) error {
@@ -197,7 +198,7 @@ func (s *StateStore) ClaimStoppedInstance(id string) (*vm.VM, error) {
 
 // UpdateStoppedInstance mimics the real CAS semantics: mutate runs under the
 // store lock against the stored value, and a missing record returns
-// jetstream.ErrKeyNotFound rather than resurrecting it.
+// kvstore.ErrNotFound rather than resurrecting it.
 func (s *StateStore) UpdateStoppedInstance(id string, mutate func(*vm.VM)) (*vm.VM, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -207,7 +208,7 @@ func (s *StateStore) UpdateStoppedInstance(id string, mutate func(*vm.VM)) (*vm.
 	}
 	v, ok := s.Stopped[id]
 	if !ok {
-		return nil, jetstream.ErrKeyNotFound
+		return nil, fmt.Errorf("%w: %s", kvstore.ErrNotFound, id)
 	}
 	mutate(v)
 	return v, nil

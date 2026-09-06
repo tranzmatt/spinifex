@@ -8,9 +8,11 @@ type StateStore interface {
 	// given node. The supplied map is owned by the caller and must not be
 	// retained.
 	SaveRunningState(nodeID string, snapshot map[string]*VM) error
-	// LoadRunningState returns the VMs persisted for the given node. An
-	// empty (non-nil) map is returned when no state exists.
-	LoadRunningState(nodeID string) (map[string]*VM, error)
+	// LoadRunningState returns the VMs persisted for the given node. The
+	// bool reports whether a record exists: "no record" and "a record
+	// holding no instances" both come back as an empty map, and only the
+	// second is evidence that the node runs nothing.
+	LoadRunningState(nodeID string) (map[string]*VM, bool, error)
 
 	WriteStoppedInstance(id string, v *VM) error
 	LoadStoppedInstance(id string) (*VM, error)
@@ -30,6 +32,7 @@ type StateStore interface {
 	// record for id and writes it back using optimistic concurrency (CAS),
 	// so a concurrent writer to the same record (e.g. two teardown-reaper
 	// sweeps advancing different dependents) cannot clobber the other's
-	// progress. Returns an error if no record exists for id.
+	// progress. Reports kvstore.ErrNotFound if no record exists for id, rather
+	// than creating one: a record the reaper already retired must stay retired.
 	UpdateTerminatedInstance(id string, mutate func(*VM)) (*VM, error)
 }

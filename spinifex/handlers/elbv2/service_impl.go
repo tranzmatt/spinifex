@@ -26,6 +26,7 @@ import (
 	handlers_dns "github.com/mulgadc/spinifex/spinifex/handlers/dns"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
+	"github.com/mulgadc/spinifex/spinifex/kvstore"
 	"github.com/mulgadc/spinifex/spinifex/network/topology"
 	"github.com/mulgadc/spinifex/spinifex/tags"
 	"github.com/mulgadc/spinifex/spinifex/utils"
@@ -1546,8 +1547,6 @@ func (s *ELBv2ServiceImpl) provisionLBDataPlane(ctx context.Context, lc lbLaunch
 	if putErr := s.store.PutLoadBalancer(ctx, record); putErr != nil {
 		return fmt.Errorf("persist launch result for %s: %w", lc.lbArn, putErr)
 	}
-	// Register the frontend A record now that the serving IP is allocated.
-	s.publishLBDNS(record, handlers_dns.ActionUpsert)
 	return nil
 }
 
@@ -1560,18 +1559,6 @@ func lbFrontendIP(r *LoadBalancerRecord) string {
 	return r.VPCIP
 }
 
-// publishLBDNS registers or withdraws the load balancer's frontend A record with
-// the control-plane DNS writer. Best-effort and a no-op when northstar is not
-// configured or no frontend IP has been allocated; the reconcile loop repairs
-// any miss and never blocks the LB operation.
-func (s *ELBv2ServiceImpl) publishLBDNS(record *LoadBalancerRecord, action handlers_dns.Action) {
-	if s.dnsBaseDomain == "" || record == nil {
-		return
-	}
-	changes := handlers_dns.ELBChanges(action, record.DNSName, s.dnsBaseDomain, lbFrontendIP(record))
-	handlers_dns.PublishChangesBestEffort(s.nc, record.AccountID, changes)
-}
-
 // DesiredDNSChanges returns the UPSERT records for every endpoint-ready load
 // balancer across all accounts, plus whether the enumeration was authoritative. The KV
 // store spans every tenant, so a successful list is a complete cross-account
@@ -1580,6 +1567,16 @@ func (s *ELBv2ServiceImpl) publishLBDNS(record *LoadBalancerRecord, action handl
 //
 // The daemon's reconcile loop calls this without a context, so the read runs on
 // the service lifetime context: the sweep should stop once the service closes.
+// DNSWatchBucket is the bucket behind DesiredDNSChanges, so the DNS reconcile
+// can be woken by a load-balancer change rather than poll for one. Nil when
+// there is no store to watch.
+func (s *ELBv2ServiceImpl) DNSWatchBucket() *kvstore.Bucket {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	return s.store.WatchBucket()
+}
+
 func (s *ELBv2ServiceImpl) DesiredDNSChanges() (changes []handlers_dns.Change, ok bool) {
 	if s == nil || s.store == nil || s.dnsBaseDomain == "" {
 		return nil, false
@@ -1791,9 +1788,6 @@ func (s *ELBv2ServiceImpl) DeleteLoadBalancer(ctx context.Context, input *elbv2.
 	// Release the name claim so the name is reusable. Idempotent on a missing
 	// key, so a delete that races the record removal still converges.
 	s.releaseLBNameClaim(ctx, lb.Name, accountID)
-
-	// Withdraw the frontend A record (best-effort; reconcile repairs a miss).
-	s.publishLBDNS(lb, handlers_dns.ActionDelete)
 
 	slog.InfoContext(ctx, "DeleteLoadBalancer completed", "lbArn", *input.LoadBalancerArn, "enis", len(lb.ENIs), "accountID", accountID)
 

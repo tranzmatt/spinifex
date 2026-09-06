@@ -1,4 +1,8 @@
 import { ACMClient } from "@aws-sdk/client-acm"
+import { BedrockClient } from "@aws-sdk/client-bedrock"
+import { BedrockAgentClient } from "@aws-sdk/client-bedrock-agent"
+import { BedrockAgentRuntimeClient } from "@aws-sdk/client-bedrock-agent-runtime"
+import { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime"
 import { EC2Client } from "@aws-sdk/client-ec2"
 import { ECRClient } from "@aws-sdk/client-ecr"
 import { ECSClient } from "@aws-sdk/client-ecs"
@@ -28,6 +32,10 @@ let s3Client: S3Client | null = null
 let ecrClient: ECRClient | null = null
 let ecsClient: ECSClient | null = null
 let rdsClient: RDSClient | null = null
+let bedrockAgentClient: BedrockAgentClient | null = null
+let bedrockAgentRuntimeClient: BedrockAgentRuntimeClient | null = null
+let bedrockClient: BedrockClient | null = null
+let bedrockRuntimeClient: BedrockRuntimeClient | null = null
 
 export function getEc2Client(): EC2Client {
   if (!ec2Client) {
@@ -316,6 +324,126 @@ export function getS3Client(): S3Client {
   return s3Client
 }
 
+export function getBedrockAgentClient(): BedrockAgentClient {
+  if (!bedrockAgentClient) {
+    const credentials = getCredentials()
+    if (!credentials) {
+      throw new Error("AWS credentials not configured")
+    }
+    bedrockAgentClient = new BedrockAgentClient({
+      endpoint: AWSGW_SIGN_ENDPOINT,
+      region: getRegion(),
+      credentials: {
+        accessKeyId: credentials.accessKeyId,
+        secretAccessKey: credentials.secretAccessKey,
+        sessionToken: credentials.sessionToken,
+      },
+    })
+    bedrockAgentClient.middlewareStack.add(
+      (next) => async (args) => {
+        if (HttpRequest.isInstance(args.request)) {
+          args.request.hostname = window.location.hostname
+          args.request.port = Number(window.location.port) || 443
+          args.request.path = `/proxy/awsgw${args.request.path}`
+        }
+        return await next(args)
+      },
+      { step: "finalizeRequest", name: "proxyRewrite", override: true },
+    )
+  }
+  return bedrockAgentClient
+}
+
+export function getBedrockAgentRuntimeClient(): BedrockAgentRuntimeClient {
+  if (!bedrockAgentRuntimeClient) {
+    const credentials = getCredentials()
+    if (!credentials) {
+      throw new Error("AWS credentials not configured")
+    }
+    bedrockAgentRuntimeClient = new BedrockAgentRuntimeClient({
+      endpoint: AWSGW_SIGN_ENDPOINT,
+      region: getRegion(),
+      credentials: {
+        accessKeyId: credentials.accessKeyId,
+        secretAccessKey: credentials.secretAccessKey,
+        sessionToken: credentials.sessionToken,
+      },
+    })
+    bedrockAgentRuntimeClient.middlewareStack.add(
+      (next) => async (args) => {
+        if (HttpRequest.isInstance(args.request)) {
+          args.request.hostname = window.location.hostname
+          args.request.port = Number(window.location.port) || 443
+          args.request.path = `/proxy/awsgw${args.request.path}`
+        }
+        return await next(args)
+      },
+      { step: "finalizeRequest", name: "proxyRewrite", override: true },
+    )
+  }
+  return bedrockAgentRuntimeClient
+}
+
+export function getBedrockClient(): BedrockClient {
+  if (!bedrockClient) {
+    const credentials = getCredentials()
+    if (!credentials) {
+      throw new Error("AWS credentials not configured")
+    }
+    bedrockClient = new BedrockClient({
+      endpoint: AWSGW_SIGN_ENDPOINT,
+      region: getRegion(),
+      credentials: {
+        accessKeyId: credentials.accessKeyId,
+        secretAccessKey: credentials.secretAccessKey,
+        sessionToken: credentials.sessionToken,
+      },
+    })
+    bedrockClient.middlewareStack.add(
+      (next) => async (args) => {
+        if (HttpRequest.isInstance(args.request)) {
+          args.request.hostname = window.location.hostname
+          args.request.port = Number(window.location.port) || 443
+          args.request.path = `/proxy/awsgw${args.request.path}`
+        }
+        return await next(args)
+      },
+      { step: "finalizeRequest", name: "proxyRewrite", override: true },
+    )
+  }
+  return bedrockClient
+}
+
+export function getBedrockRuntimeClient(): BedrockRuntimeClient {
+  if (!bedrockRuntimeClient) {
+    const credentials = getCredentials()
+    if (!credentials) {
+      throw new Error("AWS credentials not configured")
+    }
+    bedrockRuntimeClient = new BedrockRuntimeClient({
+      endpoint: AWSGW_SIGN_ENDPOINT,
+      region: getRegion(),
+      credentials: {
+        accessKeyId: credentials.accessKeyId,
+        secretAccessKey: credentials.secretAccessKey,
+        sessionToken: credentials.sessionToken,
+      },
+    })
+    bedrockRuntimeClient.middlewareStack.add(
+      (next) => async (args) => {
+        if (HttpRequest.isInstance(args.request)) {
+          args.request.hostname = window.location.hostname
+          args.request.port = Number(window.location.port) || 443
+          args.request.path = `/proxy/awsgw${args.request.path}`
+        }
+        return await next(args)
+      },
+      { step: "finalizeRequest", name: "proxyRewrite", override: true },
+    )
+  }
+  return bedrockRuntimeClient
+}
+
 // Call on logout to clear cached clients
 export function clearClients(): void {
   ec2Client = null
@@ -327,4 +455,8 @@ export function clearClients(): void {
   ecrClient = null
   ecsClient = null
   rdsClient = null
+  bedrockAgentClient = null
+  bedrockAgentRuntimeClient = null
+  bedrockClient = null
+  bedrockRuntimeClient = null
 }

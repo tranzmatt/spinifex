@@ -16,6 +16,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/mulgadc/spinifex/spinifex/ebsmetadata"
@@ -25,13 +26,13 @@ import (
 	handlers_dns "github.com/mulgadc/spinifex/spinifex/handlers/dns"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
 	"github.com/mulgadc/spinifex/spinifex/instancetypes"
+	"github.com/mulgadc/spinifex/spinifex/kvstore"
 	"github.com/mulgadc/spinifex/spinifex/network/topology"
 	"github.com/mulgadc/spinifex/spinifex/objectstore"
 	spxtypes "github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/spinifex/spinifex/vm"
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
 )
 
 // bytesPerGiB converts the byte sizes the launch path works in to the GiB
@@ -73,7 +74,7 @@ func floorVolumeSizeToAMI(ctx context.Context, loader AMIMetaLoader, imageID str
 	if amiMeta.VolumeSizeGiB == 0 {
 		return requested
 	}
-	amiSize := utils.SafeUint64ToInt64(amiMeta.VolumeSizeGiB) * 1024 * 1024 * 1024
+	amiSize := safecast.Uint64ToInt64(amiMeta.VolumeSizeGiB) * 1024 * 1024 * 1024
 	if amiSize <= int64(requested) {
 		return requested
 	}
@@ -402,14 +403,14 @@ func (s *InstanceServiceImpl) TagStoppedInstance(ctx context.Context, instanceID
 	// CAS the tag mutation into the shared KV record instead of a wholesale
 	// WriteStoppedInstance: createIfAbsent=false means a claim that deletes
 	// the record between the Load above and this write fails cleanly with
-	// jetstream.ErrKeyNotFound rather than resurrecting a stale stopped entry.
+	// kvstore.ErrNotFound rather than resurrecting a stale stopped entry.
 	newTags := instance.Instance.Tags
 	if _, err := s.stoppedStore.UpdateStoppedInstance(instanceID, func(v *vm.VM) {
 		if v.Instance != nil {
 			v.Instance.Tags = newTags
 		}
 	}); err != nil {
-		if errors.Is(err, jetstream.ErrKeyNotFound) {
+		if errors.Is(err, kvstore.ErrNotFound) {
 			slog.WarnContext(ctx, "TagStoppedInstance: instance claimed concurrently, not resurrecting", "instanceId", instanceID)
 			return errors.New(awserrors.ErrorInvalidInstanceIDNotFound)
 		}
@@ -454,7 +455,7 @@ func (s *InstanceServiceImpl) SetStoppedInstanceMonitoring(ctx context.Context, 
 		}
 		v.RunInstancesInput.Monitoring.Enabled = aws.Bool(enabled)
 	}); err != nil {
-		if errors.Is(err, jetstream.ErrKeyNotFound) {
+		if errors.Is(err, kvstore.ErrNotFound) {
 			slog.WarnContext(ctx, "SetStoppedInstanceMonitoring: instance claimed concurrently, not resurrecting", "instanceId", instanceID)
 			return errors.New(awserrors.ErrorInvalidInstanceIDNotFound)
 		}
@@ -613,6 +614,9 @@ func (s *InstanceServiceImpl) PrepareRunInstances(ctx context.Context, input *ec
 	var instances []*vm.VM
 	var allEC2Instances []*ec2.Instance
 	var lastRunErr error
+	// Whether this call created the instance's ENI, keyed by instance ID. An
+	// abandoned batch deletes the ones it made and only detaches the rest.
+	autoCreatedENI := make(map[string]bool)
 
 	for i := 0; i < launchCount; i++ {
 		instance, ec2Instance, err := s.RunInstance(input)
@@ -715,18 +719,14 @@ func (s *InstanceServiceImpl) PrepareRunInstances(ctx context.Context, input *ec
 			eni := eniOut.NetworkInterface
 			instance.ENIId = *eni.NetworkInterfaceId
 			instance.ENIMac = *eni.MacAddress
+			autoCreatedENI[instance.ID] = true
 
 			if _, attachErr := s.eniCreator.AttachENI(ctx, accountID, instance.ENIId, instance.ID, 0); attachErr != nil {
 				// Without the attachment RegisterTargets silently drops the target;
 				// aborting prevents a leak of the auto-assigned EIP.
 				slog.ErrorContext(ctx, "PrepareRunInstances: AttachENI failed — aborting launch",
 					"eniId", instance.ENIId, "instanceId", instance.ID, "err", attachErr)
-				if _, delErr := s.eniDeleter.DeleteNetworkInterface(ctx, &ec2.DeleteNetworkInterfaceInput{
-					NetworkInterfaceId: &instance.ENIId,
-				}, accountID); delErr != nil {
-					slog.WarnContext(ctx, "PrepareRunInstances: failed to delete auto-created ENI after attach failure",
-						"eniId", instance.ENIId, "err", delErr)
-				}
+				s.detachAndDeleteENI(ctx, accountID, instance.ID, instance.ENIId, true)
 				lastRunErr = attachErr
 				if reservationID == "" {
 					s.resourceMgr.Deallocate(instanceType)
@@ -770,20 +770,10 @@ func (s *InstanceServiceImpl) PrepareRunInstances(ctx context.Context, input *ec
 			if wantPublic {
 				publicIP, poolName, allocErr := s.allocatePublicIP(ctx, *eni.NetworkInterfaceId, instance.ID)
 				if allocErr != nil {
-					// Fail rather than boot an unreachable instance;
-					// detach before delete since in-use ENIs reject deletion.
+					// Fail rather than boot an unreachable instance.
 					slog.ErrorContext(ctx, "PrepareRunInstances: public IP allocation failed — aborting launch",
 						"instanceId", instance.ID, "eniId", *eni.NetworkInterfaceId, "err", allocErr)
-					if detErr := s.eniCreator.DetachENI(ctx, accountID, *eni.NetworkInterfaceId); detErr != nil {
-						slog.WarnContext(ctx, "PrepareRunInstances: failed to detach ENI after public-IP allocation failure",
-							"eniId", *eni.NetworkInterfaceId, "err", detErr)
-					}
-					if _, delErr := s.eniDeleter.DeleteNetworkInterface(ctx, &ec2.DeleteNetworkInterfaceInput{
-						NetworkInterfaceId: eni.NetworkInterfaceId,
-					}, accountID); delErr != nil {
-						slog.WarnContext(ctx, "PrepareRunInstances: failed to delete ENI after public-IP allocation failure",
-							"eniId", *eni.NetworkInterfaceId, "err", delErr)
-					}
+					s.detachAndDeleteENI(ctx, accountID, instance.ID, *eni.NetworkInterfaceId, true)
 					// Carry the allocator's own error rather than a flat
 					// capacity code: the gateway resolves the AWS code out
 					// of the wrap chain, so a genuinely exhausted pool still
@@ -834,7 +824,11 @@ func (s *InstanceServiceImpl) PrepareRunInstances(ctx context.Context, input *ec
 	}
 
 	if len(instances) < minCount {
-		for range instances {
+		// The instances that succeeded are abandoned here too, so their
+		// interfaces and external addresses have to go back with the capacity —
+		// an orphaned ENI pins its subnet, VPC and account undeletable.
+		for _, instance := range instances {
+			s.rollbackPreparedInstance(ctx, accountID, instance, autoCreatedENI[instance.ID])
 			if reservationID == "" {
 				s.resourceMgr.Deallocate(instanceType)
 			} else {
@@ -867,25 +861,6 @@ func (s *InstanceServiceImpl) PrepareRunInstances(ctx context.Context, input *ec
 	}
 
 	return reservation, instances, instanceType, nil
-}
-
-// publishDNS registers (or withdraws) the public + private A records for a batch
-// of instances with the control-plane DNS writer. Best-effort: a failure is
-// logged by the writer helper and never blocks the lifecycle operation; the
-// reconcile loop repairs any miss. No-op when northstar is not configured.
-func (s *InstanceServiceImpl) publishDNS(accountID string, action handlers_dns.Action, instances []*vm.VM) {
-	if s.dnsBaseDomain == "" || len(instances) == 0 {
-		return
-	}
-	var changes []handlers_dns.Change
-	for _, instance := range instances {
-		privateIP := ""
-		if instance.Instance != nil && instance.Instance.PrivateIpAddress != nil {
-			privateIP = *instance.Instance.PrivateIpAddress
-		}
-		changes = append(changes, handlers_dns.EC2Changes(action, s.config.Region, s.dnsBaseDomain, s.dnsInternalDomain, instance.PublicIP, privateIP)...)
-	}
-	handlers_dns.PublishChangesBestEffort(s.natsConn, accountID, changes)
 }
 
 // attachPreCreatedENI verifies the ENI is available, attaches it as device-0,
@@ -945,7 +920,6 @@ func (s *InstanceServiceImpl) attachPreCreatedENI(ctx context.Context, accountID
 // into vmMgr: volume prep, GPU claim, vmMgr.Run. Partial failures are tolerated.
 func (s *InstanceServiceImpl) LaunchRunInstances(ctx context.Context, instances []*vm.VM, input *ec2.RunInstancesInput, instanceType *ec2.InstanceTypeInfo) {
 	var successCount int
-	launchedByAccount := make(map[string][]*vm.VM)
 	for _, instance := range instances {
 		// Skip if a concurrent terminate raced with prepare.
 		status := s.vmMgr.Status(instance)
@@ -1011,38 +985,10 @@ func (s *InstanceServiceImpl) LaunchRunInstances(ctx context.Context, instances 
 		s.vmMgr.UpdateGuestDeviceNames(instance)
 
 		successCount++
-		launchedByAccount[instance.AccountID] = append(launchedByAccount[instance.AccountID], instance)
 		slog.InfoContext(ctx, "LaunchRunInstances: launched instance", "instanceId", instance.ID)
 	}
 
-	withdrawByAccount := make(map[string][]*vm.VM)
-	for accountID, launched := range launchedByAccount {
-		s.publishDNS(accountID, handlers_dns.ActionUpsert, launched)
-		for _, instance := range launched {
-			if s.terminateRacedLaunch(instance) {
-				withdrawByAccount[accountID] = append(withdrawByAccount[accountID], instance)
-			}
-		}
-	}
-	for accountID, instances := range withdrawByAccount {
-		s.publishDNS(accountID, handlers_dns.ActionDelete, instances)
-	}
 	slog.InfoContext(ctx, "LaunchRunInstances: completed", "requested", len(instances), "launched", successCount)
-}
-
-func needsDNSWithdrawal(status vm.InstanceState) bool {
-	return status != vm.StateRunning && status != vm.StateStopping && status != vm.StateStopped
-}
-
-// terminateRacedLaunch reports whether a terminate raced the deferred launch
-// UPSERT: it reads the terminate flag stamped under the lock (plus status) since
-// the async state transition may not have landed, which a status-only check misses.
-func (s *InstanceServiceImpl) terminateRacedLaunch(instance *vm.VM) bool {
-	withdraw := false
-	s.vmMgr.Inspect(instance, func(v *vm.VM) {
-		withdraw = v.Attributes.TerminateInstance || needsDNSWithdrawal(v.Status)
-	})
-	return withdraw
 }
 
 // RunInstances is for non-daemon callers (tests). The daemon calls
@@ -1100,9 +1046,9 @@ func (s *InstanceServiceImpl) StartInstance(ctx context.Context, instance *vm.VM
 		}
 	}
 
-	// Clear stop attribute before launch; a stale StopInstance=true would
-	// cause the daemon to skip QEMU reconnect on restart.
-	s.vmMgr.UpdateState(instance.ID, func(v *vm.VM) { v.Attributes = command.Attributes })
+	// Clear the stop intent before launch; a stale DesiredStopped would cause
+	// the daemon to skip QEMU reconnect on restart.
+	s.vmMgr.UpdateState(instance.ID, func(v *vm.VM) { v.DesiredState = vm.DesiredRunning })
 
 	if err := s.vmMgr.Start(ctx, instance.ID); err != nil {
 		if ok {
@@ -1158,7 +1104,12 @@ func (s *InstanceServiceImpl) StopOrTerminateInstance(ctx context.Context, insta
 			stateMismatch = true
 			return
 		}
-		v.Attributes = command.Attributes
+		if isTerminate {
+			now := time.Now().UTC()
+			v.DeletionTimestamp = &now
+		} else {
+			v.DesiredState = vm.DesiredStopped
+		}
 		// Auto-disassociate IAM profile on terminate (AWS parity; stop/start preserves it).
 		// Done under the same lock so DescribeInstances never sees a terminated
 		// instance advertising a profile.
@@ -1199,12 +1150,6 @@ func (s *InstanceServiceImpl) StopOrTerminateInstance(ctx context.Context, insta
 		slog.WarnContext(ctx, "StopOrTerminateInstance: instance in incorrect state for "+strings.ToLower(action),
 			"instanceId", instance.ID, "currentState", string(currentState))
 		return errors.New(awserrors.ErrorIncorrectInstanceState)
-	}
-
-	// Withdraw the instance's DNS records on terminate; stop/start retains
-	// the IP and the name, so they are a no-op here.
-	if isTerminate {
-		s.publishDNS(instance.AccountID, handlers_dns.ActionDelete, []*vm.VM{instance})
 	}
 
 	go func(id, ownerAccountID string) { //nolint:gosec // detached lifecycle op: stop/terminate continues after the API ack; request ctx would cancel it
@@ -1597,7 +1542,7 @@ func (s *InstanceServiceImpl) createRootVolumeViaProvider(ctx context.Context, s
 	// without one is invisible and its attach-time state write fails.
 	if err := s.metadata.PutVolume(ctx, ebsmetadata.Volume{
 		VolumeID: spec.volumeID, TenantID: spec.accountID,
-		CapacityGiB: utils.SafeIntToUint64(spec.sizeBytes / bytesPerGiB),
+		CapacityGiB: safecast.IntToUint64(spec.sizeBytes / bytesPerGiB),
 		State:       string(ebsprovider.VolumeStateAvailable),
 		CreatedAt:   time.Now(), AvailabilityZone: s.config.AZ,
 		VolumeType: spxtypes.VolumeTypeGP3, IOPS: rootVolumeIOPS(spec.iops),
@@ -2116,15 +2061,13 @@ func (s *InstanceServiceImpl) ModifyInstanceAttribute(ctx context.Context, input
 	// CAS the mutations into the shared KV record instead of a wholesale
 	// WriteStoppedInstance: createIfAbsent=false means a claim that deletes
 	// the record between the Load above and this write fails cleanly with
-	// jetstream.ErrKeyNotFound rather than resurrecting a stale stopped entry.
+	// kvstore.ErrNotFound rather than resurrecting a stale stopped entry.
 	_, err = s.stoppedStore.UpdateStoppedInstance(instanceID, func(v *vm.VM) {
 		if input.InstanceType != nil && input.InstanceType.Value != nil && v.Instance != nil {
 			newType := *input.InstanceType.Value
 			v.InstanceType = newType
 			v.Config.InstanceType = newType
 			v.Instance.InstanceType = aws.String(newType)
-			// Clear StateReason — resolves capacity-unavailable state from instance-type-missing bug.
-			v.Instance.StateReason = nil
 		}
 
 		if input.UserData != nil && input.UserData.Value != nil {
@@ -2145,7 +2088,7 @@ func (s *InstanceServiceImpl) ModifyInstanceAttribute(ctx context.Context, input
 		}
 	})
 	if err != nil {
-		if errors.Is(err, jetstream.ErrKeyNotFound) {
+		if errors.Is(err, kvstore.ErrNotFound) {
 			// The record existed moments ago (Load above) but a concurrent
 			// claim removed it: the instance is mid-transition, not gone.
 			slog.WarnContext(ctx, "ModifyInstanceAttribute: instance claimed concurrently, not resurrecting", "instanceId", instanceID)
@@ -2344,8 +2287,8 @@ func (s *InstanceServiceImpl) StartStoppedInstance(ctx context.Context, input *S
 		return nil, errors.New(awserrors.ErrorInsufficientInstanceCapacity)
 	}
 
-	// Add to local map + clear stop attribute before launch.
-	instance.Attributes = spxtypes.EC2CommandAttributes{StartInstance: true}
+	// Add to local map + clear the stop intent before launch.
+	instance.DesiredState = vm.DesiredRunning
 	s.vmMgr.Insert(instance)
 
 	// Claim GPU for GPU instance types.
@@ -2568,32 +2511,105 @@ func (s *InstanceServiceImpl) allocatePublicIP(ctx context.Context, eniID, insta
 // rollbackAutoAssignedPublicIP unwinds a failed auto-assign: clears the ENI
 // public IP record, releases the IPAM lease, then detaches and deletes the ENI.
 func (s *InstanceServiceImpl) rollbackAutoAssignedPublicIP(ctx context.Context, accountID, instanceID, eniID, publicIP, poolName string) {
+	_ = s.releaseAutoAssignedPublicIP(ctx, accountID, eniID, publicIP, poolName)
+	_ = s.detachAndDeleteENI(ctx, accountID, instanceID, eniID, true)
+}
+
+// releaseAutoAssignedPublicIP clears the ENI's public IP record and returns the
+// lease to its pool, reporting whether both steps landed. Clearing the record
+// first is what keeps the ENI delete from releasing the same address again.
+func (s *InstanceServiceImpl) releaseAutoAssignedPublicIP(ctx context.Context, accountID, eniID, publicIP, poolName string) bool {
+	released := true
 	if s.eniCreator != nil {
 		if err := s.eniCreator.UpdateENIPublicIP(ctx, accountID, eniID, "", ""); err != nil {
-			slog.WarnContext(ctx, "PrepareRunInstances: failed to clear ENI public IP during NAT-failure rollback",
+			slog.WarnContext(ctx, "PrepareRunInstances: failed to clear ENI public IP during launch rollback",
 				"eniId", eniID, "publicIp", publicIP, "err", err)
+			released = false
 		}
 	}
 	if s.ipReleaser != nil {
 		if err := s.ipReleaser.ReleaseIP(ctx, poolName, publicIP, eniID); err != nil {
-			slog.WarnContext(ctx, "PrepareRunInstances: failed to release public IP during NAT-failure rollback",
+			slog.WarnContext(ctx, "PrepareRunInstances: failed to release public IP during launch rollback",
 				"publicIp", publicIP, "pool", poolName, "err", err)
+			released = false
 		}
 	}
-	if s.eniCreator != nil {
+	return released
+}
+
+// detachAndDeleteENI releases the interface a rolled-back launch is holding and
+// reports whether it is safely gone. An auto-created ENI goes through the
+// atomic detach-and-delete: the launch owns it, so force is right, and the
+// single read is what stops a lagging replica rejecting the delete as in-use
+// and stranding the very orphan this rollback exists to prevent. A
+// caller-supplied ENI outlives the launch it was offered to, so it is detached
+// only, matching DeleteOnTermination=false on the terminate sweep.
+func (s *InstanceServiceImpl) detachAndDeleteENI(ctx context.Context, accountID, instanceID, eniID string, autoCreated bool) bool {
+	if !autoCreated {
+		if s.eniCreator == nil {
+			slog.ErrorContext(ctx, "PrepareRunInstances: no ENI service wired — caller-supplied ENI left attached to an instance that never launched",
+				"eniId", eniID, "instanceId", instanceID)
+			return false
+		}
 		if err := s.eniCreator.DetachENI(ctx, accountID, eniID); err != nil {
-			slog.WarnContext(ctx, "PrepareRunInstances: failed to detach ENI during NAT-failure rollback",
+			slog.ErrorContext(ctx, "PrepareRunInstances: failed to detach caller-supplied ENI during launch rollback",
 				"eniId", eniID, "instanceId", instanceID, "err", err)
+			return false
 		}
+		return true
 	}
-	if s.eniDeleter != nil {
-		if _, err := s.eniDeleter.DeleteNetworkInterface(ctx, &ec2.DeleteNetworkInterfaceInput{
-			NetworkInterfaceId: &eniID,
-		}, accountID); err != nil {
-			slog.WarnContext(ctx, "PrepareRunInstances: failed to delete ENI during NAT-failure rollback",
-				"eniId", eniID, "instanceId", instanceID, "err", err)
+
+	if s.eniDeleter == nil {
+		slog.ErrorContext(ctx, "PrepareRunInstances: no ENI deleter wired — auto-created ENI orphaned by launch rollback",
+			"eniId", eniID, "instanceId", instanceID)
+		return false
+	}
+	deleted, err := s.eniDeleter.DetachAndDeleteENI(ctx, accountID, eniID, true)
+	if err != nil {
+		// Not a warning: the interface survives, and it will refuse its
+		// subnet's delete and then its VPC's until something reaps it.
+		slog.ErrorContext(ctx, "PrepareRunInstances: failed to release auto-created ENI during launch rollback — interface orphaned",
+			"eniId", eniID, "instanceId", instanceID, "err", err)
+		return false
+	}
+	slog.InfoContext(ctx, "PrepareRunInstances: released auto-created ENI during launch rollback",
+		"eniId", eniID, "instanceId", instanceID, "deleted", deleted)
+	return true
+}
+
+// rollbackPreparedInstance unwinds the network resources a prepared instance
+// holds when the batch is abandoned, in the reverse order they were taken: NAT
+// rule, external address, then the interface itself. The VM needs no teardown —
+// it is metadata the caller never received.
+func (s *InstanceServiceImpl) rollbackPreparedInstance(ctx context.Context, accountID string, instance *vm.VM, autoCreatedENI bool) {
+	if instance == nil || instance.ENIId == "" {
+		return
+	}
+	rolledBack := true
+	if instance.PublicIP != "" {
+		vpcID := ""
+		privateIP := ""
+		if instance.Instance != nil {
+			vpcID = aws.StringValue(instance.Instance.VpcId)
+			privateIP = aws.StringValue(instance.Instance.PrivateIpAddress)
 		}
+		utils.PublishNATEvent(s.natsConn, "vpc.delete-nat", vpcID, instance.PublicIP, privateIP,
+			topology.Port(instance.ENIId), instance.ENIMac)
+		rolledBack = s.releaseAutoAssignedPublicIP(ctx, accountID, instance.ENIId, instance.PublicIP, instance.PublicIPPool)
 	}
+	// Evaluated before the &&: the interface must be released whether or not
+	// the address came back.
+	rolledBack = s.detachAndDeleteENI(ctx, accountID, instance.ID, instance.ENIId, autoCreatedENI) && rolledBack
+
+	if !rolledBack {
+		slog.ErrorContext(ctx, "PrepareRunInstances: prepared-instance rollback incomplete — ENI or address may be orphaned",
+			"instanceId", instance.ID, "eniId", instance.ENIId,
+			"publicIp", instance.PublicIP, "eniAutoCreated", autoCreatedENI)
+		return
+	}
+	slog.InfoContext(ctx, "PrepareRunInstances: rolled back prepared instance",
+		"instanceId", instance.ID, "eniId", instance.ENIId,
+		"publicIp", instance.PublicIP, "eniAutoCreated", autoCreatedENI)
 }
 
 func (s *InstanceServiceImpl) releaseInstancePublicIP(ctx context.Context, instance *vm.VM, instanceID string) {
@@ -2839,7 +2855,7 @@ func (s *InstanceServiceImpl) hostUnderMemoryPressure() bool {
 
 func (s *InstanceServiceImpl) buildInstanceStatus(v *vm.VM, systemImpaired bool) *ec2.InstanceStatus {
 	state := &ec2.InstanceState{}
-	if info, ok := vm.EC2StateCodes[v.Status]; ok {
+	if info, ok := vm.EC2APIState(v.Status); ok {
 		state.SetCode(info.Code)
 		state.SetName(info.Name)
 	} else {

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
@@ -45,7 +46,7 @@ func createDaemonWithJetStream(t *testing.T) *Daemon {
 	require.NoError(t, daemon.jsManager.InitKVBucket())
 	require.NoError(t, daemon.jsManager.InitClusterStateBucket())
 	require.NoError(t, daemon.jsManager.InitTerminatedInstanceBucket())
-	daemon.stateStore = newStateStoreAdapter(daemon.jsManager)
+	daemon.stateStore = newStateStoreAdapter(daemon.jsManager, daemon.persistState)
 
 	// Wire just enough vm.Deps for manager-driven state operations to work
 	// (migrate, MarkFailed, Restore classification). Full wiring (network
@@ -592,6 +593,212 @@ func simulateCleanRestore(t *testing.T, daemon *Daemon) {
 	daemon.vmMgr.Restore()
 }
 
+// TestUpdateAndPersist_MutationsReachTheLocalFile covers the API mutations of a
+// running instance at their shared choke point. Each case mirrors the mutation a
+// real handler applies; all of them used to persist to KV alone, leaving the
+// file to whatever a later, unrelated writer happened to flush.
+func TestUpdateAndPersist_MutationsReachTheLocalFile(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*vm.VM)
+		verify func(*testing.T, *vm.VM)
+	}{
+		{
+			name:   "associate IAM instance profile",
+			mutate: func(v *vm.VM) { v.IamInstanceProfileArn = "arn:aws:iam::000000000000:instance-profile/app" },
+			verify: func(t *testing.T, v *vm.VM) {
+				assert.Equal(t, "arn:aws:iam::000000000000:instance-profile/app", v.IamInstanceProfileArn)
+			},
+		},
+		{
+			name: "modify instance attribute",
+			mutate: func(v *vm.VM) {
+				v.RunInstancesInput = &ec2.RunInstancesInput{DisableApiTermination: aws.Bool(true)}
+			},
+			verify: func(t *testing.T, v *vm.VM) {
+				require.NotNil(t, v.RunInstancesInput)
+				assert.Equal(t, aws.Bool(true), v.RunInstancesInput.DisableApiTermination)
+			},
+		},
+		{
+			name: "set instance monitoring",
+			mutate: func(v *vm.VM) {
+				v.RunInstancesInput = &ec2.RunInstancesInput{
+					Monitoring: &ec2.RunInstancesMonitoringEnabled{Enabled: aws.Bool(true)},
+				}
+			},
+			verify: func(t *testing.T, v *vm.VM) {
+				require.NotNil(t, v.RunInstancesInput)
+				require.NotNil(t, v.RunInstancesInput.Monitoring)
+				assert.Equal(t, aws.Bool(true), v.RunInstancesInput.Monitoring.Enabled)
+			},
+		},
+		{
+			name: "set instance tags",
+			mutate: func(v *vm.VM) {
+				v.Instance = &ec2.Instance{
+					Tags: []*ec2.Tag{{Key: aws.String("Name"), Value: aws.String("web")}},
+				}
+			},
+			verify: func(t *testing.T, v *vm.VM) {
+				require.NotNil(t, v.Instance)
+				require.Len(t, v.Instance.Tags, 1)
+				assert.Equal(t, "web", aws.StringValue(v.Instance.Tags[0].Value))
+			},
+		},
+		{
+			name: "set spot lineage",
+			mutate: func(v *vm.VM) {
+				v.InstanceLifecycle = ec2.InstanceLifecycleTypeSpot
+				v.SpotInstanceRequestId = "sir-abc"
+			},
+			verify: func(t *testing.T, v *vm.VM) {
+				assert.Equal(t, ec2.InstanceLifecycleTypeSpot, v.InstanceLifecycle)
+				assert.Equal(t, "sir-abc", v.SpotInstanceRequestId)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			daemon := createDaemonWithJetStream(t)
+			daemon.vmMgr.Insert(&vm.VM{ID: "i-mutate", Status: vm.StateRunning})
+			require.NoError(t, daemon.WriteState())
+
+			found, err := daemon.vmMgr.UpdateAndPersist("i-mutate", func(v *vm.VM) bool {
+				tt.mutate(v)
+				return true
+			})
+			require.NoError(t, err)
+			require.True(t, found)
+
+			// Read the file directly: no second writer runs in between, so
+			// anything missing here is a write path that skipped it.
+			state, err := ReadLocalState(daemon.localStatePath())
+			require.NoError(t, err)
+			require.NotNil(t, state)
+			persisted, ok := state.VMS["i-mutate"]
+			require.True(t, ok, "the mutated instance must be in the local file")
+			tt.verify(t, persisted)
+		})
+	}
+}
+
+// TestRestoreInstances_LocalRecordSurvivesMissingKVKey pins the boot-path
+// precedence. startLocal loads the local file, then startCluster's restore
+// pulls from KV. An absent KV key means "this node has no record here", which
+// is not the same as "this node has no instances".
+func TestRestoreInstances_LocalRecordSurvivesMissingKVKey(t *testing.T) {
+	daemon := createDaemonWithJetStream(t)
+
+	// StateError is the one status classifyRestoredInstances leaves untouched,
+	// keeping this test on the load path rather than the relaunch machinery.
+	daemon.vmMgr.Insert(&vm.VM{
+		ID:     "i-survivor",
+		Status: vm.StateError,
+	})
+	require.NoError(t, daemon.WriteState())
+
+	// The node's KV record disappears: bucket recreated by recoverKVBucket,
+	// purged, or lost with its raft group. The local file still has it.
+	require.NoError(t, daemon.jsManager.DeleteState(daemon.node))
+
+	// Fresh process, then the real boot order.
+	daemon.vmMgr.Replace(map[string]*vm.VM{})
+	require.NoError(t, daemon.LoadState())
+	require.Equal(t, 1, daemon.vmMgr.Count(), "local file should carry the instance into boot")
+
+	require.NoError(t, daemon.jsManager.WriteShutdownMarker(daemon.node))
+	require.NoError(t, daemon.restoreInstances())
+
+	_, ok := daemon.vmMgr.Get("i-survivor")
+	assert.True(t, ok, "an instance held locally and absent from KV must survive restore")
+
+	state, err := ReadLocalState(daemon.localStatePath())
+	require.NoError(t, err)
+	require.NotNil(t, state, "local state file must still exist after restore")
+	assert.Contains(t, state.VMS, "i-survivor",
+		"restore must not write a KV-derived empty map over the local file")
+}
+
+// TestRestoreInstances_MissingKVKeyRepublishesLocalRecord is the other half of
+// the partition-recovery case: surviving the read is not enough, the node has
+// to put its record back so the rest of the cluster can see it again.
+func TestRestoreInstances_MissingKVKeyRepublishesLocalRecord(t *testing.T) {
+	daemon := createDaemonWithJetStream(t)
+
+	daemon.vmMgr.Insert(&vm.VM{
+		ID:     "i-republish",
+		Status: vm.StateError,
+	})
+	require.NoError(t, daemon.WriteState())
+	require.NoError(t, daemon.jsManager.DeleteState(daemon.node))
+
+	daemon.vmMgr.Replace(map[string]*vm.VM{})
+	require.NoError(t, daemon.LoadState())
+
+	require.NoError(t, daemon.jsManager.WriteShutdownMarker(daemon.node))
+	require.NoError(t, daemon.restoreInstances())
+
+	republished, found, err := daemon.jsManager.LoadState(daemon.node)
+	require.NoError(t, err)
+	require.True(t, found, "the node must write a record back, not leave the key absent")
+	assert.Contains(t, republished, "i-republish",
+		"the node must republish its own record after finding KV missing it")
+}
+
+// TestRestoreInstances_ClusterRecordWinsForSharedInstance keeps the merge from
+// becoming a licence to ignore the cluster: where both stores hold the same
+// instance, the published record is still the one that applies.
+func TestRestoreInstances_ClusterRecordWinsForSharedInstance(t *testing.T) {
+	daemon := createDaemonWithJetStream(t)
+
+	daemon.vmMgr.Insert(&vm.VM{ID: "i-shared", Status: vm.StateError, InstanceType: "t3.micro"})
+	daemon.vmMgr.Insert(&vm.VM{ID: "i-local-only", Status: vm.StateError})
+	require.NoError(t, daemon.WriteState())
+
+	// The cluster record covers only i-shared, and disagrees about it.
+	require.NoError(t, writeNodeState(t, daemon.jsManager, daemon.node, map[string]*vm.VM{
+		"i-shared": {ID: "i-shared", Status: vm.StateError, InstanceType: "t3.small"},
+	}))
+
+	daemon.vmMgr.Replace(map[string]*vm.VM{})
+	require.NoError(t, daemon.LoadState())
+	require.NoError(t, daemon.jsManager.WriteShutdownMarker(daemon.node))
+	require.NoError(t, daemon.restoreInstances())
+
+	shared, ok := daemon.vmMgr.Get("i-shared")
+	require.True(t, ok)
+	assert.Equal(t, "t3.small", shared.InstanceType,
+		"the cluster record wins where both stores hold the instance")
+
+	_, ok = daemon.vmMgr.Get("i-local-only")
+	assert.True(t, ok, "an instance the cluster record omits is still this node's to keep")
+}
+
+// TestRestoreInstances_StaleLocalTerminatedRecordIsMigrated pins the
+// self-healing half. Keeping a record the cluster dropped can revive a stale
+// terminal entry, so classification must still retire it.
+func TestRestoreInstances_StaleLocalTerminatedRecordIsMigrated(t *testing.T) {
+	daemon := createDaemonWithJetStream(t)
+
+	daemon.vmMgr.Insert(&vm.VM{ID: "i-stale-terminated", Status: vm.StateTerminated})
+	require.NoError(t, daemon.WriteState())
+	require.NoError(t, daemon.jsManager.DeleteState(daemon.node))
+
+	daemon.vmMgr.Replace(map[string]*vm.VM{})
+	require.NoError(t, daemon.LoadState())
+	require.NoError(t, daemon.jsManager.WriteShutdownMarker(daemon.node))
+	require.NoError(t, daemon.restoreInstances())
+
+	_, ok := daemon.vmMgr.Get("i-stale-terminated")
+	assert.False(t, ok, "a terminated record survives the merge only to be migrated out of it")
+
+	terminated, err := daemon.jsManager.LoadTerminatedInstance("i-stale-terminated")
+	require.NoError(t, err)
+	require.NotNil(t, terminated, "the revived record must land in the terminated bucket")
+}
+
 // TestRestoreInstances_StoppingFinalizedToStopped verifies that an instance
 // stuck in StateStopping when the daemon died gets finalized to StateStopped
 // and migrated to shared KV.
@@ -671,11 +878,9 @@ func TestRestoreInstances_UserStoppedMigratedToSharedKV(t *testing.T) {
 	daemon := createDaemonWithJetStream(t)
 
 	daemon.vmMgr.Insert(&vm.VM{
-		ID:     "i-restore-userstop",
-		Status: vm.StateStopped,
-		Attributes: types.EC2CommandAttributes{
-			StopInstance: true,
-		},
+		ID:           "i-restore-userstop",
+		Status:       vm.StateStopped,
+		DesiredState: vm.DesiredStopped,
 	})
 	require.NoError(t, daemon.WriteState())
 
@@ -767,7 +972,7 @@ func TestRestoreInstances_MixedStates(t *testing.T) {
 	})
 	daemon.vmMgr.Insert(&vm.VM{
 		ID: "i-mix-stopped", Status: vm.StateStopped,
-		Attributes: types.EC2CommandAttributes{StopInstance: true},
+		DesiredState: vm.DesiredStopped,
 	})
 	require.NoError(t, daemon.WriteState())
 
@@ -905,17 +1110,14 @@ func TestStatePersistence_RoundTrip(t *testing.T) {
 		ID:           "i-roundtrip",
 		Status:       vm.StateRunning,
 		InstanceType: "t3.micro",
-		Attributes: types.EC2CommandAttributes{
-			StopInstance:      false,
-			TerminateInstance: false,
-		},
+		DesiredState: vm.DesiredRunning,
 	}
 	daemon.vmMgr.Insert(original)
 	require.NoError(t, daemon.WriteState())
 
 	// Simulate restart: clear and reload.
 	daemon.vmMgr.Replace(map[string]*vm.VM{})
-	snapshot, err := daemon.jsManager.LoadState(daemon.node)
+	snapshot, _, err := daemon.jsManager.LoadState(daemon.node)
 	require.NoError(t, err)
 	daemon.vmMgr.Replace(snapshot)
 
@@ -924,7 +1126,7 @@ func TestStatePersistence_RoundTrip(t *testing.T) {
 	assert.Equal(t, original.ID, loaded.ID)
 	assert.Equal(t, original.Status, loaded.Status)
 	assert.Equal(t, original.InstanceType, loaded.InstanceType)
-	assert.Equal(t, original.Attributes.StopInstance, loaded.Attributes.StopInstance)
+	assert.Equal(t, original.DesiredState, loaded.DesiredState)
 }
 
 // TestWriteState_LocalFailureStillWritesKV guards against a launch-window data
@@ -967,7 +1169,7 @@ func TestRestoreInstances_StoppedInstanceMigratedToSharedKV(t *testing.T) {
 		ID:           instanceID,
 		InstanceType: "t3.micro",
 		Status:       vm.StateStopped,
-		Attributes:   types.EC2CommandAttributes{StopInstance: true},
+		DesiredState: vm.DesiredStopped,
 	})
 	require.NoError(t, daemon.WriteState())
 

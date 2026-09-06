@@ -24,6 +24,7 @@ var rdsInternalActions = []string{
 }
 
 func TestParseBuiltinManagedPolicies(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		raw     map[string]string
@@ -46,6 +47,7 @@ func TestParseBuiltinManagedPolicies(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			parsed, err := parseBuiltinManagedPolicies(tt.raw)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
@@ -58,6 +60,7 @@ func TestParseBuiltinManagedPolicies(t *testing.T) {
 	}
 }
 
+// Serial: mutates the package-level parse error that every constructor reads.
 func TestNewIAMServiceImpl_PropagatesBuiltinManagedPolicyParseError(t *testing.T) {
 	parseErr := errors.New("malformed builtin policy")
 	previousErr := builtinManagedPolicyParseErr
@@ -73,6 +76,7 @@ func TestNewIAMServiceImpl_PropagatesBuiltinManagedPolicyParseError(t *testing.T
 // resolve to a grant, the way the stock EKS roles already do, rather than fail
 // closed on a document Spinifex never stores.
 func TestResolveAttachedPolicy_RDSManagedShimsResolve(t *testing.T) {
+	t.Parallel()
 	s := &IAMServiceImpl{}
 	for _, arn := range []string{rdsFullAccessARN, rdsReadOnlyAccessARN} {
 		doc, include, err := s.resolveAttachedPolicy(t.Context(), "123456789012", arn)
@@ -86,6 +90,7 @@ func TestResolveAttachedPolicy_RDSManagedShimsResolve(t *testing.T) {
 // a path to the master password. The gateway refuses the internal actions by
 // principal class regardless, but GetPolicyVersion must not claim otherwise.
 func TestRDSManagedShims_GrantNoInternalAction(t *testing.T) {
+	t.Parallel()
 	for _, arn := range []string{rdsFullAccessARN, rdsReadOnlyAccessARN} {
 		doc, ok := builtinManagedPolicyDoc(arn)
 		require.True(t, ok, "arn %q", arn)
@@ -97,6 +102,7 @@ func TestRDSManagedShims_GrantNoInternalAction(t *testing.T) {
 }
 
 func TestRDSFullAccessShim_GrantsTheCustomerSurface(t *testing.T) {
+	t.Parallel()
 	doc, ok := builtinManagedPolicyDoc(rdsFullAccessARN)
 	require.True(t, ok)
 
@@ -120,6 +126,7 @@ func TestRDSFullAccessShim_GrantsTheCustomerSurface(t *testing.T) {
 // Read-only means read-only: the shim is the whole grant for a role that carries
 // nothing else, so a mutation reaching Allow here would be the only check missed.
 func TestRDSReadOnlyAccessShim_GrantsReadsOnly(t *testing.T) {
+	t.Parallel()
 	doc, ok := builtinManagedPolicyDoc(rdsReadOnlyAccessARN)
 	require.True(t, ok)
 
@@ -139,6 +146,7 @@ func TestRDSReadOnlyAccessShim_GrantsReadsOnly(t *testing.T) {
 // An RDS-looking managed ARN Spinifex does not model resolves to no grant rather
 // than an error, so a role carrying it is denied that grant and not broken.
 func TestResolveAttachedPolicy_UnmodeledRDSManagedARNGrantsNothing(t *testing.T) {
+	t.Parallel()
 	s := &IAMServiceImpl{}
 	for _, arn := range []string{
 		"arn:aws:iam::aws:policy/AmazonRDSDataFullAccess",

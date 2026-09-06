@@ -37,13 +37,29 @@ E2E_SUITES_MULTI="multinode lb cert quota"
 E2E_SUITES_SINGLE_RE="$(printf '%s' "${E2E_SUITES_SINGLE}" | tr ' ' '|')"
 E2E_SUITES_MULTI_RE="$(printf '%s' "${E2E_SUITES_MULTI}" | tr ' ' '|')"
 
-# e2e-nightly runs a narrower set than the two sets above, deliberately: its
-# ~19 cells each have a 35-minute budget and exist to prove that every
-# install / network / host-OS permutation boots and serves. Suite breadth is
-# the PR gate's job, and it already runs on every push. These are subsets, and
-# e2e_suites_assert_subset below enforces that.
-E2E_SUITES_NIGHTLY_SINGLE="single cert"
+# What every e2e-nightly permutation cell must prove, deliberately narrower
+# than the two sets above: those cells have a 35-minute budget and exist to show
+# that every install / network / host-OS combination boots and serves. The
+# service suites are not deferred to the PR gate — eks, ecs and rds each run
+# nightly in their own dedicated cell, because each needs a guest AMI built
+# first and a service failure should not mask whether a host OS boots. These
+# are subsets, and e2e_suites_assert_subset below enforces that.
+E2E_SUITES_NIGHTLY_SINGLE="single cert iam"
 E2E_SUITES_NIGHTLY_MULTI="multinode cert lb"
+
+# How long a suite gets, for the same reason the lists above live here: the
+# timeout was written out separately in each workflow and drifted, so rds ran
+# 50m on the PR gate and 30m nightly and panicked there. A suite needing more
+# than the default declares it once, here.
+#   e2e_suite_timeout <suite>
+e2e_suite_timeout() {
+  case "$1" in
+    # rds serialises its DB VMs behind a 4 GiB semaphore, so its wall clock is
+    # set by how long it waits for the budget, not by how long a test runs.
+    rds) echo "50m" ;;
+    *) echo "30m" ;;
+  esac
+}
 
 # Fail loudly when a narrowed list names a suite its topology cannot run. This
 # is the guard that stops the lists drifting again: a suite added to a nightly

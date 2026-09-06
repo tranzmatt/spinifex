@@ -90,7 +90,7 @@ func TestReconcile_PortSuppressDHCP(t *testing.T) {
 	intent.Ports["eni-static"] = topology.PortSpec{
 		PortID: "eni-static", SubnetID: "subnet-a", VPCID: "vpc-a",
 		PrivateIP: netip.MustParseAddr("10.0.1.11"), MAC: mac,
-		SuppressDHCP: true,
+		SGIDs: []string{"sg-a"}, SuppressDHCP: true,
 	}
 
 	if err := rec.Reconcile(ctx, intent); err != nil {
@@ -486,6 +486,125 @@ func TestReconcile_PortMembershipDriftCorrected(t *testing.T) {
 	}
 }
 
+// Every SG ACL, including the priority 900/800 default-denies, hangs off a port
+// group, so a port in none of them is unrestricted. When a port's policy cannot
+// be programmed in full, applyPorts must refuse the port rather than create it.
+func TestReconcile_UnprogrammablePolicyDoesNotCreatePort(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name   string
+		mutate func(*IntentState)
+	}{
+		{
+			// The OVN-recreate / cold-chassis window: applySGs has not yet
+			// built the port group this pass.
+			name: "every port group missing",
+			mutate: func(in *IntentState) {
+				delete(in.SGs, "sg-a")
+			},
+		},
+		{
+			// A partial miss must not land the port in the subset that exists:
+			// the absent SG's rules would silently not apply.
+			name: "one port group missing",
+			mutate: func(in *IntentState) {
+				port := in.Ports["eni-a"]
+				port.SGIDs = append(port.SGIDs, "sg-b")
+				in.Ports["eni-a"] = port
+			},
+		},
+		{
+			// A legacy ENI record written before SG defaulting: the field is
+			// omitempty and unmarshals to nil with no migration to backfill it.
+			name: "no security groups at all",
+			mutate: func(in *IntentState) {
+				port := in.Ports["eni-a"]
+				port.SGIDs = nil
+				in.Ports["eni-a"] = port
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, m := newTestReconciler(t)
+			intent := freshIntent(t)
+			tc.mutate(&intent)
+
+			err := rec.Reconcile(ctx, intent)
+			if !errors.Is(err, ErrPassIncomplete) {
+				t.Errorf("Reconcile err = %v, want ErrPassIncomplete: the port must be reported unconverged", err)
+			}
+			if _, ok := m.Ports["port-eni-a"]; ok {
+				t.Error("port created with an unprogrammable policy — it would be unrestricted")
+			}
+		})
+	}
+}
+
+// The same rule on the update path: an existing port whose desired groups have
+// gone missing keeps the memberships it has. Applying the diff would strip a
+// live guest bare, which is worse than leaving it on a stale policy.
+func TestReconcile_UnprogrammablePolicyKeepsExistingMemberships(t *testing.T) {
+	ctx := context.Background()
+	rec, m := newTestReconciler(t)
+
+	intent := freshIntent(t)
+	if err := rec.Reconcile(ctx, intent); err != nil {
+		t.Fatalf("Reconcile #1: %v", err)
+	}
+	if m.Ports["port-eni-a"] == nil {
+		t.Fatal("ENI port not created")
+	}
+
+	// A pass whose EnsureSGPortGroup failed sees the port group as absent while
+	// the LSP is still joined to it in OVN.
+	actual := newActualState()
+	var res passResult
+	rec.applyPorts(ctx, intent, actual, false, &res)
+	if len(res.failures) == 0 {
+		t.Error("applyPorts reported no failure for an unprogrammable policy")
+	}
+
+	names, err := m.ListPortGroupsForPort(ctx, "port-eni-a")
+	if err != nil {
+		t.Fatalf("ListPortGroupsForPort: %v", err)
+	}
+	if len(names) == 0 {
+		t.Error("live port stripped of every port group — it is now unrestricted")
+	}
+}
+
+// Once applySGs catches up, the next pass creates the port and joins it: the
+// refusal is a window that heals, not a permanent block.
+func TestReconcile_RefusedPortHealsOncePortGroupExists(t *testing.T) {
+	ctx := context.Background()
+	rec, m := newTestReconciler(t)
+
+	intent := freshIntent(t)
+	withoutSG := intent
+	withoutSG.SGs = map[string]policy.SGSpec{}
+	if err := rec.Reconcile(ctx, withoutSG); !errors.Is(err, ErrPassIncomplete) {
+		t.Fatalf("Reconcile #1 err = %v, want ErrPassIncomplete", err)
+	}
+	if _, ok := m.Ports["port-eni-a"]; ok {
+		t.Fatal("port created before its port group existed")
+	}
+
+	if err := rec.Reconcile(ctx, intent); err != nil {
+		t.Fatalf("Reconcile #2: %v", err)
+	}
+	storedPort := m.Ports["port-eni-a"]
+	if storedPort == nil {
+		t.Fatal("port not created once its port group existed")
+	}
+	pg := m.PortGroups[topology.SecurityGroupPortGroup("sg-a")]
+	if pg == nil || !slices.Contains(pg.Ports, storedPort.UUID) {
+		t.Error("healed port not joined to its SG port group")
+	}
+}
+
 // TestReconcile_PublicInstanceExemptFromDropGate locks the post-reboot regression: a
 // reconcile that drop-gates an IGW-attached subnet with no 0.0.0.0/0 route must also
 // install the /32 reroute above the gate for every public-IP instance in that subnet,
@@ -721,6 +840,216 @@ func TestReconcile_PruneOrphanEIPs_SkipsOnReloadError(t *testing.T) {
 	}
 }
 
+// An SG created after the pass snapshotted its intent is live but missing from
+// that snapshot. Deleting its port group breaks every later ENI create in the VPC
+// ("port group not found"), so the prune must union a fresh re-read into the keep
+// set while still sweeping a genuine orphan.
+func TestReconcile_ApplySGs_SparesMidPassSecurityGroup(t *testing.T) {
+	r, m := newTestReconciler(t)
+	ctx := context.Background()
+
+	freshPG := topology.SecurityGroupPortGroup("sg-fresh")
+	deadPG := topology.SecurityGroupPortGroup("sg-dead")
+	for _, pgName := range []string{freshPG, deadPG} {
+		if _, _, err := m.EnsurePortGroup(ctx, pgName, nil); err != nil {
+			t.Fatalf("EnsurePortGroup %s: %v", pgName, err)
+		}
+	}
+
+	// The re-read sees the SG created mid-pass; the snapshot carries sg-a only.
+	r.reloadIntent = func(context.Context) (IntentState, error) {
+		fresh := freshIntent(t)
+		fresh.SGs["sg-fresh"] = policy.SGSpec{GroupID: "sg-fresh", VPCID: "vpc-a"}
+		return fresh, nil
+	}
+
+	if err := r.reconcile(ctx, freshIntent(t), true); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if _, ok := m.PortGroups[freshPG]; !ok {
+		t.Errorf("mid-pass SG port group %s must survive the prune via the fresh re-read", freshPG)
+	}
+	if _, ok := m.PortGroups[deadPG]; ok {
+		t.Errorf("genuine orphan port group %s must still be pruned", deadPG)
+	}
+}
+
+// When the fresh-intent re-read fails, the port group sweep is skipped wholesale
+// rather than risk deleting a live SG against a snapshot known to be stale.
+func TestReconcile_ApplySGs_SkipsPruneOnReloadError(t *testing.T) {
+	r, m := newTestReconciler(t)
+	ctx := context.Background()
+
+	deadPG := topology.SecurityGroupPortGroup("sg-dead")
+	if _, _, err := m.EnsurePortGroup(ctx, deadPG, nil); err != nil {
+		t.Fatalf("EnsurePortGroup: %v", err)
+	}
+	r.reloadIntent = func(context.Context) (IntentState, error) {
+		return IntentState{}, errors.New("kv unavailable")
+	}
+
+	res := &passResult{}
+	r.applySGs(ctx, freshIntent(t), scanOrFail(t, ctx, r), true, res)
+
+	if _, ok := m.PortGroups[deadPG]; !ok {
+		t.Errorf("prune must be skipped when the fresh re-read fails")
+	}
+	if len(res.failures) == 0 {
+		t.Errorf("a skipped prune must mark the pass incomplete so the loop requeues")
+	}
+}
+
+// Same window against guest LSPs: an ENI created mid-pass is absent from the
+// snapshot, and pruning its port strands the guest with no datapath.
+func TestReconcile_PruneOrphanPorts_SparesMidPassENI(t *testing.T) {
+	r, m := newTestReconciler(t)
+	ctx := context.Background()
+
+	if err := r.reconcile(ctx, freshIntent(t), false); err != nil {
+		t.Fatalf("reconcile (seed): %v", err)
+	}
+	for _, eniID := range []string{"eni-fresh", "eni-dead"} {
+		lsp := &nbdb.LogicalSwitchPort{
+			Name: topology.Port(eniID),
+			ExternalIDs: map[string]string{
+				"spinifex:eni_id":    eniID,
+				"spinifex:subnet_id": "subnet-a",
+				"spinifex:vpc_id":    "vpc-a",
+			},
+		}
+		if err := m.CreateLogicalSwitchPort(ctx, topology.SubnetSwitch("subnet-a"), lsp); err != nil {
+			t.Fatalf("seed LSP %s: %v", eniID, err)
+		}
+	}
+
+	mac, _ := net.ParseMAC("02:00:00:00:00:02")
+	r.reloadIntent = func(context.Context) (IntentState, error) {
+		fresh := freshIntent(t)
+		fresh.Ports["eni-fresh"] = topology.PortSpec{
+			PortID: "eni-fresh", SubnetID: "subnet-a", VPCID: "vpc-a",
+			PrivateIP: netip.MustParseAddr("10.0.1.20"), MAC: mac, SGIDs: []string{"sg-a"},
+		}
+		return fresh, nil
+	}
+
+	r.pruneOrphanPorts(ctx, freshIntent(t), &passResult{})
+
+	if _, ok := m.Ports[topology.Port("eni-fresh")]; !ok {
+		t.Errorf("mid-pass ENI port must survive the prune via the fresh re-read")
+	}
+	if _, ok := m.Ports[topology.Port("eni-dead")]; ok {
+		t.Errorf("genuine orphan ENI port must still be pruned")
+	}
+}
+
+// A failed re-read skips the guest LSP sweep entirely, same as the SG and EIP paths.
+func TestReconcile_PruneOrphanPorts_SkipsOnReloadError(t *testing.T) {
+	r, m := newTestReconciler(t)
+	ctx := context.Background()
+
+	if err := r.reconcile(ctx, freshIntent(t), false); err != nil {
+		t.Fatalf("reconcile (seed): %v", err)
+	}
+	orphan := &nbdb.LogicalSwitchPort{
+		Name: topology.Port("eni-dead"),
+		ExternalIDs: map[string]string{
+			"spinifex:eni_id":    "eni-dead",
+			"spinifex:subnet_id": "subnet-a",
+			"spinifex:vpc_id":    "vpc-a",
+		},
+	}
+	if err := m.CreateLogicalSwitchPort(ctx, topology.SubnetSwitch("subnet-a"), orphan); err != nil {
+		t.Fatalf("seed orphan LSP: %v", err)
+	}
+
+	r.reloadIntent = func(context.Context) (IntentState, error) {
+		return IntentState{}, errors.New("kv unavailable")
+	}
+	res := &passResult{}
+	r.pruneOrphanPorts(ctx, freshIntent(t), res)
+
+	if _, ok := m.Ports[topology.Port("eni-dead")]; !ok {
+		t.Errorf("prune must be skipped when the fresh re-read fails")
+	}
+	if len(res.failures) == 0 {
+		t.Errorf("a skipped prune must mark the pass incomplete so the loop requeues")
+	}
+}
+
+// racingOVN creates an ENI's LSP part-way through the sweep's own listing, so
+// the returned rows include a port that did not exist when the sweep started.
+type racingOVN struct {
+	*mock.Client
+
+	listed bool
+}
+
+func (o *racingOVN) ListLogicalSwitchPorts(ctx context.Context) ([]nbdb.LogicalSwitchPort, error) {
+	if !o.listed {
+		lsp := &nbdb.LogicalSwitchPort{
+			Name: topology.Port("eni-raced"),
+			ExternalIDs: map[string]string{
+				"spinifex:eni_id":    "eni-raced",
+				"spinifex:subnet_id": "subnet-a",
+				"spinifex:vpc_id":    "vpc-a",
+			},
+		}
+		if err := o.CreateLogicalSwitchPort(ctx, topology.SubnetSwitch("subnet-a"), lsp); err != nil {
+			return nil, err
+		}
+		o.listed = true
+	}
+	return o.Client.ListLogicalSwitchPorts(ctx)
+}
+
+// The create path writes the ENI to KV before it creates the LSP, so intent read
+// after the listing covers every row in it. Re-reading first reopens the window:
+// the new port is listed but absent from both snapshots and gets swept.
+func TestReconcile_PruneOrphanPorts_ReloadsAfterListing(t *testing.T) {
+	r, m := newTestReconciler(t)
+	ctx := context.Background()
+
+	if err := r.reconcile(ctx, freshIntent(t), false); err != nil {
+		t.Fatalf("reconcile (seed): %v", err)
+	}
+	racing := &racingOVN{Client: m}
+	r.ovn = racing
+
+	mac, _ := net.ParseMAC("02:00:00:00:00:03")
+	r.reloadIntent = func(context.Context) (IntentState, error) {
+		fresh := freshIntent(t)
+		// The KV record exists only once the LSP does, mirroring KV-then-OVN.
+		if racing.listed {
+			fresh.Ports["eni-raced"] = topology.PortSpec{
+				PortID: "eni-raced", SubnetID: "subnet-a", VPCID: "vpc-a",
+				PrivateIP: netip.MustParseAddr("10.0.1.30"), MAC: mac, SGIDs: []string{"sg-a"},
+			}
+		}
+		return fresh, nil
+	}
+
+	res := &passResult{}
+	r.pruneOrphanPorts(ctx, freshIntent(t), res)
+
+	if _, ok := m.Ports[topology.Port("eni-raced")]; !ok {
+		t.Errorf("ENI created during the listing must survive; re-read the intent after listing, not before")
+	}
+	if len(res.failures) != 0 {
+		t.Errorf("a clean sweep must not mark the pass incomplete, got %d failure(s)", len(res.failures))
+	}
+}
+
+// scanOrFail snapshots the mock's OVN state the way a pass does.
+func scanOrFail(t *testing.T, ctx context.Context, r *reconciler) ActualState {
+	t.Helper()
+	actual, err := scanActual(ctx, r.ovn)
+	if err != nil {
+		t.Fatalf("scanActual: %v", err)
+	}
+	return actual
+}
+
 // findNATByExternal returns the first NAT row matching (type, externalIP), or nil.
 func findNATByExternal(m *mock.Client, natType, externalIP string) *nbdb.NAT {
 	for _, n := range m.NATs {
@@ -842,11 +1171,17 @@ type stubIGW struct {
 	external.IGWManager
 
 	attachErr error
+	// attachNoop returns success without building any OVN state, modelling an
+	// AttachIGW that reports nil on a gateway that does not actually forward.
+	attachNoop bool
 }
 
 func (s *stubIGW) AttachIGW(ctx context.Context, spec external.IGWSpec) error {
 	if s.attachErr != nil {
 		return s.attachErr
+	}
+	if s.attachNoop {
+		return nil
 	}
 	return s.IGWManager.AttachIGW(ctx, spec)
 }
@@ -856,8 +1191,176 @@ func (s *stubIGW) AttachIGW(ctx context.Context, spec external.IGWSpec) error {
 func igwIntent(t *testing.T) IntentState {
 	t.Helper()
 	intent := freshIntent(t)
-	intent.IGWs["vpc-a"] = external.IGWSpec{VPCID: "vpc-a", InternetGatewayID: "igw-a"}
+	intent.IGWs["vpc-a"] = external.IGWSpec{
+		VPCID: "vpc-a", InternetGatewayID: "igw-a", RecordKey: "acct.igw-a", AttachPending: true,
+	}
 	return intent
+}
+
+// The control plane reports an attachment only once a pass confirms it, so the
+// hook must fire on success and stay silent on failure — a record marked
+// attached after a failed attach is the bug this replaced.
+func TestReconcile_MarksIGWAttachedOnlyOnSuccess(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("success", func(t *testing.T) {
+		rec, _ := newTestReconciler(t)
+		rec.chassis = []string{"chassis-1"}
+		rec.gwClaim = &fakeClaimVerifier{}
+		var keys, vpcs []string
+		rec.markAttached = func(_ context.Context, key, vpcID string) error {
+			keys = append(keys, key)
+			vpcs = append(vpcs, vpcID)
+			return nil
+		}
+		if err := rec.Reconcile(ctx, igwIntent(t)); err != nil {
+			t.Fatalf("Reconcile = %v, want nil", err)
+		}
+		if want := []string{"acct.igw-a"}; !slices.Equal(keys, want) {
+			t.Errorf("markAttached keys = %v, want %v — a converged attach must be reported "+
+				"or DescribeInternetGateways never stops calling it pending", keys, want)
+		}
+		if want := []string{"vpc-a"}; !slices.Equal(vpcs, want) {
+			t.Errorf("markAttached vpcs = %v, want %v — the record key survives detach and "+
+				"re-attach, so the VPC is what pins the confirmation to this attachment", vpcs, want)
+		}
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		rec, _ := newTestReconciler(t)
+		rec.igw = &stubIGW{IGWManager: rec.igw, attachErr: errors.New("dhcp gw-lrp acquire: context deadline exceeded")}
+		called := false
+		rec.markAttached = func(context.Context, string, string) error {
+			called = true
+			return nil
+		}
+		if err := rec.Reconcile(ctx, igwIntent(t)); !errors.Is(err, ErrPassIncomplete) {
+			t.Fatalf("Reconcile = %v, want ErrPassIncomplete", err)
+		}
+		if called {
+			t.Error("markAttached called after a failed attach: the API would report a gateway that is not up")
+		}
+	})
+
+	// The datapath gate logs at Error and records no pass failure, so a
+	// confirmation inferred from the failure count would report a gateway that
+	// demonstrably does not forward — the bug this branch exists to fix.
+	t.Run("datapath never converges", func(t *testing.T) {
+		withFastDatapathBounds(t)
+		rec, _ := newTestReconciler(t)
+		rec.chassis = []string{"chassis-1"}
+		rec.gwClaim = &fakeClaimVerifier{reachableAfter: -1}
+		called := false
+		rec.markAttached = func(context.Context, string, string) error {
+			called = true
+			return nil
+		}
+		// A distributed-NAT gateway LRP is link-local and gates the probe off,
+		// so an EIP is what gives the datapath check a target.
+		intent := igwIntent(t)
+		intent.EIPs["10.0.1.5"] = policy.EIPSpec{VPCID: "vpc-a", ExternalIP: "203.0.113.5", LogicalIP: "10.0.1.5"}
+		if err := rec.Reconcile(ctx, intent); err != nil {
+			t.Fatalf("Reconcile = %v, want nil", err)
+		}
+		if called {
+			t.Error("markAttached called while the gateway datapath is unreachable: the API would " +
+				"report an attachment that does not forward, and the confirmation never self-corrects")
+		}
+	})
+
+	// Same shape as the datapath gate: an unclaimed SB binding leaves floating
+	// IPs dark while every other signal is green.
+	t.Run("SB claim never converges", func(t *testing.T) {
+		withFastClaimBounds(t)
+		rec, _ := newTestReconciler(t)
+		rec.chassis = []string{"chassis-1"}
+		rec.gwClaim = &fakeClaimVerifier{claimedAfter: -1}
+		called := false
+		rec.markAttached = func(context.Context, string, string) error {
+			called = true
+			return nil
+		}
+		if err := rec.Reconcile(ctx, igwIntent(t)); err != nil {
+			t.Fatalf("Reconcile = %v, want nil", err)
+		}
+		if called {
+			t.Error("markAttached called while the SB chassisredirect binding is unclaimed")
+		}
+	})
+
+	// A spec built outside the store has no address to confirm against; sending
+	// an empty key would have vpcd read key "" on every pass.
+	t.Run("no record key", func(t *testing.T) {
+		rec, _ := newTestReconciler(t)
+		rec.chassis = []string{"chassis-1"}
+		rec.gwClaim = &fakeClaimVerifier{}
+		called := false
+		rec.markAttached = func(context.Context, string, string) error {
+			called = true
+			return nil
+		}
+		intent := freshIntent(t)
+		intent.IGWs["vpc-a"] = external.IGWSpec{VPCID: "vpc-a", InternetGatewayID: "igw-a", AttachPending: true}
+		if err := rec.Reconcile(ctx, intent); err != nil {
+			t.Fatalf("Reconcile = %v, want nil", err)
+		}
+		if called {
+			t.Error("markAttached called with no record key")
+		}
+	})
+
+	// A record already confirmed must cost nothing: the drift loop watches this
+	// bucket, so a per-pass read is a per-pass wakeup risk for no work.
+	t.Run("already confirmed", func(t *testing.T) {
+		rec, _ := newTestReconciler(t)
+		rec.chassis = []string{"chassis-1"}
+		rec.gwClaim = &fakeClaimVerifier{}
+		called := false
+		rec.markAttached = func(context.Context, string, string) error {
+			called = true
+			return nil
+		}
+		intent := igwIntent(t)
+		spec := intent.IGWs["vpc-a"]
+		spec.AttachPending = false
+		intent.IGWs["vpc-a"] = spec
+		if err := rec.Reconcile(ctx, intent); err != nil {
+			t.Fatalf("Reconcile = %v, want nil", err)
+		}
+		if called {
+			t.Error("markAttached called for an attachment already confirmed")
+		}
+	})
+
+	// AttachIGW returning nil is not proof the gateway forwards. Confirming
+	// before the chassis rebind would report a gateway with no bound chassis as
+	// attached, and the confirmation is one-way so it would never self-correct.
+	t.Run("chassis rebind failed", func(t *testing.T) {
+		rec, _ := newTestReconciler(t)
+		rec.chassis = []string{"chassis-1"}
+		rec.igw = &stubIGW{IGWManager: rec.igw, attachNoop: true}
+		called := false
+		rec.markAttached = func(context.Context, string, string) error {
+			called = true
+			return nil
+		}
+		if err := rec.Reconcile(ctx, igwIntent(t)); !errors.Is(err, ErrPassIncomplete) {
+			t.Fatalf("Reconcile = %v, want ErrPassIncomplete", err)
+		}
+		if called {
+			t.Error("markAttached called after a failed chassis rebind: the gateway has no bound " +
+				"chassis, and the confirmation is one-way so no later pass would revert it")
+		}
+	})
+
+	// vpcd wires the hook, unit callers do not; a nil hook must not panic.
+	t.Run("nil hook", func(t *testing.T) {
+		rec, _ := newTestReconciler(t)
+		rec.markAttached = nil
+		if err := rec.Reconcile(ctx, igwIntent(t)); err != nil {
+			t.Fatalf("Reconcile = %v, want nil with no hook wired", err)
+		}
+	})
 }
 
 // A failed AttachIGW must surface as ErrPassIncomplete rather than a nil return:

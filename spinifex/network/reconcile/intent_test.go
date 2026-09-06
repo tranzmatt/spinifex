@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/netip"
+	"reflect"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	handlers_ec2_natgw "github.com/mulgadc/spinifex/spinifex/handlers/ec2/natgw"
 	handlers_ec2_routetable "github.com/mulgadc/spinifex/spinifex/handlers/ec2/routetable"
 	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
+	"github.com/mulgadc/spinifex/spinifex/network/policy"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -210,11 +212,53 @@ func TestLoadIntentFromKV_IGWAttachedFilter(t *testing.T) {
 		t.Fatalf("LoadIntentFromKV: %v", err)
 	}
 
-	if _, ok := intent.IGWs["vpc-local"]; !ok {
-		t.Errorf("attached IGW missing from intent")
+	spec, ok := intent.IGWs["vpc-local"]
+	if !ok {
+		t.Fatalf("attached IGW missing from intent")
+	}
+	// RecordKey is the only address the pass has to confirm the attachment
+	// against; dropping it silently stops every confirmation forever.
+	if spec.RecordKey != "acct/igw-attached" {
+		t.Errorf("RecordKey = %q, want %q — without it no attach is ever confirmed and "+
+			"DescribeInternetGateways reports every gateway as detached", spec.RecordKey, "acct/igw-attached")
 	}
 	if len(intent.IGWs) != 1 {
 		t.Errorf("got %d IGWs, want 1 (detached should be excluded)", len(intent.IGWs))
+	}
+}
+
+// Intent gates on State, never on AttachState: an IGW enters intent so a pass
+// can attach it, and every attach starts pending. Gating intent on the observed
+// state instead would mean nothing is ever attached, so nothing is ever
+// confirmed — a total IGW outage that no other test would catch.
+func TestLoadIntentFromKV_PendingIGWStillEntersIntent(t *testing.T) {
+	js := startKV(t)
+
+	testutil.SeedKV(t, js, handlers_ec2_vpc.KVBucketVPCs, map[string][]byte{
+		"acct/vpc-local": mustJSON(t, handlers_ec2_vpc.VPCRecord{
+			VpcId: "vpc-local", CidrBlock: "10.0.0.0/16", AZ: "us-east-1a",
+		}),
+	})
+	testutil.SeedKV(t, js, handlers_ec2_igw.KVBucketIGW, map[string][]byte{
+		"acct/igw-pending": mustJSON(t, handlers_ec2_igw.IGWRecord{
+			InternetGatewayId: "igw-pending", VpcId: "vpc-local",
+			State: "available", AttachState: "pending",
+		}),
+	})
+
+	intent, err := LoadIntentFromKV(context.Background(), js, "us-east-1a")
+	if err != nil {
+		t.Fatalf("LoadIntentFromKV: %v", err)
+	}
+
+	spec, ok := intent.IGWs["vpc-local"]
+	if !ok {
+		t.Fatal("a pending IGW was excluded from intent: no pass would attach it, so it would " +
+			"stay pending forever and no VPC would ever get an external gateway")
+	}
+	if !spec.AttachPending {
+		t.Error("AttachPending not set: the pass skips the confirmation, so the attachment " +
+			"stays pending and is never reported")
 	}
 }
 
@@ -442,6 +486,73 @@ func TestLoadIntentFromKV_NoDropGateWithoutIGW(t *testing.T) {
 	}
 	if len(intent.DropGates) != 0 {
 		t.Errorf("VPC has no IGW: expected 0 drop gates, got %d (%v)", len(intent.DropGates), intent.DropGates)
+	}
+}
+
+// Tenant SG rules reach the ACL builder only through sgRulesToPolicyRules. The
+// golden scenarios construct IntentState by hand and never exercise it, so a
+// field dropped or transposed here would silently ship an ACL that opens or
+// closes the wrong port.
+func TestLoadIntentFromKV_SGRuleFieldMapping(t *testing.T) {
+	js := startKV(t)
+
+	testutil.SeedKV(t, js, handlers_ec2_vpc.KVBucketVPCs, map[string][]byte{
+		"acct/vpc-local": mustJSON(t, handlers_ec2_vpc.VPCRecord{
+			VpcId: "vpc-local", CidrBlock: "10.0.0.0/16", AZ: "us-east-1a",
+		}),
+	})
+	testutil.SeedKV(t, js, handlers_ec2_vpc.KVBucketSecurityGroups, map[string][]byte{
+		"acct/sg-app": mustJSON(t, handlers_ec2_vpc.SecurityGroupRecord{
+			GroupId: "sg-app", GroupName: "app", VpcId: "vpc-local",
+			IngressRules: []handlers_ec2_vpc.SGRule{
+				{RuleId: "sgr-1", IpProtocol: "tcp", FromPort: 443, ToPort: 443, CidrIp: "0.0.0.0/0"},
+				{RuleId: "sgr-2", IpProtocol: "tcp", FromPort: 5432, ToPort: 5432, SourceSG: "sg-db"},
+			},
+			EgressRules: []handlers_ec2_vpc.SGRule{
+				{RuleId: "sgr-3", IpProtocol: "-1", FromPort: -1, ToPort: -1, CidrIp: "0.0.0.0/0"},
+			},
+		}),
+		"acct/sg-empty": mustJSON(t, handlers_ec2_vpc.SecurityGroupRecord{
+			GroupId: "sg-empty", GroupName: "empty", VpcId: "vpc-local",
+		}),
+	})
+
+	intent, err := LoadIntentFromKV(context.Background(), js, "us-east-1a")
+	if err != nil {
+		t.Fatalf("LoadIntentFromKV: %v", err)
+	}
+
+	spec, ok := intent.SGs["sg-app"]
+	if !ok {
+		t.Fatalf("sg-app missing from intent")
+	}
+	if spec.VPCID != "vpc-local" {
+		t.Errorf("VPCID = %q, want vpc-local", spec.VPCID)
+	}
+
+	wantIngress := []policy.Rule{
+		{IPProtocol: "tcp", FromPort: 443, ToPort: 443, CIDR: "0.0.0.0/0"},
+		{IPProtocol: "tcp", FromPort: 5432, ToPort: 5432, SourceSG: "sg-db"},
+	}
+	if !reflect.DeepEqual(spec.IngressRules, wantIngress) {
+		t.Errorf("IngressRules = %+v, want %+v", spec.IngressRules, wantIngress)
+	}
+
+	wantEgress := []policy.Rule{
+		{IPProtocol: "-1", FromPort: -1, ToPort: -1, CIDR: "0.0.0.0/0"},
+	}
+	if !reflect.DeepEqual(spec.EgressRules, wantEgress) {
+		t.Errorf("EgressRules = %+v, want %+v", spec.EgressRules, wantEgress)
+	}
+
+	// A rule-less SG must carry nil, not an empty non-nil slice: the ACL
+	// builder distinguishes "no tenant rules" from "rules that were dropped".
+	empty, ok := intent.SGs["sg-empty"]
+	if !ok {
+		t.Fatalf("sg-empty missing from intent")
+	}
+	if empty.IngressRules != nil || empty.EgressRules != nil {
+		t.Errorf("rule-less SG got ingress=%v egress=%v, want both nil", empty.IngressRules, empty.EgressRules)
 	}
 }
 

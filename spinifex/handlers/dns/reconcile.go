@@ -2,33 +2,24 @@ package dns
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	nsconfig "github.com/mulgadc/northstar/pkg/config"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	reconcilelock "github.com/mulgadc/spinifex/spinifex/network/reconcile"
-	"github.com/mulgadc/spinifex/spinifex/utils"
+	"github.com/mulgadc/spinifex/spinifex/reconciler"
 	"github.com/nats-io/nats.go"
 )
 
 // DefaultReconcileInterval is how often the drift backstop rebuilds managed
-// records from the live resource inventory. It is deliberately close to
-// the northstar S3 poll so a missed lifecycle event self-heals within one cycle.
-const DefaultReconcileInterval = 60 * time.Second
-
-const (
-	// maxReconcileNATSPayloadBytes stays below nats.conf's 1 MB max_payload.
-	maxReconcileNATSPayloadBytes = 900 * 1024
-	// reconcileNATSHeaderHeadroom reserves space for account and trace headers
-	// when a deployment negotiates a lower server payload limit.
-	reconcileNATSHeaderHeadroom = 4 * 1024
-	changeBatchJSONOverhead     = len(`{"changes":[]}`)
-)
+// records from the live resource inventory when nothing has changed. With the
+// watch carrying every change the loop sees, this is the backstop for drift
+// introduced outside KV — directly in the zone object, say — rather than the
+// path by which a normal lifecycle event reaches DNS.
+const DefaultReconcileInterval = reconciler.DefaultResync
 
 // DesiredFunc returns the full desired managed record set built from the live
 // resource inventory across all tenants. The daemon supplies it by enumerating
@@ -54,80 +45,104 @@ type PruneScope struct {
 	ELB bool
 	EKS bool
 	RDS bool
+
+	// EC2 is set only when the instance view spanned every node. A node's own
+	// VM manager does not qualify: pruning against it would delete the records
+	// of every instance running elsewhere.
+	EC2 bool
 }
 
-// Reconciler is the drift backstop. On a ticker it rebuilds the desired
-// managed record set from the live inventory and converges the zone toward it:
-// every desired record is re-UPSERTed (idempotent — the writer skips unchanged
-// zones) and stale *prunable* records are DELETEd.
+// Reconciler converges the zone toward the live inventory. On each pass it
+// rebuilds the desired managed record set: every desired record is re-UPSERTed
+// (idempotent — the writer skips unchanged zones) and stale *prunable* records
+// are DELETEd. A pass runs on a change to any watched resource store, and on
+// the interval as the backstop for drift those stores cannot report.
 //
-// Each cycle is gated on a CAS-elected leader so one node per interval publishes
-// the converging batch. Without it every node published its own batch on the same
-// interval, and since the queue group load-balances rather than serialises, an
-// idle cluster raced its own zone object once per tick.
+// Each pass is gated on a CAS-elected leader, which then writes the zone itself
+// rather than publishing the batch to the queue group. Handing its own work to
+// a peer put a second writer on the object and left the read that computed the
+// deletes in a different process from the write that applied them.
 //
-// Only cluster-wide-enumerable records (load balancers, EKS clusters) are
-// pruned: any node sees the full ELB/EKS set from KV. EC2 records are never
-// pruned here because a node's vmMgr holds only its own instances — an
-// incomplete view would delete another node's records. EC2 removal stays with
-// the terminate hook; the reconcile only repairs missing/incorrect EC2 records.
+// Only cluster-wide-enumerable records are pruned, and only for the classes a
+// cycle enumerated in full. Every class the desired set carries is readable
+// from KV across the whole cluster, so a pass that reads them all can prune
+// them all; one that could not read a class repairs it without pruning it.
 type Reconciler struct {
 	enabled    bool
 	s3cfg      *nsconfig.S3Config
 	baseDomain string
-	nc         *nats.Conn
-	desired    DesiredFunc
-	interval   time.Duration
-	accountID  string
-	holder     string
+	// internalDomain is the private zone instance records land in. It is read
+	// as well as the base domain because pruning one zone and not the other
+	// leaves every stale private record behind.
+	internalDomain string
+	nc             *nats.Conn
+	// writer applies the converged batch. The reconcile owns the zone object on
+	// the node that won the election, so the batch never leaves this process.
+	writer   *Writer
+	desired  DesiredFunc
+	interval time.Duration
+	holder   string
+	sources  []reconciler.Source
 }
 
 // NewReconciler builds the drift backstop. It is disabled (a no-op) when
-// northstar S3 is not configured or no desired-set provider is supplied.
-func NewReconciler(cfg *config.Config, nc *nats.Conn, desired DesiredFunc) *Reconciler {
+// northstar S3 is not configured, no desired-set provider is supplied, or the
+// writer that applies its batches is unavailable. sources name the buckets whose
+// changes should wake the loop. They are optional: with none supplied the loop
+// falls back to the interval alone, which is the behaviour that predates the
+// watch.
+func NewReconciler(cfg *config.Config, nc *nats.Conn, writer *Writer, desired DesiredFunc, sources ...reconciler.Source) *Reconciler {
 	r := &Reconciler{
-		nc:        nc,
-		desired:   desired,
-		interval:  DefaultReconcileInterval,
-		accountID: utils.GlobalAccountID,
+		nc:       nc,
+		writer:   writer,
+		desired:  desired,
+		interval: DefaultReconcileInterval,
+		sources:  sources,
 	}
 	if cfg != nil {
 		r.holder = cfg.Node
 	}
 	zoneCfg, ok := zoneS3Config(cfg)
-	if !ok || desired == nil {
+	if !ok || desired == nil || !writer.Enabled() {
 		return r
 	}
 	r.enabled = true
 	r.s3cfg = zoneCfg.s3
 	r.baseDomain = strings.TrimSpace(zoneCfg.server.DefaultDomain)
+	r.internalDomain = ResolveInternalDomain(cfg)
 	return r
 }
 
 // Enabled reports whether the reconcile loop will run.
 func (r *Reconciler) Enabled() bool { return r.enabled }
 
-// Run reconciles once immediately, then on the interval until ctx is done. It is
-// a no-op when disabled, so the daemon can start it unconditionally.
+// Run converges once, then on every change to the resource stores the desired
+// set is built from, with the interval as the drift backstop. It is a no-op
+// when disabled, so the daemon can start it unconditionally.
+//
+// Only the trigger is event-driven: each pass still rebuilds the whole desired
+// set, so the watch needs to report only that something changed, not what.
 func (r *Reconciler) Run(ctx context.Context) {
 	if !r.enabled {
 		return
 	}
-	r.reconcileOnce(ctx)
-	ticker := time.NewTicker(r.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
+	reconciler.Run(ctx, reconciler.Config{
+		Name:    "dns",
+		Sources: r.sources,
+		// No revisit deadline: the desired set is a function of the buckets
+		// being watched, so a change is the only reason to run early.
+		Reconcile: func(ctx context.Context) (time.Duration, error) {
 			r.reconcileOnce(ctx)
-		}
-	}
+			return 0, nil
+		},
+		Resync: r.interval,
+	})
 }
 
-// reconcileOnce computes the converging batch and publishes it best-effort, on
-// whichever node wins this cycle's election.
+// reconcileOnce computes the converging batch and applies it, on whichever node
+// wins this cycle's election. The read that finds the stale records and the
+// write that removes them now happen in one process, so a record re-added
+// between them is no longer deleted by a batch that predates it.
 func (r *Reconciler) reconcileOnce(ctx context.Context) {
 	if !r.enabled {
 		return
@@ -150,147 +165,57 @@ func (r *Reconciler) reconcileOnce(ctx context.Context) {
 		return
 	}
 	slog.Debug("dns reconcile: converging", "changes", len(batch))
-	payloadLimit := reconcilePayloadLimit(r.nc)
-	if err := publishReconcileBatches(batch, payloadLimit, func(changes []Change) error {
-		return publishReconcileBatch(r.nc, r.accountID, changes)
-	}); err != nil {
-		slog.Warn("dns reconcile: batching or publish failed, retrying next cycle", "changes", len(batch), "error", err)
+	res, err := r.writer.ApplyBatch(&ChangeBatch{Changes: batch})
+	if err != nil {
+		slog.Warn("dns reconcile: apply failed, retrying next cycle", "changes", len(batch), "error", err)
 		return
 	}
-	slog.Debug("dns reconcile: converged", "changes", len(batch))
+	slog.Debug("dns reconcile: converged", "changes", res.Applied, "zones", res.Zones)
 }
 
-// publishReconcileBatch requires the writer to acknowledge every submitted
-// change, so a missing transport or partial success cannot report convergence.
-func publishReconcileBatch(nc *nats.Conn, accountID string, changes []Change) error {
-	res, err := PublishChanges(nc, accountID, changes)
-	if err != nil {
-		return err
-	}
-	applied := 0
-	if res != nil {
-		applied = res.Applied
-	}
-	if applied != len(changes) {
-		return fmt.Errorf("writer acknowledged %d of %d changes", applied, len(changes))
-	}
-	return nil
-}
-
-// publishReconcileBatches sends bounded batches sequentially so each is
-// acknowledged before the next begins. On failure it stops: the next cycle
-// safely rebuilds and retries the complete idempotent desired state.
-func publishReconcileBatches(changes []Change, payloadLimit int, publish func([]Change) error) error {
-	batches, err := splitReconcileChanges(changes, payloadLimit)
-	if err != nil {
-		return err
-	}
-	for i, batch := range batches {
-		if err := publish(batch); err != nil {
-			return fmt.Errorf("publish batch %d of %d: %w", i+1, len(batches), err)
-		}
-	}
-	return nil
-}
-
-// reconcilePayloadLimit respects a lower limit advertised by the connected
-// server while retaining the repository policy ceiling.
-func reconcilePayloadLimit(nc *nats.Conn) int {
-	limit := maxReconcileNATSPayloadBytes
-	if nc == nil || nc.MaxPayload() <= 0 {
-		return limit
-	}
-	serverLimit := max(0, int(nc.MaxPayload())-reconcileNATSHeaderHeadroom)
-	return min(limit, serverLimit)
-}
-
-// splitReconcileChanges preserves change order while enforcing the Route 53
-// per-zone record/value request limits and the effective NATS payload ceiling.
-// UPSERT costs count twice, matching Route 53 semantics.
-func splitReconcileChanges(changes []Change, payloadLimit int) ([][]Change, error) {
-	var batches [][]Change
-	start := 0
-	zoneRecords := map[string]int{}
-	zoneValueChars := map[string]int{}
-	currentPayloadBytes := changeBatchJSONOverhead
-
-	flush := func(end int) {
-		if start == end {
-			return
-		}
-		batches = append(batches, changes[start:end])
-		start = end
-		clear(zoneRecords)
-		clear(zoneValueChars)
-		currentPayloadBytes = changeBatchJSONOverhead
-	}
-
-	for i, change := range changes {
-		encoded, err := json.Marshal(change)
-		if err != nil {
-			return nil, fmt.Errorf("marshal change %d for %s: %w", i+1, change.Name, err)
-		}
-		multiplier := 1
-		if change.Action == ActionUpsert {
-			multiplier = 2
-		}
-		records := multiplier
-		valueChars := multiplier * utf8.RuneCountInString(change.Value)
-		singlePayloadBytes := changeBatchJSONOverhead + len(encoded)
-
-		if records > MaxRecordsPerChangeRequest {
-			return nil, fmt.Errorf("change %d for %s has %d record elements; maximum is %d", i+1, change.Name, records, MaxRecordsPerChangeRequest)
-		}
-		if valueChars > MaxValueCharsPerChangeRequest {
-			return nil, fmt.Errorf("change %d for %s has %d value characters; maximum is %d", i+1, change.Name, valueChars, MaxValueCharsPerChangeRequest)
-		}
-		if singlePayloadBytes > payloadLimit {
-			return nil, fmt.Errorf("change %d for %s serializes to %d bytes; payload maximum is %d", i+1, change.Name, singlePayloadBytes, payloadLimit)
-		}
-
-		payloadBytes := len(encoded)
-		if i > start {
-			payloadBytes++ // JSON comma between adjacent changes.
-		}
-		if i > start && (zoneRecords[change.Zone]+records > MaxRecordsPerChangeRequest ||
-			zoneValueChars[change.Zone]+valueChars > MaxValueCharsPerChangeRequest ||
-			currentPayloadBytes+payloadBytes > payloadLimit) {
-			flush(i)
-			payloadBytes = len(encoded)
-		}
-
-		zoneRecords[change.Zone] += records
-		zoneValueChars[change.Zone] += valueChars
-		currentPayloadBytes += payloadBytes
-	}
-	flush(len(changes))
-	return batches, nil
-}
-
-// computeBatch reads the base zone (the only zone holding prunable ELB/EKS
-// records) and converges the desired set against it.
+// computeBatch reads every zone holding prunable records and converges the
+// desired set against them. That is the base domain, plus the private zone once
+// instance records are prunable — a stale private record is as wrong as a stale
+// public one, and only this zone holds it.
 func (r *Reconciler) computeBatch() ([]Change, error) {
 	ds := r.desired()
 	existing := map[string][]zoneRecord{}
-	recs, ok, err := r.readZone(r.baseDomain)
-	if err != nil {
-		return nil, err
+	zones := []string{r.baseDomain}
+	if ds.Prunable.EC2 {
+		zones = append(zones, privateZoneOrDefault(r.internalDomain))
 	}
-	if ok {
-		existing[r.baseDomain] = recs
+	for _, zone := range zones {
+		if _, seen := existing[zone]; seen || zone == "" {
+			continue
+		}
+		recs, ok, err := r.readZone(zone)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			existing[zone] = recs
+		}
 	}
 	return computeConverge(ds.Changes, existing, r.prunable(ds.Prunable))
 }
 
 // prunable returns the predicate deciding whether a (zone, label) record may be
-// deleted when absent from the desired set: load-balancer, EKS and RDS records
-// in the base domain, but only for the classes this cycle enumerated authoritatively
-// across all tenants. EC2 (`.compute.`) records are never pruned (a node sees
-// only its own instances); structural (apex/NS/glue) records never match.
+// deleted when absent from the desired set, for the classes this cycle
+// enumerated authoritatively across all tenants. Structural (apex/NS/glue)
+// records carry none of these prefixes, so they never match.
 func (r *Reconciler) prunable(scope PruneScope) func(zone, label string) bool {
+	private := privateZoneOrDefault(r.internalDomain)
 	return func(zone, label string) bool {
+		// The private zone holds instance records and nothing else: every other
+		// producer writes the base domain.
+		if zone == private {
+			return scope.EC2 && strings.HasPrefix(label, ec2PrivateLabelPrefix)
+		}
 		if zone != r.baseDomain {
 			return false
+		}
+		if scope.EC2 && strings.HasPrefix(label, ec2PublicLabelPrefix) {
+			return true
 		}
 		if scope.ELB && strings.Contains(label, ".elb.") {
 			return true

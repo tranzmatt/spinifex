@@ -76,17 +76,23 @@ func (m *Manager) Restore() {
 	m.reportRecordlessQEMUOrphans()
 }
 
-// loadRunningState replaces the manager's running set from the persisted snapshot.
-// A missing key returns an empty map and no error.
+// loadRunningState folds the cluster's snapshot into the running set, which by
+// this point already holds whatever the node's own state file carried in. With
+// no cluster record at all there is nothing to fold and the local set stands.
 func (m *Manager) loadRunningState() error {
 	if m.deps.StateStore == nil {
 		return fmt.Errorf("StateStore not wired")
 	}
-	loaded, err := m.deps.StateStore.LoadRunningState(m.deps.NodeID)
+	loaded, found, err := m.deps.StateStore.LoadRunningState(m.deps.NodeID)
 	if err != nil {
 		return err
 	}
-	m.Replace(loaded)
+	if !found {
+		slog.Warn("No cluster record for this node, keeping local instance state",
+			"node", m.deps.NodeID, "instances", m.Count())
+		return nil
+	}
+	m.AdoptClusterState(loaded)
 	return nil
 }
 
@@ -114,7 +120,7 @@ func (m *Manager) classifyRestoredInstances() []*VM {
 		}
 
 		if instance.Status == StateStopped {
-			if instance.Attributes.StopInstance {
+			if instance.DesiredState == DesiredStopped {
 				if !m.MigrateStoppedToSharedKV(instance) {
 					// KV write failed — keep in local state so the next restart
 					// retries the migration. Deleting here would create a "void":
@@ -126,7 +132,7 @@ func (m *Manager) classifyRestoredInstances() []*VM {
 				continue
 			}
 
-			// StateStopped with no operator StopInstance intent means the
+			// StateStopped that nobody asked for means the
 			// host DRAIN sequence stopped it for a coordinated reboot/shutdown,
 			// not the operator. Treat it like a running instance whose QEMU
 			// exited: reset to Pending and relaunch.
@@ -226,11 +232,11 @@ func (m *Manager) classifyRestoredInstances() []*VM {
 
 // markUnschedulable flips an instance to Stopped with InsufficientInstanceCapacity
 // so DescribeInstances reports a useful error when the node can no longer host the type.
-// StopInstance is stamped so a future restore's drain-relaunch path (which
-// resumes StateStopped without operator intent) does not try to relaunch it.
+// DesiredStopped is stamped so a future restore's drain-relaunch path (which
+// resumes a StateStopped nobody asked for) does not try to relaunch it.
 func markUnschedulable(instance *VM, reason string) {
 	instance.Status = StateStopped
-	instance.Attributes.StopInstance = true
+	instance.DesiredState = DesiredStopped
 	if instance.Instance != nil {
 		instance.Instance.StateReason = &ec2.StateReason{}
 		instance.Instance.StateReason.SetCode("Server.InsufficientInstanceCapacity")

@@ -85,6 +85,11 @@ func (gw *GatewayConfig) SigV4AuthMiddleware() func(http.Handler) http.Handler {
 			// every rejection below still shares.
 			auditFrom(r.Context()).setAccessKeyID(sig.Credential.AccessKeyID)
 
+			// Carry the signed service now, so a rejection below (a signature
+			// mismatch on a bedrock Converse) renders in the client's format —
+			// GetService reads this to pick JSON over XML for the bedrock family.
+			r = r.WithContext(context.WithValue(r.Context(), ctxService, sig.Credential.Service))
+
 			// Reject unknown services before crypto; otherwise Verify re-signs with
 			// the client-claimed service name and rubber-stamps the scope.
 			if !supportedServices[sig.Credential.Service] {
@@ -362,7 +367,7 @@ func (gw *GatewayConfig) resolveSessionAKID(r *http.Request, accessKeyID, client
 	}, ""
 }
 
-// writeSigV4Error writes an EC2-compatible XML error response for auth failures.
+// writeSigV4Error writes an auth-failure error in the service-appropriate format.
 // Every auth rejection funnels through here, a rate-limit lockout included, so
 // this is the one place that has to record the verdict onto the request.
 func (gw *GatewayConfig) writeSigV4Error(w http.ResponseWriter, r *http.Request, errorCode string) {
@@ -374,9 +379,28 @@ func (gw *GatewayConfig) writeSigV4Error(w http.ResponseWriter, r *http.Request,
 		errorMsg = awserrors.ErrorMessage{HTTPCode: 500, Message: "Internal error"}
 	}
 
-	xmlError := GenerateEC2ErrorResponse(errorCode, errorMsg.Message, requestID)
+	svc := signedService(r)
+
+	// AWS JSON 1.1 services (bedrock family, EKS, …) need a JSON error body, or
+	// the SDK chokes deserializing our XML into its shape.
+	if jsonErrorService(svc) {
+		w.Header().Set("Content-Type", eksJSONContentType)
+		w.WriteHeader(errorMsg.HTTPCode)
+		_, _ = w.Write(GenerateEKSErrorResponse(errorCode, errorMsg.Message, requestID))
+		return
+	}
+
+	xmlError := xmlErrorBody(svc, errorCode, errorMsg.Message, requestID, r.URL.Path)
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(errorMsg.HTTPCode)
 	_, _ = w.Write(xmlError)
+}
+
+// signedService returns the credential-scope service the client signed with,
+// including a scope the gateway does not serve. A rejection has to render in
+// the client's format, and GetService reports those scopes as empty.
+func signedService(r *http.Request) string {
+	svc, _ := r.Context().Value(ctxService).(string)
+	return svc
 }

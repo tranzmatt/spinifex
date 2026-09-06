@@ -28,22 +28,25 @@ import (
 )
 
 // stateStoreAdapter satisfies vm.StateStore by delegating to JetStreamManager.
-// Tolerates nil JetStreamManager during early boot.
+// Tolerates nil JetStreamManager during early boot. The running set is the one
+// exception: it goes through the daemon's persist path so that the local file,
+// not just KV, sees every change the vm package makes.
 type stateStoreAdapter struct {
-	js *JetStreamManager
+	js      *JetStreamManager
+	persist func(nodeID string, vms map[string]*vm.VM) error
 }
 
 var _ vm.StateStore = (*stateStoreAdapter)(nil)
 
-func newStateStoreAdapter(js *JetStreamManager) *stateStoreAdapter {
-	return &stateStoreAdapter{js: js}
+func newStateStoreAdapter(js *JetStreamManager, persist func(string, map[string]*vm.VM) error) *stateStoreAdapter {
+	return &stateStoreAdapter{js: js, persist: persist}
 }
 
 func (a *stateStoreAdapter) SaveRunningState(nodeID string, snapshot map[string]*vm.VM) error {
-	return a.js.WriteState(nodeID, snapshot)
+	return a.persist(nodeID, snapshot)
 }
 
-func (a *stateStoreAdapter) LoadRunningState(nodeID string) (map[string]*vm.VM, error) {
+func (a *stateStoreAdapter) LoadRunningState(nodeID string) (map[string]*vm.VM, bool, error) {
 	return a.js.LoadState(nodeID)
 }
 
@@ -220,27 +223,30 @@ func (a *volumeMounterAdapter) Unmount(ctx context.Context, instance *vm.VM) err
 	instance.EBSRequests.Mu.Lock()
 	defer instance.EBSRequests.Mu.Unlock()
 
+	var sealErrs []error
 	for _, ebsRequest := range instance.EBSRequests.Requests {
 		ebsUnMountRequest, err := json.Marshal(ebsRequest)
 		if err != nil {
 			slog.Error("Failed to marshal volume payload for unmount", "err", err)
+			sealErrs = append(sealErrs, fmt.Errorf("marshal unmount request for %s: %w", ebsRequest.Name, err))
 			continue
 		}
 
-		// ebs.unmount seals the block map to predastore. Teardown tolerates a
-		// failed seal (log + continue) so terminate stays idempotent, but the
-		// volume must NOT then go available: a reattach on a node without the
-		// local WAL would find no checkpoint (bad superblock). On terminate the
-		// volume is deleted regardless; on stop it stays attached/retryable.
+		// ebs.unmount seals the block map to predastore. Every volume is
+		// attempted, and the failures are aggregated for the caller: the
+		// volume must NOT go available, because a reattach on a node without
+		// the local WAL would find no checkpoint (bad superblock).
 		sealed := true
 		msg, err := ebsRequestWithTrace(ctx, a.nc, instance.AccountID, a.topic("unmount"), ebsUnMountRequest, unmountSealTimeout)
 		if err != nil {
 			slog.Error("Failed to unmount volume",
 				"name", ebsRequest.Name, "instance", instance.ID, "err", err)
+			sealErrs = append(sealErrs, fmt.Errorf("unmount %s: %w", ebsRequest.Name, err))
 			sealed = false
 		} else if sealErr := unmountResponseError(msg.Data); sealErr != nil {
 			slog.Error("Volume unmount seal failed, leaving volume non-available",
 				"instance", instance.ID, "volume", ebsRequest.Name, "err", sealErr)
+			sealErrs = append(sealErrs, fmt.Errorf("seal %s: %w", ebsRequest.Name, sealErr))
 			sealed = false
 		} else {
 			slog.Info("Unmounted volume",
@@ -259,7 +265,7 @@ func (a *volumeMounterAdapter) Unmount(ctx context.Context, instance *vm.VM) err
 		}
 	}
 
-	return nil
+	return errors.Join(sealErrs...)
 }
 
 // MountOne sends ebs.mount for a single request and writes the resolved
@@ -829,6 +835,9 @@ func (a *instanceCleanerAdapter) DetachAndDeleteENI(instance *vm.VM) error {
 			slog.Info("ENI already absent on termination",
 				"eni", instance.ENIId, "instanceId", instance.ID)
 		}
+		if err == nil {
+			a.disassociateENIEIP(instance.AccountID, instance.ENIId)
+		}
 	}
 
 	a.releaseAttachedENIs(instance)
@@ -873,6 +882,7 @@ func (a *instanceCleanerAdapter) releaseAttachedENIs(instance *vm.VM) {
 				"eni", eniId, "instanceId", instance.ID, "err", err)
 			continue
 		}
+		a.disassociateENIEIP(instance.AccountID, eniId)
 		if deleted {
 			slog.Info("Deleted attached ENI on termination",
 				"eni", eniId, "instanceId", instance.ID)
@@ -880,6 +890,30 @@ func (a *instanceCleanerAdapter) releaseAttachedENIs(instance *vm.VM) {
 			slog.Info("Attached ENI already absent on termination",
 				"eni", eniId, "instanceId", instance.ID)
 		}
+	}
+}
+
+// disassociateENIEIP releases any Elastic IP associated with an ENI that has
+// just been deleted. Nothing else did: the ENI delete deliberately leaves an
+// EIP-owned public address alone, since the allocation outlives the interface,
+// but the association is the interface's and has to go with it. Left behind, the
+// EIP record stays "associated" and the network reconciler keeps re-asserting a
+// NAT rule for a guest that no longer exists.
+//
+// Called after the delete, never before: the delete decides whether the ENI's
+// public address may return to the pool by looking for an EIP that names it.
+func (a *instanceCleanerAdapter) disassociateENIEIP(accountID, eniID string) {
+	eip, ok := a.d.eipService.(eipDisassociator)
+	if !ok {
+		return
+	}
+	found, err := eip.DisassociateByENI(context.Background(), accountID, eniID)
+	if err != nil {
+		slog.Warn("Failed to disassociate EIP on termination", "eni", eniID, "accountId", accountID, "err", err)
+		return
+	}
+	if found {
+		slog.Info("Disassociated EIP on termination", "eni", eniID, "accountId", accountID)
 	}
 }
 

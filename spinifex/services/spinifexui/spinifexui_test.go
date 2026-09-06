@@ -10,12 +10,14 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"io"
+	"io/fs"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"testing"
 	"time"
@@ -347,6 +349,29 @@ func TestNewReverseProxy_StripsPrefixAndSetsHost(t *testing.T) {
 	}
 }
 
+// TestNewReverseProxy_PreservesEscapedPath guards the SigV4 contract: a
+// percent-encoded path segment (a ':' in a bedrock modelId) must reach the
+// backend byte-identical, or the gateway recanonicalises it and the signature
+// the client computed over the escaped form no longer verifies.
+func TestNewReverseProxy_PreservesEscapedPath(t *testing.T) {
+	var gotEscaped string
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		gotEscaped = r.URL.EscapedPath()
+	}))
+	defer backend.Close()
+
+	transport, ok := backend.Client().Transport.(*http.Transport)
+	require.True(t, ok, "expected *http.Transport")
+
+	proxy := newReverseProxy(backend.Listener.Addr().String(), "/proxy/awsgw", transport)
+
+	const escaped = "/proxy/awsgw/model/meta.llama3-2-1b-instruct-v1%3A0/converse"
+	proxy.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, escaped, nil))
+
+	assert.Equal(t, "/model/meta.llama3-2-1b-instruct-v1%3A0/converse", gotEscaped,
+		"escaped path must survive the proxy byte-identical")
+}
+
 func TestNewReverseProxy_ErrorHandler(t *testing.T) {
 	// Use a transport that will fail to connect (no backend listening).
 	transport := &http.Transport{
@@ -543,27 +568,120 @@ func TestStart_GracefulShutdownIsNotAnError(t *testing.T) {
 
 func TestClusterConfigHandler_ServesRegion(t *testing.T) {
 	rec := httptest.NewRecorder()
-	clusterConfigHandler("us-west-1")(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+	clusterConfigHandler("us-west-1", false)(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
 
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
-	assert.JSONEq(t, `{"region":"us-west-1"}`, rec.Body.String())
+	assert.JSONEq(t, `{"region":"us-west-1","ochreEnabled":false}`, rec.Body.String())
 }
 
 // A proxy fronting several clusters must not be able to serve one cluster's
 // region to another.
 func TestClusterConfigHandler_IsNotCacheable(t *testing.T) {
 	rec := httptest.NewRecorder()
-	clusterConfigHandler("us-west-1")(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+	clusterConfigHandler("us-west-1", false)(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
 
 	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+}
+
+// The flag must always be explicit in the body, both on and off, so the
+// browser never has to treat an absent field as ambiguous.
+func TestClusterConfigHandler_ServesOchreEnabledTrue(t *testing.T) {
+	rec := httptest.NewRecorder()
+	clusterConfigHandler("us-west-1", true)(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.JSONEq(t, `{"region":"us-west-1","ochreEnabled":true}`, rec.Body.String())
+}
+
+func TestClusterConfigHandler_ServesOchreEnabledFalse(t *testing.T) {
+	rec := httptest.NewRecorder()
+	clusterConfigHandler("us-west-1", false)(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.JSONEq(t, `{"region":"us-west-1","ochreEnabled":false}`, rec.Body.String())
+}
+
+// A build's chunks only agree with each other. Caching index.html would let a
+// browser keep pointing at hashed names from a build it no longer has.
+func TestAssetCacheControl_RevalidatesTheEntryPoint(t *testing.T) {
+	for _, path := range []string{"index.html", "favicon.svg", "robots.txt"} {
+		assert.Equal(t, "no-cache", assetCacheControl(path), "%s must be revalidated", path)
+	}
+}
+
+// The hash makes the name address one build, which is what allows the response
+// to be cached without a validator.
+func TestAssetCacheControl_PinsHashedAssets(t *testing.T) {
+	assert.Equal(t, "public, max-age=31536000, immutable", assetCacheControl("assets/index-BjYsi73f.js"))
+}
+
+// Every emitted chunk must carry a hash. Without one a deploy replaces chunks in
+// place, and a browser can pair a cached chunk with a newer entry point.
+func TestEmbeddedAssetsAreContentHashed(t *testing.T) {
+	contentFS, err := fs.Sub(distFS, "frontend/dist")
+	require.NoError(t, err)
+
+	entries, err := fs.ReadDir(contentFS, "assets")
+	require.NoError(t, err)
+	require.NotEmpty(t, entries, "the UI build must be embedded")
+
+	hashed := regexp.MustCompile(`-[A-Za-z0-9_-]{8}\.[a-z0-9]+$`)
+	for _, entry := range entries {
+		assert.Regexp(t, hashed, entry.Name(), "asset filename must carry a content hash")
+	}
+}
+
+// index.html is the only thing naming the hashed chunks, so a stale copy is how
+// a browser ends up mixing builds.
+func TestSPAHandler_ServesIndexRevalidated(t *testing.T) {
+	contentFS, err := fs.Sub(distFS, "frontend/dist")
+	require.NoError(t, err)
+
+	rec := httptest.NewRecorder()
+	newSPAHandler(contentFS)(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "no-cache", rec.Header().Get("Cache-Control"))
+}
+
+// The header has to reach a real asset request, not just assetCacheControl —
+// the handler is what pairs the pinned response with the hashed name.
+func TestSPAHandler_PinsHashedAssetResponses(t *testing.T) {
+	contentFS, err := fs.Sub(distFS, "frontend/dist")
+	require.NoError(t, err)
+
+	entries, err := fs.ReadDir(contentFS, "assets")
+	require.NoError(t, err)
+	require.NotEmpty(t, entries)
+
+	rec := httptest.NewRecorder()
+	newSPAHandler(contentFS)(rec, httptest.NewRequest(http.MethodGet, "/assets/"+entries[0].Name(), nil))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "public, max-age=31536000, immutable", rec.Header().Get("Cache-Control"))
+	assert.NotEmpty(t, rec.Body.Bytes())
+}
+
+// An unknown path is a client-side route, so it gets index.html rather than a
+// 404 — and must not be cached under the requested path.
+func TestSPAHandler_FallsBackForClientRoutes(t *testing.T) {
+	contentFS, err := fs.Sub(distFS, "frontend/dist")
+	require.NoError(t, err)
+
+	rec := httptest.NewRecorder()
+	newSPAHandler(contentFS)(rec, httptest.NewRequest(http.MethodGet, "/ec2/instances", nil))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "no-cache", rec.Header().Get("Cache-Control"))
+	assert.Contains(t, rec.Header().Get("Content-Type"), "text/html")
 }
 
 // Failing loudly beats serving a default: a wrong region reaches the gateway as
 // an opaque credential error.
 func TestClusterConfigHandler_FailsWhenRegionUnset(t *testing.T) {
 	rec := httptest.NewRecorder()
-	clusterConfigHandler("")(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+	clusterConfigHandler("", false)(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
 
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
 	assert.NotContains(t, rec.Body.String(), "region\":")

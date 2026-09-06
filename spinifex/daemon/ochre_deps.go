@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	gateway_bedrock "github.com/mulgadc/spinifex/spinifex/gateway/bedrock"
 	handlers_bedrock "github.com/mulgadc/spinifex/spinifex/handlers/bedrock"
-	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	handlers_ochrevector "github.com/mulgadc/spinifex/spinifex/handlers/ochrevector"
 	"github.com/mulgadc/spinifex/spinifex/network/host"
 	"github.com/mulgadc/spinifex/spinifex/objectstore"
@@ -60,7 +60,7 @@ func (d *Daemon) startOchreVector() {
 		return
 	}
 
-	masterKey, err := handlers_iam.LoadMasterKey(filepath.Join(filepath.Dir(d.configPath), "master.key"))
+	masterKey, err := masterkey.ReadShared(filepath.Join(filepath.Dir(d.configPath), "master.key"))
 	if err != nil {
 		slog.Warn("Ochre vector store disabled: master key unavailable", "err", err)
 		return
@@ -161,6 +161,7 @@ func (d *Daemon) startOchreVector() {
 		{handlers_ochrevector.SubjectDescribeJob, handleNATSRequest(vectorService.DescribeJob), "spinifex-workers"},
 		{handlers_ochrevector.SubjectQuery, handleNATSRequest(vectorService.Query), "spinifex-workers"},
 		{handlers_ochrevector.SubjectListJobs, handleNATSRequest(vectorService.ListJobs), "spinifex-workers"},
+		{handlers_ochrevector.SubjectStopJob, handleNATSRequest(vectorService.StopJob), "spinifex-workers"},
 	}
 
 	// backup/restore need RegrantAccount alongside EnsureAccount, which is

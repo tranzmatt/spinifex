@@ -5,9 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
 )
 
 func TestGenerateMasterKey(t *testing.T) {
+	t.Parallel()
 	key, err := GenerateMasterKey()
 	if err != nil {
 		t.Fatalf("GenerateMasterKey() error: %v", err)
@@ -26,7 +29,8 @@ func TestGenerateMasterKey(t *testing.T) {
 	}
 }
 
-func TestSaveLoadMasterKey(t *testing.T) {
+func TestSaveAndReadMasterKey(t *testing.T) {
+	t.Parallel()
 	key, err := GenerateMasterKey()
 	if err != nil {
 		t.Fatalf("GenerateMasterKey() error: %v", err)
@@ -48,16 +52,17 @@ func TestSaveLoadMasterKey(t *testing.T) {
 		t.Fatalf("expected permissions 0600, got %04o", perm)
 	}
 
-	loaded, err := LoadMasterKey(path)
+	loaded, err := masterkey.ReadShared(path)
 	if err != nil {
-		t.Fatalf("LoadMasterKey() error: %v", err)
+		t.Fatalf("masterkey.ReadShared() error: %v", err)
 	}
 	if string(loaded) != string(key) {
 		t.Fatal("loaded key does not match saved key")
 	}
 }
 
-func TestLoadMasterKeyWrongSize(t *testing.T) {
+func TestReadMasterKeyWrongSize(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad.key")
 
@@ -65,20 +70,22 @@ func TestLoadMasterKeyWrongSize(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := LoadMasterKey(path)
+	_, err := masterkey.ReadShared(path)
 	if err == nil {
-		t.Fatal("LoadMasterKey() should fail for wrong-size key")
+		t.Fatal("masterkey.ReadShared() should fail for wrong-size key")
 	}
 }
 
-func TestLoadMasterKeyNotFound(t *testing.T) {
-	_, err := LoadMasterKey("/nonexistent/master.key")
+func TestReadMasterKeyNotFound(t *testing.T) {
+	t.Parallel()
+	_, err := masterkey.ReadShared("/nonexistent/master.key")
 	if err == nil {
-		t.Fatal("LoadMasterKey() should fail for missing file")
+		t.Fatal("masterkey.ReadShared() should fail for missing file")
 	}
 }
 
 func TestSaveMasterKeyWrongSize(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad.key")
 
@@ -89,6 +96,7 @@ func TestSaveMasterKeyWrongSize(t *testing.T) {
 }
 
 func TestEncryptDecryptRoundTrip(t *testing.T) {
+	t.Parallel()
 	key, err := GenerateMasterKey()
 	if err != nil {
 		t.Fatalf("GenerateMasterKey() error: %v", err)
@@ -116,6 +124,7 @@ func TestEncryptDecryptRoundTrip(t *testing.T) {
 }
 
 func TestEncryptProducesDifferentCiphertexts(t *testing.T) {
+	t.Parallel()
 	key, _ := GenerateMasterKey()
 	secret := "test-secret"
 
@@ -128,6 +137,7 @@ func TestEncryptProducesDifferentCiphertexts(t *testing.T) {
 }
 
 func TestDecryptWrongKey(t *testing.T) {
+	t.Parallel()
 	key1, _ := GenerateMasterKey()
 	key2, _ := GenerateMasterKey()
 	secret := "test-secret"
@@ -144,6 +154,7 @@ func TestDecryptWrongKey(t *testing.T) {
 }
 
 func TestDecryptTamperedCiphertext(t *testing.T) {
+	t.Parallel()
 	key, _ := GenerateMasterKey()
 	secret := "test-secret"
 
@@ -164,6 +175,7 @@ func TestDecryptTamperedCiphertext(t *testing.T) {
 }
 
 func TestDecryptInvalidBase64(t *testing.T) {
+	t.Parallel()
 	key, _ := GenerateMasterKey()
 	_, err := DecryptSecret("not-valid-base64!!!", key)
 	if err == nil {
@@ -172,6 +184,7 @@ func TestDecryptInvalidBase64(t *testing.T) {
 }
 
 func TestDecryptTooShort(t *testing.T) {
+	t.Parallel()
 	key, _ := GenerateMasterKey()
 	// Valid base64 but too short for nonce + ciphertext
 	_, err := DecryptSecret("AQID", key)
@@ -181,6 +194,7 @@ func TestDecryptTooShort(t *testing.T) {
 }
 
 func TestLoadBootstrapData(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bootstrap.json")
 
@@ -215,6 +229,7 @@ func TestLoadBootstrapData(t *testing.T) {
 }
 
 func TestLoadBootstrapDataNotFound(t *testing.T) {
+	t.Parallel()
 	_, err := LoadBootstrapData("/nonexistent/bootstrap.json")
 	if err == nil {
 		t.Fatal("LoadBootstrapData() should fail for missing file")
@@ -222,6 +237,7 @@ func TestLoadBootstrapDataNotFound(t *testing.T) {
 }
 
 func TestLoadBootstrapDataInvalidJSON(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bootstrap.json")
 
@@ -236,6 +252,7 @@ func TestLoadBootstrapDataInvalidJSON(t *testing.T) {
 }
 
 func TestSaveBootstrapData_RoundTrip(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bootstrap.json")
 
@@ -278,6 +295,7 @@ func TestSaveBootstrapData_RoundTrip(t *testing.T) {
 }
 
 func TestBootstrapData_ExtendedRoundTrip(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bootstrap.json")
 
@@ -333,6 +351,7 @@ func TestBootstrapData_ExtendedRoundTrip(t *testing.T) {
 }
 
 func TestBootstrapData_NoAdmin(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bootstrap.json")
 
@@ -355,6 +374,7 @@ func TestBootstrapData_NoAdmin(t *testing.T) {
 }
 
 func TestLoadBootstrapData_MissingVersion(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bootstrap.json")
 
@@ -370,6 +390,7 @@ func TestLoadBootstrapData_MissingVersion(t *testing.T) {
 }
 
 func TestSaveBootstrapData_InvalidPath(t *testing.T) {
+	t.Parallel()
 	data := &BootstrapData{
 		AccessKeyID:     "AKIAIOSFODNN7EXAMPLE",
 		EncryptedSecret: "dGVzdA==",

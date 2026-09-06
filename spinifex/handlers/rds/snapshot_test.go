@@ -9,7 +9,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/rds"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
-	handlers_dns "github.com/mulgadc/spinifex/spinifex/handlers/dns"
 	iammock "github.com/mulgadc/spinifex/spinifex/handlers/iam/mock"
 	"github.com/mulgadc/spinifex/spinifex/tags"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
@@ -46,7 +45,6 @@ func newSnapshotHarness(t *testing.T, agentFails bool) *snapshotHarness {
 	h.agent = newStubAgent(t, nc, testAccountID, testDBID, agentFails)
 	// Without a responder the best-effort endpoint publish would sit out its own
 	// timeout on every restore.
-	stubDNSWriter(t, nc)
 
 	h.svc = NewService(nc, testRegion).WithDeps(Deps{
 		LoadCA:             newTestCA(t),
@@ -58,17 +56,6 @@ func newSnapshotHarness(t *testing.T, agentFails bool) *snapshotHarness {
 		ServingCertKeyBits: testServingCertKeyBits,
 	})
 	return h
-}
-
-func stubDNSWriter(t *testing.T, nc *nats.Conn) {
-	t.Helper()
-	sub, err := nc.Subscribe(handlers_dns.SubjectRecordsetChange, func(msg *nats.Msg) {
-		if err := msg.Respond([]byte(`{}`)); err != nil {
-			t.Logf("respond on %s: %v", handlers_dns.SubjectRecordsetChange, err)
-		}
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = sub.Unsubscribe() })
 }
 
 func (h *snapshotHarness) instance(t *testing.T, id string) DBInstanceRecord {
@@ -565,7 +552,7 @@ func TestReconciler_AdoptsTheEC2SnapshotOfAnUnfinishedDBSnapshot(t *testing.T) {
 		rdsSnapshotAccountTagKey: testAccountID,
 	}}
 
-	require.NoError(t, rec.reconcileOnce(t.Context()))
+	require.NoError(t, onePass(t, rec))
 
 	stored, found := h.snapshot(t, testSnapshotID)
 	require.True(t, found)
@@ -603,7 +590,7 @@ func TestReconciler_DoesNotAdoptAnotherAccountsSnapshot(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, reconciler.reconcileOnce(t.Context()))
+	require.NoError(t, onePass(t, reconciler))
 
 	stored, found := h.snapshot(t, testSnapshotID)
 	require.True(t, found)
@@ -627,7 +614,7 @@ func TestReconciler_KeepsCreatingSnapshotWhenEC2LookupIsIncomplete(t *testing.T)
 	}
 	require.NoError(t, putJSON(t.Context(), kv, DBSnapshotKey(testSnapshotID), &stale))
 
-	err = reconciler.reconcileOnce(t.Context())
+	err = onePass(t, reconciler)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "metadata temporarily unavailable")
 
@@ -661,7 +648,7 @@ func TestReconciler_DoesNotDeleteAConcurrentlyCompletedSnapshot(t *testing.T) {
 		require.NoError(t, updateJSON(t.Context(), kv, DBSnapshotKey(testSnapshotID), rev, &current))
 	}
 
-	require.NoError(t, reconciler.reconcileOnce(t.Context()))
+	require.NoError(t, onePass(t, reconciler))
 
 	stored, found := h.snapshot(t, testSnapshotID)
 	require.True(t, found)
@@ -693,7 +680,7 @@ func TestReconciler_RejectsAmbiguousEC2Snapshots(t *testing.T) {
 		"snap-duplicate-b": matchingTags,
 	}
 
-	err = reconciler.reconcileOnce(t.Context())
+	err = onePass(t, reconciler)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "multiple EC2 snapshots")
 
@@ -719,7 +706,7 @@ func TestReconciler_WithdrawsADBSnapshotWhoseDataWasNeverCut(t *testing.T) {
 	}
 	require.NoError(t, putJSON(t.Context(), kv, DBSnapshotKey(testSnapshotID), &stale))
 
-	require.NoError(t, rec.reconcileOnce(t.Context()))
+	require.NoError(t, onePass(t, rec))
 
 	_, found := h.snapshot(t, testSnapshotID)
 	assert.False(t, found)
@@ -744,7 +731,7 @@ func TestReconciler_LeavesAFreshCreatingSnapshotAlone(t *testing.T) {
 	}
 	require.NoError(t, putJSON(t.Context(), kv, DBSnapshotKey(testSnapshotID), &fresh))
 
-	require.NoError(t, rec.reconcileOnce(t.Context()))
+	require.NoError(t, onePass(t, rec))
 
 	stored, found := h.snapshot(t, testSnapshotID)
 	require.True(t, found)
@@ -770,7 +757,7 @@ func TestReconciler_ReturnsAnInstanceStuckInBackingUp(t *testing.T) {
 			}
 			seedInstance(t, h.svc, rec)
 
-			require.NoError(t, reconciler.reconcileOnce(t.Context()))
+			require.NoError(t, onePass(t, reconciler))
 
 			stored := h.instance(t, testDBID)
 			assert.Equal(t, resume, stored.Status)
@@ -797,7 +784,7 @@ func TestReconciler_LeavesAnInFlightSnapshotAlone(t *testing.T) {
 	}
 	seedInstance(t, h.svc, rec)
 
-	require.NoError(t, reconciler.reconcileOnce(t.Context()))
+	require.NoError(t, onePass(t, reconciler))
 
 	stored := h.instance(t, testDBID)
 	assert.Equal(t, StatusBackingUp, stored.Status)

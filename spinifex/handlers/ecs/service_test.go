@@ -449,7 +449,7 @@ func TestScheduler_ReapBucket_StopsStaleInstanceTasks(t *testing.T) {
 // Leader election: first holder wins Create; a second holder is rejected.
 func TestScheduler_AcquireLease_SingleLeader(t *testing.T) {
 	_, nc, _ := testutil.StartTestJetStream(t)
-	svc := NewService(nc, testRegion, "")
+	svc := NewService(nc, testRegion, "").WithDeps(Deps{IAM: newStubIAM()})
 	a := NewScheduler(nc, svc, "holder-a")
 	b := NewScheduler(nc, svc, "holder-b")
 	require.True(t, a.lease.TryAcquire(t.Context()))
@@ -462,14 +462,14 @@ func TestScheduler_AcquireLease_SingleLeader(t *testing.T) {
 // conversion could introduce and the one thing kvlease cannot check itself.
 func TestScheduler_LeadershipWiresBusSubscriptions(t *testing.T) {
 	_, nc, _ := testutil.StartTestJetStream(t)
-	svc := NewService(nc, testRegion, "")
+	svc := NewService(nc, testRegion, "").WithDeps(Deps{IAM: newStubIAM()})
 	sc := NewScheduler(nc, svc, "holder-a")
 	require.NoError(t, sc.leaseErr)
 
 	require.Zero(t, sc.subCount(), "subscriptions must not exist before election")
 
 	require.True(t, sc.lease.TryAcquire(t.Context()))
-	assert.Equal(t, 3, sc.subCount(), "leader must own the register, heartbeat and task-state subscriptions")
+	assert.Equal(t, 4, sc.subCount(), "leader must own the register, heartbeat, task-state and reconcile-wake subscriptions")
 
 	sc.lease.Release(t.Context())
 	assert.Zero(t, sc.subCount(), "a released leader must drop its subscriptions")
@@ -479,19 +479,19 @@ func TestScheduler_LeadershipWiresBusSubscriptions(t *testing.T) {
 // and loser writing the same KV records is the split-brain this lease prevents.
 func TestScheduler_LoserHoldsNoSubscriptions(t *testing.T) {
 	_, nc, _ := testutil.StartTestJetStream(t)
-	svc := NewService(nc, testRegion, "")
+	svc := NewService(nc, testRegion, "").WithDeps(Deps{IAM: newStubIAM()})
 	a := NewScheduler(nc, svc, "holder-a")
 	b := NewScheduler(nc, svc, "holder-b")
 
 	require.True(t, a.lease.TryAcquire(t.Context()))
 	require.False(t, b.lease.TryAcquire(t.Context()))
 	assert.Zero(t, b.subCount())
-	assert.Equal(t, 3, a.subCount())
+	assert.Equal(t, 4, a.subCount())
 }
 
 func TestScheduler_RunReleasesLeaseOnShutdown(t *testing.T) {
 	_, nc, js := testutil.StartTestJetStream(t)
-	svc := NewService(nc, testRegion, "")
+	svc := NewService(nc, testRegion, "").WithDeps(Deps{IAM: newStubIAM()})
 	sc := NewScheduler(nc, svc, "holder-a")
 	require.NoError(t, sc.leaseErr)
 

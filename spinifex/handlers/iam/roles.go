@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/nats-io/nats.go/jetstream"
 
+	iamarn "github.com/mulgadc/bluebottle/pkg/auth"
 	"github.com/mulgadc/spinifex/spinifex/arn"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/kvutil"
@@ -41,6 +42,10 @@ func (s *IAMServiceImpl) CreateRole(accountID string, input *iam.CreateRoleInput
 	roleName := *input.RoleName
 	if err := validateUserName(roleName); err != nil {
 		return nil, errors.New(awserrors.ErrorIAMInvalidInput)
+	}
+
+	if err := validatePermissionsBoundary(input.PermissionsBoundary); err != nil {
+		return nil, err
 	}
 
 	path := "/"
@@ -130,7 +135,9 @@ func (s *IAMServiceImpl) ListRoles(accountID string, input *iam.ListRolesInput) 
 	}
 
 	keyPrefix := accountID + "."
-	var roles []*iam.Role
+	// Non-nil: Roles is a required member, and a nil slice marshals to no
+	// element at all rather than an empty one.
+	roles := []*iam.Role{}
 	for _, key := range keys {
 		if key == utils.VersionKey {
 			continue
@@ -361,9 +368,16 @@ func (s *IAMServiceImpl) PutRolePolicy(accountID string, input *iam.PutRolePolic
 		return nil, errors.New(awserrors.ErrorIAMMalformedPolicyDocument)
 	}
 
+	// An unchanged document writes nothing: converge loops re-assert the same
+	// policy on every pass, and each write would burn a KV revision.
+	changed := false
 	err := s.updateRoleCAS(ctx, accountID, roleName, func(role *Role) (bool, error) {
 		if role.InlinePolicies == nil {
 			role.InlinePolicies = map[string]string{}
+		}
+		changed = role.InlinePolicies[policyName] != policyDoc
+		if !changed {
+			return false, nil
 		}
 		role.InlinePolicies[policyName] = policyDoc
 		return true, nil
@@ -372,7 +386,9 @@ func (s *IAMServiceImpl) PutRolePolicy(accountID string, input *iam.PutRolePolic
 		return nil, err
 	}
 
-	slog.Info("IAM inline policy put on role", "accountID", accountID, "roleName", roleName, "policyName", policyName)
+	if changed {
+		slog.Info("IAM inline policy put on role", "accountID", accountID, "roleName", roleName, "policyName", policyName)
+	}
 	return &iam.PutRolePolicyOutput{}, nil
 }
 
@@ -536,17 +552,17 @@ func (s *IAMServiceImpl) GetRolePolicies(accountID, roleName string) ([]PolicyDo
 // stored and round-tripped opaquely so stock EKS tooling that attaches them
 // works without a backing policy document.
 func isAWSManagedPolicyARN(arn string) bool {
-	return strings.HasPrefix(arn, "arn:aws:iam::aws:policy/")
+	return iamarn.IsAWSManagedPolicyARN(arn)
 }
 
 // managedPolicyNameFromARN returns the final path segment of an AWS-managed
 // policy ARN, e.g. .../service-role/AmazonEKS_CNI_Policy -> AmazonEKS_CNI_Policy.
+// Display-only, so an unparseable ARN falls back to itself rather than erroring.
 func managedPolicyNameFromARN(arn string) string {
-	name := strings.TrimPrefix(arn, "arn:aws:iam::aws:policy/")
-	if i := strings.LastIndex(name, "/"); i >= 0 {
-		name = name[i+1:]
+	if _, name, err := iamarn.ParsePolicyARN(arn); err == nil {
+		return name
 	}
-	return name
+	return arn
 }
 
 func (s *IAMServiceImpl) getRole(ctx context.Context, accountID, roleName string) (*Role, error) {

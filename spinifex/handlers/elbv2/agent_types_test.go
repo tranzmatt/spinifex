@@ -11,6 +11,7 @@ import (
 // TestToHealthReport verifies the LBAgentHeartbeatInput.toHealthReport conversion,
 // in particular that aws.StringValue handles nil pointers without panicking.
 func TestToHealthReport(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		in      *LBAgentHeartbeatInput
@@ -78,6 +79,7 @@ func TestToHealthReport(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			report := tt.in.toHealthReport()
 			assert.Equal(t, tt.wantLB, report.LBID)
 			if tt.wantSrv == nil {

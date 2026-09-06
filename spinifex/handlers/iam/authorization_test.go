@@ -12,6 +12,7 @@ import (
 )
 
 func TestCanonicalResourceARNPreservesStoredPaths(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	trust := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}`
 	policy := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}`
@@ -40,6 +41,7 @@ func TestCanonicalResourceARNPreservesStoredPaths(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.kind), func(t *testing.T) {
+			t.Parallel()
 			got, err := svc.CanonicalResourceARN(testAccountID, tt.kind, tt.name)
 			require.NoError(t, err)
 			require.Equal(t, tt.want, got)

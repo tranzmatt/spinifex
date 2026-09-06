@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/mulgadc/spinifex/spinifex/ebsmetadata"
@@ -222,7 +223,12 @@ func (s *ImageServiceImpl) describeImages(ctx context.Context, input *ec2.Descri
 			State:              aws.String(amiImageState(amiMeta.State)),
 			ImageType:          aws.String("machine"),
 			Hypervisor:         aws.String("xen"),
-			BootMode:           aws.String(amiMeta.BootMode),
+		}
+
+		// RegisterImage takes BootMode as an optional input, so an AMI can
+		// record none. The enum has no empty member: omit it, don't emit "".
+		if amiMeta.BootMode != "" {
+			image.BootMode = aws.String(amiMeta.BootMode)
 		}
 
 		if bdms := synthesizeRootBlockDeviceMapping(amiMeta, encryptedAtRest); bdms != nil {
@@ -695,7 +701,7 @@ func (s *ImageServiceImpl) putSnapshotMetadata(ctx context.Context, snapshotID, 
 	cfg := handlers_ec2_snapshot.SnapshotConfig{
 		SnapshotID: snapshotID,
 		VolumeID:   volumeID,
-		VolumeSize: utils.SafeUint64ToInt64(volumeSizeGiB),
+		VolumeSize: safecast.Uint64ToInt64(volumeSizeGiB),
 		State:      "completed",
 		Progress:   "100%",
 		StartTime:  time.Now(),
@@ -744,7 +750,7 @@ func (s *ImageServiceImpl) CopyImage(ctx context.Context, input *ec2.CopyImageIn
 			srcSnap = &handlers_ec2_snapshot.SnapshotConfig{
 				SnapshotID: srcMeta.SnapshotID,
 				VolumeID:   sourceImageID,
-				VolumeSize: utils.SafeUint64ToInt64(srcMeta.VolumeSizeGiB),
+				VolumeSize: safecast.Uint64ToInt64(srcMeta.VolumeSizeGiB),
 			}
 		} else if objectstore.IsNoSuchKeyError(err) || errors.Is(err, handlers_ec2_snapshot.ErrCorruptSnapshotMetadata) {
 			return nil, errors.New(awserrors.ErrorInvalidAMIIDNotFound)
@@ -909,7 +915,7 @@ func synthesizeRootBlockDeviceMapping(meta ebsmetadata.AMI, encrypted bool) []*e
 		return nil
 	}
 	ebs := &ec2.EbsBlockDevice{
-		VolumeSize:          aws.Int64(utils.SafeUint64ToInt64(meta.VolumeSizeGiB)),
+		VolumeSize:          aws.Int64(safecast.Uint64ToInt64(meta.VolumeSizeGiB)),
 		VolumeType:          aws.String("gp3"),
 		DeleteOnTermination: aws.Bool(true),
 		Encrypted:           aws.Bool(encrypted),

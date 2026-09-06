@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mulgadc/spinifex/internal/tlsconfig"
+	"github.com/mulgadc/bluebottle/pkg/tlsconfig"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
@@ -59,8 +59,13 @@ func newReverseProxy(backendHost, pathPrefix string, transport http.RoundTripper
 			pr.SetURL(target)
 			pr.Out.Host = target.Host
 
-			// Strip the proxy path prefix.
+			// Strip the prefix from both path forms. RawPath must survive: a
+			// client that percent-encodes a segment (a ':' in a bedrock
+			// modelId) signs it, so dropping it re-encodes and breaks SigV4.
 			pr.Out.URL.Path = strings.TrimPrefix(pr.In.URL.Path, pathPrefix)
+			if pr.In.URL.RawPath != "" {
+				pr.Out.URL.RawPath = strings.TrimPrefix(pr.In.URL.RawPath, pathPrefix)
+			}
 			if pr.Out.URL.Path == "" {
 				pr.Out.URL.Path = "/"
 			}

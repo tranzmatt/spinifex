@@ -41,13 +41,13 @@ func (f *fakeStateStore) SaveRunningState(nodeID string, snap map[string]*VM) er
 	return nil
 }
 
-func (f *fakeStateStore) LoadRunningState(nodeID string) (map[string]*VM, error) {
+func (f *fakeStateStore) LoadRunningState(nodeID string) (map[string]*VM, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if v, ok := f.saved[nodeID]; ok {
-		return v, nil
+		return v, true, nil
 	}
-	return map[string]*VM{}, nil
+	return map[string]*VM{}, false, nil
 }
 
 func (f *fakeStateStore) WriteStoppedInstance(id string, v *VM) error {
@@ -146,6 +146,7 @@ type fakeVolumeMounter struct {
 	mountedOne, unmountedOne []string
 	mountErr                 error
 	mountOneErr              error
+	unmountErr               error
 	unmountOneErr            error
 	mountOneURI              string
 	// onMount fires synchronously inside Mount before the configured
@@ -169,8 +170,9 @@ func (f *fakeVolumeMounter) Mount(_ context.Context, v *VM) error {
 func (f *fakeVolumeMounter) Unmount(_ context.Context, v *VM) error {
 	f.mu.Lock()
 	f.unmounted = append(f.unmounted, v.ID)
+	err := f.unmountErr
 	f.mu.Unlock()
-	return nil
+	return err
 }
 
 func (f *fakeVolumeMounter) MountOne(_ context.Context, _ string, req *types.EBSRequest) error {

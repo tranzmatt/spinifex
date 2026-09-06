@@ -27,6 +27,8 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/mulgadc/spinifex/spinifex/ebsmetadata"
@@ -445,7 +447,7 @@ func amiVolumeSizeGiB(sizeBytes int64) uint64 {
 	if sizeBytes <= 0 {
 		return 0
 	}
-	return utils.SafeInt64ToUint64((sizeBytes + bytesPerGiB - 1) / bytesPerGiB)
+	return safecast.Int64ToUint64((sizeBytes + bytesPerGiB - 1) / bytesPerGiB)
 }
 
 func runimagesImportCmd(cmd *cobra.Command, args []string) {
@@ -693,7 +695,7 @@ func runimagesImportCmd(cmd *cobra.Command, args []string) {
 	err = admin.ImportImage(context.Background(), provider, admin.ImportOpts{
 		VolumeID:         volumeId,
 		NodeID:           appConfig.Node,
-		SizeBytes:        utils.SafeUint64ToInt64(ami.VolumeSizeGiB * bytesPerGiB),
+		SizeBytes:        safecast.Uint64ToInt64(ami.VolumeSizeGiB * bytesPerGiB),
 		AvailabilityZone: node.AZ,
 		SourcePath:       extractedImagePath,
 		Snapshot:         true,
@@ -734,7 +736,7 @@ func registerImportedAMISnapshot(store objectstore.ObjectStore, bucket string, a
 	cfg := &handlers_ec2_snapshot.SnapshotConfig{
 		SnapshotID:       ami.SnapshotID,
 		VolumeID:         ami.ImageID,
-		VolumeSize:       utils.SafeUint64ToInt64(ami.VolumeSizeGiB),
+		VolumeSize:       safecast.Uint64ToInt64(ami.VolumeSizeGiB),
 		State:            "completed",
 		Progress:         "100%",
 		StartTime:        time.Now(),
@@ -842,9 +844,9 @@ func runimagesRemoveCmd(cmd *cobra.Command, args []string) {
 		}
 	}
 	fmt.Printf("  Backing storage: %s/      (%d objects, %s)\n",
-		preview.ImageID, preview.AMIObjectCount, utils.HumanBytes(utils.SafeInt64ToUint64(preview.AMIBytesTotal)))
+		preview.ImageID, preview.AMIObjectCount, utils.HumanBytes(safecast.Int64ToUint64(preview.AMIBytesTotal)))
 	fmt.Printf("                   %s/ (%d objects, %s)\n",
-		admin.SnapPrefix(preview.ImageID), preview.SnapObjectCount, utils.HumanBytes(utils.SafeInt64ToUint64(preview.SnapBytesTotal)))
+		admin.SnapPrefix(preview.ImageID), preview.SnapObjectCount, utils.HumanBytes(safecast.Int64ToUint64(preview.SnapBytesTotal)))
 	fmt.Println()
 
 	// Account-owned guard before salvage / dependents — the AWS-flow hint is
@@ -900,7 +902,7 @@ func runimagesRemoveCmd(cmd *cobra.Command, args []string) {
 	// BytesDeleted is logical: predastore reclaims the underlying disk space
 	// asynchronously via background compaction, not at delete time.
 	fmt.Printf("✅ Removed AMI %s (%d objects, %s marked for deletion; disk space is reclaimed by background compaction).\n",
-		imageID, res.ObjectsDeleted, utils.HumanBytes(utils.SafeInt64ToUint64(res.BytesDeleted)))
+		imageID, res.ObjectsDeleted, utils.HumanBytes(safecast.Int64ToUint64(res.BytesDeleted)))
 }
 
 func printDependents(w io.Writer, d admin.Dependents) {
@@ -1599,6 +1601,7 @@ func runAdminInit(cmd *cobra.Command, args []string) {
 		ClusterName:   clusterName,
 
 		PredastoreHostID:          predastoreHostID,
+		PredastoreAdminPort:       admin.PredastoreAdminPort,
 		CompactionIntervalSeconds: compactionInterval,
 		Services:                  services,
 
@@ -1900,6 +1903,7 @@ func runAdminInitMultiNode(cmd *cobra.Command, accessKey, secretKey, accountID, 
 		ClusterName:   clusterName,
 
 		PredastoreHostID:          predastoreHostID,
+		PredastoreAdminPort:       admin.PredastoreAdminPort,
 		CompactionIntervalSeconds: compactionInterval,
 		Services:                  services,
 		RemoteNodes:               buildRemoteNodes(allNodes, node, northstarConfigPath),
@@ -2459,6 +2463,7 @@ func runAdminJoin(cmd *cobra.Command, args []string) {
 		ClusterName:   creds.ClusterName,
 
 		PredastoreHostID:          predastoreHostID,
+		PredastoreAdminPort:       admin.PredastoreAdminPort,
 		CompactionIntervalSeconds: compactionInterval,
 		Services:                  services,
 		RemoteNodes:               buildRemoteNodes(statusResp.Nodes, node, northstarConfigPath),
@@ -2578,7 +2583,7 @@ func initIAMServiceFromConfig() (*handlers_iam.IAMServiceImpl, *config.ClusterCo
 	}
 
 	masterKeyPath := filepath.Join(cfg.NodeBaseDir(), "config", "master.key")
-	masterKey, err := handlers_iam.LoadMasterKey(masterKeyPath)
+	masterKey, err := masterkey.ReadShared(masterKeyPath)
 	if err != nil {
 		nc.Close()
 		return nil, nil, nil, nil, fmt.Errorf("load master key: %w", err)
@@ -2984,7 +2989,7 @@ type writeBootstrapResult struct {
 func ensureMasterKey(configDir string) (key []byte, existed bool, err error) {
 	keyPath := filepath.Join(configDir, "master.key")
 	if admin.FileExists(keyPath) {
-		key, err = handlers_iam.LoadMasterKey(keyPath)
+		key, err = masterkey.ReadShared(keyPath)
 		if err != nil {
 			return nil, false, fmt.Errorf("load master key: %w", err)
 		}
@@ -3077,7 +3082,7 @@ func ensureViperblockEncryptionKey(configDir string) ([]byte, string, error) {
 	}
 	keyPath := filepath.Join(viperblockDir, "encryption.key")
 	if admin.FileExists(keyPath) {
-		key, err := handlers_iam.LoadMasterKey(keyPath)
+		key, err := masterkey.ReadShared(keyPath)
 		if err != nil {
 			return nil, "", fmt.Errorf("load viperblock encryption key: %w", err)
 		}

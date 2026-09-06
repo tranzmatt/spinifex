@@ -125,7 +125,9 @@ func (s *IAMServiceImpl) ListGroups(accountID string, input *iam.ListGroupsInput
 	}
 
 	keyPrefix := accountID + "."
-	var groups []*iam.Group
+	// Non-nil: Groups is a required member, and a nil slice marshals to no
+	// element at all rather than an empty one.
+	groups := []*iam.Group{}
 	for _, key := range keys {
 		if key == utils.VersionKey {
 			continue
@@ -275,7 +277,9 @@ func (s *IAMServiceImpl) ListGroupsForUser(accountID string, input *iam.ListGrou
 		return nil, err
 	}
 
-	var groups []*iam.Group
+	// Non-nil: Groups is a required member, and a nil slice marshals to no
+	// element at all rather than an empty one.
+	groups := []*iam.Group{}
 	for _, name := range user.Groups {
 		group, err := s.getGroup(ctx, accountID, name)
 		if err != nil {

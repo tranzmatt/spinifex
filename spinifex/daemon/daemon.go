@@ -28,7 +28,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/go-chi/chi/v5"
-	"github.com/mulgadc/spinifex/internal/tlsconfig"
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
+	"github.com/mulgadc/bluebottle/pkg/tlsconfig"
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/config"
@@ -1529,10 +1530,11 @@ func (d *Daemon) startCluster() error {
 	}
 
 	// Reconcile OVN native IPsec both ways (idempotent): a node that does not
-	// use it should not be left running charon on 500/4500 either.
-	if err := host.ReconcileOVNIPSec(d.configPath, d.clusterConfig); err != nil {
-		slog.Warn("Failed to reconcile OVN native IPsec", "err", err)
-	}
+	// use it should not be left running charon on 500/4500 either. Runs in the
+	// background because the first attempt routinely loses the race with
+	// ovn-central accepting connections, and a node that gives up there stays
+	// unconfigured while a peer may already require encryption cluster-wide.
+	go host.MaintainIPSec(d.ctx, d.configPath, d.clusterConfig, d.ipsecBarrier())
 
 	// Keep the host firewall's peer sets in step with cluster membership. Every
 	// formation path reaches this, which none of the installers do. Runs in the
@@ -1557,7 +1559,7 @@ func (d *Daemon) startCluster() error {
 	store := objectstore.NewS3ObjectStoreFromConfig(admin.DialTarget(d.config.Predastore.Host), d.config.Predastore.Region, d.config.Predastore.AccessKey, d.config.Predastore.SecretKey)
 	d.instanceService = handlers_ec2_instance.NewInstanceServiceImpl(d.config, d.resourceMgr.instanceTypes, d.natsConn, store, d.vmMgr, d.resourceMgr, d.jsManager)
 	d.dnsWriter = handlers_dns.NewWriter(d.config, d.clusterConfig, d.natsConn)
-	d.dnsReconciler = handlers_dns.NewReconciler(d.config, d.natsConn, d.dnsDesiredSet)
+	d.dnsReconciler = handlers_dns.NewReconciler(d.config, d.natsConn, d.dnsWriter, d.dnsDesiredSet, d.dnsWatchSources()...)
 	d.dnsBaseDomain = handlers_dns.ResolveBaseDomain(d.config)
 	d.dnsInternalDomain = handlers_dns.ResolveInternalDomain(d.config)
 	d.keyService = handlers_ec2_key.NewKeyServiceImpl(d.config)
@@ -1737,7 +1739,7 @@ func (d *Daemon) startCluster() error {
 	// safe degraded mode for certificate private keys, so a missing key must
 	// fail daemon startup rather than leave HTTPS listeners uncreatable.
 	d.elbv2Service, err = initServiceWithRetry("ELBv2 service", func() (*handlers_elbv2.ELBv2ServiceImpl, error) {
-		masterKey, mkErr := handlers_iam.LoadMasterKey(filepath.Join(filepath.Dir(d.configPath), "master.key"))
+		masterKey, mkErr := masterkey.ReadShared(filepath.Join(filepath.Dir(d.configPath), "master.key"))
 		if mkErr != nil {
 			return nil, fmt.Errorf("load ELBv2 master key: %w", mkErr)
 		}
@@ -1872,7 +1874,7 @@ func (d *Daemon) startCluster() error {
 	// concurrent boot — but a master key that never arrives fails startCluster
 	// after the retry window instead of leaving acmService permanently nil.
 	d.acmService, err = initServiceWithRetry("ACM service", func() (*handlers_acm.ACMServiceImpl, error) {
-		masterKey, mkErr := handlers_iam.LoadMasterKey(filepath.Join(filepath.Dir(d.configPath), "master.key"))
+		masterKey, mkErr := masterkey.ReadShared(filepath.Join(filepath.Dir(d.configPath), "master.key"))
 		if mkErr != nil {
 			return nil, fmt.Errorf("load ACM master key: %w", mkErr)
 		}
@@ -2028,22 +2030,10 @@ func (d *Daemon) startCluster() error {
 		})
 	}
 
-	// DNS record writer: a queue-group consumer of dns.recordset.change. Every
-	// node subscribes, so the writer locks each zone before its
-	// read-modify-write. No-op when northstar S3 is not configured.
-	if sub, err := d.dnsWriter.Subscribe(d.natsConn); err != nil {
-		return fmt.Errorf("failed to subscribe DNS record writer: %w", err)
-	} else if sub != nil {
-		d.mu.Lock()
-		d.natsSubscriptions[handlers_dns.SubjectRecordsetChange] = sub
-		d.mu.Unlock()
-		slog.Info("Subscribed DNS record writer", "subject", handlers_dns.SubjectRecordsetChange, "queue", handlers_dns.QueueGroup)
-	}
-
-	// DNS drift backstop: periodically rebuild managed records from the live
-	// cross-tenant inventory and converge the zone. Started on every node but
-	// gated on a per-cycle leader election, so one node publishes per interval.
-	// No-op when northstar is not configured.
+	// DNS: rebuild managed records from the live cross-tenant inventory and
+	// converge the zone, on a resource change or the interval. Started on every
+	// node but gated on a per-cycle leader election, so exactly one node writes a
+	// zone. No-op when northstar is not configured.
 	if d.dnsReconciler.Enabled() {
 		go d.dnsReconciler.Run(d.ctx)
 		slog.Info("Started DNS reconcile backstop", "interval_ms", otelsetup.Millis(handlers_dns.DefaultReconcileInterval))
@@ -2179,12 +2169,14 @@ func (d *Daemon) leakedVolumeInstances() (map[string]bool, error) {
 }
 
 // nodeRunningVMs returns this node's running VMs for the EKS billable reaper to
-// scan. A nil stateStore (early init / test) yields an empty set.
+// scan. A nil stateStore (early init / test) yields an empty set. The reaper
+// only ever acts on VMs in this list, so a missing record fails closed and the
+// absence flag adds nothing.
 func (d *Daemon) nodeRunningVMs() ([]*vm.VM, error) {
 	if d.stateStore == nil {
 		return nil, nil
 	}
-	running, err := d.stateStore.LoadRunningState(d.node)
+	running, _, err := d.stateStore.LoadRunningState(d.node)
 	if err != nil {
 		return nil, err
 	}
@@ -2258,7 +2250,7 @@ func (d *Daemon) initJetStream() error {
 		retryDelay = min(retryDelay*2, 10*time.Second)
 	}
 
-	d.stateStore = newStateStoreAdapter(d.jsManager)
+	d.stateStore = newStateStoreAdapter(d.jsManager, d.persistState)
 
 	return nil
 }
@@ -2308,11 +2300,18 @@ func initServiceWithRetry[T any](name string, initFn func() (T, error)) (T, erro
 	}
 }
 
+// clusterReadySleep is the poll delay seam used by waitForClusterReady, and
+// clusterReadyMaxWait bounds the loop; tests override both.
+var (
+	clusterReadySleep   = time.Sleep
+	clusterReadyMaxWait = 2 * time.Minute
+)
+
 // waitForClusterReady blocks until viperblock and predastore are reachable,
 // preventing races during VM recovery.
 func (d *Daemon) waitForClusterReady() {
 	slog.Info("Waiting for cluster readiness...")
-	maxWait := 2 * time.Minute
+	maxWait := clusterReadyMaxWait
 	start := time.Now()
 	interval := 2 * time.Second
 
@@ -2338,7 +2337,7 @@ func (d *Daemon) waitForClusterReady() {
 		}
 
 		slog.Debug("Cluster not ready, waiting...", "reason", reason, "elapsed_ms", otelsetup.Millis(time.Since(start)))
-		time.Sleep(interval)
+		clusterReadySleep(interval)
 	}
 
 	slog.Warn("Cluster readiness timeout, proceeding with recovery anyway", "max_wait_ms", otelsetup.Millis(maxWait))
@@ -2581,24 +2580,25 @@ func (d *Daemon) localStatePath() string {
 // WriteState persists instance state. Local file is the source of truth; KV is
 // best-effort. Both forms are marshalled inside vmMgr.View to avoid data races.
 func (d *Daemon) WriteState() error {
+	var err error
+	d.vmMgr.View(func(vms map[string]*vm.VM) {
+		err = d.persistState(d.node, vms)
+	})
+	return err
+}
+
+// persistState is the single path both stores move through: every caller that
+// changes the running set reaches it, so the file cannot fall behind the map.
+// Callers hold the manager lock, so vms cannot change mid-encode; the two locks
+// are always taken manager-first to keep one order across every writer.
+func (d *Daemon) persistState(nodeID string, vms map[string]*vm.VM) error {
 	d.stateWriteMu.Lock()
 	defer d.stateWriteMu.Unlock()
 
-	var (
-		localData, kvData []byte
-		marshalErr        error
-	)
-	d.vmMgr.View(func(vms map[string]*vm.VM) {
-		localData, marshalErr = MarshalLocalState(vms)
-		if marshalErr != nil {
-			return
-		}
-		kvData, marshalErr = marshalInstanceState(vms)
-	})
-	if marshalErr != nil {
-		return fmt.Errorf("marshal state: %w", marshalErr)
+	localData, err := MarshalLocalState(vms)
+	if err != nil {
+		return fmt.Errorf("marshal state: %w", err)
 	}
-
 	// The KV write is independent of local disk health (JetStream, not this
 	// disk), so a local failure must not skip it — attempt both, then report
 	// the local failure. Revision only advances when the local write (the
@@ -2611,8 +2611,13 @@ func (d *Daemon) WriteState() error {
 		d.stateRevision.Add(1)
 	}
 
+	// The marker is written before the records so a reader that sees the node
+	// at all can only under-report it, never conclude it has no instances from
+	// a set that has not been written yet. vms is the caller's snapshot and
+	// cannot change underneath either write.
 	if d.jsManager != nil {
-		d.jsManager.WriteStateBytesBestEffort(d.node, kvData, kvSyncTimeout)
+		d.jsManager.WriteNodeMarkerBestEffort(nodeID, kvSyncTimeout)
+		d.jsManager.WriteRunningSet(nodeID, vms)
 	}
 
 	if localErr != nil {

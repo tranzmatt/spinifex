@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as AuthRouteRouteImport } from './routes/_auth/route'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as AuthIndexRouteImport } from './routes/_auth/index'
+import { Route as AuthBedrockRouteRouteImport } from './routes/_auth/bedrock/route'
 import { Route as AuthNodesRouteImport } from './routes/_auth/nodes'
 import { Route as AuthS3ServiceMetricsRouteImport } from './routes/_auth/s3/service-metrics'
 import { Route as AuthEc2elasticIpsAllocateAddressRouteImport } from './routes/_auth/ec2/(elastic-ips)/allocate-address'
@@ -46,6 +47,14 @@ import { Route as AuthRdssubnetGroupsCreateDbSubnetGroupRouteImport } from './ro
 import { Route as AuthS3bucketsCreateBucketRouteImport } from './routes/_auth/s3/(buckets)/create-bucket'
 import { Route as AuthS3LsIndexRouteImport } from './routes/_auth/s3/ls/index'
 import { Route as AuthS3LsBucketRouteRouteImport } from './routes/_auth/s3/ls/$bucket/route'
+import { Route as AuthBedrockcatalogListModelCatalogIndexRouteImport } from './routes/_auth/bedrock/(catalog)/list-model-catalog/index'
+import { Route as AuthBedrockguardrailsListGuardrailsIndexRouteImport } from './routes/_auth/bedrock/(guardrails)/list-guardrails/index'
+import { Route as AuthBedrockguardrailsListGuardrailsCreateRouteImport } from './routes/_auth/bedrock/(guardrails)/list-guardrails/create'
+import { Route as AuthBedrockknowledgeBasesListKnowledgeBasesIndexRouteImport } from './routes/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/index'
+import { Route as AuthBedrockknowledgeBasesListKnowledgeBasesKnowledgeBaseIdRouteImport } from './routes/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/$knowledgeBaseId'
+import { Route as AuthBedrockknowledgeBasesListKnowledgeBasesCreateRouteImport } from './routes/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/create'
+import { Route as AuthBedrockmodelAccessListModelAccessIndexRouteImport } from './routes/_auth/bedrock/(model-access)/list-model-access/index'
+import { Route as AuthBedrockplaygroundPlaygroundIndexRouteImport } from './routes/_auth/bedrock/(playground)/playground/index'
 import { Route as AuthEc2elasticIpsDescribeAddressesIndexRouteImport } from './routes/_auth/ec2/(elastic-ips)/describe-addresses/index'
 import { Route as AuthEc2elasticIpsDescribeAddressesIdRouteImport } from './routes/_auth/ec2/(elastic-ips)/describe-addresses/$id'
 import { Route as AuthEc2imagesDescribeImagesIndexRouteImport } from './routes/_auth/ec2/(images)/describe-images/index'
@@ -106,6 +115,8 @@ import { Route as AuthRdssubnetGroupsDescribeDbSubnetGroupsIndexRouteImport } fr
 import { Route as AuthRdssubnetGroupsDescribeDbSubnetGroupsNameRouteImport } from './routes/_auth/rds/(subnet-groups)/describe-db-subnet-groups/$name'
 import { Route as AuthS3LsBucketIndexRouteImport } from './routes/_auth/s3/ls/$bucket/index'
 import { Route as AuthS3LsBucketSplatRouteImport } from './routes/_auth/s3/ls/$bucket/$'
+import { Route as AuthBedrockguardrailsListGuardrailsGuardrailIdIndexRouteImport } from './routes/_auth/bedrock/(guardrails)/list-guardrails/$guardrailId.index'
+import { Route as AuthBedrockguardrailsListGuardrailsGuardrailIdEditRouteImport } from './routes/_auth/bedrock/(guardrails)/list-guardrails/$guardrailId.edit'
 import { Route as AuthEcsclustersListClustersClusterNameServicesServiceNameRouteImport } from './routes/_auth/ecs/(clusters)/list-clusters/$clusterName_/services/$serviceName'
 import { Route as AuthEcsclustersListClustersClusterNameTasksTaskIdRouteImport } from './routes/_auth/ecs/(clusters)/list-clusters/$clusterName_/tasks/$taskId'
 
@@ -121,6 +132,11 @@ const LoginRoute = LoginRouteImport.update({
 const AuthIndexRoute = AuthIndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => AuthRouteRoute,
+} as any)
+const AuthBedrockRouteRoute = AuthBedrockRouteRouteImport.update({
+  id: '/bedrock',
+  path: '/bedrock',
   getParentRoute: () => AuthRouteRoute,
 } as any)
 const AuthNodesRoute = AuthNodesRouteImport.update({
@@ -317,6 +333,54 @@ const AuthS3LsBucketRouteRoute = AuthS3LsBucketRouteRouteImport.update({
   path: '/s3/ls/$bucket',
   getParentRoute: () => AuthRouteRoute,
 } as any)
+const AuthBedrockcatalogListModelCatalogIndexRoute =
+  AuthBedrockcatalogListModelCatalogIndexRouteImport.update({
+    id: '/(catalog)/list-model-catalog/',
+    path: '/list-model-catalog/',
+    getParentRoute: () => AuthBedrockRouteRoute,
+  } as any)
+const AuthBedrockguardrailsListGuardrailsIndexRoute =
+  AuthBedrockguardrailsListGuardrailsIndexRouteImport.update({
+    id: '/(guardrails)/list-guardrails/',
+    path: '/list-guardrails/',
+    getParentRoute: () => AuthBedrockRouteRoute,
+  } as any)
+const AuthBedrockguardrailsListGuardrailsCreateRoute =
+  AuthBedrockguardrailsListGuardrailsCreateRouteImport.update({
+    id: '/(guardrails)/list-guardrails/create',
+    path: '/list-guardrails/create',
+    getParentRoute: () => AuthBedrockRouteRoute,
+  } as any)
+const AuthBedrockknowledgeBasesListKnowledgeBasesIndexRoute =
+  AuthBedrockknowledgeBasesListKnowledgeBasesIndexRouteImport.update({
+    id: '/(knowledge-bases)/list-knowledge-bases/',
+    path: '/list-knowledge-bases/',
+    getParentRoute: () => AuthBedrockRouteRoute,
+  } as any)
+const AuthBedrockknowledgeBasesListKnowledgeBasesKnowledgeBaseIdRoute =
+  AuthBedrockknowledgeBasesListKnowledgeBasesKnowledgeBaseIdRouteImport.update({
+    id: '/(knowledge-bases)/list-knowledge-bases/$knowledgeBaseId',
+    path: '/list-knowledge-bases/$knowledgeBaseId',
+    getParentRoute: () => AuthBedrockRouteRoute,
+  } as any)
+const AuthBedrockknowledgeBasesListKnowledgeBasesCreateRoute =
+  AuthBedrockknowledgeBasesListKnowledgeBasesCreateRouteImport.update({
+    id: '/(knowledge-bases)/list-knowledge-bases/create',
+    path: '/list-knowledge-bases/create',
+    getParentRoute: () => AuthBedrockRouteRoute,
+  } as any)
+const AuthBedrockmodelAccessListModelAccessIndexRoute =
+  AuthBedrockmodelAccessListModelAccessIndexRouteImport.update({
+    id: '/(model-access)/list-model-access/',
+    path: '/list-model-access/',
+    getParentRoute: () => AuthBedrockRouteRoute,
+  } as any)
+const AuthBedrockplaygroundPlaygroundIndexRoute =
+  AuthBedrockplaygroundPlaygroundIndexRouteImport.update({
+    id: '/(playground)/playground/',
+    path: '/playground/',
+    getParentRoute: () => AuthBedrockRouteRoute,
+  } as any)
 const AuthEc2elasticIpsDescribeAddressesIndexRoute =
   AuthEc2elasticIpsDescribeAddressesIndexRouteImport.update({
     id: '/ec2/(elastic-ips)/describe-addresses/',
@@ -677,6 +741,18 @@ const AuthS3LsBucketSplatRoute = AuthS3LsBucketSplatRouteImport.update({
   path: '/$',
   getParentRoute: () => AuthS3LsBucketRouteRoute,
 } as any)
+const AuthBedrockguardrailsListGuardrailsGuardrailIdIndexRoute =
+  AuthBedrockguardrailsListGuardrailsGuardrailIdIndexRouteImport.update({
+    id: '/(guardrails)/list-guardrails/$guardrailId/',
+    path: '/list-guardrails/$guardrailId/',
+    getParentRoute: () => AuthBedrockRouteRoute,
+  } as any)
+const AuthBedrockguardrailsListGuardrailsGuardrailIdEditRoute =
+  AuthBedrockguardrailsListGuardrailsGuardrailIdEditRouteImport.update({
+    id: '/(guardrails)/list-guardrails/$guardrailId/edit',
+    path: '/list-guardrails/$guardrailId/edit',
+    getParentRoute: () => AuthBedrockRouteRoute,
+  } as any)
 const AuthEcsclustersListClustersClusterNameServicesServiceNameRoute =
   AuthEcsclustersListClustersClusterNameServicesServiceNameRouteImport.update({
     id: '/ecs/(clusters)/list-clusters/$clusterName_/services/$serviceName',
@@ -693,6 +769,7 @@ const AuthEcsclustersListClustersClusterNameTasksTaskIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof AuthIndexRoute
   '/login': typeof LoginRoute
+  '/bedrock': typeof AuthBedrockRouteRouteWithChildren
   '/nodes': typeof AuthNodesRoute
   '/s3/service-metrics': typeof AuthS3ServiceMetricsRoute
   '/s3/ls/$bucket': typeof AuthS3LsBucketRouteRouteWithChildren
@@ -727,6 +804,9 @@ export interface FileRoutesByFullPath {
   '/rds/create-db-subnet-group': typeof AuthRdssubnetGroupsCreateDbSubnetGroupRoute
   '/s3/create-bucket': typeof AuthS3bucketsCreateBucketRoute
   '/s3/ls/': typeof AuthS3LsIndexRoute
+  '/bedrock/list-guardrails/create': typeof AuthBedrockguardrailsListGuardrailsCreateRoute
+  '/bedrock/list-knowledge-bases/$knowledgeBaseId': typeof AuthBedrockknowledgeBasesListKnowledgeBasesKnowledgeBaseIdRoute
+  '/bedrock/list-knowledge-bases/create': typeof AuthBedrockknowledgeBasesListKnowledgeBasesCreateRoute
   '/ec2/describe-addresses/$id': typeof AuthEc2elasticIpsDescribeAddressesIdRoute
   '/ec2/describe-images/$id': typeof AuthEc2imagesDescribeImagesIdRoute
   '/ec2/describe-instances/$id': typeof AuthEc2instancesDescribeInstancesIdRoute
@@ -758,6 +838,11 @@ export interface FileRoutesByFullPath {
   '/rds/restore-db-instance-from-db-snapshot/$id': typeof AuthRdssnapshotsRestoreDbInstanceFromDbSnapshotIdRoute
   '/rds/describe-db-subnet-groups/$name': typeof AuthRdssubnetGroupsDescribeDbSubnetGroupsNameRoute
   '/s3/ls/$bucket/$': typeof AuthS3LsBucketSplatRoute
+  '/bedrock/list-model-catalog/': typeof AuthBedrockcatalogListModelCatalogIndexRoute
+  '/bedrock/list-guardrails/': typeof AuthBedrockguardrailsListGuardrailsIndexRoute
+  '/bedrock/list-knowledge-bases/': typeof AuthBedrockknowledgeBasesListKnowledgeBasesIndexRoute
+  '/bedrock/list-model-access/': typeof AuthBedrockmodelAccessListModelAccessIndexRoute
+  '/bedrock/playground/': typeof AuthBedrockplaygroundPlaygroundIndexRoute
   '/ec2/describe-addresses/': typeof AuthEc2elasticIpsDescribeAddressesIndexRoute
   '/ec2/describe-images/': typeof AuthEc2imagesDescribeImagesIndexRoute
   '/ec2/describe-instances/': typeof AuthEc2instancesDescribeInstancesIndexRoute
@@ -787,11 +872,14 @@ export interface FileRoutesByFullPath {
   '/rds/describe-db-snapshots/': typeof AuthRdssnapshotsDescribeDbSnapshotsIndexRoute
   '/rds/describe-db-subnet-groups/': typeof AuthRdssubnetGroupsDescribeDbSubnetGroupsIndexRoute
   '/s3/ls/$bucket/': typeof AuthS3LsBucketIndexRoute
+  '/bedrock/list-guardrails/$guardrailId/edit': typeof AuthBedrockguardrailsListGuardrailsGuardrailIdEditRoute
+  '/bedrock/list-guardrails/$guardrailId/': typeof AuthBedrockguardrailsListGuardrailsGuardrailIdIndexRoute
   '/ecs/list-clusters/$clusterName/services/$serviceName': typeof AuthEcsclustersListClustersClusterNameServicesServiceNameRoute
   '/ecs/list-clusters/$clusterName/tasks/$taskId': typeof AuthEcsclustersListClustersClusterNameTasksTaskIdRoute
 }
 export interface FileRoutesByTo {
   '/login': typeof LoginRoute
+  '/bedrock': typeof AuthBedrockRouteRouteWithChildren
   '/nodes': typeof AuthNodesRoute
   '/': typeof AuthIndexRoute
   '/s3/service-metrics': typeof AuthS3ServiceMetricsRoute
@@ -826,6 +914,9 @@ export interface FileRoutesByTo {
   '/rds/create-db-subnet-group': typeof AuthRdssubnetGroupsCreateDbSubnetGroupRoute
   '/s3/create-bucket': typeof AuthS3bucketsCreateBucketRoute
   '/s3/ls': typeof AuthS3LsIndexRoute
+  '/bedrock/list-guardrails/create': typeof AuthBedrockguardrailsListGuardrailsCreateRoute
+  '/bedrock/list-knowledge-bases/$knowledgeBaseId': typeof AuthBedrockknowledgeBasesListKnowledgeBasesKnowledgeBaseIdRoute
+  '/bedrock/list-knowledge-bases/create': typeof AuthBedrockknowledgeBasesListKnowledgeBasesCreateRoute
   '/ec2/describe-addresses/$id': typeof AuthEc2elasticIpsDescribeAddressesIdRoute
   '/ec2/describe-images/$id': typeof AuthEc2imagesDescribeImagesIdRoute
   '/ec2/describe-instances/$id': typeof AuthEc2instancesDescribeInstancesIdRoute
@@ -857,6 +948,11 @@ export interface FileRoutesByTo {
   '/rds/restore-db-instance-from-db-snapshot/$id': typeof AuthRdssnapshotsRestoreDbInstanceFromDbSnapshotIdRoute
   '/rds/describe-db-subnet-groups/$name': typeof AuthRdssubnetGroupsDescribeDbSubnetGroupsNameRoute
   '/s3/ls/$bucket/$': typeof AuthS3LsBucketSplatRoute
+  '/bedrock/list-model-catalog': typeof AuthBedrockcatalogListModelCatalogIndexRoute
+  '/bedrock/list-guardrails': typeof AuthBedrockguardrailsListGuardrailsIndexRoute
+  '/bedrock/list-knowledge-bases': typeof AuthBedrockknowledgeBasesListKnowledgeBasesIndexRoute
+  '/bedrock/list-model-access': typeof AuthBedrockmodelAccessListModelAccessIndexRoute
+  '/bedrock/playground': typeof AuthBedrockplaygroundPlaygroundIndexRoute
   '/ec2/describe-addresses': typeof AuthEc2elasticIpsDescribeAddressesIndexRoute
   '/ec2/describe-images': typeof AuthEc2imagesDescribeImagesIndexRoute
   '/ec2/describe-instances': typeof AuthEc2instancesDescribeInstancesIndexRoute
@@ -886,6 +982,8 @@ export interface FileRoutesByTo {
   '/rds/describe-db-snapshots': typeof AuthRdssnapshotsDescribeDbSnapshotsIndexRoute
   '/rds/describe-db-subnet-groups': typeof AuthRdssubnetGroupsDescribeDbSubnetGroupsIndexRoute
   '/s3/ls/$bucket': typeof AuthS3LsBucketIndexRoute
+  '/bedrock/list-guardrails/$guardrailId/edit': typeof AuthBedrockguardrailsListGuardrailsGuardrailIdEditRoute
+  '/bedrock/list-guardrails/$guardrailId': typeof AuthBedrockguardrailsListGuardrailsGuardrailIdIndexRoute
   '/ecs/list-clusters/$clusterName/services/$serviceName': typeof AuthEcsclustersListClustersClusterNameServicesServiceNameRoute
   '/ecs/list-clusters/$clusterName/tasks/$taskId': typeof AuthEcsclustersListClustersClusterNameTasksTaskIdRoute
 }
@@ -893,6 +991,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_auth': typeof AuthRouteRouteWithChildren
   '/login': typeof LoginRoute
+  '/_auth/bedrock': typeof AuthBedrockRouteRouteWithChildren
   '/_auth/nodes': typeof AuthNodesRoute
   '/_auth/': typeof AuthIndexRoute
   '/_auth/s3/service-metrics': typeof AuthS3ServiceMetricsRoute
@@ -928,6 +1027,9 @@ export interface FileRoutesById {
   '/_auth/rds/(subnet-groups)/create-db-subnet-group': typeof AuthRdssubnetGroupsCreateDbSubnetGroupRoute
   '/_auth/s3/(buckets)/create-bucket': typeof AuthS3bucketsCreateBucketRoute
   '/_auth/s3/ls/': typeof AuthS3LsIndexRoute
+  '/_auth/bedrock/(guardrails)/list-guardrails/create': typeof AuthBedrockguardrailsListGuardrailsCreateRoute
+  '/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/$knowledgeBaseId': typeof AuthBedrockknowledgeBasesListKnowledgeBasesKnowledgeBaseIdRoute
+  '/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/create': typeof AuthBedrockknowledgeBasesListKnowledgeBasesCreateRoute
   '/_auth/ec2/(elastic-ips)/describe-addresses/$id': typeof AuthEc2elasticIpsDescribeAddressesIdRoute
   '/_auth/ec2/(images)/describe-images/$id': typeof AuthEc2imagesDescribeImagesIdRoute
   '/_auth/ec2/(instances)/describe-instances/$id': typeof AuthEc2instancesDescribeInstancesIdRoute
@@ -959,6 +1061,11 @@ export interface FileRoutesById {
   '/_auth/rds/(snapshots)/restore-db-instance-from-db-snapshot/$id': typeof AuthRdssnapshotsRestoreDbInstanceFromDbSnapshotIdRoute
   '/_auth/rds/(subnet-groups)/describe-db-subnet-groups/$name': typeof AuthRdssubnetGroupsDescribeDbSubnetGroupsNameRoute
   '/_auth/s3/ls/$bucket/$': typeof AuthS3LsBucketSplatRoute
+  '/_auth/bedrock/(catalog)/list-model-catalog/': typeof AuthBedrockcatalogListModelCatalogIndexRoute
+  '/_auth/bedrock/(guardrails)/list-guardrails/': typeof AuthBedrockguardrailsListGuardrailsIndexRoute
+  '/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/': typeof AuthBedrockknowledgeBasesListKnowledgeBasesIndexRoute
+  '/_auth/bedrock/(model-access)/list-model-access/': typeof AuthBedrockmodelAccessListModelAccessIndexRoute
+  '/_auth/bedrock/(playground)/playground/': typeof AuthBedrockplaygroundPlaygroundIndexRoute
   '/_auth/ec2/(elastic-ips)/describe-addresses/': typeof AuthEc2elasticIpsDescribeAddressesIndexRoute
   '/_auth/ec2/(images)/describe-images/': typeof AuthEc2imagesDescribeImagesIndexRoute
   '/_auth/ec2/(instances)/describe-instances/': typeof AuthEc2instancesDescribeInstancesIndexRoute
@@ -988,6 +1095,8 @@ export interface FileRoutesById {
   '/_auth/rds/(snapshots)/describe-db-snapshots/': typeof AuthRdssnapshotsDescribeDbSnapshotsIndexRoute
   '/_auth/rds/(subnet-groups)/describe-db-subnet-groups/': typeof AuthRdssubnetGroupsDescribeDbSubnetGroupsIndexRoute
   '/_auth/s3/ls/$bucket/': typeof AuthS3LsBucketIndexRoute
+  '/_auth/bedrock/(guardrails)/list-guardrails/$guardrailId/edit': typeof AuthBedrockguardrailsListGuardrailsGuardrailIdEditRoute
+  '/_auth/bedrock/(guardrails)/list-guardrails/$guardrailId/': typeof AuthBedrockguardrailsListGuardrailsGuardrailIdIndexRoute
   '/_auth/ecs/(clusters)/list-clusters/$clusterName_/services/$serviceName': typeof AuthEcsclustersListClustersClusterNameServicesServiceNameRoute
   '/_auth/ecs/(clusters)/list-clusters/$clusterName_/tasks/$taskId': typeof AuthEcsclustersListClustersClusterNameTasksTaskIdRoute
 }
@@ -996,6 +1105,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/login'
+    | '/bedrock'
     | '/nodes'
     | '/s3/service-metrics'
     | '/s3/ls/$bucket'
@@ -1030,6 +1140,9 @@ export interface FileRouteTypes {
     | '/rds/create-db-subnet-group'
     | '/s3/create-bucket'
     | '/s3/ls/'
+    | '/bedrock/list-guardrails/create'
+    | '/bedrock/list-knowledge-bases/$knowledgeBaseId'
+    | '/bedrock/list-knowledge-bases/create'
     | '/ec2/describe-addresses/$id'
     | '/ec2/describe-images/$id'
     | '/ec2/describe-instances/$id'
@@ -1061,6 +1174,11 @@ export interface FileRouteTypes {
     | '/rds/restore-db-instance-from-db-snapshot/$id'
     | '/rds/describe-db-subnet-groups/$name'
     | '/s3/ls/$bucket/$'
+    | '/bedrock/list-model-catalog/'
+    | '/bedrock/list-guardrails/'
+    | '/bedrock/list-knowledge-bases/'
+    | '/bedrock/list-model-access/'
+    | '/bedrock/playground/'
     | '/ec2/describe-addresses/'
     | '/ec2/describe-images/'
     | '/ec2/describe-instances/'
@@ -1090,11 +1208,14 @@ export interface FileRouteTypes {
     | '/rds/describe-db-snapshots/'
     | '/rds/describe-db-subnet-groups/'
     | '/s3/ls/$bucket/'
+    | '/bedrock/list-guardrails/$guardrailId/edit'
+    | '/bedrock/list-guardrails/$guardrailId/'
     | '/ecs/list-clusters/$clusterName/services/$serviceName'
     | '/ecs/list-clusters/$clusterName/tasks/$taskId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/login'
+    | '/bedrock'
     | '/nodes'
     | '/'
     | '/s3/service-metrics'
@@ -1129,6 +1250,9 @@ export interface FileRouteTypes {
     | '/rds/create-db-subnet-group'
     | '/s3/create-bucket'
     | '/s3/ls'
+    | '/bedrock/list-guardrails/create'
+    | '/bedrock/list-knowledge-bases/$knowledgeBaseId'
+    | '/bedrock/list-knowledge-bases/create'
     | '/ec2/describe-addresses/$id'
     | '/ec2/describe-images/$id'
     | '/ec2/describe-instances/$id'
@@ -1160,6 +1284,11 @@ export interface FileRouteTypes {
     | '/rds/restore-db-instance-from-db-snapshot/$id'
     | '/rds/describe-db-subnet-groups/$name'
     | '/s3/ls/$bucket/$'
+    | '/bedrock/list-model-catalog'
+    | '/bedrock/list-guardrails'
+    | '/bedrock/list-knowledge-bases'
+    | '/bedrock/list-model-access'
+    | '/bedrock/playground'
     | '/ec2/describe-addresses'
     | '/ec2/describe-images'
     | '/ec2/describe-instances'
@@ -1189,12 +1318,15 @@ export interface FileRouteTypes {
     | '/rds/describe-db-snapshots'
     | '/rds/describe-db-subnet-groups'
     | '/s3/ls/$bucket'
+    | '/bedrock/list-guardrails/$guardrailId/edit'
+    | '/bedrock/list-guardrails/$guardrailId'
     | '/ecs/list-clusters/$clusterName/services/$serviceName'
     | '/ecs/list-clusters/$clusterName/tasks/$taskId'
   id:
     | '__root__'
     | '/_auth'
     | '/login'
+    | '/_auth/bedrock'
     | '/_auth/nodes'
     | '/_auth/'
     | '/_auth/s3/service-metrics'
@@ -1230,6 +1362,9 @@ export interface FileRouteTypes {
     | '/_auth/rds/(subnet-groups)/create-db-subnet-group'
     | '/_auth/s3/(buckets)/create-bucket'
     | '/_auth/s3/ls/'
+    | '/_auth/bedrock/(guardrails)/list-guardrails/create'
+    | '/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/$knowledgeBaseId'
+    | '/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/create'
     | '/_auth/ec2/(elastic-ips)/describe-addresses/$id'
     | '/_auth/ec2/(images)/describe-images/$id'
     | '/_auth/ec2/(instances)/describe-instances/$id'
@@ -1261,6 +1396,11 @@ export interface FileRouteTypes {
     | '/_auth/rds/(snapshots)/restore-db-instance-from-db-snapshot/$id'
     | '/_auth/rds/(subnet-groups)/describe-db-subnet-groups/$name'
     | '/_auth/s3/ls/$bucket/$'
+    | '/_auth/bedrock/(catalog)/list-model-catalog/'
+    | '/_auth/bedrock/(guardrails)/list-guardrails/'
+    | '/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/'
+    | '/_auth/bedrock/(model-access)/list-model-access/'
+    | '/_auth/bedrock/(playground)/playground/'
     | '/_auth/ec2/(elastic-ips)/describe-addresses/'
     | '/_auth/ec2/(images)/describe-images/'
     | '/_auth/ec2/(instances)/describe-instances/'
@@ -1290,6 +1430,8 @@ export interface FileRouteTypes {
     | '/_auth/rds/(snapshots)/describe-db-snapshots/'
     | '/_auth/rds/(subnet-groups)/describe-db-subnet-groups/'
     | '/_auth/s3/ls/$bucket/'
+    | '/_auth/bedrock/(guardrails)/list-guardrails/$guardrailId/edit'
+    | '/_auth/bedrock/(guardrails)/list-guardrails/$guardrailId/'
     | '/_auth/ecs/(clusters)/list-clusters/$clusterName_/services/$serviceName'
     | '/_auth/ecs/(clusters)/list-clusters/$clusterName_/tasks/$taskId'
   fileRoutesById: FileRoutesById
@@ -1320,6 +1462,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof AuthIndexRouteImport
+      parentRoute: typeof AuthRouteRoute
+    }
+    '/_auth/bedrock': {
+      id: '/_auth/bedrock'
+      path: '/bedrock'
+      fullPath: '/bedrock'
+      preLoaderRoute: typeof AuthBedrockRouteRouteImport
       parentRoute: typeof AuthRouteRoute
     }
     '/_auth/nodes': {
@@ -1559,6 +1708,62 @@ declare module '@tanstack/react-router' {
       fullPath: '/s3/ls/$bucket'
       preLoaderRoute: typeof AuthS3LsBucketRouteRouteImport
       parentRoute: typeof AuthRouteRoute
+    }
+    '/_auth/bedrock/(catalog)/list-model-catalog/': {
+      id: '/_auth/bedrock/(catalog)/list-model-catalog/'
+      path: '/list-model-catalog'
+      fullPath: '/bedrock/list-model-catalog/'
+      preLoaderRoute: typeof AuthBedrockcatalogListModelCatalogIndexRouteImport
+      parentRoute: typeof AuthBedrockRouteRoute
+    }
+    '/_auth/bedrock/(guardrails)/list-guardrails/': {
+      id: '/_auth/bedrock/(guardrails)/list-guardrails/'
+      path: '/list-guardrails'
+      fullPath: '/bedrock/list-guardrails/'
+      preLoaderRoute: typeof AuthBedrockguardrailsListGuardrailsIndexRouteImport
+      parentRoute: typeof AuthBedrockRouteRoute
+    }
+    '/_auth/bedrock/(guardrails)/list-guardrails/create': {
+      id: '/_auth/bedrock/(guardrails)/list-guardrails/create'
+      path: '/list-guardrails/create'
+      fullPath: '/bedrock/list-guardrails/create'
+      preLoaderRoute: typeof AuthBedrockguardrailsListGuardrailsCreateRouteImport
+      parentRoute: typeof AuthBedrockRouteRoute
+    }
+    '/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/': {
+      id: '/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/'
+      path: '/list-knowledge-bases'
+      fullPath: '/bedrock/list-knowledge-bases/'
+      preLoaderRoute: typeof AuthBedrockknowledgeBasesListKnowledgeBasesIndexRouteImport
+      parentRoute: typeof AuthBedrockRouteRoute
+    }
+    '/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/$knowledgeBaseId': {
+      id: '/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/$knowledgeBaseId'
+      path: '/list-knowledge-bases/$knowledgeBaseId'
+      fullPath: '/bedrock/list-knowledge-bases/$knowledgeBaseId'
+      preLoaderRoute: typeof AuthBedrockknowledgeBasesListKnowledgeBasesKnowledgeBaseIdRouteImport
+      parentRoute: typeof AuthBedrockRouteRoute
+    }
+    '/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/create': {
+      id: '/_auth/bedrock/(knowledge-bases)/list-knowledge-bases/create'
+      path: '/list-knowledge-bases/create'
+      fullPath: '/bedrock/list-knowledge-bases/create'
+      preLoaderRoute: typeof AuthBedrockknowledgeBasesListKnowledgeBasesCreateRouteImport
+      parentRoute: typeof AuthBedrockRouteRoute
+    }
+    '/_auth/bedrock/(model-access)/list-model-access/': {
+      id: '/_auth/bedrock/(model-access)/list-model-access/'
+      path: '/list-model-access'
+      fullPath: '/bedrock/list-model-access/'
+      preLoaderRoute: typeof AuthBedrockmodelAccessListModelAccessIndexRouteImport
+      parentRoute: typeof AuthBedrockRouteRoute
+    }
+    '/_auth/bedrock/(playground)/playground/': {
+      id: '/_auth/bedrock/(playground)/playground/'
+      path: '/playground'
+      fullPath: '/bedrock/playground/'
+      preLoaderRoute: typeof AuthBedrockplaygroundPlaygroundIndexRouteImport
+      parentRoute: typeof AuthBedrockRouteRoute
     }
     '/_auth/ec2/(elastic-ips)/describe-addresses/': {
       id: '/_auth/ec2/(elastic-ips)/describe-addresses/'
@@ -1980,6 +2185,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthS3LsBucketSplatRouteImport
       parentRoute: typeof AuthS3LsBucketRouteRoute
     }
+    '/_auth/bedrock/(guardrails)/list-guardrails/$guardrailId/': {
+      id: '/_auth/bedrock/(guardrails)/list-guardrails/$guardrailId/'
+      path: '/list-guardrails/$guardrailId'
+      fullPath: '/bedrock/list-guardrails/$guardrailId/'
+      preLoaderRoute: typeof AuthBedrockguardrailsListGuardrailsGuardrailIdIndexRouteImport
+      parentRoute: typeof AuthBedrockRouteRoute
+    }
+    '/_auth/bedrock/(guardrails)/list-guardrails/$guardrailId/edit': {
+      id: '/_auth/bedrock/(guardrails)/list-guardrails/$guardrailId/edit'
+      path: '/list-guardrails/$guardrailId/edit'
+      fullPath: '/bedrock/list-guardrails/$guardrailId/edit'
+      preLoaderRoute: typeof AuthBedrockguardrailsListGuardrailsGuardrailIdEditRouteImport
+      parentRoute: typeof AuthBedrockRouteRoute
+    }
     '/_auth/ecs/(clusters)/list-clusters/$clusterName_/services/$serviceName': {
       id: '/_auth/ecs/(clusters)/list-clusters/$clusterName_/services/$serviceName'
       path: '/ecs/list-clusters/$clusterName/services/$serviceName'
@@ -1997,6 +2216,45 @@ declare module '@tanstack/react-router' {
   }
 }
 
+interface AuthBedrockRouteRouteChildren {
+  AuthBedrockguardrailsListGuardrailsCreateRoute: typeof AuthBedrockguardrailsListGuardrailsCreateRoute
+  AuthBedrockknowledgeBasesListKnowledgeBasesKnowledgeBaseIdRoute: typeof AuthBedrockknowledgeBasesListKnowledgeBasesKnowledgeBaseIdRoute
+  AuthBedrockknowledgeBasesListKnowledgeBasesCreateRoute: typeof AuthBedrockknowledgeBasesListKnowledgeBasesCreateRoute
+  AuthBedrockcatalogListModelCatalogIndexRoute: typeof AuthBedrockcatalogListModelCatalogIndexRoute
+  AuthBedrockguardrailsListGuardrailsIndexRoute: typeof AuthBedrockguardrailsListGuardrailsIndexRoute
+  AuthBedrockknowledgeBasesListKnowledgeBasesIndexRoute: typeof AuthBedrockknowledgeBasesListKnowledgeBasesIndexRoute
+  AuthBedrockmodelAccessListModelAccessIndexRoute: typeof AuthBedrockmodelAccessListModelAccessIndexRoute
+  AuthBedrockplaygroundPlaygroundIndexRoute: typeof AuthBedrockplaygroundPlaygroundIndexRoute
+  AuthBedrockguardrailsListGuardrailsGuardrailIdEditRoute: typeof AuthBedrockguardrailsListGuardrailsGuardrailIdEditRoute
+  AuthBedrockguardrailsListGuardrailsGuardrailIdIndexRoute: typeof AuthBedrockguardrailsListGuardrailsGuardrailIdIndexRoute
+}
+
+const AuthBedrockRouteRouteChildren: AuthBedrockRouteRouteChildren = {
+  AuthBedrockguardrailsListGuardrailsCreateRoute:
+    AuthBedrockguardrailsListGuardrailsCreateRoute,
+  AuthBedrockknowledgeBasesListKnowledgeBasesKnowledgeBaseIdRoute:
+    AuthBedrockknowledgeBasesListKnowledgeBasesKnowledgeBaseIdRoute,
+  AuthBedrockknowledgeBasesListKnowledgeBasesCreateRoute:
+    AuthBedrockknowledgeBasesListKnowledgeBasesCreateRoute,
+  AuthBedrockcatalogListModelCatalogIndexRoute:
+    AuthBedrockcatalogListModelCatalogIndexRoute,
+  AuthBedrockguardrailsListGuardrailsIndexRoute:
+    AuthBedrockguardrailsListGuardrailsIndexRoute,
+  AuthBedrockknowledgeBasesListKnowledgeBasesIndexRoute:
+    AuthBedrockknowledgeBasesListKnowledgeBasesIndexRoute,
+  AuthBedrockmodelAccessListModelAccessIndexRoute:
+    AuthBedrockmodelAccessListModelAccessIndexRoute,
+  AuthBedrockplaygroundPlaygroundIndexRoute:
+    AuthBedrockplaygroundPlaygroundIndexRoute,
+  AuthBedrockguardrailsListGuardrailsGuardrailIdEditRoute:
+    AuthBedrockguardrailsListGuardrailsGuardrailIdEditRoute,
+  AuthBedrockguardrailsListGuardrailsGuardrailIdIndexRoute:
+    AuthBedrockguardrailsListGuardrailsGuardrailIdIndexRoute,
+}
+
+const AuthBedrockRouteRouteWithChildren =
+  AuthBedrockRouteRoute._addFileChildren(AuthBedrockRouteRouteChildren)
+
 interface AuthS3LsBucketRouteRouteChildren {
   AuthS3LsBucketSplatRoute: typeof AuthS3LsBucketSplatRoute
   AuthS3LsBucketIndexRoute: typeof AuthS3LsBucketIndexRoute
@@ -2011,6 +2269,7 @@ const AuthS3LsBucketRouteRouteWithChildren =
   AuthS3LsBucketRouteRoute._addFileChildren(AuthS3LsBucketRouteRouteChildren)
 
 interface AuthRouteRouteChildren {
+  AuthBedrockRouteRoute: typeof AuthBedrockRouteRouteWithChildren
   AuthNodesRoute: typeof AuthNodesRoute
   AuthIndexRoute: typeof AuthIndexRoute
   AuthS3ServiceMetricsRoute: typeof AuthS3ServiceMetricsRoute
@@ -2109,6 +2368,7 @@ interface AuthRouteRouteChildren {
 }
 
 const AuthRouteRouteChildren: AuthRouteRouteChildren = {
+  AuthBedrockRouteRoute: AuthBedrockRouteRouteWithChildren,
   AuthNodesRoute: AuthNodesRoute,
   AuthIndexRoute: AuthIndexRoute,
   AuthS3ServiceMetricsRoute: AuthS3ServiceMetricsRoute,

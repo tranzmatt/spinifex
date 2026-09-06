@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mulgadc/spinifex/spinifex/kvstore"
 	"github.com/mulgadc/spinifex/spinifex/kvutil"
 	"github.com/mulgadc/spinifex/spinifex/migrate"
 	"github.com/mulgadc/spinifex/spinifex/utils"
@@ -46,6 +47,9 @@ const (
 // internal wait the legacy KV API applied.
 type Store struct {
 	kv jetstream.KeyValue
+
+	// js is what a watcher's bucket reopens against after the stream is lost.
+	js jetstream.JetStream
 
 	// now and claimTTL back ClaimLBName's pending-vs-orphan check. Both are
 	// overridden in tests (same package) so the crash-orphan reclaim path never
@@ -92,7 +96,7 @@ func NewStore(ctx context.Context, nc *nats.Conn) (*Store, error) {
 	}
 
 	slog.Info("ELBv2 store initialized", "bucket", KVBucketELBv2)
-	return &Store{kv: kv, now: time.Now, claimTTL: lbNameClaimTTL}, nil
+	return &Store{kv: kv, js: js, now: time.Now, claimTTL: lbNameClaimTTL}, nil
 }
 
 // --- Load Balancer CRUD ---
@@ -208,6 +212,14 @@ func (s *Store) ListLoadBalancers(ctx context.Context) ([]*LoadBalancerRecord, e
 // complete inventory (the DNS reconcile prune authority requires the whole set).
 func (s *Store) ListLoadBalancersStrict(ctx context.Context) ([]*LoadBalancerRecord, error) {
 	return listByPrefixStrict[LoadBalancerRecord](ctx, s.kv, KeyPrefixLB)
+}
+
+// WatchBucket exposes the bucket so a reconciler can be woken by changes to it
+// rather than poll. The store shares one bucket across load balancers, target
+// groups, listeners and rules, so a caller wanting only one of those filters on
+// the corresponding key prefix.
+func (s *Store) WatchBucket() *kvstore.Bucket {
+	return kvstore.NewOpenBucket(s.js, s.kv, kvstore.Config{Name: KVBucketELBv2})
 }
 
 // GetLoadBalancerByArn finds a load balancer by the short ID in the ARN's final

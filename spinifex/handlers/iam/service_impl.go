@@ -20,6 +20,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	iamarn "github.com/mulgadc/bluebottle/pkg/auth"
 	"github.com/mulgadc/bluebottle/pkg/iampolicy"
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/mulgadc/spinifex/spinifex/admin"
@@ -322,6 +323,10 @@ func (s *IAMServiceImpl) CreateUser(accountID string, input *iam.CreateUserInput
 		return nil, errors.New(awserrors.ErrorIAMInvalidInput)
 	}
 
+	if err := validatePermissionsBoundary(input.PermissionsBoundary); err != nil {
+		return nil, err
+	}
+
 	path := "/"
 	if input.Path != nil {
 		path = *input.Path
@@ -415,7 +420,9 @@ func (s *IAMServiceImpl) ListUsers(accountID string, input *iam.ListUsersInput) 
 	}
 
 	keyPrefix := accountID + "."
-	var users []*iam.User
+	// Non-nil: Users is a required member, and a nil slice marshals to no
+	// element at all rather than an empty one.
+	users := []*iam.User{}
 	for _, key := range keys {
 		if key == utils.VersionKey {
 			continue
@@ -578,7 +585,9 @@ func (s *IAMServiceImpl) ListAccessKeys(accountID string, input *iam.ListAccessK
 		return nil, err
 	}
 
-	var metadata []*iam.AccessKeyMetadata
+	// Non-nil: AccessKeyMetadata is a required member, and a nil slice marshals
+	// to no element at all rather than an empty one.
+	metadata := []*iam.AccessKeyMetadata{}
 	for _, keyID := range user.AccessKeys {
 		entry, err := s.accessKeysBucket.Get(ctx, keyID)
 		if err != nil {
@@ -1833,13 +1842,12 @@ func (s *IAMServiceImpl) GetUserPolicies(accountID, userName string) ([]PolicyDo
 // ---------------------------------------------------------------------------
 
 func (s *IAMServiceImpl) getPolicyByARN(ctx context.Context, accountID, policyARN string) (*Policy, error) {
-	parts := strings.SplitN(policyARN, ":policy", 2)
-	if len(parts) != 2 || parts[1] == "" {
-		return nil, errors.New(awserrors.ErrorIAMNoSuchEntity)
-	}
-	segments := strings.Split(parts[1], "/")
-	policyName := segments[len(segments)-1]
-	if policyName == "" {
+	_, policyName, err := iamarn.ParsePolicyARN(policyARN)
+	if err != nil {
+		// NoSuchEntity is the response contract, so log the parse reason —
+		// otherwise a malformed ARN is indistinguishable from a missing policy.
+		slog.Debug("getPolicyByARN: unparseable policy ARN",
+			"accountID", accountID, "policyArn", policyARN, "err", err)
 		return nil, errors.New(awserrors.ErrorIAMNoSuchEntity)
 	}
 
@@ -1978,6 +1986,17 @@ func validatePolicyName(name string) error {
 		}
 	}
 	return nil
+}
+
+// validatePermissionsBoundary rejects a boundary the evaluator cannot enforce.
+// Storing an identity with an unenforced boundary would widen access silently,
+// so the create fails visibly instead.
+func validatePermissionsBoundary(boundary *string) error {
+	if aws.StringValue(boundary) == "" {
+		return nil
+	}
+	return awserrors.Errorf(awserrors.ErrorValidationError,
+		"PermissionsBoundary is not supported in this release; omit it and scope the identity with its attached policies instead")
 }
 
 func validatePath(path string) error {

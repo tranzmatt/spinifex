@@ -708,20 +708,20 @@ func TestDaemon_BootAllocation(t *testing.T) {
 			InstanceType: getTestInstanceType(t),
 			Status:       vm.StateRunning,
 			AccountID:    testAccountID,
-			Attributes:   types.EC2CommandAttributes{StopInstance: false},
+			DesiredState: vm.DesiredRunning,
 		},
 		"i-stopped": {
 			ID:           "i-stopped",
 			InstanceType: getTestInstanceType(t),
 			Status:       vm.StateStopped,
 			AccountID:    testAccountID,
-			Attributes:   types.EC2CommandAttributes{StopInstance: true},
+			DesiredState: vm.DesiredStopped,
 		},
 		"i-terminated": {
 			ID:           "i-terminated",
 			InstanceType: getTestInstanceType(t),
 			Status:       vm.StateTerminated,
-			Attributes:   types.EC2CommandAttributes{StopInstance: false},
+			DesiredState: vm.DesiredRunning,
 		},
 	}
 
@@ -756,7 +756,7 @@ func TestDaemon_BootAllocation(t *testing.T) {
 
 	// Simulate the allocation loop in Start()
 	for _, instance := range daemon.vmMgr.Snapshot() {
-		if instance.Status != vm.StateTerminated && !instance.Attributes.StopInstance {
+		if instance.Status != vm.StateTerminated && instance.DesiredState != vm.DesiredStopped {
 			instanceType, ok := daemon.resourceMgr.instanceTypes[instance.InstanceType]
 			if ok {
 				err := daemon.resourceMgr.allocate(instanceType)
@@ -1695,7 +1695,7 @@ func TestTerminatedTeardownReaper_SelfHealsFailedVolumeTeardown(t *testing.T) {
 	jsManager, err := NewJetStreamManager(daemon.natsConn, 1)
 	require.NoError(t, err)
 	require.NoError(t, jsManager.InitTerminatedInstanceBucket())
-	daemon.stateStore = newStateStoreAdapter(jsManager)
+	daemon.stateStore = newStateStoreAdapter(jsManager, daemon.persistState)
 
 	// DeleteVolume's snapshot-reference guard requires a non-nil snapshotKV.
 	js, err := jetstream.New(daemon.natsConn)
@@ -3420,7 +3420,8 @@ var _ vm.VolumeStateUpdater = (*recordingVolState)(nil)
 // teardown-path durability gate: a per-volume seal failure during the bulk
 // Unmount (stop/terminate) must NOT transition that volume to available — a
 // reattach on a WAL-less node would find no checkpoint (bad superblock) — while
-// other volumes still seal and the loop completes (terminate stays idempotent).
+// other volumes still seal and the loop completes. The failure is returned, not
+// swallowed: the caller decides whether losing that seal is survivable.
 func TestVolumeMounterAdapter_Unmount_SealFailureSkipsAvailable(t *testing.T) {
 	daemon := createTestDaemon(t, sharedNATSURL)
 	volState := &recordingVolState{}
@@ -3445,8 +3446,9 @@ func TestVolumeMounterAdapter_Unmount_SealFailureSkipsAvailable(t *testing.T) {
 			Requests: []types.EBSRequest{{Name: "vol-fail"}, {Name: "vol-ok"}},
 		},
 	}
-	require.NoError(t, adapter.Unmount(t.Context(), inst),
-		"bulk Unmount must tolerate a per-volume seal failure so terminate stays idempotent")
+	err = adapter.Unmount(t.Context(), inst)
+	require.Error(t, err, "bulk Unmount must report a per-volume seal failure")
+	assert.Contains(t, err.Error(), "vol-fail", "the error must name the volume that did not seal")
 
 	calls := volState.snapshot()
 	assert.NotContains(t, calls, "vol-fail:available",

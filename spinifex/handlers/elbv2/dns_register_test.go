@@ -3,12 +3,12 @@ package handlers_elbv2
 import (
 	"testing"
 
-	handlers_dns "github.com/mulgadc/spinifex/spinifex/handlers/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestLBFrontendIP(t *testing.T) {
+	t.Parallel()
 	// internet-facing → the AZ-0 public IP.
 	inet := &LoadBalancerRecord{
 		Scheme:     SchemeInternetFacing,
@@ -34,20 +34,8 @@ func TestLBFrontendIP(t *testing.T) {
 	assert.Equal(t, "10.0.0.9", lbFrontendIP(internal))
 }
 
-func TestPublishLBDNS_NoopWhenDisabled(t *testing.T) {
-	rec := &LoadBalancerRecord{
-		Scheme:    SchemeInternal,
-		DNSName:   "internal-web-abc.ap-southeast-2.elb.spx3.net",
-		VPCIP:     "10.0.0.1",
-		AccountID: "000000000000",
-	}
-	// No base domain → no-op; must not panic on the nil NATS connection.
-	(&ELBv2ServiceImpl{}).publishLBDNS(rec, handlers_dns.ActionUpsert)
-	// Base domain set but nil NATS conn → PublishChangesBestEffort tolerates it.
-	(&ELBv2ServiceImpl{dnsBaseDomain: "spx3.net"}).publishLBDNS(rec, handlers_dns.ActionDelete)
-}
-
 func TestDesiredDNSChanges_IncludesEndpointReadyProvisioningLoadBalancers(t *testing.T) {
+	t.Parallel()
 	svc := setupTestService(t)
 	svc.dnsBaseDomain = "spx3.net"
 

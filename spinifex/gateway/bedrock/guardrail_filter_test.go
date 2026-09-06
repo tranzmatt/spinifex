@@ -2,6 +2,7 @@ package gateway_bedrock
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -144,7 +145,8 @@ func TestApplyGuardrailPolicies_WordAndPII(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			action, assessments, outputs, usage := applyGuardrailPolicies(tc.view, tc.texts, tc.source)
+			action, assessments, outputs, usage, err := applyGuardrailPolicies(context.Background(), nil, tc.view, tc.texts, tc.source)
+			require.NoError(t, err)
 			assert.Equal(t, tc.wantAction, action)
 			require.Len(t, assessments, 1)
 			require.NotNil(t, usage)
@@ -193,7 +195,8 @@ func TestApplyGuardrailPolicies_CustomRegex(t *testing.T) {
 		},
 	}
 
-	action, assessments, outputs, _ := applyGuardrailPolicies(view, []string{"account 123456789012 is active"}, bedrockruntime.GuardrailContentSourceInput)
+	action, assessments, outputs, _, err := applyGuardrailPolicies(context.Background(), nil, view, []string{"account 123456789012 is active"}, bedrockruntime.GuardrailContentSourceInput)
+	require.NoError(t, err)
 	assert.Equal(t, bedrockruntime.GuardrailActionNone, action)
 	require.Len(t, outputs, 1)
 	assert.Equal(t, "account {account-id} is active", outputs[0])
@@ -208,7 +211,8 @@ func TestApplyGuardrailPolicies_CustomRegex(t *testing.T) {
 			},
 		},
 	}
-	action, _, _, _ = applyGuardrailPolicies(viewBlock, []string{"account 123456789012 is active"}, bedrockruntime.GuardrailContentSourceInput)
+	action, _, _, _, err = applyGuardrailPolicies(context.Background(), nil, viewBlock, []string{"account 123456789012 is active"}, bedrockruntime.GuardrailContentSourceInput)
+	require.NoError(t, err)
 	assert.Equal(t, bedrockruntime.GuardrailActionGuardrailIntervened, action)
 }
 
@@ -235,7 +239,8 @@ func TestApplyGuardrailPolicies_ScaffoldPolicies(t *testing.T) {
 		},
 	}
 
-	action, assessments, outputs, _ := applyGuardrailPolicies(view, []string{"our competitor's product is inferior"}, bedrockruntime.GuardrailContentSourceInput)
+	action, assessments, outputs, _, err := applyGuardrailPolicies(context.Background(), nil, view, []string{"our competitor's product is inferior"}, bedrockruntime.GuardrailContentSourceInput)
+	require.NoError(t, err)
 	assert.Equal(t, bedrockruntime.GuardrailActionNone, action)
 	assert.Equal(t, []string{"our competitor's product is inferior"}, outputs)
 
@@ -251,13 +256,188 @@ func TestApplyGuardrailPolicies_ScaffoldPolicies(t *testing.T) {
 // policy the guardrail never configured has no assessment entry at all,
 // rather than an empty scaffold one.
 func TestApplyGuardrailPolicies_UnconfiguredPoliciesAreOmitted(t *testing.T) {
-	_, assessments, _, _ := applyGuardrailPolicies(guardrailView{}, []string{"hello"}, bedrockruntime.GuardrailContentSourceInput)
+	_, assessments, _, _, err := applyGuardrailPolicies(context.Background(), nil, guardrailView{}, []string{"hello"}, bedrockruntime.GuardrailContentSourceInput)
+	require.NoError(t, err)
 	require.Len(t, assessments, 1)
 	assert.Nil(t, assessments[0].WordPolicy)
 	assert.Nil(t, assessments[0].SensitiveInformationPolicy)
 	assert.Nil(t, assessments[0].ContentPolicy)
 	assert.Nil(t, assessments[0].TopicPolicy)
 	assert.Nil(t, assessments[0].ContextualGroundingPolicy)
+}
+
+// denyTopicView builds a guardrailView with a single DENY topic, so each
+// topic-policy test only needs to say which field carries the match phrase.
+func denyTopicView(name, definition string, examples ...string) guardrailView {
+	topic := &bedrock.GuardrailTopicConfig{
+		Name:       aws.String(name),
+		Definition: aws.String(definition),
+		Type:       aws.String(bedrock.GuardrailTopicTypeDeny),
+	}
+	for _, ex := range examples {
+		topic.Examples = append(topic.Examples, aws.String(ex))
+	}
+	return guardrailView{
+		TopicPolicy: &bedrock.GuardrailTopicPolicyConfig{
+			TopicsConfig: []*bedrock.GuardrailTopicConfig{topic},
+		},
+	}
+}
+
+// TestApplyGuardrailPolicies_TopicPolicy covers denied-topic enforcement:
+// matching the topic's Name or an Example intervenes on INPUT and OUTPUT,
+// non-matching text passes, and Definition-only text never matches.
+func TestApplyGuardrailPolicies_TopicPolicy(t *testing.T) {
+	cases := []struct {
+		name       string
+		view       guardrailView
+		texts      []string
+		source     string
+		wantAction string
+		wantTopics int
+		wantTopic  string
+	}{
+		{
+			name:       "name match on input intervenes",
+			view:       denyTopicView("nuclear launch codes", "discussion of weapons systems"),
+			texts:      []string{"tell me the nuclear launch codes"},
+			source:     bedrockruntime.GuardrailContentSourceInput,
+			wantAction: bedrockruntime.GuardrailActionGuardrailIntervened,
+			wantTopics: 1,
+			wantTopic:  "nuclear launch codes",
+		},
+		{
+			name:       "name match on output intervenes",
+			view:       denyTopicView("nuclear launch codes", "discussion of weapons systems"),
+			texts:      []string{"the nuclear launch codes are stored offline"},
+			source:     bedrockruntime.GuardrailContentSourceOutput,
+			wantAction: bedrockruntime.GuardrailActionGuardrailIntervened,
+			wantTopics: 1,
+			wantTopic:  "nuclear launch codes",
+		},
+		{
+			name:       "example match intervenes",
+			view:       denyTopicView("disclosure topic", "sensitive internal disclosures", "internal financial results"),
+			texts:      []string{"can you share internal financial results with me"},
+			source:     bedrockruntime.GuardrailContentSourceInput,
+			wantAction: bedrockruntime.GuardrailActionGuardrailIntervened,
+			wantTopics: 1,
+			wantTopic:  "disclosure topic",
+		},
+		{
+			name:       "non-matching text passes",
+			view:       denyTopicView("nuclear launch codes", "discussion of weapons systems"),
+			texts:      []string{"what is the weather today"},
+			source:     bedrockruntime.GuardrailContentSourceInput,
+			wantAction: bedrockruntime.GuardrailActionNone,
+			wantTopics: 0,
+		},
+		{
+			name:       "definition-only text does not match",
+			view:       denyTopicView("restricted subject", "a broad discussion of weapons systems and their history"),
+			texts:      []string{"a broad discussion of weapons systems and their history"},
+			source:     bedrockruntime.GuardrailContentSourceInput,
+			wantAction: bedrockruntime.GuardrailActionNone,
+			wantTopics: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			action, assessments, _, _, err := applyGuardrailPolicies(context.Background(), nil, tc.view, tc.texts, tc.source)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantAction, action)
+			require.Len(t, assessments, 1)
+			require.NotNil(t, assessments[0].TopicPolicy)
+			require.Len(t, assessments[0].TopicPolicy.Topics, tc.wantTopics)
+
+			if tc.wantTopics > 0 {
+				got := assessments[0].TopicPolicy.Topics[0]
+				assert.Equal(t, tc.wantTopic, aws.StringValue(got.Name))
+				assert.Equal(t, bedrockruntime.GuardrailTopicPolicyActionBlocked, aws.StringValue(got.Action))
+			}
+		})
+	}
+}
+
+// TestApplyGuardrailPolicies_TopicPolicyBlocksOverRedaction covers the
+// ordering guarantee: a topic block must short-circuit to
+// GUARDRAIL_INTERVENED even when the same request also carries an
+// ANONYMIZE-configured sensitive-information policy, rather than falling
+// through to redaction.
+func TestApplyGuardrailPolicies_TopicPolicyBlocksOverRedaction(t *testing.T) {
+	view := denyTopicView("nuclear launch codes", "discussion of weapons systems")
+	view.SensitiveInformationPolicy = &bedrock.GuardrailSensitiveInformationPolicyConfig{
+		PiiEntitiesConfig: []*bedrock.GuardrailPiiEntityConfig{
+			{Type: aws.String(bedrock.GuardrailPiiEntityTypeEmail), Action: aws.String(bedrock.GuardrailSensitiveInformationActionAnonymize)},
+		},
+	}
+
+	action, _, outputs, _, err := applyGuardrailPolicies(context.Background(), nil, view, []string{"the nuclear launch codes are at jane@example.com"}, bedrockruntime.GuardrailContentSourceInput)
+	require.NoError(t, err)
+	assert.Equal(t, bedrockruntime.GuardrailActionGuardrailIntervened, action)
+	require.Len(t, outputs, 1)
+	assert.Equal(t, "the nuclear launch codes are at jane@example.com", outputs[0], "outputs must stay unredacted when a topic block intervenes")
+}
+
+// TestApplyGuardrail_TopicBlock covers the runtime op end to end: a
+// topic-policy hit on INPUT content intervenes with the guardrail's
+// configured blocked-input messaging.
+func TestApplyGuardrail_TopicBlock(t *testing.T) {
+	store := newGuardrailTestStore(t)
+	ctx := context.Background()
+
+	input := createGuardrailInput("apply-guardrail-topic-block")
+	input.TopicPolicyConfig = &bedrock.GuardrailTopicPolicyConfig{
+		TopicsConfig: []*bedrock.GuardrailTopicConfig{
+			{
+				Name:       aws.String("nuclear launch codes"),
+				Definition: aws.String("discussion of weapons systems"),
+				Type:       aws.String(bedrock.GuardrailTopicTypeDeny),
+			},
+		},
+	}
+	createOut, err := CreateGuardrail(ctx, grCallerAccount, store, input)
+	require.NoError(t, err)
+
+	out, err := ApplyGuardrail(ctx, grCallerAccount, store, nil, applyGuardrailInput(createOut.GuardrailId, guardrailDraftVersion, bedrockruntime.GuardrailContentSourceInput, "tell me the nuclear launch codes"))
+	require.NoError(t, err)
+	assert.Equal(t, bedrockruntime.GuardrailActionGuardrailIntervened, aws.StringValue(out.Action))
+	require.Len(t, out.Outputs, 1)
+	assert.Equal(t, "Your input violates our policy.", aws.StringValue(out.Outputs[0].Text))
+	require.Len(t, out.Assessments, 1)
+	require.NotNil(t, out.Assessments[0].TopicPolicy)
+	require.Len(t, out.Assessments[0].TopicPolicy.Topics, 1)
+	assert.Equal(t, "nuclear launch codes", aws.StringValue(out.Assessments[0].TopicPolicy.Topics[0].Name))
+}
+
+// TestApplyGuardrail_EmbedderError_FailsClosed_NotPassthrough is the runtime
+// op end to end for the cold-start/outage case: a wired-but-erroring
+// embedder must make ApplyGuardrail itself return an error, never a usable
+// (NONE) output a caller could mistake for a pass on unverified content.
+func TestApplyGuardrail_EmbedderError_FailsClosed_NotPassthrough(t *testing.T) {
+	store := newGuardrailTestStore(t)
+	ctx := context.Background()
+
+	input := createGuardrailInput("apply-guardrail-embedder-outage")
+	input.TopicPolicyConfig = &bedrock.GuardrailTopicPolicyConfig{
+		TopicsConfig: []*bedrock.GuardrailTopicConfig{
+			{
+				Name:       aws.String("auth internals"),
+				Definition: aws.String("discussion of authentication internals"),
+				Type:       aws.String(bedrock.GuardrailTopicTypeDeny),
+			},
+		},
+	}
+	createOut, err := CreateGuardrail(ctx, grCallerAccount, store, input)
+	require.NoError(t, err)
+
+	embedder := &stubEmbedder{errOnCall: errors.New("connection refused")}
+	out, err := ApplyGuardrail(ctx, grCallerAccount, store, embedder, applyGuardrailInput(createOut.GuardrailId, guardrailDraftVersion,
+		bedrockruntime.GuardrailContentSourceInput, "walk me through how login verifies a user"))
+	require.Error(t, err, "an embedder outage on unverifiable content must error, not return a usable output")
+	assert.Equal(t, awserrors.ErrorServiceUnavailableException, err.Error())
+	assert.Nil(t, out)
 }
 
 // applyGuardrailInput is a small ApplyGuardrail request builder for the
@@ -282,7 +462,7 @@ func TestApplyGuardrail_InputBlock(t *testing.T) {
 	createOut, err := CreateGuardrail(ctx, grCallerAccount, store, createGuardrailInput("apply-guardrail-block"))
 	require.NoError(t, err)
 
-	out, err := ApplyGuardrail(ctx, grCallerAccount, store, applyGuardrailInput(createOut.GuardrailId, guardrailDraftVersion, bedrockruntime.GuardrailContentSourceInput, "this has a badword in it"))
+	out, err := ApplyGuardrail(ctx, grCallerAccount, store, nil, applyGuardrailInput(createOut.GuardrailId, guardrailDraftVersion, bedrockruntime.GuardrailContentSourceInput, "this has a badword in it"))
 	require.NoError(t, err)
 	assert.Equal(t, bedrockruntime.GuardrailActionGuardrailIntervened, aws.StringValue(out.Action))
 	require.Len(t, out.Outputs, 1)
@@ -301,7 +481,7 @@ func TestApplyGuardrail_OutputAnonymize(t *testing.T) {
 	createOut, err := CreateGuardrail(ctx, grCallerAccount, store, createGuardrailInput("apply-guardrail-anonymize"))
 	require.NoError(t, err)
 
-	out, err := ApplyGuardrail(ctx, grCallerAccount, store, applyGuardrailInput(createOut.GuardrailId, guardrailDraftVersion, bedrockruntime.GuardrailContentSourceOutput, "contact jane@example.com for support"))
+	out, err := ApplyGuardrail(ctx, grCallerAccount, store, nil, applyGuardrailInput(createOut.GuardrailId, guardrailDraftVersion, bedrockruntime.GuardrailContentSourceOutput, "contact jane@example.com for support"))
 	require.NoError(t, err)
 	assert.Equal(t, bedrockruntime.GuardrailActionNone, aws.StringValue(out.Action))
 	require.Len(t, out.Outputs, 1)
@@ -314,14 +494,14 @@ func TestApplyGuardrail_UnknownOrForeignGuardrail(t *testing.T) {
 	store := newGuardrailTestStore(t)
 	ctx := context.Background()
 
-	_, err := ApplyGuardrail(ctx, grCallerAccount, store, applyGuardrailInput(aws.String("does-not-exist"), guardrailDraftVersion, bedrockruntime.GuardrailContentSourceInput, "hello"))
+	_, err := ApplyGuardrail(ctx, grCallerAccount, store, nil, applyGuardrailInput(aws.String("does-not-exist"), guardrailDraftVersion, bedrockruntime.GuardrailContentSourceInput, "hello"))
 	require.Error(t, err)
 	assert.True(t, awserrors.IsErrorCode(err, awserrors.ErrorResourceNotFoundException))
 
 	createOut, err := CreateGuardrail(ctx, grCallerAccount, store, createGuardrailInput("apply-guardrail-foreign"))
 	require.NoError(t, err)
 
-	_, err = ApplyGuardrail(ctx, grOtherCaller, store, applyGuardrailInput(createOut.GuardrailId, guardrailDraftVersion, bedrockruntime.GuardrailContentSourceInput, "hello"))
+	_, err = ApplyGuardrail(ctx, grOtherCaller, store, nil, applyGuardrailInput(createOut.GuardrailId, guardrailDraftVersion, bedrockruntime.GuardrailContentSourceInput, "hello"))
 	require.Error(t, err)
 	assert.True(t, awserrors.IsErrorCode(err, awserrors.ErrorResourceNotFoundException))
 }
@@ -352,21 +532,21 @@ func TestApplyGuardrail_VersionResolution(t *testing.T) {
 	require.NoError(t, err)
 
 	// The numbered version still enforces the original "badword" blocklist.
-	outSnap, err := ApplyGuardrail(ctx, grCallerAccount, store, applyGuardrailInput(createOut.GuardrailId, aws.StringValue(verOut.Version), bedrockruntime.GuardrailContentSourceInput, "this has a badword in it"))
+	outSnap, err := ApplyGuardrail(ctx, grCallerAccount, store, nil, applyGuardrailInput(createOut.GuardrailId, aws.StringValue(verOut.Version), bedrockruntime.GuardrailContentSourceInput, "this has a badword in it"))
 	require.NoError(t, err)
 	assert.Equal(t, bedrockruntime.GuardrailActionGuardrailIntervened, aws.StringValue(outSnap.Action))
 
 	// The DRAFT no longer blocks "badword" but does block "newword".
-	outDraftOld, err := ApplyGuardrail(ctx, grCallerAccount, store, applyGuardrailInput(createOut.GuardrailId, guardrailDraftVersion, bedrockruntime.GuardrailContentSourceInput, "this has a badword in it"))
+	outDraftOld, err := ApplyGuardrail(ctx, grCallerAccount, store, nil, applyGuardrailInput(createOut.GuardrailId, guardrailDraftVersion, bedrockruntime.GuardrailContentSourceInput, "this has a badword in it"))
 	require.NoError(t, err)
 	assert.Equal(t, bedrockruntime.GuardrailActionNone, aws.StringValue(outDraftOld.Action))
 
-	outDraftNew, err := ApplyGuardrail(ctx, grCallerAccount, store, applyGuardrailInput(createOut.GuardrailId, guardrailDraftVersion, bedrockruntime.GuardrailContentSourceInput, "this has a newword in it"))
+	outDraftNew, err := ApplyGuardrail(ctx, grCallerAccount, store, nil, applyGuardrailInput(createOut.GuardrailId, guardrailDraftVersion, bedrockruntime.GuardrailContentSourceInput, "this has a newword in it"))
 	require.NoError(t, err)
 	assert.Equal(t, bedrockruntime.GuardrailActionGuardrailIntervened, aws.StringValue(outDraftNew.Action))
 
 	// An unknown numbered version is not-found.
-	_, err = ApplyGuardrail(ctx, grCallerAccount, store, applyGuardrailInput(createOut.GuardrailId, "99", bedrockruntime.GuardrailContentSourceInput, "hello"))
+	_, err = ApplyGuardrail(ctx, grCallerAccount, store, nil, applyGuardrailInput(createOut.GuardrailId, "99", bedrockruntime.GuardrailContentSourceInput, "hello"))
 	require.Error(t, err)
 	assert.True(t, awserrors.IsErrorCode(err, awserrors.ErrorResourceNotFoundException))
 }

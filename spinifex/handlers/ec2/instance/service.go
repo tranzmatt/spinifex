@@ -88,7 +88,7 @@ type StoppedInstanceStore interface {
 	// UpdateStoppedInstance atomically applies mutate to the current stopped
 	// record under optimistic concurrency (CAS) with createIfAbsent=false, so
 	// a caller racing a winning ClaimStoppedInstance gets a clean
-	// jetstream.ErrKeyNotFound instead of resurrecting a deleted record.
+	// kvstore.ErrNotFound instead of resurrecting a deleted record.
 	UpdateStoppedInstance(instanceID string, mutate func(*vm.VM)) (*vm.VM, error)
 	WriteTerminatedInstance(instanceID string, instance *vm.VM) error
 	// ClaimStoppedInstance atomically removes instanceID's record and
@@ -127,6 +127,13 @@ type VolumeDeleter interface {
 // ENIDeleter deletes ENIs. Implemented by handlers/ec2/vpc's VPCServiceImpl.
 type ENIDeleter interface {
 	DeleteNetworkInterface(ctx context.Context, input *ec2.DeleteNetworkInterfaceInput, accountID string) (*ec2.DeleteNetworkInterfaceOutput, error)
+
+	// DetachAndDeleteENI releases an ENI under a single KV read. A separate
+	// DetachENI + DeleteNetworkInterface pair lets a lagging replica serve the
+	// delete's read the pre-detach record, which then rejects as in-use and
+	// strands the interface. force skips the in-use guard for an owner
+	// tearing down its own ENI. deleted is false when the ENI was already gone.
+	DetachAndDeleteENI(ctx context.Context, accountID, eniID string, force bool) (deleted bool, err error)
 }
 
 // PublicIPReleaser releases a previously allocated public IP back to a pool.

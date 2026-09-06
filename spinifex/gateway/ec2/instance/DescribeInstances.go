@@ -17,6 +17,24 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+// defaultDescribeFanoutTimeout is the hard deadline the describe fan-out waits
+// for node replies before treating the sweep as incomplete.
+const defaultDescribeFanoutTimeout = 3 * time.Second
+
+// describeConfig holds the tunable knobs of the describe fan-out.
+type describeConfig struct {
+	fanoutTimeout time.Duration
+}
+
+// DescribeOption customises a describe fan-out. Production callers pass none
+// and get defaultDescribeFanoutTimeout.
+type DescribeOption func(*describeConfig)
+
+// WithFanoutTimeout overrides the fan-out deadline.
+func WithFanoutTimeout(d time.Duration) DescribeOption {
+	return func(c *describeConfig) { c.fanoutTimeout = d }
+}
+
 // DescribeInstances fans out to all nodes via NATS and aggregates the results.
 // It is lenient: partial results from a slow or unreachable node are returned
 // without error, and an explicitly named instance ID that is simply absent
@@ -28,8 +46,8 @@ import (
 // which adds the InvalidInstanceID.NotFound assertion AWS callers expect.
 // Callers that must not act on a partial view at all (the quota reconcile)
 // use DescribeInstancesForReconcile.
-func DescribeInstances(ctx context.Context, input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string) (*ec2.DescribeInstancesOutput, error) {
-	reservations, _, firstClient4xx, err := gatherInstances(ctx, input, natsConn, expectedNodes, accountID)
+func DescribeInstances(ctx context.Context, input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string, opts ...DescribeOption) (*ec2.DescribeInstancesOutput, error) {
+	reservations, _, firstClient4xx, err := gatherInstances(ctx, input, natsConn, expectedNodes, accountID, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -49,8 +67,8 @@ func DescribeInstances(ctx context.Context, input *ec2.DescribeInstancesInput, n
 // fan-out must never turn into a false NotFound for an instance that actually
 // exists on that node. A --filters-only query (no explicit IDs) is never
 // affected and keeps returning an empty list with no error.
-func DescribeInstancesChecked(ctx context.Context, input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string) (*ec2.DescribeInstancesOutput, error) {
-	reservations, complete, firstClient4xx, err := gatherInstances(ctx, input, natsConn, expectedNodes, accountID)
+func DescribeInstancesChecked(ctx context.Context, input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string, opts ...DescribeOption) (*ec2.DescribeInstancesOutput, error) {
+	reservations, complete, firstClient4xx, err := gatherInstances(ctx, input, natsConn, expectedNodes, accountID, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -77,12 +95,13 @@ func DescribeInstancesChecked(ctx context.Context, input *ec2.DescribeInstancesI
 	return &ec2.DescribeInstancesOutput{Reservations: reservations}, nil
 }
 
-// DescribeInstancesForReconcile is the strict variant the quota reconcile uses.
-// complete is true only when the sweep observed every expected node and both
-// instance buckets, so reconcile may lower a counter only from a provably
-// complete view. A partial sweep — a node down, a timed-out fan-out, or a failed
-// bucket query — returns complete=false, and reconcile leaves the counter for the
-// next clean pass rather than under-counting usage and lifting the cap.
+// DescribeInstancesForReconcile is the strict variant, for a caller that may act
+// only on a provably whole view. complete is true only when the sweep observed
+// every expected node and both instance buckets; a partial sweep — a node down,
+// a timed-out fan-out, or a failed bucket query — returns complete=false so the
+// caller can decline to act rather than act on a short count. The quota vCPU
+// sweep reads the instance record space instead of this; the retype gate and the
+// volume delete guard are what still call it.
 func DescribeInstancesForReconcile(ctx context.Context, input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string) (reservations []*ec2.Reservation, complete bool, err error) {
 	reservations, complete, _, err = gatherInstances(ctx, input, natsConn, expectedNodes, accountID)
 	return reservations, complete, err
@@ -94,7 +113,12 @@ func DescribeInstancesForReconcile(ctx context.Context, input *ec2.DescribeInsta
 // both bucket queries succeeded — the precondition reconcile needs before it may
 // lower a counter. firstClient4xx carries the first deterministic 4xx for the
 // lenient caller to surface when nothing was collected.
-func gatherInstances(ctx context.Context, input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string) (reservations []*ec2.Reservation, complete bool, firstClient4xx string, err error) {
+func gatherInstances(ctx context.Context, input *ec2.DescribeInstancesInput, natsConn *nats.Conn, expectedNodes int, accountID string, opts ...DescribeOption) (reservations []*ec2.Reservation, complete bool, firstClient4xx string, err error) {
+	cfg := describeConfig{fanoutTimeout: defaultDescribeFanoutTimeout}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	jsonData, err := json.Marshal(input)
 	if err != nil {
 		slog.ErrorContext(ctx, "DescribeInstances: Failed to marshal input", "err", err)
@@ -102,7 +126,7 @@ func gatherInstances(ctx context.Context, input *ec2.DescribeInstancesInput, nat
 	}
 
 	frames, sum, err := utils.Gather(ctx, natsConn, "ec2.DescribeInstances", jsonData,
-		utils.GatherOpts{Timeout: 3 * time.Second, ExpectedNodes: expectedNodes, AccountID: accountID})
+		utils.GatherOpts{Timeout: cfg.fanoutTimeout, ExpectedNodes: expectedNodes, AccountID: accountID})
 	if err != nil {
 		return nil, false, "", err
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -30,6 +31,7 @@ func createTestSG(t *testing.T, svc *VPCServiceImpl, vpcID, name string) string 
 // --- CreateSecurityGroup ---
 
 func TestCreateSecurityGroup_Success(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
@@ -43,6 +45,7 @@ func TestCreateSecurityGroup_Success(t *testing.T) {
 }
 
 func TestCreateSecurityGroup_MissingGroupName(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 
 	_, err := svc.CreateSecurityGroup(context.Background(), &ec2.CreateSecurityGroupInput{
@@ -52,6 +55,7 @@ func TestCreateSecurityGroup_MissingGroupName(t *testing.T) {
 }
 
 func TestCreateSecurityGroup_MissingVpcId(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 
 	_, err := svc.CreateSecurityGroup(context.Background(), &ec2.CreateSecurityGroupInput{
@@ -61,6 +65,7 @@ func TestCreateSecurityGroup_MissingVpcId(t *testing.T) {
 }
 
 func TestCreateSecurityGroup_InvalidVpc(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 
 	_, err := svc.CreateSecurityGroup(context.Background(), &ec2.CreateSecurityGroupInput{
@@ -72,6 +77,7 @@ func TestCreateSecurityGroup_InvalidVpc(t *testing.T) {
 }
 
 func TestCreateSecurityGroup_DuplicateName(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
@@ -92,6 +98,7 @@ func TestCreateSecurityGroup_DuplicateName(t *testing.T) {
 // --- DeleteSecurityGroup ---
 
 func TestDeleteSecurityGroup_Success(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "delete-me")
@@ -110,6 +117,7 @@ func TestDeleteSecurityGroup_Success(t *testing.T) {
 }
 
 func TestDeleteSecurityGroup_MissingGroupId(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 
 	_, err := svc.DeleteSecurityGroup(context.Background(), &ec2.DeleteSecurityGroupInput{}, testAccountID)
@@ -119,6 +127,7 @@ func TestDeleteSecurityGroup_MissingGroupId(t *testing.T) {
 // --- DescribeSecurityGroups ---
 
 func TestDescribeSecurityGroups_All(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	createTestSG(t, svc, vpcID, "sg-a")
@@ -131,6 +140,7 @@ func TestDescribeSecurityGroups_All(t *testing.T) {
 }
 
 func TestDescribeSecurityGroups_ByGroupId(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "target-sg")
@@ -145,6 +155,7 @@ func TestDescribeSecurityGroups_ByGroupId(t *testing.T) {
 }
 
 func TestDescribeSecurityGroups_ByGroupName(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	createTestSG(t, svc, vpcID, "find-me")
@@ -161,6 +172,7 @@ func TestDescribeSecurityGroups_ByGroupName(t *testing.T) {
 }
 
 func TestDescribeSecurityGroups_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 
 	_, err := svc.DescribeSecurityGroups(context.Background(), &ec2.DescribeSecurityGroupsInput{
@@ -173,6 +185,7 @@ func TestDescribeSecurityGroups_NotFound(t *testing.T) {
 // --- AuthorizeSecurityGroupIngress ---
 
 func TestAuthorizeSecurityGroupIngress_Success(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "ingress-sg")
@@ -200,6 +213,7 @@ func TestAuthorizeSecurityGroupIngress_Success(t *testing.T) {
 }
 
 func TestAuthorizeSecurityGroupIngress_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 
 	_, err := svc.AuthorizeSecurityGroupIngress(context.Background(), &ec2.AuthorizeSecurityGroupIngressInput{
@@ -210,6 +224,7 @@ func TestAuthorizeSecurityGroupIngress_NotFound(t *testing.T) {
 }
 
 func TestAuthorizeSecurityGroupIngress_MissingGroupId(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 
 	_, err := svc.AuthorizeSecurityGroupIngress(context.Background(), &ec2.AuthorizeSecurityGroupIngressInput{}, testAccountID)
@@ -219,6 +234,7 @@ func TestAuthorizeSecurityGroupIngress_MissingGroupId(t *testing.T) {
 // --- AuthorizeSecurityGroupEgress ---
 
 func TestAuthorizeSecurityGroupEgress_Success(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "egress-sg")
@@ -239,6 +255,7 @@ func TestAuthorizeSecurityGroupEgress_Success(t *testing.T) {
 }
 
 func TestAuthorizeSecurityGroupEgress_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 
 	_, err := svc.AuthorizeSecurityGroupEgress(context.Background(), &ec2.AuthorizeSecurityGroupEgressInput{
@@ -250,6 +267,7 @@ func TestAuthorizeSecurityGroupEgress_NotFound(t *testing.T) {
 // The AWS provider reads SecurityGroupRules[0].SecurityGroupRuleId on create;
 // an empty ruleset panics the plugin. Authorize must echo the created rules.
 func TestAuthorizeSecurityGroupIngress_ReturnsRuleSet(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "ingress-ruleset-sg")
@@ -277,6 +295,7 @@ func TestAuthorizeSecurityGroupIngress_ReturnsRuleSet(t *testing.T) {
 }
 
 func TestAuthorizeSecurityGroupEgress_ReturnsRuleSet(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "egress-ruleset-sg")
@@ -301,6 +320,7 @@ func TestAuthorizeSecurityGroupEgress_ReturnsRuleSet(t *testing.T) {
 // --- RevokeSecurityGroupIngress ---
 
 func TestRevokeSecurityGroupIngress_Success(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "revoke-ingress-sg")
@@ -329,6 +349,7 @@ func TestRevokeSecurityGroupIngress_Success(t *testing.T) {
 }
 
 func TestRevokeSecurityGroupIngress_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 
 	_, err := svc.RevokeSecurityGroupIngress(context.Background(), &ec2.RevokeSecurityGroupIngressInput{
@@ -341,6 +362,7 @@ func TestRevokeSecurityGroupIngress_NotFound(t *testing.T) {
 // rule returns InvalidPermission.NotFound, matching AWS non-idempotent
 // revoke behavior.
 func TestRevokeSecurityGroupIngress_RuleNotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "rule-notfound-ingress")
@@ -362,6 +384,7 @@ func TestRevokeSecurityGroupIngress_RuleNotFound(t *testing.T) {
 // --- RevokeSecurityGroupEgress ---
 
 func TestRevokeSecurityGroupEgress_Success(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "revoke-egress-sg")
@@ -381,6 +404,7 @@ func TestRevokeSecurityGroupEgress_Success(t *testing.T) {
 }
 
 func TestRevokeSecurityGroupEgress_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 
 	_, err := svc.RevokeSecurityGroupEgress(context.Background(), &ec2.RevokeSecurityGroupEgressInput{
@@ -393,6 +417,7 @@ func TestRevokeSecurityGroupEgress_NotFound(t *testing.T) {
 // IPv6-only permission succeeds as a no-op; Terraform auto-revokes ::/0 IPv6
 // egress and must not abort when spinifex stores no IPv6 rules.
 func TestRevokeSecurityGroupEgress_IPv6OnlyIsNoOp(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "ipv6-revoke-noop")
@@ -413,6 +438,7 @@ func TestRevokeSecurityGroupEgress_IPv6OnlyIsNoOp(t *testing.T) {
 // TestRevokeSecurityGroupIngress_IPv6OnlyIsNoOp mirrors the egress no-op test
 // — the ingress path shares the same parsing code and must behave the same.
 func TestRevokeSecurityGroupIngress_IPv6OnlyIsNoOp(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "ipv6-revoke-ingress-noop")
@@ -433,6 +459,7 @@ func TestRevokeSecurityGroupIngress_IPv6OnlyIsNoOp(t *testing.T) {
 // TestAuthorizeSecurityGroupEgress_IPv6Rejected asserts that authorizing
 // IPv6 sources is rejected; spinifex cannot program IPv6 OVN ACLs.
 func TestAuthorizeSecurityGroupEgress_IPv6Rejected(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "ipv6-authorize-rejected")
@@ -452,6 +479,7 @@ func TestAuthorizeSecurityGroupEgress_IPv6Rejected(t *testing.T) {
 // TestRevokeSecurityGroupEgress_RuleNotFound: egress counterpart — revoking a
 // non-existent egress rule returns InvalidPermission.NotFound.
 func TestRevokeSecurityGroupEgress_RuleNotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "rule-notfound-egress")
@@ -501,12 +529,53 @@ func ingressRuleIDReferencing(t *testing.T, svc *VPCServiceImpl, sgID, srcSG str
 	return ""
 }
 
+// TestDeleteSecurityGroup_DependencyViolationNamesENI pins that the refusal
+// identifies the attached ENI. A bare code forces the blocking id to be
+// recovered by cross-referencing the whole ENI table after the fact.
+func TestDeleteSecurityGroup_DependencyViolationNamesENI(t *testing.T) {
+	t.Parallel()
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
+	subnetID := createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
+	sgID := createTestSG(t, svc, vpcID, "attached-sg")
+	eniID := createAutoENI(t, svc, subnetID, "i-holder", []string{sgID}, time.Hour)
+
+	_, err := svc.DeleteSecurityGroup(context.Background(), &ec2.DeleteSecurityGroupInput{
+		GroupId: aws.String(sgID),
+	}, testAccountID)
+	require.Error(t, err)
+	code, _ := awserrors.ResolveErrorCode(err)
+	assert.Equal(t, awserrors.ErrorDependencyViolation, code)
+	assert.ErrorContains(t, err, eniID, "the refusal must name the blocking ENI")
+}
+
+// TestDeleteSecurityGroup_DependencyViolationNamesReferencingSG pins the same
+// for the SourceSG case: the group holding the rule is named, not just the code.
+func TestDeleteSecurityGroup_DependencyViolationNamesReferencingSG(t *testing.T) {
+	t.Parallel()
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
+	targetSG := createTestSG(t, svc, vpcID, "referenced-sg")
+	holderSG := createTestSG(t, svc, vpcID, "holder-sg")
+
+	authorizeIngressFromSG(t, svc, holderSG, targetSG)
+
+	_, err := svc.DeleteSecurityGroup(context.Background(), &ec2.DeleteSecurityGroupInput{
+		GroupId: aws.String(targetSG),
+	}, testAccountID)
+	require.Error(t, err)
+	code, _ := awserrors.ResolveErrorCode(err)
+	assert.Equal(t, awserrors.ErrorDependencyViolation, code)
+	assert.ErrorContains(t, err, holderSG, "the refusal must name the referencing security group")
+}
+
 // TestRevokeSecurityGroupIngress_ByRuleID_BreaksMutualReferenceTeardown
 // reproduces a Terraform destroy of two mutually-referencing SGs. Modern TF
 // (aws_vpc_security_group_ingress_rule) revokes each rule by SecurityGroupRuleId
 // with empty IpPermissions; if the handler ignores SecurityGroupRuleIds the
 // cross-ref rule survives and DeleteSecurityGroup deadlocks on DependencyViolation.
 func TestRevokeSecurityGroupIngress_ByRuleID_BreaksMutualReferenceTeardown(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgA := createTestSG(t, svc, vpcID, "tf-sg-a")
@@ -537,6 +606,7 @@ func TestRevokeSecurityGroupIngress_ByRuleID_BreaksMutualReferenceTeardown(t *te
 }
 
 func TestRevokeSecurityGroupEgress_ByRuleID_RemovesRule(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "tf-egress-byid")
@@ -569,6 +639,7 @@ func TestRevokeSecurityGroupEgress_ByRuleID_RemovesRule(t *testing.T) {
 }
 
 func TestRevokeSecurityGroupIngress_ByRuleID_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "tf-byid-notfound")
@@ -581,6 +652,7 @@ func TestRevokeSecurityGroupIngress_ByRuleID_NotFound(t *testing.T) {
 }
 
 func TestRevokeSecurityGroupIngress_ByRuleID_Malformed(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "tf-byid-malformed")
@@ -595,6 +667,7 @@ func TestRevokeSecurityGroupIngress_ByRuleID_Malformed(t *testing.T) {
 // --- Helper function tests ---
 
 func TestIpPermissionsToSGRules_TCP(t *testing.T) {
+	t.Parallel()
 	proto := "tcp"
 	perms := []*ec2.IpPermission{
 		{
@@ -615,6 +688,7 @@ func TestIpPermissionsToSGRules_TCP(t *testing.T) {
 }
 
 func TestIpPermissionsToSGRules_AllTraffic(t *testing.T) {
+	t.Parallel()
 	allProto := "-1"
 	perms := []*ec2.IpPermission{
 		{
@@ -630,6 +704,7 @@ func TestIpPermissionsToSGRules_AllTraffic(t *testing.T) {
 }
 
 func TestIpPermissionsToSGRules_SourceSG(t *testing.T) {
+	t.Parallel()
 	proto := "-1"
 	srcSG := "sg-0123456789abcdef0"
 	perms := []*ec2.IpPermission{
@@ -648,6 +723,7 @@ func TestIpPermissionsToSGRules_SourceSG(t *testing.T) {
 // TestIpPermissionsToSGRules_IPv6OnlyAuthorize rejects authorize calls whose
 // only source is Ipv6Ranges (OVN ACL builder is IPv4-only).
 func TestIpPermissionsToSGRules_IPv6OnlyAuthorize(t *testing.T) {
+	t.Parallel()
 	allProto := "-1"
 	perms := []*ec2.IpPermission{
 		{
@@ -665,6 +741,7 @@ func TestIpPermissionsToSGRules_IPv6OnlyAuthorize(t *testing.T) {
 // revoke (returns zero rules, no error), matching Terraform's auto-revoke of
 // the default ::/0 IPv6 egress rule.
 func TestIpPermissionsToSGRules_IPv6OnlyRevoke(t *testing.T) {
+	t.Parallel()
 	allProto := "-1"
 	perms := []*ec2.IpPermission{
 		{
@@ -681,6 +758,7 @@ func TestIpPermissionsToSGRules_IPv6OnlyRevoke(t *testing.T) {
 // TestIpPermissionsToSGRules_MixedV4V6Revoke keeps the v4 rule and drops the
 // v6 part on a mixed-source permission on revoke.
 func TestIpPermissionsToSGRules_MixedV4V6Revoke(t *testing.T) {
+	t.Parallel()
 	proto := "tcp"
 	perms := []*ec2.IpPermission{
 		{
@@ -699,6 +777,7 @@ func TestIpPermissionsToSGRules_MixedV4V6Revoke(t *testing.T) {
 }
 
 func TestSGRulesToIpPermissions_Conversion(t *testing.T) {
+	t.Parallel()
 	rules := []SGRule{
 		{IpProtocol: "tcp", FromPort: 443, ToPort: 443, CidrIp: "0.0.0.0/0"},
 		{IpProtocol: "-1", SourceSG: "sg-other"},
@@ -728,6 +807,7 @@ func TestSGRulesToIpPermissions_Conversion(t *testing.T) {
 }
 
 func TestSGRuleKey(t *testing.T) {
+	t.Parallel()
 	rule := SGRule{IpProtocol: "tcp", FromPort: 80, ToPort: 80, CidrIp: "10.0.0.0/8"}
 	key := sgRuleKey(rule)
 	assert.NotEmpty(t, key)
@@ -743,6 +823,7 @@ func TestSGRuleKey(t *testing.T) {
 }
 
 func TestSGRecordToEC2_Basic(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 
 	record := &SecurityGroupRecord{
@@ -770,6 +851,7 @@ func TestSGRecordToEC2_Basic(t *testing.T) {
 }
 
 func TestRemoveSGRules_MatchingRule(t *testing.T) {
+	t.Parallel()
 	existing := []SGRule{
 		{IpProtocol: "tcp", FromPort: 22, ToPort: 22, CidrIp: "10.0.0.0/8"},
 		{IpProtocol: "tcp", FromPort: 80, ToPort: 80, CidrIp: "0.0.0.0/0"},
@@ -784,6 +866,7 @@ func TestRemoveSGRules_MatchingRule(t *testing.T) {
 }
 
 func TestRemoveSGRules_NoMatch(t *testing.T) {
+	t.Parallel()
 	existing := []SGRule{
 		{IpProtocol: "tcp", FromPort: 80, ToPort: 80, CidrIp: "0.0.0.0/0"},
 	}
@@ -798,6 +881,7 @@ func TestRemoveSGRules_NoMatch(t *testing.T) {
 // --- SG-rule input validation (OVN ACL match-expression injection) ---
 
 func TestValidateSGRule(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name    string
 		rule    SGRule
@@ -825,6 +909,12 @@ func TestValidateSGRule(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			// Fixtures exercise CidrIp/SourceSG; supply a valid protocol so the
+			// protocol check is never what fails.
+			if c.rule.IpProtocol == "" {
+				c.rule.IpProtocol = "-1"
+			}
 			err := validateSGRule(c.rule)
 			if c.wantErr {
 				assert.Error(t, err)
@@ -835,10 +925,49 @@ func TestValidateSGRule(t *testing.T) {
 	}
 }
 
+// validateSGRule is the last gate before the OVN ACL builder, which emits no L4
+// predicate for a protocol it does not recognise. Only canonical names pass.
+func TestValidateSGRule_Protocol(t *testing.T) {
+	t.Parallel()
+	for _, proto := range []string{"tcp", "udp", "icmp", "-1"} {
+		assert.NoError(t, validateSGRule(SGRule{IpProtocol: proto, CidrIp: "10.0.0.0/8"}), "protocol %q", proto)
+	}
+	for _, proto := range []string{"", "6", "17", "1", "58", "47", "icmpv6", "banana"} {
+		assert.Error(t, validateSGRule(SGRule{IpProtocol: proto, CidrIp: "10.0.0.0/8"}), "protocol %q", proto)
+	}
+}
+
+func TestNormalizeIPProtocol(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"":     "-1",
+		"-1":   "-1",
+		"tcp":  "tcp",
+		"TCP":  "tcp",
+		"6":    "tcp",
+		"udp":  "udp",
+		"17":   "udp",
+		"icmp": "icmp",
+		"1":    "icmp",
+	}
+	for in, want := range cases {
+		got, err := normalizeIPProtocol(in)
+		assert.NoError(t, err, "protocol %q", in)
+		assert.Equal(t, want, got, "protocol %q", in)
+	}
+
+	// 58/icmpv6 is rejected with the rest: the ACL builder is IPv4-only.
+	for _, in := range []string{"58", "icmpv6", "47", "50", "0", "256", "banana", "tcp; drop"} {
+		_, err := normalizeIPProtocol(in)
+		assert.Error(t, err, "protocol %q", in)
+	}
+}
+
 // Each handler smoke-test confirms the wire-up to ipPermissionsToSGRules; the
 // full payload table lives in TestValidateSGRule above.
 
 func TestAuthorizeSecurityGroupIngress_RejectsInvalidRule(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "inj-sg")
@@ -858,6 +987,7 @@ func TestAuthorizeSecurityGroupIngress_RejectsInvalidRule(t *testing.T) {
 }
 
 func TestAuthorizeSecurityGroupEgress_RejectsInvalidRule(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "inj-sg-egress")
@@ -875,6 +1005,7 @@ func TestAuthorizeSecurityGroupEgress_RejectsInvalidRule(t *testing.T) {
 }
 
 func TestRevokeSecurityGroupIngress_RejectsInvalidRule(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "inj-sg-revoke")
@@ -894,6 +1025,7 @@ func TestRevokeSecurityGroupIngress_RejectsInvalidRule(t *testing.T) {
 }
 
 func TestAuthorizeSecurityGroupIngress_AcceptsValidSourceSG(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "valid-src-sg")
@@ -910,9 +1042,76 @@ func TestAuthorizeSecurityGroupIngress_AcceptsValidSourceSG(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// --protocol 6 must be stored as tcp, so it builds the same ACL as
+// --protocol tcp instead of an L4-less match that allows every IP protocol.
+func TestAuthorizeSecurityGroupIngress_NormalizesNumericProtocol(t *testing.T) {
+	t.Parallel()
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
+	sgID := createTestSG(t, svc, vpcID, "numeric-proto-sg")
+
+	_, err := svc.AuthorizeSecurityGroupIngress(context.Background(), &ec2.AuthorizeSecurityGroupIngressInput{
+		GroupId: aws.String(sgID),
+		IpPermissions: []*ec2.IpPermission{{
+			IpProtocol: aws.String("6"),
+			FromPort:   aws.Int64(22),
+			ToPort:     aws.Int64(22),
+			IpRanges:   []*ec2.IpRange{{CidrIp: aws.String("10.0.0.0/8")}},
+		}},
+	}, testAccountID)
+	require.NoError(t, err)
+
+	out, err := svc.DescribeSecurityGroups(context.Background(), &ec2.DescribeSecurityGroupsInput{
+		GroupIds: []*string{aws.String(sgID)},
+	}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, out.SecurityGroups, 1)
+	require.Len(t, out.SecurityGroups[0].IpPermissions, 1)
+	assert.Equal(t, "tcp", aws.StringValue(out.SecurityGroups[0].IpPermissions[0].IpProtocol))
+
+	// The rule was authorized as "6"; revoking it as "tcp" must match.
+	_, err = svc.RevokeSecurityGroupIngress(context.Background(), &ec2.RevokeSecurityGroupIngressInput{
+		GroupId: aws.String(sgID),
+		IpPermissions: []*ec2.IpPermission{{
+			IpProtocol: aws.String("tcp"),
+			FromPort:   aws.Int64(22),
+			ToPort:     aws.Int64(22),
+			IpRanges:   []*ec2.IpRange{{CidrIp: aws.String("10.0.0.0/8")}},
+		}},
+	}, testAccountID)
+	require.NoError(t, err)
+
+	out, err = svc.DescribeSecurityGroups(context.Background(), &ec2.DescribeSecurityGroupsInput{
+		GroupIds: []*string{aws.String(sgID)},
+	}, testAccountID)
+	require.NoError(t, err)
+	require.Len(t, out.SecurityGroups, 1)
+	assert.Empty(t, out.SecurityGroups[0].IpPermissions)
+}
+
+func TestAuthorizeSecurityGroupIngress_RejectsUnsupportedProtocol(t *testing.T) {
+	t.Parallel()
+	svc := setupTestVPCService(t)
+	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
+	sgID := createTestSG(t, svc, vpcID, "bad-proto-sg")
+
+	for _, proto := range []string{"58", "icmpv6", "47", "banana"} {
+		_, err := svc.AuthorizeSecurityGroupIngress(context.Background(), &ec2.AuthorizeSecurityGroupIngressInput{
+			GroupId: aws.String(sgID),
+			IpPermissions: []*ec2.IpPermission{{
+				IpProtocol: aws.String(proto),
+				IpRanges:   []*ec2.IpRange{{CidrIp: aws.String("10.0.0.0/8")}},
+			}},
+		}, testAccountID)
+		require.Error(t, err, "protocol %q", proto)
+		assert.Contains(t, err.Error(), "InvalidParameterValue")
+	}
+}
+
 // --- DescribeSecurityGroups filter tests ---
 
 func TestDescribeSecurityGroups_FilterByGroupId(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "target-sg")
@@ -929,6 +1128,7 @@ func TestDescribeSecurityGroups_FilterByGroupId(t *testing.T) {
 }
 
 func TestDescribeSecurityGroups_FilterByDescription(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
@@ -957,6 +1157,7 @@ func TestDescribeSecurityGroups_FilterByDescription(t *testing.T) {
 }
 
 func TestDescribeSecurityGroups_FilterByVpcId(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpc1 := createTestVPC(t, svc, "10.0.0.0/16")
 	vpc2 := createTestVPC(t, svc, "172.16.0.0/16")
@@ -977,6 +1178,7 @@ func TestDescribeSecurityGroups_FilterByVpcId(t *testing.T) {
 }
 
 func TestDescribeSecurityGroups_FilterByIpPermissionCidr(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "cidr-sg")
@@ -1009,6 +1211,7 @@ func TestDescribeSecurityGroups_FilterByIpPermissionCidr(t *testing.T) {
 }
 
 func TestDescribeSecurityGroups_FilterMultipleValues_OR(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	createTestSG(t, svc, vpcID, "sg-alpha")
@@ -1025,6 +1228,7 @@ func TestDescribeSecurityGroups_FilterMultipleValues_OR(t *testing.T) {
 }
 
 func TestDescribeSecurityGroups_FilterMultipleFilters_AND(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpc1 := createTestVPC(t, svc, "10.0.0.0/16")
 	vpc2 := createTestVPC(t, svc, "172.16.0.0/16")
@@ -1043,6 +1247,7 @@ func TestDescribeSecurityGroups_FilterMultipleFilters_AND(t *testing.T) {
 }
 
 func TestDescribeSecurityGroups_FilterUnknownName_Error(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 
 	_, err := svc.DescribeSecurityGroups(context.Background(), &ec2.DescribeSecurityGroupsInput{
@@ -1054,6 +1259,7 @@ func TestDescribeSecurityGroups_FilterUnknownName_Error(t *testing.T) {
 }
 
 func TestDescribeSecurityGroups_FilterWildcard(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	createTestSG(t, svc, vpcID, "prod-web")
@@ -1070,6 +1276,7 @@ func TestDescribeSecurityGroups_FilterWildcard(t *testing.T) {
 }
 
 func TestDescribeSecurityGroups_FilterByTag(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
@@ -1099,6 +1306,7 @@ func TestDescribeSecurityGroups_FilterByTag(t *testing.T) {
 }
 
 func TestDescribeSecurityGroups_FilterNoResults(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	createTestSG(t, svc, vpcID, "my-sg")
@@ -1138,6 +1346,7 @@ func findDefaultSGInVPC(t *testing.T, svc *VPCServiceImpl, vpcID string) string 
 }
 
 func TestCreateVpc_ProvisionsDefaultSG(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
@@ -1159,6 +1368,7 @@ func TestCreateVpc_ProvisionsDefaultSG(t *testing.T) {
 }
 
 func TestCreateSecurityGroup_RejectsReservedDefaultName(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
@@ -1172,6 +1382,7 @@ func TestCreateSecurityGroup_RejectsReservedDefaultName(t *testing.T) {
 }
 
 func TestDeleteSecurityGroup_RejectsDefault(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := findDefaultSGInVPC(t, svc, vpcID)
@@ -1184,6 +1395,7 @@ func TestDeleteSecurityGroup_RejectsDefault(t *testing.T) {
 }
 
 func TestDeleteSecurityGroup_RejectsAttachedToENI(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	subnetID := createTestSubnet(t, svc, vpcID, "10.0.1.0/24")
@@ -1203,6 +1415,7 @@ func TestDeleteSecurityGroup_RejectsAttachedToENI(t *testing.T) {
 }
 
 func TestDeleteSecurityGroup_RejectsReferencedFromOtherSG(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	srcSG := createTestSG(t, svc, vpcID, "src-sg")
@@ -1226,6 +1439,7 @@ func TestDeleteSecurityGroup_RejectsReferencedFromOtherSG(t *testing.T) {
 }
 
 func TestDeleteVpc_BlocksOnNonDefaultSG(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "user-sg")
@@ -1239,6 +1453,7 @@ func TestDeleteVpc_BlocksOnNonDefaultSG(t *testing.T) {
 }
 
 func TestDeleteVpc_CascadesDefaultSG(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	defaultSG := findDefaultSGInVPC(t, svc, vpcID)
@@ -1255,6 +1470,7 @@ func TestDeleteVpc_CascadesDefaultSG(t *testing.T) {
 }
 
 func TestAuthorizeSecurityGroupIngress_RuleLimit(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "rule-limit-sg")
@@ -1287,6 +1503,7 @@ func TestAuthorizeSecurityGroupIngress_RuleLimit(t *testing.T) {
 }
 
 func TestEnsureDefaultVPC_CreatesDefaultSG(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	info, err := svc.EnsureDefaultVPC(testAccountID)
 	require.NoError(t, err)
@@ -1305,6 +1522,7 @@ func TestEnsureDefaultVPC_CreatesDefaultSG(t *testing.T) {
 // --- SourceSG existence + same-VPC validation on Authorize ---
 
 func TestAuthorizeSecurityGroupIngress_SourceSG_SameVPC(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	ownerSG := createTestSG(t, svc, vpcID, "owner-sg")
@@ -1322,6 +1540,7 @@ func TestAuthorizeSecurityGroupIngress_SourceSG_SameVPC(t *testing.T) {
 }
 
 func TestAuthorizeSecurityGroupIngress_SourceSG_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	ownerSG := createTestSG(t, svc, vpcID, "owner-sg-nf")
@@ -1340,6 +1559,7 @@ func TestAuthorizeSecurityGroupIngress_SourceSG_NotFound(t *testing.T) {
 }
 
 func TestAuthorizeSecurityGroupIngress_SourceSG_CrossVPC(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcA := createTestVPC(t, svc, "10.0.0.0/16")
 	vpcB := createTestVPC(t, svc, "10.1.0.0/16")
@@ -1360,6 +1580,7 @@ func TestAuthorizeSecurityGroupIngress_SourceSG_CrossVPC(t *testing.T) {
 }
 
 func TestAuthorizeSecurityGroupEgress_SourceSG_CrossVPC(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcA := createTestVPC(t, svc, "10.0.0.0/16")
 	vpcB := createTestVPC(t, svc, "10.1.0.0/16")
@@ -1381,6 +1602,7 @@ func TestAuthorizeSecurityGroupEgress_SourceSG_CrossVPC(t *testing.T) {
 // --- Egress dependency check (mirror of ingress coverage) ---
 
 func TestDeleteSecurityGroup_RejectsReferencedFromOtherSGEgress(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	srcSG := createTestSG(t, svc, vpcID, "egress-src-sg")
@@ -1406,6 +1628,7 @@ func TestDeleteSecurityGroup_RejectsReferencedFromOtherSGEgress(t *testing.T) {
 // --- Egress rule-count limit (mirror of ingress) ---
 
 func TestAuthorizeSecurityGroupEgress_RuleLimit(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "egress-rule-limit-sg")
@@ -1445,6 +1668,7 @@ func TestAuthorizeSecurityGroupEgress_RuleLimit(t *testing.T) {
 // persists on vpcd error — the orphan-PG reconciler is the safety net. This
 // asserts both the error is surfaced AND the KV-first contract is held.
 func TestCreateSecurityGroup_VpcdError_RecordPersists(t *testing.T) {
+	t.Parallel()
 	svc, _ := setupTestVPCServiceWithFailingVpcd(t, "forced-create-sg-error")
 
 	// CreateVpc also publishes vpc.create-sg and would fail; seed the VPC
@@ -1470,6 +1694,7 @@ func TestCreateSecurityGroup_VpcdError_RecordPersists(t *testing.T) {
 }
 
 func TestDeleteSecurityGroup_VpcdError_Propagated(t *testing.T) {
+	t.Parallel()
 	// Build the SG using a temporary success stub, then swap to failing for
 	// the delete call.
 	svc, nc := setupTestVPCServiceWithNC(t)
@@ -1496,6 +1721,7 @@ func TestDeleteSecurityGroup_VpcdError_Propagated(t *testing.T) {
 }
 
 func TestAuthorizeSecurityGroupIngress_VpcdError_Propagated(t *testing.T) {
+	t.Parallel()
 	svc, nc := setupTestVPCServiceWithNC(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "to-authorize")
@@ -1525,6 +1751,7 @@ func TestAuthorizeSecurityGroupIngress_VpcdError_Propagated(t *testing.T) {
 }
 
 func TestRevokeSecurityGroupIngress_VpcdError_Propagated(t *testing.T) {
+	t.Parallel()
 	svc, nc := setupTestVPCServiceWithNC(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "to-revoke")
@@ -1555,6 +1782,7 @@ func TestRevokeSecurityGroupIngress_VpcdError_Propagated(t *testing.T) {
 // TestAuthorizeSecurityGroupEgress_VpcdError_Propagated asserts that vpcd
 // failures on the egress path are surfaced to the caller.
 func TestAuthorizeSecurityGroupEgress_VpcdError_Propagated(t *testing.T) {
+	t.Parallel()
 	svc, nc := setupTestVPCServiceWithNC(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "egress-vpcd-fail")
@@ -1576,6 +1804,7 @@ func TestAuthorizeSecurityGroupEgress_VpcdError_Propagated(t *testing.T) {
 }
 
 func TestRevokeSecurityGroupEgress_VpcdError_Propagated(t *testing.T) {
+	t.Parallel()
 	svc, nc := setupTestVPCServiceWithNC(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "egress-revoke-fail")
@@ -1599,6 +1828,7 @@ func TestRevokeSecurityGroupEgress_VpcdError_Propagated(t *testing.T) {
 // TestFindDefaultSGForVPC_NoMatch asserts that a lookup for vpcB's default SG
 // returns "" (not an error) when only vpcA has SGs.
 func TestFindDefaultSGForVPC_NoMatch(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcA := createTestVPC(t, svc, "10.0.0.0/16")
 	_ = createTestSG(t, svc, vpcA, "non-default-a")
@@ -1611,6 +1841,7 @@ func TestFindDefaultSGForVPC_NoMatch(t *testing.T) {
 // TestFindDefaultSGForVPC_SkipsMalformedRecord asserts that a corrupt SG entry
 // is skipped rather than aborting the scan.
 func TestFindDefaultSGForVPC_SkipsMalformedRecord(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
@@ -1627,6 +1858,7 @@ func TestFindDefaultSGForVPC_SkipsMalformedRecord(t *testing.T) {
 // --- Fix #1: DeleteVpc cascade failure must leave VPC record intact ---
 
 func TestDeleteVpc_VpcdError_VPCNotDeleted(t *testing.T) {
+	t.Parallel()
 	svc, nc := setupTestVPCServiceWithNC(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 
@@ -1648,6 +1880,7 @@ func TestDeleteVpc_VpcdError_VPCNotDeleted(t *testing.T) {
 // --- Fix #3: checkSGDependencies fails closed on KV read error ---
 
 func TestDeleteSecurityGroup_FailsClosedOnCorruptENI(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "to-delete-corrupt")
@@ -1726,6 +1959,7 @@ func authorizeIngressTCP(t *testing.T, svc *VPCServiceImpl, sgID string, port in
 }
 
 func TestDescribeSecurityGroupRules_All(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgA := createTestSG(t, svc, vpcID, "rules-a")
@@ -1761,6 +1995,7 @@ func TestDescribeSecurityGroupRules_All(t *testing.T) {
 }
 
 func TestDescribeSecurityGroupRules_FilterByGroupID(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgA := createTestSG(t, svc, vpcID, "filter-a")
@@ -1779,6 +2014,7 @@ func TestDescribeSecurityGroupRules_FilterByGroupID(t *testing.T) {
 }
 
 func TestDescribeSecurityGroupRules_FilterByRuleID(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "by-rule-id")
@@ -1793,6 +2029,7 @@ func TestDescribeSecurityGroupRules_FilterByRuleID(t *testing.T) {
 }
 
 func TestDescribeSecurityGroupRules_ByRuleIDsExplicit(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "explicit-ids")
@@ -1807,6 +2044,7 @@ func TestDescribeSecurityGroupRules_ByRuleIDsExplicit(t *testing.T) {
 }
 
 func TestDescribeSecurityGroupRules_RuleIDNotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	createTestSG(t, svc, vpcID, "any")
@@ -1819,6 +2057,7 @@ func TestDescribeSecurityGroupRules_RuleIDNotFound(t *testing.T) {
 }
 
 func TestDescribeSecurityGroupRules_NilInput(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	createTestSG(t, svc, vpcID, "nil-input")
@@ -1829,6 +2068,7 @@ func TestDescribeSecurityGroupRules_NilInput(t *testing.T) {
 }
 
 func TestDescribeSecurityGroupRules_TagFiltersReturnNothing(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "tag-filter")
@@ -1842,6 +2082,7 @@ func TestDescribeSecurityGroupRules_TagFiltersReturnNothing(t *testing.T) {
 }
 
 func TestDescribeSecurityGroupRules_ReferencedGroupInfo(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	srcSG := createTestSG(t, svc, vpcID, "source")
@@ -1881,6 +2122,7 @@ func TestDescribeSecurityGroupRules_ReferencedGroupInfo(t *testing.T) {
 }
 
 func TestAuthorizeSecurityGroupIngress_AssignsRuleIDs(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "assigns-ids")
@@ -1910,6 +2152,7 @@ func TestAuthorizeSecurityGroupIngress_AssignsRuleIDs(t *testing.T) {
 // TestAuthorizeSecurityGroupIngress_RejectsContentDuplicate verifies key-based
 // dedup catches duplicate-content rules regardless of generated RuleId values.
 func TestAuthorizeSecurityGroupIngress_RejectsContentDuplicate(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	sgID := createTestSG(t, svc, vpcID, "dup-rule")
@@ -1936,6 +2179,7 @@ func TestAuthorizeSecurityGroupIngress_RejectsContentDuplicate(t *testing.T) {
 }
 
 func TestDescribeSecurityGroupRules_InvalidFilter(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	createTestSG(t, svc, vpcID, "invalid-filter")
@@ -1954,6 +2198,7 @@ func TestDescribeSecurityGroupRules_InvalidFilter(t *testing.T) {
 // cannot match its rules, never revokes them, and the backend SG is pinned by
 // DependencyViolation — hanging tofu destroy with orphaned security groups.
 func TestSecurityGroupRule_DescriptionRoundTrips(t *testing.T) {
+	t.Parallel()
 	svc := setupTestVPCService(t)
 	vpcID := createTestVPC(t, svc, "10.0.0.0/16")
 	nodeSG := createTestSG(t, svc, vpcID, "node-sg")

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -383,13 +384,9 @@ func (d *Daemon) LaunchSystemInstance(input *handlers_elbv2.SystemInstanceInput)
 		}
 	}
 
-	// Store extra hostfwd ports (filled in by StartInstance with actual host ports)
-	if len(input.HostfwdPorts) > 0 {
-		instance.ExtraHostfwd = make(map[int]int, len(input.HostfwdPorts))
-		for _, port := range input.HostfwdPorts {
-			instance.ExtraHostfwd[port] = 0 // host port assigned in StartInstance
-		}
-	}
+	// The requested guest ports. The host ports they land on are observed by
+	// the launch and reported back through HostfwdPortMap.
+	instance.HostfwdPorts = slices.Clone(input.HostfwdPorts)
 
 	// Direct-boot (microvm) path: build the vm.Config directly with microvm
 	// machine settings and fw_cfg blobs for network, lb-agent env, and CA cert.
@@ -423,7 +420,7 @@ func (d *Daemon) LaunchSystemInstance(input *handlers_elbv2.SystemInstanceInput)
 		InstanceID: instance.ID,
 		PrivateIP:  privateIP,
 		PublicIP:   publicIP,
-		HostfwdMap: instance.ExtraHostfwd,
+		HostfwdMap: instance.HostfwdPortMap,
 	}, nil
 }
 
@@ -734,6 +731,9 @@ func (d *Daemon) cleanupFailedSystemInstance(instance *vm.VM, _ *ec2.InstanceTyp
 	d.vmMgr.MarkFailed(context.Background(), instance, "system_instance_launch_failed")
 }
 
+// waitPollSleep is the poll delay seam used by WaitForSystemInstance; tests override it.
+var waitPollSleep = time.Sleep
+
 // WaitForSystemInstance polls until the instance reaches running state or times out.
 func (d *Daemon) WaitForSystemInstance(instanceID string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
@@ -752,7 +752,7 @@ func (d *Daemon) WaitForSystemInstance(instanceID string, timeout time.Duration)
 			return fmt.Errorf("instance %s in terminal state: %s", instanceID, status)
 		}
 
-		time.Sleep(500 * time.Millisecond)
+		waitPollSleep(500 * time.Millisecond)
 	}
 	return fmt.Errorf("instance %s did not reach running state within %s", instanceID, timeout)
 }

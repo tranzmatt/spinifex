@@ -82,6 +82,71 @@ func TestGenerateEC2ErrorResponse_Structure(t *testing.T) {
 	}
 }
 
+// xmlRootName returns the local name of body's root element, which is what
+// distinguishes the S3, IAM and EC2 error envelopes from each other.
+func xmlRootName(t *testing.T, body []byte) string {
+	t.Helper()
+	dec := xml.NewDecoder(strings.NewReader(string(body)))
+	for {
+		tok, err := dec.Token()
+		require.NoError(t, err)
+		if se, ok := tok.(xml.StartElement); ok {
+			return se.Name.Local
+		}
+	}
+}
+
+func TestGenerateS3ErrorResponse_FlatEnvelope(t *testing.T) {
+	output := GenerateS3ErrorResponse("SignatureDoesNotMatch", "bad signature", "req-s3-1", "/bucket/key.txt")
+	require.NotNil(t, output)
+
+	assert.True(t, strings.HasPrefix(string(output), xml.Header))
+	assert.Equal(t, "Error", xmlRootName(t, output))
+
+	var parsed struct {
+		Code      string `xml:"Code"`
+		Message   string `xml:"Message"`
+		Resource  string `xml:"Resource"`
+		RequestID string `xml:"RequestId"`
+	}
+	require.NoError(t, xml.Unmarshal(output, &parsed))
+
+	assert.Equal(t, "SignatureDoesNotMatch", parsed.Code)
+	assert.Equal(t, "bad signature", parsed.Message)
+	assert.Equal(t, "/bucket/key.txt", parsed.Resource)
+	assert.Equal(t, "req-s3-1", parsed.RequestID)
+}
+
+func TestGenerateS3ErrorResponse_OmitsEmptyResource(t *testing.T) {
+	output := GenerateS3ErrorResponse("AccessDenied", "denied", "req-s3-2", "")
+	assert.NotContains(t, string(output), "<Resource>")
+}
+
+func TestXMLErrorBody_EnvelopePerService(t *testing.T) {
+	tests := []struct {
+		svc  string
+		root string
+	}{
+		{"s3", "Error"},
+		{"iam", "ErrorResponse"},
+		{"sts", "ErrorResponse"},
+		{"elasticloadbalancing", "ErrorResponse"},
+		{"rds", "ErrorResponse"},
+		{"ec2", "Response"},
+		{"spinifex", "Response"},
+		{"unknown-service", "Response"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.svc, func(t *testing.T) {
+			body := xmlErrorBody(tc.svc, "AccessDenied", "denied", "req-1", "/path")
+
+			assert.Equal(t, tc.root, xmlRootName(t, body))
+			assert.Contains(t, string(body), "<Code>AccessDenied</Code>")
+		})
+	}
+}
+
 func TestGenerateEC2ErrorResponse_ValidXML(t *testing.T) {
 	output := GenerateEC2ErrorResponse("TestCode", "Test message", "req-999")
 	require.NotNil(t, output)
@@ -1115,9 +1180,36 @@ func TestCheckPolicy_FailsClosed(t *testing.T) {
 	}
 }
 
+// Shared authorization errors must not expose a canonical resource that was
+// resolved from storage. STS opts into detailed wording at its dispatcher.
+func TestCheckPolicyResources_DenialIsOpaque(t *testing.T) {
+	mock := &policyMockIAMService{
+		getUserPoliciesFn: func(_, _ string) ([]handlers_iam.PolicyDocument, error) {
+			return nil, nil
+		},
+	}
+	gw := &GatewayConfig{DisableLogging: true, IAMService: mock}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx := context.WithValue(req.Context(), ctxIdentity, "alice")
+	ctx = context.WithValue(ctx, ctxAccountID, "123456789012")
+	ctx = context.WithValue(ctx, ctxPrincipalType, principalTypeUser)
+	req = req.WithContext(ctx)
+
+	resource := "arn:aws:iam::123456789012:role/private/target"
+	err := gw.checkPolicyResources(req, "iam", "GetRole", []string{resource})
+	require.Error(t, err)
+	assert.Equal(t, awserrors.ErrorAccessDenied, err.Error())
+
+	code, message, ok := awserrors.ResolveErrorDetail(err)
+	require.True(t, ok)
+	assert.Equal(t, awserrors.ErrorAccessDenied, code)
+	assert.Empty(t, message)
+	assert.NotContains(t, err.Error(), resource)
+}
+
 // TestCheckPolicy_PassRoleFailsClosed proves the change reaches a real gated
-// call site, not just the helper: an unauthenticated RunInstances carrying an
-// instance profile is denied rather than passing the iam:PassRole check.
+// call site: an unauthenticated RunInstances carrying an instance profile is
+// denied rather than passing the iam:PassRole check.
 func TestCheckPolicy_PassRoleFailsClosed(t *testing.T) {
 	gw := &GatewayConfig{DisableLogging: true, IAMService: allowAllIAMService()}
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
@@ -1125,7 +1217,7 @@ func TestCheckPolicy_PassRoleFailsClosed(t *testing.T) {
 	err := gw.checkPolicyResources(req, "iam", "PassRole",
 		[]string{"arn:aws:iam::123456789012:role/app"})
 	require.Error(t, err)
-	assert.Equal(t, awserrors.ErrorAccessDenied, err.Error())
+	assertDenied(t, err)
 }
 
 func TestCheckPolicy_RootUserGlobalAccount(t *testing.T) {
@@ -1154,7 +1246,7 @@ func TestCheckPolicy_AssumedRoleSessionNamedRoot(t *testing.T) {
 
 	err := gw.checkPolicy(req, "ec2", "DescribeInstances")
 	require.Error(t, err)
-	assert.Equal(t, awserrors.ErrorAccessDenied, err.Error())
+	assertDenied(t, err)
 }
 
 func TestCheckPolicy_NonRootAllowPolicy(t *testing.T) {
@@ -1203,7 +1295,7 @@ func TestCheckPolicy_NonRootDenyPolicy(t *testing.T) {
 
 	err := gw.checkPolicy(req, "ec2", "DescribeInstances")
 	require.Error(t, err)
-	assert.Equal(t, awserrors.ErrorAccessDenied, err.Error())
+	assertDenied(t, err)
 }
 
 func TestCheckPolicy_NonRootNoPolicies(t *testing.T) {
@@ -1221,7 +1313,7 @@ func TestCheckPolicy_NonRootNoPolicies(t *testing.T) {
 
 	err := gw.checkPolicy(req, "ec2", "DescribeInstances")
 	require.Error(t, err)
-	assert.Equal(t, awserrors.ErrorAccessDenied, err.Error())
+	assertDenied(t, err)
 }
 
 func TestCheckPolicy_GetUserPoliciesError(t *testing.T) {
@@ -1433,6 +1525,39 @@ func TestWriteThrottleError_IAM(t *testing.T) {
 	assert.Equal(t, 503, resp.StatusCode)
 	assert.Contains(t, string(body), "<Code>Throttling</Code>")
 	assert.Contains(t, string(body), "<ErrorResponse>")
+}
+
+func TestWriteThrottleError_Bedrock(t *testing.T) {
+	gw := &GatewayConfig{DisableLogging: true}
+
+	req := httptest.NewRequest(http.MethodPost, "/model/meta.llama3-2-1b-instruct-v1%3A0/converse", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ctxService, "bedrock"))
+	w := httptest.NewRecorder()
+
+	gw.writeThrottleError(w, req)
+
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, eksJSONContentType, resp.Header.Get("Content-Type"), "bedrock must get JSON, not XML")
+	assert.Contains(t, string(body), `"__type"`)
+	assert.NotContains(t, string(body), "<?xml")
+}
+
+func TestWriteSigV4Error_BedrockEmitsJSON(t *testing.T) {
+	gw := &GatewayConfig{DisableLogging: true}
+
+	req := httptest.NewRequest(http.MethodPost, "/model/meta.llama3-2-1b-instruct-v1%3A0/converse", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ctxService, "bedrock"))
+	w := httptest.NewRecorder()
+
+	gw.writeSigV4Error(w, req, awserrors.ErrorSignatureDoesNotMatch)
+
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, 403, resp.StatusCode)
+	assert.Equal(t, eksJSONContentType, resp.Header.Get("Content-Type"), "a bedrock auth failure must be SDK-parseable JSON")
+	assert.Contains(t, string(body), "SignatureDoesNotMatch")
+	assert.NotContains(t, string(body), "<?xml")
 }
 
 func TestThrottleMiddleware_Integration(t *testing.T) {

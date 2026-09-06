@@ -26,9 +26,14 @@ import (
 // milliseconds rather than in the minute a real one is given.
 const testVMStopTimeout = 40 * time.Millisecond
 
-// The wait for an apply-params reply, shrunk so an unreachable agent is
-// bounded in milliseconds rather than in the real command budget.
-const testApplyParamsTimeout = 40 * time.Millisecond
+// The wait for an apply-params reply. Well under the real budget, but with
+// enough headroom that a stub agent answering over NATS lands inside it on a
+// machine running the whole suite in parallel.
+const testApplyParamsTimeout = 10 * time.Second
+
+// The same wait for the cases that expect no reply at all, shrunk so an
+// unreachable agent is bounded in milliseconds.
+const testUnreachableApplyParamsTimeout = 40 * time.Millisecond
 
 // fakeInstanceCommander records the power commands the lifecycle ops issue, and
 // can refuse them the way a node that no longer holds the VM does.
@@ -502,7 +507,7 @@ func TestReconciler_DoesNotCallAStillRunningVMStopped(t *testing.T) {
 	rec.TransitionStartedAt = &started
 	seedInstance(t, h.svc, rec)
 
-	require.NoError(t, NewReconciler(h.svc, "node-a").reconcileOnce(t.Context()))
+	require.NoError(t, onePass(t, NewReconciler(h.svc, "node-a")))
 
 	// Left stopping so the next pass retries; the bound is what ends it.
 	assert.Equal(t, StatusStopping, h.record(t).Status)
@@ -671,7 +676,7 @@ func TestReconciler_CompletesARestartOnAHeartbeatFromTheRestartedEngine(t *testi
 			now := time.Now().UTC()
 			seedInstance(t, h.svc, restartingRecord(status, now.Add(-time.Minute), now))
 
-			require.NoError(t, NewReconciler(h.svc, "node-a").reconcileOnce(t.Context()))
+			require.NoError(t, onePass(t, NewReconciler(h.svc, "node-a")))
 
 			rec := h.record(t)
 			assert.Equal(t, StatusAvailable, rec.Status)
@@ -690,7 +695,7 @@ func TestReconciler_CompletesARestartOnAPersistedHeartbeatInsideTheFloor(t *test
 	persisted := time.Now().UTC().Add(-HeartbeatStaleAfter - time.Minute)
 	seedInstance(t, h.svc, restartingRecord(StatusRebooting, persisted.Add(-time.Second), persisted))
 
-	require.NoError(t, NewReconciler(h.svc, "node-a").reconcileOnce(t.Context()))
+	require.NoError(t, onePass(t, NewReconciler(h.svc, "node-a")))
 
 	assert.Equal(t, StatusAvailable, h.record(t).Status)
 }
@@ -704,7 +709,7 @@ func TestReconciler_IgnoresAHeartbeatPredatingTheRestart(t *testing.T) {
 	now := time.Now().UTC()
 	seedInstance(t, h.svc, restartingRecord(StatusRebooting, now, now.Add(-time.Minute)))
 
-	require.NoError(t, NewReconciler(h.svc, "node-a").reconcileOnce(t.Context()))
+	require.NoError(t, onePass(t, NewReconciler(h.svc, "node-a")))
 
 	assert.Equal(t, StatusRebooting, h.record(t).Status)
 }
@@ -718,7 +723,7 @@ func TestReconciler_MarksFailedWhenARestartOverrunsItsBound(t *testing.T) {
 	started := now.Add(-2 * transitionTimeout)
 	seedInstance(t, h.svc, restartingRecord(StatusStarting, started, started.Add(-time.Minute)))
 
-	require.NoError(t, NewReconciler(h.svc, "node-a").reconcileOnce(t.Context()))
+	require.NoError(t, onePass(t, NewReconciler(h.svc, "node-a")))
 
 	rec := h.record(t)
 	assert.Equal(t, StatusFailed, rec.Status)

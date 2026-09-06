@@ -38,6 +38,7 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -105,7 +106,12 @@ type GatewayConfig struct {
 	activeNodesMu    sync.RWMutex
 	activeNodesCount int
 	activeNodesAt    time.Time
-	InternalSuffix   string // Internal DNS suffix for AWS-parity endpoints (e.g. spinifex.internal)
+	// The EC2 client-token KV binding, bound on first use and reused after, so
+	// the creates that honour ClientToken do not rebind it per request.
+	ec2TokenOnce   sync.Once
+	ec2TokenKV     jetstream.KeyValue
+	ec2TokenErr    error
+	InternalSuffix string // Internal DNS suffix for AWS-parity endpoints (e.g. spinifex.internal)
 	// RegistryPort is the gateway's advertised port, appended to the ECR
 	// registry host so docker login/tag/push dial the right port. Empty or
 	// "443" renders a port-less host (standard HTTPS parity).
@@ -180,6 +186,10 @@ type GatewayConfig struct {
 	// and friends). Nil falls back to an unconfigured store, under which
 	// reads/writes error rather than panic.
 	BedrockGuardrails *gateway_bedrock.GuardrailStore
+	// BedrockEmbedder drives guardrail topicPolicy's semantic match, reusing
+	// the same embedding endpoint the Ochre KB path resolves models through.
+	// Nil leaves topicPolicy on its literal (word-boundary) matcher alone.
+	BedrockEmbedder gateway_bedrock.Embedder
 
 	// SignupMaxAccounts caps how many accounts /admin/CreateAccount will allow
 	// to exist. Zero means uncapped, which is the behaviour of every cluster
@@ -235,6 +245,17 @@ type EC2Errors struct {
 type ErrorDetail struct {
 	Code    string `xml:"Code"`
 	Message string `xml:"Message"`
+}
+
+// S3ErrorResponse is the S3 REST error envelope: a flat <Error> document rather
+// than the query-API wrapper. SDKs look for a top-level <Error><Code> on an S3
+// response and report an empty code for anything else.
+type S3ErrorResponse struct {
+	XMLName   xml.Name `xml:"Error"`
+	Code      string   `xml:"Code"`
+	Message   string   `xml:"Message"`
+	Resource  string   `xml:"Resource,omitempty"`
+	RequestID string   `xml:"RequestId"`
 }
 
 func (gw *GatewayConfig) SetupRoutes() http.Handler {
@@ -327,53 +348,43 @@ func (gw *GatewayConfig) throttleKeyFuncs() []ratelimit.KeyFunc {
 // eksJSONContentType is the AWS REST-JSON 1.1 content type EKS clients expect.
 const eksJSONContentType = "application/x-amz-json-1.1"
 
+// jsonErrorService reports whether svc returns AWS JSON 1.1 errors rather than
+// XML. One source of truth so every error emitter agrees with ErrorHandler; an
+// XML body to these clients is an unparseable "<?xml…" deserialization error.
+func jsonErrorService(svc string) bool {
+	switch svc {
+	case "eks", "ecr", "acm", "ecs", "tagging",
+		"bedrock", "bedrock-runtime", "bedrock-agent", "bedrock-agent-runtime":
+		return true
+	}
+	return false
+}
+
 // clusterUnavailableMsg is the 503 body when NATS is disconnected. Points
 // operators at /local/status rather than leaving the AWS CLI hanging on timeouts.
 const clusterUnavailableMsg = "cluster unavailable: NATS disconnected — check daemon /local/status"
 
 // writeClusterUnavailable writes a 503 ServiceUnavailable in the service-appropriate
-// format. It emits XML directly (not via GenerateEC2ErrorResponse) to ensure the
-// /local/status hint is preserved in <Message>.
-func (gw *GatewayConfig) writeClusterUnavailable(w http.ResponseWriter, _ *http.Request, svc string) {
+// format, carrying the /local/status hint in <Message>.
+func (gw *GatewayConfig) writeClusterUnavailable(w http.ResponseWriter, r *http.Request, svc string) {
 	requestID := uuid.NewV4().String()
 
-	// EKS and ECS use AWS JSON 1.1.
-	if svc == "eks" || svc == "ecs" {
+	// AWS JSON 1.1 services (EKS/ECS/bedrock family, …) get a JSON body.
+	if jsonErrorService(svc) {
 		body := GenerateEKSErrorResponse(awserrors.ErrorServiceUnavailable, clusterUnavailableMsg, requestID)
 		w.Header().Set("Content-Type", eksJSONContentType)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		if _, err := w.Write(body); err != nil {
-			slog.Error("Failed to write EKS cluster-unavailable response", "err", err)
+			slog.Error("Failed to write JSON cluster-unavailable response", "err", err)
 		}
 		return
 	}
 
-	var xmlBody string
-	if svc == "iam" || svc == "sts" || svc == "rds" {
-		iam := IAMErrorResponse{
-			Error: IAMErrorDetail{
-				Type:    "Sender",
-				Code:    awserrors.ErrorServiceUnavailable,
-				Message: clusterUnavailableMsg,
-			},
-			RequestID: requestID,
-		}
-		out, err := xml.MarshalIndent(iam, "", "  ")
-		if err != nil {
-			slog.Error("Failed to marshal IAM cluster-unavailable XML", "err", err)
-			out = []byte(`<ErrorResponse><Error><Type>Sender</Type><Code>ServiceUnavailable</Code><Message>` + clusterUnavailableMsg + `</Message></Error><RequestId>` + requestID + `</RequestId></ErrorResponse>`)
-		}
-		xmlBody = xml.Header + string(out)
-	} else {
-		// ec2, elasticloadbalancing, account, spinifex all share the EC2 envelope.
-		xmlBody = xml.Header + `<Response><Errors><Error><Code>` + awserrors.ErrorServiceUnavailable +
-			`</Code><Message>` + clusterUnavailableMsg + `</Message></Error></Errors><RequestID>` +
-			requestID + `</RequestID></Response>`
-	}
+	xmlBody := xmlErrorBody(svc, awserrors.ErrorServiceUnavailable, clusterUnavailableMsg, requestID, r.URL.Path)
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(http.StatusServiceUnavailable)
-	if _, err := w.Write([]byte(xmlBody)); err != nil {
+	if _, err := w.Write(xmlBody); err != nil {
 		slog.Error("Failed to write cluster-unavailable response", "err", err)
 	}
 }
@@ -389,23 +400,18 @@ func (gw *GatewayConfig) writeThrottleError(w http.ResponseWriter, r *http.Reque
 	}
 	errorMsg := awserrors.ErrorLookup[errorCode]
 
-	// EKS and ECS use AWS JSON 1.1.
-	if svc == "eks" || svc == "ecs" {
+	// AWS JSON 1.1 services (EKS/ECS/bedrock family, …) get a JSON body.
+	if jsonErrorService(svc) {
 		body := GenerateEKSErrorResponse(errorCode, errorMsg.Message, requestID)
 		w.Header().Set("Content-Type", eksJSONContentType)
 		w.WriteHeader(errorMsg.HTTPCode)
 		if _, err := w.Write(body); err != nil {
-			slog.Error("Failed to write EKS throttle error response", "err", err)
+			slog.Error("Failed to write JSON throttle error response", "err", err)
 		}
 		return
 	}
 
-	var xmlErr []byte
-	if svc == "iam" || svc == "sts" || svc == "elasticloadbalancing" || svc == "rds" {
-		xmlErr = GenerateIAMErrorResponse(errorCode, errorMsg.Message, requestID)
-	} else { // ec2, account, spinifex
-		xmlErr = GenerateEC2ErrorResponse(errorCode, errorMsg.Message, requestID)
-	}
+	xmlErr := xmlErrorBody(svc, errorCode, errorMsg.Message, requestID, r.URL.Path)
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(errorMsg.HTTPCode)
@@ -692,10 +698,37 @@ func (gw *GatewayConfig) evaluatePrincipalPolicyResources(
 		if iampolicy.EvaluateWithKeys(iamAction, resource, policies, keys) == iampolicy.Deny {
 			slog.Info("evaluatePrincipalPolicy: access denied",
 				"identity", logIdentity, "action", iamAction, "resource", resource)
-			return errors.New(awserrors.ErrorAccessDenied)
+			return &identityPolicyDenialError{
+				principal: principal, logIdentity: logIdentity,
+				action: iamAction, resource: resource,
+			}
 		}
 	}
 	return nil
+}
+
+// identityPolicyDenialError keeps shared authorization failures opaque. A
+// caller that proves its resource is non-sensitive may opt into details.
+type identityPolicyDenialError struct {
+	principal   principalContext
+	logIdentity string
+	action      string
+	resource    string
+}
+
+func (d *identityPolicyDenialError) Error() string {
+	return awserrors.ErrorAccessDenied
+}
+
+func (d *identityPolicyDenialError) detailedError() error {
+	callerARN, err := buildCallerARN(d.principal.accountID, d.principal.identity,
+		d.principal.principalType, d.principal.assumedRoleARN)
+	if err != nil {
+		callerARN = d.logIdentity
+	}
+	return awserrors.Errorf(awserrors.ErrorAccessDenied,
+		"User: %s is not authorized to perform: %s on resource: %s",
+		callerARN, d.action, d.resource)
 }
 
 func (gw *GatewayConfig) ErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
@@ -721,10 +754,17 @@ func (gw *GatewayConfig) ErrorHandler(w http.ResponseWriter, r *http.Request, er
 		errorMsg.HTTPCode = 500
 	}
 
-	// EKS, ECR, ACM, ECS, tagging, and the bedrock/bedrock-runtime/bedrock-agent/
-	// bedrock-agent-runtime family use AWS JSON 1.1; query/XML services fall
-	// through.
-	if svc == "eks" || svc == "ecr" || svc == "acm" || svc == "ecs" || svc == "tagging" || svc == "bedrock" || svc == "bedrock-runtime" || svc == "bedrock-agent" || svc == "bedrock-agent-runtime" {
+	// A 503 the producing call site knows is a bounded, self-clearing
+	// condition (e.g. the embedder warm-up window) carries a suggested
+	// Retry-After so SDK clients back off on their own cadence instead of
+	// hammering the endpoint every request.
+	if d, ok := awserrors.ResolveRetryAfter(err); ok {
+		w.Header().Set("Retry-After", strconv.Itoa(int(d.Seconds())))
+	}
+
+	// EKS, ECR, ACM, ECS, tagging, and the bedrock family use AWS JSON 1.1;
+	// query/XML services fall through.
+	if jsonErrorService(svc) {
 		body := GenerateEKSErrorResponse(code, errorMsg.Message, requestId)
 		slog.Debug("Generated JSON error response", "service", svc, "error", err, "code", code, "json", string(body), "requestId", requestId)
 		w.Header().Set("Content-Type", eksJSONContentType)
@@ -735,12 +775,7 @@ func (gw *GatewayConfig) ErrorHandler(w http.ResponseWriter, r *http.Request, er
 		return
 	}
 
-	var xmlError []byte
-	if svc == "iam" || svc == "sts" || svc == "elasticloadbalancing" || svc == "rds" {
-		xmlError = GenerateIAMErrorResponse(code, errorMsg.Message, requestId)
-	} else {
-		xmlError = GenerateEC2ErrorResponse(code, errorMsg.Message, requestId)
-	}
+	xmlError := xmlErrorBody(svc, code, errorMsg.Message, requestId, r.URL.Path)
 
 	slog.Debug("Generated error response", "error", err, "code", code, "xml", string(xmlError), "requestId", requestId)
 
@@ -842,6 +877,42 @@ func GenerateIAMErrorResponse(code, message, requestID string) (output []byte) {
 
 	output = append([]byte(xml.Header), output...)
 	return output
+}
+
+// GenerateS3ErrorResponse builds the flat S3 REST error document. resource is
+// the request path and is omitted when empty.
+func GenerateS3ErrorResponse(code, message, requestID, resource string) (output []byte) {
+	errorXml := S3ErrorResponse{
+		Code:      code,
+		Message:   message,
+		Resource:  resource,
+		RequestID: requestID,
+	}
+
+	output, err := xml.MarshalIndent(errorXml, "", "  ")
+	if err != nil {
+		slog.Error("Failed to build S3 error XML", "error", err)
+		return []byte(xml.Header + "<Error><Code>InternalError</Code><Message>Internal error</Message><RequestId>" + requestID + "</RequestId></Error>")
+	}
+
+	output = append([]byte(xml.Header), output...)
+	return output
+}
+
+// xmlErrorBody renders an error in the XML envelope svc's clients expect. The
+// one place the service-to-envelope mapping lives, so a service cannot be added
+// to some emitters and missed by others. JSON services never reach here — every
+// caller checks jsonErrorService first.
+func xmlErrorBody(svc, code, message, requestID, resource string) []byte {
+	switch svc {
+	case "s3":
+		return GenerateS3ErrorResponse(code, message, requestID, resource)
+	case "iam", "sts", "elasticloadbalancing", "rds":
+		return GenerateIAMErrorResponse(code, message, requestID)
+	default:
+		// ec2, account, spinifex, and any scope the gateway does not serve.
+		return GenerateEC2ErrorResponse(code, message, requestID)
+	}
 }
 
 // How long a discovered node count is reused before it is gathered again.

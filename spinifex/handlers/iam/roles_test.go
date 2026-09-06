@@ -35,6 +35,7 @@ func createTestRole(t *testing.T, svc *IAMServiceImpl, name string) *iam.Role {
 // ============================================================================
 
 func TestCreateRole(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	out, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
@@ -62,6 +63,7 @@ func TestCreateRole(t *testing.T) {
 }
 
 func TestCreateRole_DefaultPath(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	out, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
@@ -74,6 +76,7 @@ func TestCreateRole_DefaultPath(t *testing.T) {
 }
 
 func TestCreateRole_DefaultMaxSessionDuration(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	out, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
@@ -85,6 +88,7 @@ func TestCreateRole_DefaultMaxSessionDuration(t *testing.T) {
 }
 
 func TestCreateRole_InvalidName(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	longName := strings.Repeat("a", 65)
 
@@ -97,6 +101,7 @@ func TestCreateRole_InvalidName(t *testing.T) {
 }
 
 func TestCreateRole_InvalidPath(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
@@ -108,7 +113,53 @@ func TestCreateRole_InvalidPath(t *testing.T) {
 	assert.Contains(t, err.Error(), awserrors.ErrorIAMInvalidInput)
 }
 
+func TestCreateRole_PermissionsBoundarySet(t *testing.T) {
+	t.Parallel()
+	svc := setupTestIAMService(t)
+
+	_, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
+		RoleName:                 aws.String("bounded-role"),
+		AssumeRolePolicyDocument: aws.String(validTrustPolicy()),
+		PermissionsBoundary:      aws.String("arn:aws:iam::" + testAccountID + ":policy/deny-all"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), awserrors.ErrorValidationError)
+	assert.Contains(t, err.Error(), "PermissionsBoundary")
+
+	_, err = svc.GetRole(testAccountID, &iam.GetRoleInput{RoleName: aws.String("bounded-role")})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), awserrors.ErrorIAMNoSuchEntity)
+}
+
+func TestCreateRole_PermissionsBoundaryAbsent(t *testing.T) {
+	t.Parallel()
+	svc := setupTestIAMService(t)
+
+	tests := []struct {
+		name     string
+		roleName string
+		boundary *string
+	}{
+		{name: "nil", roleName: "nil-boundary", boundary: nil},
+		{name: "empty string", roleName: "empty-boundary", boundary: aws.String("")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			out, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
+				RoleName:                 aws.String(tt.roleName),
+				AssumeRolePolicyDocument: aws.String(validTrustPolicy()),
+				PermissionsBoundary:      tt.boundary,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tt.roleName, *out.Role.RoleName)
+		})
+	}
+}
+
 func TestCreateRole_MalformedTrustPolicy_InvalidJSON(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
@@ -120,6 +171,7 @@ func TestCreateRole_MalformedTrustPolicy_InvalidJSON(t *testing.T) {
 }
 
 func TestCreateRole_MalformedTrustPolicy_WrongVersion(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
@@ -131,6 +183,7 @@ func TestCreateRole_MalformedTrustPolicy_WrongVersion(t *testing.T) {
 }
 
 func TestCreateRole_MalformedTrustPolicy_NoStatements(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
@@ -142,6 +195,7 @@ func TestCreateRole_MalformedTrustPolicy_NoStatements(t *testing.T) {
 }
 
 func TestCreateRole_MalformedTrustPolicy_MissingPrincipal(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
@@ -153,6 +207,7 @@ func TestCreateRole_MalformedTrustPolicy_MissingPrincipal(t *testing.T) {
 }
 
 func TestCreateRole_MalformedTrustPolicy_BadEffect(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
@@ -164,6 +219,7 @@ func TestCreateRole_MalformedTrustPolicy_BadEffect(t *testing.T) {
 }
 
 func TestCreateRole_MalformedTrustPolicy_TooLarge(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	// Pad the Sid to push the doc past 2048 bytes.
@@ -178,6 +234,7 @@ func TestCreateRole_MalformedTrustPolicy_TooLarge(t *testing.T) {
 }
 
 func TestCreateRole_TrustPolicy_DenyEffectAccepted(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"sts:AssumeRole"}]}`
@@ -189,6 +246,7 @@ func TestCreateRole_TrustPolicy_DenyEffectAccepted(t *testing.T) {
 }
 
 func TestCreateRole_MaxSessionDuration_TooSmall(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
@@ -201,6 +259,7 @@ func TestCreateRole_MaxSessionDuration_TooSmall(t *testing.T) {
 }
 
 func TestCreateRole_MaxSessionDuration_TooLarge(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
@@ -213,6 +272,7 @@ func TestCreateRole_MaxSessionDuration_TooLarge(t *testing.T) {
 }
 
 func TestCreateRole_Duplicate(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "dup-role")
 
@@ -225,6 +285,7 @@ func TestCreateRole_Duplicate(t *testing.T) {
 }
 
 func TestGetRole(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "get-role")
 
@@ -237,6 +298,7 @@ func TestGetRole(t *testing.T) {
 }
 
 func TestGetRole_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.GetRole(testAccountID, &iam.GetRoleInput{
@@ -247,6 +309,7 @@ func TestGetRole_NotFound(t *testing.T) {
 }
 
 func TestListRoles(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	createTestRole(t, svc, "role1")
@@ -267,6 +330,7 @@ func TestListRoles(t *testing.T) {
 }
 
 func TestListRoles_Empty(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	out, err := svc.ListRoles(testAccountID, &iam.ListRolesInput{})
@@ -275,6 +339,7 @@ func TestListRoles_Empty(t *testing.T) {
 }
 
 func TestListRoles_PathPrefix(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreateRole(testAccountID, &iam.CreateRoleInput{
@@ -300,6 +365,7 @@ func TestListRoles_PathPrefix(t *testing.T) {
 }
 
 func TestDeleteRole(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "del-role")
 
@@ -316,6 +382,7 @@ func TestDeleteRole(t *testing.T) {
 }
 
 func TestDeleteRole_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.DeleteRole(testAccountID, &iam.DeleteRoleInput{
@@ -326,6 +393,7 @@ func TestDeleteRole_NotFound(t *testing.T) {
 }
 
 func TestDeleteRole_WithAttachedPolicies(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	role := createTestRole(t, svc, "attached-role")
 	policy := createTestPolicy(t, svc, "RolePolicy")
@@ -344,6 +412,7 @@ func TestDeleteRole_WithAttachedPolicies(t *testing.T) {
 }
 
 func TestDeleteRole_InInstanceProfile(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "inprofile-role")
 
@@ -366,6 +435,7 @@ func TestDeleteRole_InInstanceProfile(t *testing.T) {
 }
 
 func TestUpdateRole(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "upd-role")
 
@@ -385,6 +455,7 @@ func TestUpdateRole(t *testing.T) {
 }
 
 func TestUpdateRole_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.UpdateRole(testAccountID, &iam.UpdateRoleInput{
@@ -396,6 +467,7 @@ func TestUpdateRole_NotFound(t *testing.T) {
 }
 
 func TestUpdateRole_InvalidMaxSessionDuration(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "session-role")
 
@@ -408,6 +480,7 @@ func TestUpdateRole_InvalidMaxSessionDuration(t *testing.T) {
 }
 
 func TestUpdateAssumeRolePolicy(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "trust-role")
 
@@ -426,6 +499,7 @@ func TestUpdateAssumeRolePolicy(t *testing.T) {
 }
 
 func TestUpdateAssumeRolePolicy_Malformed(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "trust-role-malformed")
 
@@ -438,6 +512,7 @@ func TestUpdateAssumeRolePolicy_Malformed(t *testing.T) {
 }
 
 func TestUpdateAssumeRolePolicy_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.UpdateAssumeRolePolicy(testAccountID, &iam.UpdateAssumeRolePolicyInput{
@@ -453,6 +528,7 @@ func TestUpdateAssumeRolePolicy_NotFound(t *testing.T) {
 // ============================================================================
 
 func TestAttachRolePolicy(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	role := createTestRole(t, svc, "attachtarget")
 	policy := createTestPolicy(t, svc, "AttachPolicy")
@@ -473,6 +549,7 @@ func TestAttachRolePolicy(t *testing.T) {
 }
 
 func TestAttachRolePolicy_Idempotent(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	role := createTestRole(t, svc, "idempotent")
 	policy := createTestPolicy(t, svc, "IdempotentPolicy")
@@ -497,6 +574,7 @@ func TestAttachRolePolicy_Idempotent(t *testing.T) {
 }
 
 func TestAttachRolePolicy_PolicyNotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "needspolicy")
 
@@ -509,6 +587,7 @@ func TestAttachRolePolicy_PolicyNotFound(t *testing.T) {
 }
 
 func TestAttachRolePolicy_RoleNotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	policy := createTestPolicy(t, svc, "OrphanPolicy")
 
@@ -521,6 +600,7 @@ func TestAttachRolePolicy_RoleNotFound(t *testing.T) {
 }
 
 func TestAttachRolePolicy_AWSManagedPolicyNotSeeded(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	role := createTestRole(t, svc, "eks-node-role")
 	// AWS-managed ARN with no backing policy in the store — stock EKS tooling
@@ -554,7 +634,27 @@ func TestAttachRolePolicy_AWSManagedPolicyNotSeeded(t *testing.T) {
 	assert.Empty(t, out.AttachedPolicies)
 }
 
+func TestAttachRolePolicy_MalformedAWSManagedPolicyRejected(t *testing.T) {
+	t.Parallel()
+	svc := setupTestIAMService(t)
+	role := createTestRole(t, svc, "malformed-managed-policy")
+
+	_, err := svc.AttachRolePolicy(testAccountID, &iam.AttachRolePolicyInput{
+		RoleName:  role.RoleName,
+		PolicyArn: aws.String("arn:aws:iam::aws:policy/"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), awserrors.ErrorIAMNoSuchEntity)
+
+	out, err := svc.ListAttachedRolePolicies(testAccountID, &iam.ListAttachedRolePoliciesInput{
+		RoleName: role.RoleName,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, out.AttachedPolicies)
+}
+
 func TestDetachRolePolicy(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	role := createTestRole(t, svc, "detach-role")
 	policy := createTestPolicy(t, svc, "DetachPolicy")
@@ -579,6 +679,7 @@ func TestDetachRolePolicy(t *testing.T) {
 }
 
 func TestDetachRolePolicy_NotAttached(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	role := createTestRole(t, svc, "detach-empty")
 	policy := createTestPolicy(t, svc, "NotAttachedPolicy")
@@ -597,6 +698,7 @@ func TestDetachRolePolicy_NotAttached(t *testing.T) {
 // from the same revision and clobbered each other); the CAS path must persist
 // all three.
 func TestAttachRolePolicy_ConcurrentDistinctPolicies(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	role := createTestRole(t, svc, "eks-node-role")
 
@@ -636,6 +738,7 @@ func TestAttachRolePolicy_ConcurrentDistinctPolicies(t *testing.T) {
 }
 
 func TestListAttachedRolePolicies_Empty(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	role := createTestRole(t, svc, "empty-attach")
 
@@ -651,6 +754,7 @@ func TestListAttachedRolePolicies_Empty(t *testing.T) {
 // ============================================================================
 
 func TestGetRolePolicies(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	role := createTestRole(t, svc, "eval-role")
 	p1 := createTestPolicy(t, svc, "RolePolicy1")
@@ -679,6 +783,7 @@ func TestGetRolePolicies(t *testing.T) {
 }
 
 func TestGetRolePolicies_NoPolicies(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "bare-role")
 
@@ -688,6 +793,7 @@ func TestGetRolePolicies_NoPolicies(t *testing.T) {
 }
 
 func TestGetRolePolicies_NonexistentRole(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.GetRolePolicies(testAccountID, "ghost-role")
@@ -699,6 +805,7 @@ func TestGetRolePolicies_NonexistentRole(t *testing.T) {
 // referencing an attached policy ARN that can no longer be resolved must return
 // an error so the gateway denies rather than evaluating a partial policy set.
 func TestGetRolePolicies_UnresolvablePolicy(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "dangling-role")
 
@@ -722,6 +829,7 @@ func TestGetRolePolicies_UnresolvablePolicy(t *testing.T) {
 // grant documents, so assumed-role authorization honours them instead of
 // denying every call.
 func TestGetRolePolicies_AWSManagedResolved(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	role := createTestRole(t, svc, "eks-node-role")
 
@@ -749,6 +857,7 @@ func TestGetRolePolicies_AWSManagedResolved(t *testing.T) {
 // does not model resolves to no grant (fail-closed deny) rather than erroring
 // the whole request.
 func TestGetRolePolicies_UnmodeledManagedSkipped(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	role := createTestRole(t, svc, "unknown-managed-role")
 	_, err := svc.AttachRolePolicy(testAccountID, &iam.AttachRolePolicyInput{
@@ -784,6 +893,7 @@ func inlineDenyDocument() string {
 }
 
 func TestPutRolePolicy_RoundTrip(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "inline-role")
 
@@ -805,6 +915,7 @@ func TestPutRolePolicy_RoundTrip(t *testing.T) {
 }
 
 func TestPutRolePolicy_IdempotentOverwrite(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "overwrite-role")
 
@@ -837,6 +948,7 @@ func TestPutRolePolicy_IdempotentOverwrite(t *testing.T) {
 }
 
 func TestPutRolePolicy_InvalidName(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "badname-role")
 
@@ -850,6 +962,7 @@ func TestPutRolePolicy_InvalidName(t *testing.T) {
 }
 
 func TestPutRolePolicy_MalformedDocument(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "malformed-role")
 
@@ -863,6 +976,7 @@ func TestPutRolePolicy_MalformedDocument(t *testing.T) {
 }
 
 func TestPutRolePolicy_OversizedDocument(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "oversized-role")
 
@@ -877,6 +991,7 @@ func TestPutRolePolicy_OversizedDocument(t *testing.T) {
 }
 
 func TestPutRolePolicy_RoleNotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.PutRolePolicy(testAccountID, &iam.PutRolePolicyInput{
@@ -889,6 +1004,7 @@ func TestPutRolePolicy_RoleNotFound(t *testing.T) {
 }
 
 func TestGetRolePolicy_UnknownName(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "get-unknown")
 
@@ -901,6 +1017,7 @@ func TestGetRolePolicy_UnknownName(t *testing.T) {
 }
 
 func TestGetRolePolicy_RoleNotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.GetRolePolicy(testAccountID, &iam.GetRolePolicyInput{
@@ -912,6 +1029,7 @@ func TestGetRolePolicy_RoleNotFound(t *testing.T) {
 }
 
 func TestListRolePolicies_Sorted(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "list-role")
 
@@ -937,6 +1055,7 @@ func TestListRolePolicies_Sorted(t *testing.T) {
 }
 
 func TestListRolePolicies_Empty(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "empty-inline")
 
@@ -950,6 +1069,7 @@ func TestListRolePolicies_Empty(t *testing.T) {
 }
 
 func TestListRolePolicies_RoleNotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.ListRolePolicies(testAccountID, &iam.ListRolePoliciesInput{
@@ -960,6 +1080,7 @@ func TestListRolePolicies_RoleNotFound(t *testing.T) {
 }
 
 func TestDeleteRolePolicy(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "del-inline")
 
@@ -991,6 +1112,7 @@ func TestDeleteRolePolicy(t *testing.T) {
 }
 
 func TestDeleteRolePolicy_DoubleDelete(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "double-del")
 
@@ -1016,6 +1138,7 @@ func TestDeleteRolePolicy_DoubleDelete(t *testing.T) {
 }
 
 func TestDeleteRolePolicy_RoleNotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.DeleteRolePolicy(testAccountID, &iam.DeleteRolePolicyInput{
@@ -1027,6 +1150,7 @@ func TestDeleteRolePolicy_RoleNotFound(t *testing.T) {
 }
 
 func TestDeleteRole_WithInlinePolicy(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "inline-conflict")
 
@@ -1059,6 +1183,7 @@ func TestDeleteRole_WithInlinePolicy(t *testing.T) {
 // TestGetRolePolicies_Inline proves the enforcement resolver walks inline
 // policies, not just managed attachments, so an inline statement is evaluated.
 func TestGetRolePolicies_Inline(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "inline-eval")
 
@@ -1078,6 +1203,7 @@ func TestGetRolePolicies_Inline(t *testing.T) {
 // TestGetRolePolicies_ManagedAndInline proves managed and inline documents both
 // surface from the resolver in one combined set.
 func TestGetRolePolicies_ManagedAndInline(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	role := createTestRole(t, svc, "combined-eval")
 	policy := createTestPolicy(t, svc, "ManagedAllow")
@@ -1107,6 +1233,7 @@ func TestGetRolePolicies_ManagedAndInline(t *testing.T) {
 // ============================================================================
 
 func TestRoles_AccountScoping(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	accA, err := svc.CreateAccount("Org A")
@@ -1161,6 +1288,7 @@ func TestRoles_AccountScoping(t *testing.T) {
 // ============================================================================
 
 func TestCreateRole_MalformedTrustPolicy_ConditionRejected_StringEquals(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRole","Condition":{"StringEquals":{"sts:ExternalId":"abc"}}}]}`
@@ -1173,6 +1301,7 @@ func TestCreateRole_MalformedTrustPolicy_ConditionRejected_StringEquals(t *testi
 }
 
 func TestCreateRole_MalformedTrustPolicy_ConditionRejected_IpAddress(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRole","Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}]}`
@@ -1185,6 +1314,7 @@ func TestCreateRole_MalformedTrustPolicy_ConditionRejected_IpAddress(t *testing.
 }
 
 func TestCreateRole_TrustPolicy_EmptyConditionAccepted(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	// Condition: {} is trivially empty — no field actually present at
@@ -1198,6 +1328,7 @@ func TestCreateRole_TrustPolicy_EmptyConditionAccepted(t *testing.T) {
 }
 
 func TestCreateRole_TrustPolicy_NullConditionAccepted(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRole","Condition":null}]}`
@@ -1209,6 +1340,7 @@ func TestCreateRole_TrustPolicy_NullConditionAccepted(t *testing.T) {
 }
 
 func TestCreateRole_MalformedTrustPolicy_NotPrincipalRejected(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","NotPrincipal":{"AWS":"arn:aws:iam::123456789012:user/Bob"},"Action":"sts:AssumeRole"}]}`
@@ -1221,6 +1353,7 @@ func TestCreateRole_MalformedTrustPolicy_NotPrincipalRejected(t *testing.T) {
 }
 
 func TestCreateRole_MalformedTrustPolicy_NotActionRejected(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"NotAction":["sts:AssumeRole"]}]}`
@@ -1233,6 +1366,7 @@ func TestCreateRole_MalformedTrustPolicy_NotActionRejected(t *testing.T) {
 }
 
 func TestCreateRole_MalformedTrustPolicy_EmptyActionElement(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	// len(Action) > 0, but the single element is empty — the original
@@ -1247,6 +1381,7 @@ func TestCreateRole_MalformedTrustPolicy_EmptyActionElement(t *testing.T) {
 }
 
 func TestCreateRole_MalformedTrustPolicy_EmptyPrincipalObject(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{},"Action":"sts:AssumeRole"}]}`
@@ -1259,6 +1394,7 @@ func TestCreateRole_MalformedTrustPolicy_EmptyPrincipalObject(t *testing.T) {
 }
 
 func TestCreateRole_MalformedTrustPolicy_EmptyPrincipalArray(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":[],"Action":"sts:AssumeRole"}]}`
@@ -1271,6 +1407,7 @@ func TestCreateRole_MalformedTrustPolicy_EmptyPrincipalArray(t *testing.T) {
 }
 
 func TestCreateRole_MalformedTrustPolicy_MultiStatementOneForbidden(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	// First statement is clean; the second carries a Condition. The whole
@@ -1288,6 +1425,7 @@ func TestCreateRole_MalformedTrustPolicy_MultiStatementOneForbidden(t *testing.T
 }
 
 func TestUpdateAssumeRolePolicy_ConditionRejected(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "update-cond")
 
@@ -1301,6 +1439,7 @@ func TestUpdateAssumeRolePolicy_ConditionRejected(t *testing.T) {
 }
 
 func TestUpdateAssumeRolePolicy_NotPrincipalRejected(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "update-notprincipal")
 
@@ -1314,6 +1453,7 @@ func TestUpdateAssumeRolePolicy_NotPrincipalRejected(t *testing.T) {
 }
 
 func TestUpdateAssumeRolePolicy_NotActionRejected(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestRole(t, svc, "update-notaction")
 

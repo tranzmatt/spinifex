@@ -12,9 +12,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Shipped catalog entries, one per tier, referenced by the access tests.
-// Naming them here keeps a catalog change to one edit per tier rather than one
-// per assertion.
+// selfHostTestModel and selfHostTestModel3B are shipped catalog entries.
+// anthropicTestModel is not: v1 ships no provider-tier entry, so
+// provider-path tests pair it with withProviderCatalogEntry. Naming them here
+// keeps a catalog change to one edit per tier rather than one per assertion.
 const (
 	selfHostTestModel   = "meta.llama3-2-1b-instruct-v1:0"
 	selfHostTestModel3B = "meta.llama3-2-3b-instruct-v1:0"
@@ -241,4 +242,25 @@ func TestSeedAccountGrants_MarkerIsNotAGrant(t *testing.T) {
 	models, err := store.List(ctx, "000000000001")
 	require.NoError(t, err)
 	assert.Empty(t, models, "the seed marker must not be listed as a grant")
+}
+
+// TestModelAccessStore_RequiresJetStream covers a store constructed with no
+// JetStream client: every accessor must report the misconfiguration rather
+// than panic on a nil handle.
+func TestModelAccessStore_RequiresJetStream(t *testing.T) {
+	store := NewModelAccessStore(nil, 1)
+	ctx := context.Background()
+
+	_, err := store.Granted(ctx, "000000000001", "anthropic.claude-3-5-sonnet-20240620-v1:0")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no JetStream client configured")
+
+	require.Error(t, store.Grant(ctx, "000000000001", "m"))
+	require.Error(t, store.Revoke(ctx, "000000000001", "m"))
+
+	_, err = store.List(ctx, "000000000001")
+	require.Error(t, err)
+
+	_, err = store.SeedAccountGrants(ctx, "000000000001", []string{"m"})
+	require.Error(t, err)
 }

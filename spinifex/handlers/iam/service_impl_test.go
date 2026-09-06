@@ -48,6 +48,7 @@ func createTestUser(t *testing.T, svc *IAMServiceImpl, userName string) *iam.Use
 // ============================================================================
 
 func TestCreateUser(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	out, err := svc.CreateUser(testAccountID, &iam.CreateUserInput{
@@ -67,6 +68,7 @@ func TestCreateUser(t *testing.T) {
 }
 
 func TestCreateUser_DefaultPath(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	out, err := svc.CreateUser(testAccountID, &iam.CreateUserInput{
@@ -77,6 +79,7 @@ func TestCreateUser_DefaultPath(t *testing.T) {
 }
 
 func TestCreateUser_Duplicate(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreateUser(testAccountID, &iam.CreateUserInput{
@@ -91,7 +94,51 @@ func TestCreateUser_Duplicate(t *testing.T) {
 	assert.Contains(t, err.Error(), awserrors.ErrorIAMEntityAlreadyExists)
 }
 
+func TestCreateUser_PermissionsBoundarySet(t *testing.T) {
+	t.Parallel()
+	svc := setupTestIAMService(t)
+
+	_, err := svc.CreateUser(testAccountID, &iam.CreateUserInput{
+		UserName:            aws.String("boundeduser"),
+		PermissionsBoundary: aws.String("arn:aws:iam::" + testAccountID + ":policy/deny-all"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), awserrors.ErrorValidationError)
+	assert.Contains(t, err.Error(), "PermissionsBoundary")
+
+	_, err = svc.GetUser(testAccountID, &iam.GetUserInput{UserName: aws.String("boundeduser")})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), awserrors.ErrorIAMNoSuchEntity)
+}
+
+func TestCreateUser_PermissionsBoundaryAbsent(t *testing.T) {
+	t.Parallel()
+	svc := setupTestIAMService(t)
+
+	tests := []struct {
+		name     string
+		userName string
+		boundary *string
+	}{
+		{name: "nil", userName: "nilboundary", boundary: nil},
+		{name: "empty string", userName: "emptyboundary", boundary: aws.String("")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			out, err := svc.CreateUser(testAccountID, &iam.CreateUserInput{
+				UserName:            aws.String(tt.userName),
+				PermissionsBoundary: tt.boundary,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tt.userName, *out.User.UserName)
+		})
+	}
+}
+
 func TestGetUser(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "getuser")
 
@@ -103,6 +150,7 @@ func TestGetUser(t *testing.T) {
 }
 
 func TestGetUser_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.GetUser(testAccountID, &iam.GetUserInput{
@@ -113,6 +161,7 @@ func TestGetUser_NotFound(t *testing.T) {
 }
 
 func TestListUsers(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	createTestUser(t, svc, "user1")
@@ -133,6 +182,7 @@ func TestListUsers(t *testing.T) {
 }
 
 func TestListUsers_Empty(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	out, err := svc.ListUsers(testAccountID, &iam.ListUsersInput{})
@@ -140,7 +190,100 @@ func TestListUsers_Empty(t *testing.T) {
 	assert.Empty(t, out.Users)
 }
 
+// TestListRequiredMembersAreEmptyNotNil covers every IAM list operation whose
+// output shape marks the list member required. Each seeds a record that cannot
+// match, so the filtering loop runs rather than the no-keys shortcut, and the
+// result must come back empty but non-nil.
+func TestListRequiredMembersAreEmptyNotNil(t *testing.T) {
+	t.Parallel()
+	const otherAccountID = "999988887777"
+
+	tests := []struct {
+		operation string
+		member    string
+		// seed writes a record the listing must filter out, so an empty result
+		// is reached through the loop rather than the empty-bucket shortcut.
+		seed func(t *testing.T, svc *IAMServiceImpl)
+		list func(t *testing.T, svc *IAMServiceImpl) any
+	}{
+		{
+			operation: "ListUsers",
+			member:    "Users",
+			seed: func(t *testing.T, svc *IAMServiceImpl) {
+				_, err := svc.CreateUser(otherAccountID, &iam.CreateUserInput{UserName: aws.String("otheruser")})
+				require.NoError(t, err)
+			},
+			list: func(t *testing.T, svc *IAMServiceImpl) any {
+				out, err := svc.ListUsers(testAccountID, &iam.ListUsersInput{})
+				require.NoError(t, err)
+				return out.Users
+			},
+		},
+		{
+			operation: "ListRoles",
+			member:    "Roles",
+			seed: func(t *testing.T, svc *IAMServiceImpl) {
+				_, err := svc.CreateRole(otherAccountID, &iam.CreateRoleInput{
+					RoleName:                 aws.String("otherrole"),
+					AssumeRolePolicyDocument: aws.String(validTrustPolicy()),
+				})
+				require.NoError(t, err)
+			},
+			list: func(t *testing.T, svc *IAMServiceImpl) any {
+				out, err := svc.ListRoles(testAccountID, &iam.ListRolesInput{})
+				require.NoError(t, err)
+				return out.Roles
+			},
+		},
+		{
+			operation: "ListInstanceProfiles",
+			member:    "InstanceProfiles",
+			seed: func(t *testing.T, svc *IAMServiceImpl) {
+				_, err := svc.CreateInstanceProfile(otherAccountID, &iam.CreateInstanceProfileInput{
+					InstanceProfileName: aws.String("otherprofile"),
+				})
+				require.NoError(t, err)
+			},
+			list: func(t *testing.T, svc *IAMServiceImpl) any {
+				out, err := svc.ListInstanceProfiles(testAccountID, &iam.ListInstanceProfilesInput{})
+				require.NoError(t, err)
+				return out.InstanceProfiles
+			},
+		},
+		{
+			operation: "ListGroupsForUser",
+			member:    "Groups",
+			// Membership is read off the user, so a user belonging to no group
+			// is the empty case; a foreign record would not reach the loop.
+			seed: func(t *testing.T, svc *IAMServiceImpl) {
+				createTestUser(t, svc, "grouplessuser")
+				createTestGroup(t, svc, "unrelatedgroup")
+			},
+			list: func(t *testing.T, svc *IAMServiceImpl) any {
+				out, err := svc.ListGroupsForUser(testAccountID, &iam.ListGroupsForUserInput{
+					UserName: aws.String("grouplessuser"),
+				})
+				require.NoError(t, err)
+				return out.Groups
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.operation, func(t *testing.T) {
+			t.Parallel()
+			svc := setupTestIAMService(t)
+			tt.seed(t, svc)
+
+			got := tt.list(t, svc)
+			assert.Empty(t, got)
+			assert.NotNil(t, got, emptyRequiredListMsg(tt.operation, tt.member))
+		})
+	}
+}
+
 func TestListUsers_PathFilter(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	svc.CreateUser(testAccountID, &iam.CreateUserInput{
@@ -161,6 +304,7 @@ func TestListUsers_PathFilter(t *testing.T) {
 }
 
 func TestDeleteUser(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "deleteuser")
 
@@ -177,6 +321,7 @@ func TestDeleteUser(t *testing.T) {
 }
 
 func TestDeleteUser_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.DeleteUser(testAccountID, &iam.DeleteUserInput{
@@ -187,6 +332,7 @@ func TestDeleteUser_NotFound(t *testing.T) {
 }
 
 func TestDeleteUser_WithAccessKeys(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "userWithKeys")
 
@@ -203,6 +349,7 @@ func TestDeleteUser_WithAccessKeys(t *testing.T) {
 }
 
 func TestDeleteUser_WithAttachedPolicies(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "policyuser")
 
@@ -231,6 +378,7 @@ func TestDeleteUser_WithAttachedPolicies(t *testing.T) {
 // ============================================================================
 
 func TestCreateUser_InvalidName_TooLong(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	longName := strings.Repeat("a", 65)
 
@@ -242,6 +390,7 @@ func TestCreateUser_InvalidName_TooLong(t *testing.T) {
 }
 
 func TestCreateUser_InvalidName_BadChars(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreateUser(testAccountID, &iam.CreateUserInput{
@@ -252,6 +401,7 @@ func TestCreateUser_InvalidName_BadChars(t *testing.T) {
 }
 
 func TestCreateUser_InvalidPath(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreateUser(testAccountID, &iam.CreateUserInput{
@@ -263,6 +413,7 @@ func TestCreateUser_InvalidPath(t *testing.T) {
 }
 
 func TestCreatePolicy_InvalidName(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	longName := strings.Repeat("a", 129)
 
@@ -275,6 +426,7 @@ func TestCreatePolicy_InvalidName(t *testing.T) {
 }
 
 func TestCreatePolicy_InvalidPath(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreatePolicy(testAccountID, &iam.CreatePolicyInput{
@@ -287,6 +439,7 @@ func TestCreatePolicy_InvalidPath(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_TooLarge(t *testing.T) {
+	t.Parallel()
 	largeDoc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"` + strings.Repeat("a", maxPolicyDocumentSize) + `"}]}`
 	_, err := ValidatePolicyDocument(largeDoc)
 	assert.Error(t, err)
@@ -298,6 +451,7 @@ func TestValidatePolicyDocument_TooLarge(t *testing.T) {
 // ============================================================================
 
 func TestCreateAccessKey(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "keyuser")
 
@@ -315,6 +469,7 @@ func TestCreateAccessKey(t *testing.T) {
 }
 
 func TestCreateAccessKey_SecretIsDecryptable(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "decryptuser")
 
@@ -336,6 +491,7 @@ func TestCreateAccessKey_SecretIsDecryptable(t *testing.T) {
 }
 
 func TestCreateAccessKey_UserNotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreateAccessKey(testAccountID, &iam.CreateAccessKeyInput{
@@ -346,6 +502,7 @@ func TestCreateAccessKey_UserNotFound(t *testing.T) {
 }
 
 func TestCreateAccessKey_MaxLimit(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "limituser")
 
@@ -368,6 +525,7 @@ func TestCreateAccessKey_MaxLimit(t *testing.T) {
 }
 
 func TestAccessKeyQuota_Recovery(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "quotauser")
 
@@ -397,6 +555,7 @@ func TestAccessKeyQuota_Recovery(t *testing.T) {
 }
 
 func TestAccessKeyQuota_PerUser(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "user1")
 	createTestUser(t, svc, "user2")
@@ -413,6 +572,7 @@ func TestAccessKeyQuota_PerUser(t *testing.T) {
 }
 
 func TestListAccessKeys(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "listkeysuser")
 
@@ -438,6 +598,7 @@ func TestListAccessKeys(t *testing.T) {
 }
 
 func TestDeleteAccessKey(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "delkeyuser")
 
@@ -458,6 +619,7 @@ func TestDeleteAccessKey(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Empty(t, listOut.AccessKeyMetadata)
+	assert.NotNil(t, listOut.AccessKeyMetadata, emptyRequiredListMsg("ListAccessKeys", "AccessKeyMetadata"))
 
 	// User should now be deletable (no access keys)
 	_, err = svc.DeleteUser(testAccountID, &iam.DeleteUserInput{
@@ -467,6 +629,7 @@ func TestDeleteAccessKey(t *testing.T) {
 }
 
 func TestDeleteAccessKey_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "delnotfounduser")
 
@@ -479,6 +642,7 @@ func TestDeleteAccessKey_NotFound(t *testing.T) {
 }
 
 func TestUpdateAccessKey(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "updatekeyuser")
 
@@ -514,6 +678,7 @@ func TestUpdateAccessKey(t *testing.T) {
 }
 
 func TestUpdateAccessKey_InvalidStatus(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "invalidstatususer")
 
@@ -530,6 +695,7 @@ func TestUpdateAccessKey_InvalidStatus(t *testing.T) {
 }
 
 func TestUpdateAccessKey_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.UpdateAccessKey(testAccountID, &iam.UpdateAccessKeyInput{
@@ -541,6 +707,7 @@ func TestUpdateAccessKey_NotFound(t *testing.T) {
 }
 
 func TestUpdateAccessKey_CaseSensitiveStatus(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "caseuser")
 
@@ -571,6 +738,7 @@ func TestUpdateAccessKey_CaseSensitiveStatus(t *testing.T) {
 }
 
 func TestUpdateAccessKey_CrossAccountBlocked(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	accA, err := svc.CreateAccount("Status Org A")
@@ -599,6 +767,7 @@ func TestUpdateAccessKey_CrossAccountBlocked(t *testing.T) {
 // ============================================================================
 
 func TestLookupAccessKey(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "lookupuser")
 
@@ -615,6 +784,7 @@ func TestLookupAccessKey(t *testing.T) {
 }
 
 func TestLookupAccessKey_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.LookupAccessKey("AKIANONEXISTENT12345")
@@ -623,6 +793,7 @@ func TestLookupAccessKey_NotFound(t *testing.T) {
 }
 
 func TestLookupAccessKey_InactiveKey(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "inactiveuser")
 
@@ -647,6 +818,7 @@ func TestLookupAccessKey_InactiveKey(t *testing.T) {
 // ============================================================================
 
 func TestSeedBootstrap(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	encryptedSecret, err := svc.key.EncryptBase64("test-secret-key")
@@ -689,6 +861,7 @@ func TestSeedBootstrap(t *testing.T) {
 }
 
 func TestSeedBootstrap_Idempotent(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	encryptedSecret, _ := svc.key.EncryptBase64("test-secret")
@@ -715,6 +888,7 @@ func TestSeedBootstrap_Idempotent(t *testing.T) {
 }
 
 func TestSeedBootstrap_WithAdmin(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	systemSecret, err := svc.key.EncryptBase64("system-secret")
@@ -783,6 +957,7 @@ func TestSeedBootstrap_WithAdmin(t *testing.T) {
 }
 
 func TestSeedBootstrap_AdminNil_BackwardCompat(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	encryptedSecret, err := svc.key.EncryptBase64("test-secret")
@@ -813,6 +988,7 @@ func TestSeedBootstrap_AdminNil_BackwardCompat(t *testing.T) {
 // ============================================================================
 
 func TestIsEmpty_True(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	empty, err := svc.IsEmpty()
@@ -821,6 +997,7 @@ func TestIsEmpty_True(t *testing.T) {
 }
 
 func TestIsEmpty_False(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "notempty")
 
@@ -834,6 +1011,7 @@ func TestIsEmpty_False(t *testing.T) {
 // ============================================================================
 
 func TestGenerateIAMID(t *testing.T) {
+	t.Parallel()
 	id, err := generateIAMID("AIDA")
 	assert.NoError(t, err)
 	assert.Equal(t, "AIDA", id[:4])
@@ -852,6 +1030,7 @@ func TestGenerateIAMID(t *testing.T) {
 }
 
 func TestGenerateAccessKeyID(t *testing.T) {
+	t.Parallel()
 	id, err := generateAccessKeyID()
 	assert.NoError(t, err)
 	assert.Equal(t, "AKIA", id[:4])
@@ -863,6 +1042,7 @@ func TestGenerateAccessKeyID(t *testing.T) {
 }
 
 func TestGenerateSecretAccessKey(t *testing.T) {
+	t.Parallel()
 	secret, err := admin.GenerateAWSSecretKey()
 	assert.NoError(t, err)
 	assert.Len(t, secret, 40)
@@ -892,6 +1072,7 @@ func createTestPolicy(t *testing.T, svc *IAMServiceImpl, name string) *iam.Polic
 }
 
 func TestCreatePolicy(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	out, err := svc.CreatePolicy(testAccountID, &iam.CreatePolicyInput{
@@ -914,6 +1095,7 @@ func TestCreatePolicy(t *testing.T) {
 }
 
 func TestCreatePolicy_DefaultPath(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	out, err := svc.CreatePolicy(testAccountID, &iam.CreatePolicyInput{
@@ -926,6 +1108,7 @@ func TestCreatePolicy_DefaultPath(t *testing.T) {
 }
 
 func TestCreatePolicy_InvalidJSON(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreatePolicy(testAccountID, &iam.CreatePolicyInput{
@@ -937,6 +1120,7 @@ func TestCreatePolicy_InvalidJSON(t *testing.T) {
 }
 
 func TestCreatePolicy_InvalidVersion(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreatePolicy(testAccountID, &iam.CreatePolicyInput{
@@ -948,6 +1132,7 @@ func TestCreatePolicy_InvalidVersion(t *testing.T) {
 }
 
 func TestCreatePolicy_NoStatements(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreatePolicy(testAccountID, &iam.CreatePolicyInput{
@@ -959,6 +1144,7 @@ func TestCreatePolicy_NoStatements(t *testing.T) {
 }
 
 func TestCreatePolicy_InvalidEffect(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreatePolicy(testAccountID, &iam.CreatePolicyInput{
@@ -970,6 +1156,7 @@ func TestCreatePolicy_InvalidEffect(t *testing.T) {
 }
 
 func TestCreatePolicy_MissingAction(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreatePolicy(testAccountID, &iam.CreatePolicyInput{
@@ -981,6 +1168,7 @@ func TestCreatePolicy_MissingAction(t *testing.T) {
 }
 
 func TestCreatePolicy_MissingResource(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.CreatePolicy(testAccountID, &iam.CreatePolicyInput{
@@ -992,6 +1180,7 @@ func TestCreatePolicy_MissingResource(t *testing.T) {
 }
 
 func TestCreatePolicy_Duplicate(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	createTestPolicy(t, svc, "DupPolicy")
@@ -1005,6 +1194,7 @@ func TestCreatePolicy_Duplicate(t *testing.T) {
 }
 
 func TestCreatePolicy_ArrayActions(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:DescribeInstances","ec2:RunInstances"],"Resource":"*"}]}`
@@ -1017,6 +1207,7 @@ func TestCreatePolicy_ArrayActions(t *testing.T) {
 }
 
 func TestGetPolicy(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	created := createTestPolicy(t, svc, "GetMe")
 
@@ -1032,6 +1223,7 @@ func TestGetPolicy(t *testing.T) {
 }
 
 func TestGetPolicy_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.GetPolicy(testAccountID, &iam.GetPolicyInput{
@@ -1042,6 +1234,7 @@ func TestGetPolicy_NotFound(t *testing.T) {
 }
 
 func TestGetPolicy_MalformedARN(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.GetPolicy(testAccountID, &iam.GetPolicyInput{
@@ -1052,6 +1245,7 @@ func TestGetPolicy_MalformedARN(t *testing.T) {
 }
 
 func TestGetPolicy_ARNParsingEdgeCases(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`
 
@@ -1072,19 +1266,25 @@ func TestGetPolicy_ARNParsingEdgeCases(t *testing.T) {
 		{"trailing slash only", "arn:aws:iam::" + testAccountID + ":policy/"},
 		{"empty after policy", "arn:aws:iam::" + testAccountID + ":policy"},
 		{"no policy segment", "arn:aws:iam::" + testAccountID + ":user/TestARN"},
+		{"policy-backup near miss", "arn:aws:iam::" + testAccountID + ":policy-backup/TestARN"},
+		{"policyset near miss", "arn:aws:iam::" + testAccountID + ":policyset/TestARN"},
+		{"empty account", "arn:aws:iam:::policy/TestARN"},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			_, err := svc.GetPolicy(testAccountID, &iam.GetPolicyInput{
 				PolicyArn: aws.String(tc.arn),
 			})
-			assert.Error(t, err, "ARN %q should fail", tc.arn)
+			require.Error(t, err, "ARN %q should fail", tc.arn)
+			assert.Contains(t, err.Error(), awserrors.ErrorIAMNoSuchEntity, "ARN %q", tc.arn)
 		})
 	}
 }
 
 func TestGetPolicy_WithAttachments(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	created := createTestPolicy(t, svc, "AttachedPolicy")
 	createTestUser(t, svc, "attachuser1")
@@ -1107,6 +1307,7 @@ func TestGetPolicy_WithAttachments(t *testing.T) {
 }
 
 func TestGetPolicyVersion(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	created := createTestPolicy(t, svc, "VersionPolicy")
 
@@ -1127,6 +1328,7 @@ func TestGetPolicyVersion(t *testing.T) {
 }
 
 func TestGetPolicyVersion_InvalidVersion(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	created := createTestPolicy(t, svc, "VersionPolicy2")
 
@@ -1139,6 +1341,7 @@ func TestGetPolicyVersion_InvalidVersion(t *testing.T) {
 }
 
 func TestGetPolicyVersion_PolicyNotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.GetPolicyVersion(testAccountID, &iam.GetPolicyVersionInput{
@@ -1150,6 +1353,7 @@ func TestGetPolicyVersion_PolicyNotFound(t *testing.T) {
 }
 
 func TestListPolicyVersions(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	created := createTestPolicy(t, svc, "ListVersionPolicy")
 
@@ -1166,6 +1370,7 @@ func TestListPolicyVersions(t *testing.T) {
 }
 
 func TestListPolicyVersions_PolicyNotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.ListPolicyVersions(testAccountID, &iam.ListPolicyVersionsInput{
@@ -1176,6 +1381,7 @@ func TestListPolicyVersions_PolicyNotFound(t *testing.T) {
 }
 
 func TestListPolicies(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	createTestPolicy(t, svc, "Policy1")
@@ -1196,6 +1402,7 @@ func TestListPolicies(t *testing.T) {
 }
 
 func TestListPolicies_Empty(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	out, err := svc.ListPolicies(testAccountID, &iam.ListPoliciesInput{})
@@ -1204,6 +1411,7 @@ func TestListPolicies_Empty(t *testing.T) {
 }
 
 func TestDeletePolicy(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	created := createTestPolicy(t, svc, "DeleteMe")
 
@@ -1221,6 +1429,7 @@ func TestDeletePolicy(t *testing.T) {
 }
 
 func TestDeletePolicy_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.DeletePolicy(testAccountID, &iam.DeletePolicyInput{
@@ -1231,6 +1440,7 @@ func TestDeletePolicy_NotFound(t *testing.T) {
 }
 
 func TestDeletePolicy_AttachedConflict(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	created := createTestPolicy(t, svc, "Attached")
 	createTestUser(t, svc, "conflictuser")
@@ -1265,6 +1475,7 @@ func TestDeletePolicy_AttachedConflict(t *testing.T) {
 // ============================================================================
 
 func TestAttachUserPolicy(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	created := createTestPolicy(t, svc, "AttachPolicy")
 	createTestUser(t, svc, "attachme")
@@ -1286,6 +1497,7 @@ func TestAttachUserPolicy(t *testing.T) {
 }
 
 func TestAttachUserPolicy_Idempotent(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	created := createTestPolicy(t, svc, "IdempotentPolicy")
 	createTestUser(t, svc, "idempotentuser")
@@ -1311,6 +1523,7 @@ func TestAttachUserPolicy_Idempotent(t *testing.T) {
 }
 
 func TestAttachUserPolicy_NonexistentPolicy(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "orphanuser")
 
@@ -1323,6 +1536,7 @@ func TestAttachUserPolicy_NonexistentPolicy(t *testing.T) {
 }
 
 func TestAttachUserPolicy_NonexistentUser(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	created := createTestPolicy(t, svc, "OrphanPolicy")
 
@@ -1335,6 +1549,7 @@ func TestAttachUserPolicy_NonexistentUser(t *testing.T) {
 }
 
 func TestDetachUserPolicy(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	created := createTestPolicy(t, svc, "DetachPolicy")
 	createTestUser(t, svc, "detachme")
@@ -1360,6 +1575,7 @@ func TestDetachUserPolicy(t *testing.T) {
 }
 
 func TestDetachUserPolicy_NotAttached(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	created := createTestPolicy(t, svc, "NeverAttached")
 	createTestUser(t, svc, "cleanuser")
@@ -1373,6 +1589,7 @@ func TestDetachUserPolicy_NotAttached(t *testing.T) {
 }
 
 func TestDetachUserPolicy_NonexistentUser(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.DetachUserPolicy(testAccountID, &iam.DetachUserPolicyInput{
@@ -1384,6 +1601,7 @@ func TestDetachUserPolicy_NonexistentUser(t *testing.T) {
 }
 
 func TestListAttachedUserPolicies(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	p1 := createTestPolicy(t, svc, "ListPolicy1")
@@ -1414,6 +1632,7 @@ func TestListAttachedUserPolicies(t *testing.T) {
 }
 
 func TestListAttachedUserPolicies_Empty(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "nopolicies")
 
@@ -1425,6 +1644,7 @@ func TestListAttachedUserPolicies_Empty(t *testing.T) {
 }
 
 func TestListAttachedUserPolicies_NonexistentUser(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.ListAttachedUserPolicies(testAccountID, &iam.ListAttachedUserPoliciesInput{
@@ -1439,6 +1659,7 @@ func TestListAttachedUserPolicies_NonexistentUser(t *testing.T) {
 // ============================================================================
 
 func TestGetUserPolicies(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ec2:DescribeInstances","Resource":"*"}]}`
@@ -1474,6 +1695,7 @@ func TestGetUserPolicies(t *testing.T) {
 }
 
 func TestGetUserPolicies_NoPolicies(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "emptyuser")
 
@@ -1483,6 +1705,7 @@ func TestGetUserPolicies_NoPolicies(t *testing.T) {
 }
 
 func TestGetUserPolicies_NonexistentUser(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	_, err := svc.GetUserPolicies(testAccountID, "ghostuser")
@@ -1495,6 +1718,7 @@ func TestGetUserPolicies_NonexistentUser(t *testing.T) {
 // ============================================================================
 
 func TestValidatePolicyDocument_Valid(t *testing.T) {
+	t.Parallel()
 	doc, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`)
 	require.NoError(t, err)
 	assert.Equal(t, "2012-10-17", doc.Version)
@@ -1503,6 +1727,7 @@ func TestValidatePolicyDocument_Valid(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_MultipleStatements(t *testing.T) {
+	t.Parallel()
 	doc, err := ValidatePolicyDocument(`{
 		"Version":"2012-10-17",
 		"Statement":[
@@ -1517,41 +1742,48 @@ func TestValidatePolicyDocument_MultipleStatements(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_BadJSON(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{broken`)
 	assert.Error(t, err)
 }
 
 func TestValidatePolicyDocument_WrongVersion(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{"Version":"2008-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported policy version")
 }
 
 func TestValidatePolicyDocument_EmptyStatements(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[]}`)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "at least one statement")
 }
 
 func TestValidatePolicyDocument_BadEffect(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[{"Effect":"Maybe","Action":"*","Resource":"*"}]}`)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "Effect must be Allow or Deny")
 }
 
 func TestValidatePolicyDocument_MissingAction(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Resource":"*"}]}`)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "Action is required")
 }
 
 func TestValidatePolicyDocument_MissingResource(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*"}]}`)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "Resource is required")
 }
 
 func TestValidatePolicyDocument_SupportedCondition(t *testing.T) {
+	t.Parallel()
 	doc, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*",
 	 "Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}]}`)
 	require.NoError(t, err)
@@ -1560,6 +1792,7 @@ func TestValidatePolicyDocument_SupportedCondition(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_UnsupportedConditionOperator(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*",
 	 "Condition":{"StringEquals":{"aws:SourceIp":"10.0.0.1"}}}]}`)
 	assert.Error(t, err)
@@ -1567,6 +1800,7 @@ func TestValidatePolicyDocument_UnsupportedConditionOperator(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_UnsupportedConditionKey(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*",
 	 "Condition":{"StringEquals":{"aws:PrincipalOrgID":"o-1234"}}}]}`)
 	assert.Error(t, err)
@@ -1576,6 +1810,7 @@ func TestValidatePolicyDocument_UnsupportedConditionKey(t *testing.T) {
 // MFA does not exist in spinifex, so this key could never be true and accepting
 // it would mint a grant that silently never fires.
 func TestValidatePolicyDocument_RejectsMFACondition(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*",
 	 "Condition":{"Bool":{"aws:MultiFactorAuthPresent":"true"}}}]}`)
 	assert.Error(t, err)
@@ -1583,6 +1818,7 @@ func TestValidatePolicyDocument_RejectsMFACondition(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_RejectsPrincipal(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*",
 	 "Principal":{"AWS":"arn:aws:iam::123456789012:root"}}]}`)
 	assert.Error(t, err)
@@ -1590,6 +1826,7 @@ func TestValidatePolicyDocument_RejectsPrincipal(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_RejectsNotAction(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*",
 	 "NotAction":"sts:AssumeRole"}]}`)
 	assert.Error(t, err)
@@ -1600,6 +1837,7 @@ func TestValidatePolicyDocument_RejectsNotAction(t *testing.T) {
 // matcher cannot parse it, so the Allow never fires and the operator gets a bare
 // AccessDenied with nothing naming the cause.
 func TestValidatePolicyDocument_RejectsMalformedConditionValues(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		cond    string
@@ -1614,6 +1852,7 @@ func TestValidatePolicyDocument_RejectsMalformedConditionValues(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			_, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
 			 "Action":"s3:*","Resource":"*","Condition":` + tt.cond + `}]}`)
 			require.Error(t, err)
@@ -1625,6 +1864,7 @@ func TestValidatePolicyDocument_RejectsMalformedConditionValues(t *testing.T) {
 // D4's lenient leaf parsing must survive at the API surface: a native JSON bool
 // is what Terraform emits, and rejecting it would fail ordinary valid policies.
 func TestValidatePolicyDocument_AcceptsNativeBoolAndCIDRForms(t *testing.T) {
+	t.Parallel()
 	for _, cond := range []string{
 		`{"Bool":{"aws:SecureTransport":true}}`,
 		`{"Bool":{"aws:SecureTransport":"TRUE"}}`,
@@ -1640,6 +1880,7 @@ func TestValidatePolicyDocument_AcceptsNativeBoolAndCIDRForms(t *testing.T) {
 // Map iteration order makes a break-instead-of-continue bug non-deterministic,
 // so a single-operator document cannot pin the loop.
 func TestValidatePolicyDocument_RejectsUnsupportedAlongsideSupported(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*",
 	 "Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/8"},"StringEquals":{"aws:PrincipalOrgID":"o-1234"}}}]}`)
 	require.Error(t, err)
@@ -1647,6 +1888,7 @@ func TestValidatePolicyDocument_RejectsUnsupportedAlongsideSupported(t *testing.
 }
 
 func TestValidatePolicyDocument_RejectsNotResource(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*",
 	 "NotResource":"arn:aws:s3:::public/*"}]}`)
 	assert.Error(t, err)
@@ -1657,6 +1899,9 @@ func TestValidatePolicyDocument_RejectsNotResource(t *testing.T) {
 // Sensitive Data Not Logged Tests
 // ============================================================================
 
+// Serial: swaps the process-wide default logger to capture output. In parallel
+// a racing restore would leave this asserting against an empty buffer, which
+// passes while proving nothing.
 func TestSensitiveDataNotLogged_CreateAccessKey(t *testing.T) {
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "loguser")
@@ -1688,6 +1933,7 @@ func TestSensitiveDataNotLogged_CreateAccessKey(t *testing.T) {
 		"encrypted secret must not appear in log output")
 }
 
+// Serial: swaps the process-wide default logger, as above.
 func TestSensitiveDataNotLogged_MasterKey(t *testing.T) {
 	// Capture log output during service init
 	var buf strings.Builder
@@ -1717,6 +1963,7 @@ func TestSensitiveDataNotLogged_MasterKey(t *testing.T) {
 // ============================================================================
 
 func TestInputValidation_UserNameLength(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	// 64 chars — should pass
@@ -1731,6 +1978,7 @@ func TestInputValidation_UserNameLength(t *testing.T) {
 }
 
 func TestInputValidation_PolicyNameLength(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`
 
@@ -1752,6 +2000,7 @@ func TestInputValidation_PolicyNameLength(t *testing.T) {
 }
 
 func TestInputValidation_PathLength(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	// 512 chars — should pass (path must start and end with /)
@@ -1774,6 +2023,7 @@ func TestInputValidation_PathLength(t *testing.T) {
 }
 
 func TestInputValidation_PolicyDocumentSize(t *testing.T) {
+	t.Parallel()
 	// 6144 bytes — should pass
 	filler6144 := strings.Repeat("a", 6144-len(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"`)-len(`"}]}`))
 	doc6144 := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"` + filler6144 + `"}]}`
@@ -1788,6 +2038,7 @@ func TestInputValidation_PolicyDocumentSize(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_OverlappingDenyAllow(t *testing.T) {
+	t.Parallel()
 	doc, err := ValidatePolicyDocument(`{
 		"Version":"2012-10-17",
 		"Statement":[
@@ -1804,6 +2055,7 @@ func TestValidatePolicyDocument_OverlappingDenyAllow(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_WithoutSid(t *testing.T) {
+	t.Parallel()
 	doc, err := ValidatePolicyDocument(`{
 		"Version":"2012-10-17",
 		"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]
@@ -1813,6 +2065,7 @@ func TestValidatePolicyDocument_WithoutSid(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_ActionSingleString(t *testing.T) {
+	t.Parallel()
 	doc, err := ValidatePolicyDocument(`{
 		"Version":"2012-10-17",
 		"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]
@@ -1822,6 +2075,7 @@ func TestValidatePolicyDocument_ActionSingleString(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_ActionArray(t *testing.T) {
+	t.Parallel()
 	doc, err := ValidatePolicyDocument(`{
 		"Version":"2012-10-17",
 		"Statement":[{"Effect":"Allow","Action":["s3:Get*","s3:List*"],"Resource":"*"}]
@@ -1831,6 +2085,7 @@ func TestValidatePolicyDocument_ActionArray(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_EmptyActionArray(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{
 		"Version":"2012-10-17",
 		"Statement":[{"Effect":"Allow","Action":[],"Resource":"*"}]
@@ -1840,6 +2095,7 @@ func TestValidatePolicyDocument_EmptyActionArray(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_EmptyResourceArray(t *testing.T) {
+	t.Parallel()
 	_, err := ValidatePolicyDocument(`{
 		"Version":"2012-10-17",
 		"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":[]}]
@@ -1849,6 +2105,7 @@ func TestValidatePolicyDocument_EmptyResourceArray(t *testing.T) {
 }
 
 func TestValidatePolicyDocument_ResourceARNFormat(t *testing.T) {
+	t.Parallel()
 	doc, err := ValidatePolicyDocument(`{
 		"Version":"2012-10-17",
 		"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::my-bucket/*"}]
@@ -1862,6 +2119,7 @@ func TestValidatePolicyDocument_ResourceARNFormat(t *testing.T) {
 // ============================================================================
 
 func TestGeneratePolicyID(t *testing.T) {
+	t.Parallel()
 	id, err := generateIAMID("ANPA")
 	assert.NoError(t, err)
 	assert.Equal(t, "ANPA", id[:4])
@@ -1877,6 +2135,7 @@ func TestGeneratePolicyID(t *testing.T) {
 // ============================================================================
 
 func TestIsIAMNameChar(t *testing.T) {
+	t.Parallel()
 	// Valid characters
 	for _, c := range "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+=,.@-_" {
 		assert.True(t, isIAMNameChar(byte(c)), "expected valid: %c", c)
@@ -1888,6 +2147,7 @@ func TestIsIAMNameChar(t *testing.T) {
 }
 
 func TestValidateUserName(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		input   string
@@ -1905,6 +2165,7 @@ func TestValidateUserName(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := validateUserName(tt.input)
 			if tt.wantErr {
 				assert.Error(t, err)
@@ -1916,6 +2177,7 @@ func TestValidateUserName(t *testing.T) {
 }
 
 func TestValidatePolicyName(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		input   string
@@ -1932,6 +2194,7 @@ func TestValidatePolicyName(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := validatePolicyName(tt.input)
 			if tt.wantErr {
 				assert.Error(t, err)
@@ -1943,6 +2206,7 @@ func TestValidatePolicyName(t *testing.T) {
 }
 
 func TestValidatePath(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		input   string
@@ -1959,6 +2223,7 @@ func TestValidatePath(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := validatePath(tt.input)
 			if tt.wantErr {
 				assert.Error(t, err)
@@ -1970,6 +2235,7 @@ func TestValidatePath(t *testing.T) {
 }
 
 func TestParseCreatedAt(t *testing.T) {
+	t.Parallel()
 	// Valid RFC3339
 	ts := "2024-01-15T10:30:00Z"
 	result := parseCreatedAt(ts)
@@ -1995,6 +2261,7 @@ func TestParseCreatedAt(t *testing.T) {
 }
 
 func TestGenerateIAMID_AllUpperHex(t *testing.T) {
+	t.Parallel()
 	for range 20 {
 		id, err := generateIAMID("AIDA")
 		assert.NoError(t, err)
@@ -2007,6 +2274,7 @@ func TestGenerateIAMID_AllUpperHex(t *testing.T) {
 }
 
 func TestGenerateAccessKeyID_AllUpperHex(t *testing.T) {
+	t.Parallel()
 	for range 20 {
 		id, err := generateAccessKeyID()
 		assert.NoError(t, err)
@@ -2019,6 +2287,7 @@ func TestGenerateAccessKeyID_AllUpperHex(t *testing.T) {
 }
 
 func TestAttachUserPolicy_AWSManagedOpaque(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "managed-user")
 	const managedARN = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly"
@@ -2040,6 +2309,7 @@ func TestAttachUserPolicy_AWSManagedOpaque(t *testing.T) {
 }
 
 func TestAttachUserPolicy_CustomerManagedMustExist(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "strict-user")
 

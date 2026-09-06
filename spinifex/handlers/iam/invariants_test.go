@@ -20,6 +20,7 @@ import (
 // a new writer path bypassing the helpers also fails CI.
 
 func TestInvariant_AccessKeysBucket_RejectsNonAKIAPrefix(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	cases := []struct {
@@ -36,6 +37,7 @@ func TestInvariant_AccessKeysBucket_RejectsNonAKIAPrefix(t *testing.T) {
 	payload := []byte(`{}`)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			err := svc.putAccessKey(t.Context(), tc.akid, payload)
 			require.Error(t, err, "putAccessKey accepted invalid prefix %q", tc.akid)
 			assert.Contains(t, err.Error(), LongLivedAccessKeyIDPrefix)
@@ -48,6 +50,7 @@ func TestInvariant_AccessKeysBucket_RejectsNonAKIAPrefix(t *testing.T) {
 }
 
 func TestInvariant_AccessKeysBucket_AcceptsAKIAPrefix(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 
 	akid := LongLivedAccessKeyIDPrefix + "0123456789ABCDEF"

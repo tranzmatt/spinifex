@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/mulgadc/spinifex/internal/tlsconfig"
+	"github.com/mulgadc/bluebottle/pkg/tlsconfig"
 	"github.com/mulgadc/spinifex/spinifex/otelsetup"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 )
@@ -41,12 +41,16 @@ type Config struct {
 	// Region is the cluster's AWS-parity region, served to the browser so the
 	// console can sign requests for the cluster it is actually talking to.
 	Region string `json:"region"`
+	// OchreEnabled gates the Ochre console (nav group and /bedrock/* routes)
+	// until it is ready to ship. Absent from the node config → false → hidden.
+	OchreEnabled bool `json:"ochre_enabled"`
 }
 
 // clusterConfig is the body of GET /api/config. It carries only non-secret
 // facts, matching the unauthenticated posture of /api/ca.pem.
 type clusterConfig struct {
-	Region string `json:"region"`
+	Region       string `json:"region"`
+	OchreEnabled bool   `json:"ochreEnabled"`
 }
 
 // namedRoute labels a route's request metrics with a fixed action, so
@@ -61,7 +65,7 @@ func namedRoute(action string, next http.Handler) http.Handler {
 // clusterConfigHandler serves the facts the SPA needs before it can sign
 // anything. no-store keeps a caching proxy in front of several clusters from
 // serving one the other's region.
-func clusterConfigHandler(region string) http.HandlerFunc {
+func clusterConfigHandler(region string, ochreEnabled bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if region == "" {
 			slog.Error("Cluster region is not configured; the console cannot sign requests")
@@ -70,7 +74,7 @@ func clusterConfigHandler(region string) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
-		if err := json.NewEncoder(w).Encode(clusterConfig{Region: region}); err != nil {
+		if err := json.NewEncoder(w).Encode(clusterConfig{Region: region, OchreEnabled: ochreEnabled}); err != nil {
 			slog.Error("Failed to write cluster config", "error", err)
 		}
 	}
@@ -167,6 +171,54 @@ func (svc *Service) Reload() error {
 }
 
 // launchService starts the HTTP server.
+// newSPAHandler serves the embedded build, falling back to index.html so the
+// router can resolve client-side paths.
+func newSPAHandler(contentFS fs.FS) http.HandlerFunc {
+	fileServer := http.FileServer(http.FS(contentFS))
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path == "" {
+			path = "index.html"
+		}
+
+		file, err := contentFS.Open(path)
+		if err == nil {
+			_ = file.Close()
+			// Asset filenames are content-hashed, so the action names the branch
+			// rather than the path — one series per build otherwise.
+			otelsetup.SetRequestAction(r.Context(), "ui.static")
+			w.Header().Set("Cache-Control", assetCacheControl(path))
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+
+		otelsetup.SetRequestAction(r.Context(), "ui.spa")
+		w.Header().Set("Cache-Control", "no-cache")
+		indexContent, err := fs.ReadFile(contentFS, "index.html")
+		if err != nil {
+			http.Error(w, "index.html not found", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if _, err := w.Write(indexContent); err != nil {
+			slog.Error("Failed to write index.html response", "error", err)
+		}
+	}
+}
+
+// embed.FS reports a zero ModTime and FileServer sets no ETag, so a revalidated
+// response has no validator to answer 304 with. The content hash under assets/
+// is that validator: the name addresses one build, so it can be cached forever.
+// Everything else is revalidated, index.html above all — it is what points at
+// the current build's hashed names.
+func assetCacheControl(path string) string {
+	if strings.HasPrefix(path, "assets/") {
+		return "public, max-age=31536000, immutable"
+	}
+	return "no-cache"
+}
+
 func (svc *Service) launchService() error {
 	// Strip the "frontend/dist" prefix from embedded filesystem
 	contentFS, err := fs.Sub(distFS, "frontend/dist")
@@ -194,44 +246,7 @@ func (svc *Service) launchService() error {
 		return fmt.Errorf("proxy transport: %w", err)
 	}
 
-	// Serve static files from embedded filesystem
-	fileServer := http.FileServer(http.FS(contentFS))
-
-	// SPA handler: try to serve the file, fallback to index.html
-	spaHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Clean the path
-		path := strings.TrimPrefix(r.URL.Path, "/")
-		if path == "" {
-			path = "index.html"
-		}
-
-		// Check if the requested path is a file that exists in embedded FS
-		file, err := contentFS.Open(path)
-		if err == nil {
-			_ = file.Close()
-			// Asset filenames are content-hashed, so the action names the branch
-			// rather than the path — one series per build otherwise.
-			otelsetup.SetRequestAction(r.Context(), "ui.static")
-			// Use no-cache to force revalidation; http.FileServer sets ETags
-			// so browsers will get 304 Not Modified when files haven't changed
-			w.Header().Set("Cache-Control", "no-cache")
-			fileServer.ServeHTTP(w, r)
-			return
-		}
-
-		// File doesn't exist, serve index.html for SPA routing
-		otelsetup.SetRequestAction(r.Context(), "ui.spa")
-		w.Header().Set("Cache-Control", "no-cache")
-		indexContent, err := fs.ReadFile(contentFS, "index.html")
-		if err != nil {
-			http.Error(w, "index.html not found", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if _, err := w.Write(indexContent); err != nil {
-			slog.Error("Failed to write index.html response", "error", err)
-		}
-	})
+	spaHandler := newSPAHandler(contentFS)
 
 	mux := http.NewServeMux()
 
@@ -257,7 +272,7 @@ func (svc *Service) launchService() error {
 		http.ServeFile(w, r, caCertPath)
 	})
 
-	mux.Handle("/api/config", namedRoute("ui.api.config", clusterConfigHandler(svc.Config.Region)))
+	mux.Handle("/api/config", namedRoute("ui.api.config", clusterConfigHandler(svc.Config.Region, svc.Config.OchreEnabled)))
 
 	// SPA catch-all.
 	mux.Handle("/", spaHandler)

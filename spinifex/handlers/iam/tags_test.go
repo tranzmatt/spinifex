@@ -17,6 +17,7 @@ func sdkTag(key, value string) *iam.Tag {
 }
 
 func TestValidateTags(t *testing.T) {
+	t.Parallel()
 	tooMany := make([]*iam.Tag, maxTagsPerResource+1)
 	for i := range tooMany {
 		tooMany[i] = sdkTag("key"+strings.Repeat("a", i%100+1), "v")
@@ -43,6 +44,7 @@ func TestValidateTags(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			err := validateTags(tc.tags)
 			if tc.wantErr == "" {
 				require.NoError(t, err)
@@ -55,6 +57,7 @@ func TestValidateTags(t *testing.T) {
 }
 
 func TestMergeTags(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name     string
 		existing []Tag
@@ -84,6 +87,7 @@ func TestMergeTags(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got := mergeTags(tc.existing, tc.add)
 			assert.Equal(t, tc.want, got)
 		})
@@ -91,12 +95,14 @@ func TestMergeTags(t *testing.T) {
 }
 
 func TestMergeTags_DoesNotMutateExisting(t *testing.T) {
+	t.Parallel()
 	existing := []Tag{{Key: "a", Value: "1"}}
 	_ = mergeTags(existing, []*iam.Tag{sdkTag("a", "9")})
 	assert.Equal(t, []Tag{{Key: "a", Value: "1"}}, existing)
 }
 
 func TestRemoveTagKeys(t *testing.T) {
+	t.Parallel()
 	existing := []Tag{{Key: "a", Value: "1"}, {Key: "b", Value: "2"}, {Key: "c", Value: "3"}}
 
 	cases := []struct {
@@ -112,6 +118,7 @@ func TestRemoveTagKeys(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got := removeTagKeys(existing, tc.keys)
 			assert.Equal(t, tc.want, got)
 		})
@@ -262,8 +269,10 @@ func tagsAsMap(tags []*iam.Tag) map[string]string {
 }
 
 func TestResourceTagging_RoundTrip(t *testing.T) {
+	t.Parallel()
 	for _, ops := range allTagOps() {
 		t.Run(ops.resource, func(t *testing.T) {
+			t.Parallel()
 			svc := setupTestIAMService(t)
 			id := ops.create(t, svc)
 
@@ -292,6 +301,7 @@ func TestResourceTagging_RoundTrip(t *testing.T) {
 }
 
 func TestTagUser_GetUserSurfacesTags(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	user := createTestUser(t, svc, "tagme")
 
@@ -307,8 +317,10 @@ func TestTagUser_GetUserSurfacesTags(t *testing.T) {
 }
 
 func TestResourceTagging_MissingEntity(t *testing.T) {
+	t.Parallel()
 	for _, ops := range allTagOps() {
 		t.Run(ops.resource, func(t *testing.T) {
+			t.Parallel()
 			svc := setupTestIAMService(t)
 
 			err := ops.tag(svc, ops.missingID, []*iam.Tag{sdkTag("env", "prod")})
@@ -327,6 +339,7 @@ func TestResourceTagging_MissingEntity(t *testing.T) {
 }
 
 func TestTagUser_MergedLimitExceeded(t *testing.T) {
+	t.Parallel()
 	svc := setupTestIAMService(t)
 	createTestUser(t, svc, "taglimit")
 
@@ -354,6 +367,7 @@ func TestTagUser_MergedLimitExceeded(t *testing.T) {
 }
 
 func TestTagsToSDK(t *testing.T) {
+	t.Parallel()
 	assert.Nil(t, tagsToSDK(nil))
 	assert.Nil(t, tagsToSDK([]Tag{}))
 	got := tagsToSDK([]Tag{{Key: "a", Value: "1"}})
