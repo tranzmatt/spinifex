@@ -649,7 +649,7 @@ func (s *Service) beginSnapshotOperation(ctx context.Context, kv jetstream.KeyVa
 	rec.UpdatedAt = now
 
 	if err := updateJSON(ctx, kv, DBInstanceKey(rec.DBInstanceIdentifier), rev, rec); err != nil {
-		if errors.Is(err, jetstream.ErrKeyExists) {
+		if errors.Is(err, jetstream.ErrKeyRevisionMismatch) {
 			return "", awserrors.Errorf(awserrors.ErrorDBInstanceInvalidState,
 				"DB instance %s changed state concurrently; retry the snapshot", rec.DBInstanceIdentifier)
 		}
@@ -686,7 +686,7 @@ func (s *Service) projectDBSnapshot(rec *DBSnapshotRecord) *rds.DBSnapshot {
 	}
 	out := &rds.DBSnapshot{
 		DBSnapshotIdentifier: aws.String(rec.DBSnapshotIdentifier),
-		DBSnapshotArn:        aws.String(DBSnapshotARN(s.region, rec.AccountID, rec.DBSnapshotIdentifier)),
+		DBSnapshotArn:        aws.String(FormatARN(ResourceKindDBSnapshot, s.region, rec.AccountID, rec.DBSnapshotIdentifier)),
 		DBInstanceIdentifier: aws.String(rec.DBInstanceIdentifier),
 		SnapshotType:         aws.String(rec.SnapshotType),
 		Status:               aws.String(rec.Status),

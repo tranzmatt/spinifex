@@ -177,9 +177,9 @@ func setFieldValue(field reflect.Value, value string) error {
 	return nil
 }
 
-// maxSliceLen caps list materialisation to prevent unbounded allocation
-// from adversarial indexes like `Filter.999999`.
-const maxSliceLen = 1024
+// MaxSliceLen caps list materialisation to prevent unbounded allocation from
+// adversarial indexes like `Filter.999999`.
+const MaxSliceLen = 1024
 
 // Records the 1-based indices of the entries stored under prefix, reporting
 // whether it matched anything at all.
@@ -227,8 +227,8 @@ func setSliceField(field reflect.Value, params map[string]string, prefix, listNa
 	denseLen := 0
 	for indices[denseLen+1] {
 		denseLen++
-		if denseLen > maxSliceLen {
-			return fmt.Errorf("%w: %q (max %d)", ErrSliceTooLarge, prefix, maxSliceLen)
+		if denseLen > MaxSliceLen {
+			return fmt.Errorf("%w: %q (max %d)", ErrSliceTooLarge, prefix, MaxSliceLen)
 		}
 	}
 	if denseLen == 0 {
@@ -282,4 +282,40 @@ func setSliceField(field reflect.Value, params map[string]string, prefix, listNa
 
 	field.Set(slice)
 	return nil
+}
+
+// StringValuesAt reads every string at a dotted field path in a parsed query
+// input, flattening slices along the way. Authorization resolvers use it to
+// pull a request's identifiers out of the same struct the handler receives.
+func StringValuesAt(input any, path string) []string {
+	return stringValuesAt(reflect.ValueOf(input), strings.Split(path, "."))
+}
+
+func stringValuesAt(value reflect.Value, path []string) []string {
+	for value.IsValid() && (value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) {
+		if value.IsNil() {
+			return nil
+		}
+		value = value.Elem()
+	}
+	if !value.IsValid() {
+		return nil
+	}
+	if value.Kind() == reflect.Slice || value.Kind() == reflect.Array {
+		var values []string
+		for i := 0; i < value.Len(); i++ {
+			values = append(values, stringValuesAt(value.Index(i), path)...)
+		}
+		return values
+	}
+	if len(path) == 0 {
+		if value.Kind() == reflect.String {
+			return []string{value.String()}
+		}
+		return nil
+	}
+	if value.Kind() != reflect.Struct {
+		return nil
+	}
+	return stringValuesAt(value.FieldByName(path[0]), path[1:])
 }

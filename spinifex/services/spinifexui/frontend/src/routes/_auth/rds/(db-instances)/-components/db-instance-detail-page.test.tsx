@@ -1,6 +1,6 @@
 import type { QueryClient } from "@tanstack/react-query"
 import { fireEvent, screen, waitFor, within } from "@testing-library/react"
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { formatDateTime } from "@/lib/utils"
 import {
@@ -146,6 +146,10 @@ function openTab(name: string) {
 }
 
 describe("DBInstanceDetailPage", () => {
+  beforeEach(() => {
+    mockSend.mockResolvedValue({})
+  })
+
   it("renders the identifier and status", () => {
     renderWithClient(
       <DBInstanceDetailPage dbInstanceIdentifier="orders-db" />,
@@ -307,7 +311,9 @@ describe("DBInstanceDetailPage", () => {
       seed({ instances: [{ ...INSTANCE, DBInstanceStatus: "stopped" }] }),
     )
     fireEvent.click(screen.getByRole("button", { name: "Start" }))
-    await waitFor(() => expect(mockSend).toHaveBeenCalled())
+    await waitFor(() => {
+      expect(mockSend).toHaveBeenCalled()
+    })
     expect(mockSend.mock.calls[0]?.[0].input).toStrictEqual({
       DBInstanceIdentifier: "orders-db",
     })
@@ -364,6 +370,44 @@ describe("DBInstanceDetailPage", () => {
     )
     openTab("Backups")
     expect(screen.getByText("active")).toBeInTheDocument()
+  })
+
+  // The status is the automated backup's own, so nothing the instance describe
+  // returns can refresh it.
+  it("refreshes the automated backup status after a modify", async () => {
+    mockSend.mockImplementation(
+      async (command: { constructor: { name: string } }) => {
+        if (command.constructor.name === "DescribeDBInstancesCommand") {
+          return { DBInstances: [{ ...INSTANCE, BackupRetentionPeriod: 0 }] }
+        }
+        if (
+          command.constructor.name ===
+          "DescribeDBInstanceAutomatedBackupsCommand"
+        ) {
+          return { DBInstanceAutomatedBackups: [] }
+        }
+        return {}
+      },
+    )
+    renderWithClient(
+      <DBInstanceDetailPage dbInstanceIdentifier="orders-db" />,
+      seed({ automatedBackups: [{ Status: "creating" }] }),
+    )
+    openTab("Backups")
+    expect(screen.getByText("creating")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "Modify" }))
+    fireEvent.change(screen.getByLabelText("Backup retention (days)"), {
+      target: { value: "0" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save Changes" }))
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("None — automated backups are off"),
+      ).toBeInTheDocument(),
+    )
+    expect(screen.getByText("Disabled")).toBeInTheDocument()
   })
 
   it("says automated backups are off when the backend reports none", () => {

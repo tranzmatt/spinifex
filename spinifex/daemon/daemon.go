@@ -163,6 +163,7 @@ type Daemon struct {
 	acmRenewalWorker      *handlers_acm.Worker
 	ochreVectorService    handlers_ochrevector.VectorService
 	ochreAppliance        *handlers_ochrevector.Appliance
+	ochreBackupService    *handlers_ochrevector.BackupService
 	ecrMetaService        *handlers_ecr.MetaServiceImpl
 	routeTableService     *handlers_ec2_routetable.RouteTableServiceImpl
 	natGatewayService     *handlers_ec2_natgw.NatGatewayServiceImpl
@@ -969,6 +970,8 @@ func (d *Daemon) subscribeAll() error {
 		{"ec2.RevokeSecurityGroupEgress", handleNATSRequest(d.vpcService.RevokeSecurityGroupEgress), "spinifex-workers"},
 		{"ec2.ModifyInstanceAttribute", handleNATSRequest(d.instanceService.ModifyInstanceAttribute), "spinifex-workers"},
 		{"ec2.ModifyInstanceMetadataOptions", handleNATSRequest(d.instanceService.ModifyInstanceMetadataOptions), "spinifex-workers"},
+		{"ec2.MonitorInstances", handleNATSRequest(d.monitorInstances), "spinifex-workers"},
+		{"ec2.UnmonitorInstances", handleNATSRequest(d.unmonitorInstances), "spinifex-workers"},
 		{"ec2.start", d.handleEC2StartStoppedInstance, "spinifex-workers"},
 		// ec2.start.{node} is the node-targeted variant: it always starts locally
 		// and never re-forwards, so it goes straight to the service (no routing loop).
@@ -1385,7 +1388,7 @@ func (d *Daemon) startLocal() error {
 	d.shutdownWg.Go(d.monitorPeerReachability)
 
 	d.ready.Store(true)
-	slog.Info("Daemon local-bootstrap complete", "node", d.node, "elapsed", time.Since(d.startTime).Round(time.Second))
+	slog.Info("Daemon local-bootstrap complete", "node", d.node, "elapsed_ms", otelsetup.Millis(time.Since(d.startTime)))
 	return nil
 }
 
@@ -1400,6 +1403,33 @@ func publicExternalPools(pools []config.ExternalPool) []config.ExternalPool {
 		public = append(public, p)
 	}
 	return public
+}
+
+// externalPoolConfigs converts the node's public pools into IPAM pool configs
+// and reports whether any of them leases from DHCP. The transit pool never
+// enters IPAM — its addresses are gateway-LRP plumbing, not EIPs.
+func (d *Daemon) externalPoolConfigs() (pools []external.ExternalPoolConfig, anyDHCP bool) {
+	for _, p := range publicExternalPools(d.clusterConfig.Network.ExternalPools) {
+		pools = append(pools, external.ExternalPoolConfig{
+			Name:            p.Name,
+			Source:          p.Source,
+			BindBridge:      p.BindBridge,
+			DHCPMAC:         p.DHCPMAC,
+			RangeStart:      p.RangeStart,
+			RangeEnd:        p.RangeEnd,
+			Gateway:         p.Gateway,
+			GatewayIP:       p.GatewayIP,
+			PrefixLen:       p.PrefixLen,
+			Region:          p.Region,
+			AZ:              p.AZ,
+			GwLrpRangeStart: p.GwLrpRangeStart,
+			GwLrpRangeEnd:   p.GwLrpRangeEnd,
+		})
+		if p.Source == "dhcp" {
+			anyDHCP = true
+		}
+	}
+	return pools, anyDHCP
 }
 
 // hasPublicIPPools reports whether the cluster can allocate routable public
@@ -1473,7 +1503,7 @@ func (d *Daemon) startCluster() error {
 		// flipping the prod default (which would re-introduce the SPOF that 1d
 		// removed).
 		if err := d.connectNATS(utils.WithMaxWait(d.requireNATSTimeout)); err != nil {
-			slog.Error("SPINIFEX_REQUIRE_NATS=1 set, NATS connect failed within 30s, aborting", "err", err, "timeout", d.requireNATSTimeout)
+			slog.Error("SPINIFEX_REQUIRE_NATS=1 set, NATS connect failed within 30s, aborting", "err", err, "timeout_ms", otelsetup.Millis(d.requireNATSTimeout))
 			d.exitFunc(1)
 			return fmt.Errorf("connect NATS (strict): %w", err)
 		}
@@ -1615,74 +1645,57 @@ func (d *Daemon) startCluster() error {
 		return fmt.Errorf("failed to initialize NatGateway service: %w", err)
 	}
 
-	// Initialize external IPAM when public IP pools exist (pool mode, or nat
-	// mode with a public pool alongside the transit segment). The transit pool
-	// never enters IPAM — its addresses are gateway-LRP plumbing, not EIPs.
+	// A node declaring public pools must serve EIPs or refuse to start: EIP
+	// subjects are a queue group, so one node silently on the disabled stub
+	// answers cluster-wide with an empty address list on the requests it wins.
 	if d.hasPublicIPPools() {
-		js, jsErr := jetstream.New(d.natsConn)
-		if jsErr != nil {
-			slog.Warn("Failed to get JetStream for external IPAM", "err", jsErr)
-		} else {
-			var pools []external.ExternalPoolConfig
-			anyDHCP := false
-			for _, p := range publicExternalPools(d.clusterConfig.Network.ExternalPools) {
-				pools = append(pools, external.ExternalPoolConfig{
-					Name:            p.Name,
-					Source:          p.Source,
-					BindBridge:      p.BindBridge,
-					DHCPMAC:         p.DHCPMAC,
-					RangeStart:      p.RangeStart,
-					RangeEnd:        p.RangeEnd,
-					Gateway:         p.Gateway,
-					GatewayIP:       p.GatewayIP,
-					PrefixLen:       p.PrefixLen,
-					Region:          p.Region,
-					AZ:              p.AZ,
-					GwLrpRangeStart: p.GwLrpRangeStart,
-					GwLrpRangeEnd:   p.GwLrpRangeEnd,
-				})
-				if p.Source == "dhcp" {
-					anyDHCP = true
+		pools, anyDHCP := d.externalPoolConfigs()
+		d.externalIPAM, err = initServiceWithRetry("external IPAM", func() (*handlers_ec2_vpc.ExternalIPAM, error) {
+			js, jsErr := jetstream.New(d.natsConn)
+			if jsErr != nil {
+				return nil, fmt.Errorf("jetstream handle: %w", jsErr)
+			}
+			ipam, ipamErr := handlers_ec2_vpc.NewExternalIPAM(d.ctx, js, pools)
+			if ipamErr != nil {
+				return nil, ipamErr
+			}
+			if anyDHCP {
+				if dhcpErr := ipam.EnableDHCP(dhcp.NewNATSClient(d.natsConn, 0)); dhcpErr != nil {
+					return nil, fmt.Errorf("enable DHCP allocator: %w", dhcpErr)
 				}
 			}
-			d.externalIPAM, err = handlers_ec2_vpc.NewExternalIPAM(d.ctx, js, pools)
-			if err != nil {
-				slog.Warn("Failed to initialize external IPAM", "err", err)
-			} else {
-				if anyDHCP {
-					dhcpClient := dhcp.NewNATSClient(d.natsConn, 0)
-					if dhcpErr := d.externalIPAM.EnableDHCP(dhcpClient); dhcpErr != nil {
-						slog.Warn("Failed to enable DHCP allocator on external IPAM", "err", dhcpErr)
-					}
-				}
-				slog.Info("External IPAM initialized", "mode", d.clusterConfig.Network.ExternalMode, "pools", len(pools), "dhcp", anyDHCP)
-			}
+			return ipam, nil
+		})
+		if err != nil {
+			return fmt.Errorf("failed to initialize external IPAM: %w", err)
 		}
+		slog.Info("External IPAM initialized", "mode", d.clusterConfig.Network.ExternalMode, "pools", len(pools), "dhcp", anyDHCP)
 	}
 
 	// Initialize EIP service if external IPAM is available
 	if d.externalIPAM != nil && d.vpcService != nil {
-		eipSvc, eipErr := handlers_ec2_eip.NewEIPServiceImpl(d.ctx, d.natsConn, d.externalIPAM, d.vpcService)
+		eipSvc, eipErr := initServiceWithRetry("EIP service", func() (*handlers_ec2_eip.EIPServiceImpl, error) {
+			return handlers_ec2_eip.NewEIPServiceImpl(d.ctx, d.natsConn, d.externalIPAM, d.vpcService)
+		})
 		if eipErr != nil {
-			slog.Warn("Failed to initialize EIP service", "err", eipErr)
-		} else {
-			d.eipService = eipSvc
-			slog.Info("EIP service initialized")
+			return fmt.Errorf("failed to initialize EIP service: %w", eipErr)
 		}
+		d.eipService = eipSvc
+		slog.Info("EIP service initialized")
 
 		// Inject external IPAM + EIP KV into VPC service so DeleteNetworkInterface
 		// can release auto-assigned public IPs and NAT rules.
-		eipJS, eipJSErr := jetstream.New(d.natsConn)
-		if eipJSErr != nil {
-			slog.Warn("Failed to get JetStream for VPC external IPAM injection", "err", eipJSErr)
-		} else {
-			eipKV, eipKVErr := kvutil.GetOrCreateBucket(d.ctx, eipJS, handlers_ec2_eip.KVBucketEIPs, 10)
-			if eipKVErr != nil {
-				slog.Warn("Failed to get EIP KV bucket for VPC service", "err", eipKVErr)
-			} else {
-				d.vpcService.SetExternalIPAM(d.externalIPAM, eipKV)
+		eipKV, eipKVErr := initServiceWithRetry("EIP KV bucket", func() (jetstream.KeyValue, error) {
+			eipJS, jsErr := jetstream.New(d.natsConn)
+			if jsErr != nil {
+				return nil, fmt.Errorf("jetstream handle: %w", jsErr)
 			}
+			return kvutil.GetOrCreateBucket(d.ctx, eipJS, handlers_ec2_eip.KVBucketEIPs, 10)
+		})
+		if eipKVErr != nil {
+			return fmt.Errorf("failed to get EIP KV bucket for VPC service: %w", eipKVErr)
 		}
+		d.vpcService.SetExternalIPAM(d.externalIPAM, eipKV)
 	}
 
 	// Without external IPAM (nat mode or external disabled) serve EIP requests
@@ -1692,8 +1705,20 @@ func (d *Daemon) startCluster() error {
 		slog.Info("EIP service disabled — no external IPAM; serving empty/unsupported responses")
 	}
 
-	d.instanceService.SetTerminationDeps(d.volumeService, d.vpcService, d.externalIPAM, d.tagsService)
-	d.instanceService.SetRunInstancesDeps(d.imageService, d.keyService, &daemonENICreator{d: d}, d.externalIPAM)
+	// A nil *ExternalIPAM stored in an interface is not a nil interface, so hand
+	// the concrete value over only once init succeeded — otherwise the service's
+	// own nil checks pass and the allocate path derefs a nil receiver.
+	var (
+		ipAllocator handlers_ec2_instance.PublicIPAllocator
+		ipReleaser  handlers_ec2_instance.PublicIPReleaser
+	)
+	if d.externalIPAM != nil {
+		ipAllocator = d.externalIPAM
+		ipReleaser = d.externalIPAM
+	}
+
+	d.instanceService.SetTerminationDeps(d.volumeService, d.vpcService, ipReleaser, d.tagsService)
+	d.instanceService.SetRunInstancesDeps(d.imageService, d.keyService, &daemonENICreator{d: d}, ipAllocator)
 
 	if d.gpuManager != nil {
 		d.instanceService.SetGPUClaimer(&daemonGPUClaimer{d: d})
@@ -1796,6 +1821,9 @@ func (d *Daemon) startCluster() error {
 	// whichever node the queue group picks, so a node without it would make the
 	// first boot of a DB instance fail intermittently rather than not at all.
 	d.rdsService, err = initServiceWithRetry("RDS service", func() (*handlers_rds.Service, error) {
+		if registryErr := handlers_rds.ValidateEngineRegistry(); registryErr != nil {
+			return nil, registryErr
+		}
 		deps, depsErr := d.buildRDSDeps()
 		if depsErr != nil {
 			return nil, depsErr
@@ -2018,7 +2046,7 @@ func (d *Daemon) startCluster() error {
 	// No-op when northstar is not configured.
 	if d.dnsReconciler.Enabled() {
 		go d.dnsReconciler.Run(d.ctx)
-		slog.Info("Started DNS reconcile backstop", "interval", handlers_dns.DefaultReconcileInterval)
+		slog.Info("Started DNS reconcile backstop", "interval_ms", otelsetup.Millis(handlers_dns.DefaultReconcileInterval))
 	}
 
 	// Initialize per-instance-type NATS subscriptions for capacity-aware routing.
@@ -2066,7 +2094,7 @@ func (d *Daemon) startCluster() error {
 	}
 
 	d.ready.Store(true)
-	slog.Info("Daemon fully initialized", "node", d.node, "startupTime", time.Since(d.startTime).Round(time.Second))
+	slog.Info("Daemon fully initialized", "node", d.node, "startup_time_ms", otelsetup.Millis(time.Since(d.startTime)))
 
 	// Return once bootstrap is done. Start already installed the signal handler
 	// and owns the single awaitShutdown; waiting here would block on the wait
@@ -2216,7 +2244,7 @@ func (d *Daemon) initJetStream() error {
 
 		if err == nil {
 			d.jsManager.SetSyncObserver(d)
-			slog.Info("JetStream KV stores initialized successfully", "replicas", 1, "attempts", attempt, "elapsed", time.Since(start).Round(time.Second))
+			slog.Info("JetStream KV stores initialized successfully", "replicas", 1, "attempts", attempt, "elapsed_ms", otelsetup.Millis(time.Since(start)))
 			break
 		}
 
@@ -2225,7 +2253,7 @@ func (d *Daemon) initJetStream() error {
 			return fmt.Errorf("failed to initialize JetStream after %s (%d attempts): %w", elapsed.Round(time.Second), attempt, err)
 		}
 
-		slog.Warn("JetStream not ready (waiting for cluster quorum)", "error", err, "attempt", attempt, "elapsed", elapsed.Round(time.Second), "retryIn", retryDelay)
+		slog.Warn("JetStream not ready (waiting for cluster quorum)", "error", err, "attempt", attempt, "elapsed_ms", otelsetup.Millis(elapsed), "retry_in_ms", otelsetup.Millis(retryDelay))
 		time.Sleep(retryDelay)
 		retryDelay = min(retryDelay*2, 10*time.Second)
 	}
@@ -2263,7 +2291,7 @@ func initServiceWithRetry[T any](name string, initFn func() (T, error)) (T, erro
 		result, err := initFn()
 		if err == nil {
 			if attempt > 1 {
-				slog.Info(name+" initialized successfully", "attempts", attempt, "elapsed", time.Since(start).Round(time.Second))
+				slog.Info(name+" initialized successfully", "attempts", attempt, "elapsed_ms", otelsetup.Millis(time.Since(start)))
 			}
 			return result, nil
 		}
@@ -2274,7 +2302,7 @@ func initServiceWithRetry[T any](name string, initFn func() (T, error)) (T, erro
 			return zero, fmt.Errorf("%s unavailable after %s (%d attempts): %w", name, elapsed.Round(time.Second), attempt, err)
 		}
 
-		slog.Warn("Failed to init "+name, "error", err, "attempt", attempt, "elapsed", elapsed.Round(time.Second))
+		slog.Warn("Failed to init "+name, "error", err, "attempt", attempt, "elapsed_ms", otelsetup.Millis(elapsed))
 		initRetrySleep(retryDelay)
 		retryDelay = min(retryDelay*2, 10*time.Second)
 	}
@@ -2305,15 +2333,15 @@ func (d *Daemon) waitForClusterReady() {
 		}
 
 		if ready {
-			slog.Info("Cluster readiness check passed", "elapsed", time.Since(start))
+			slog.Info("Cluster readiness check passed", "elapsed_ms", otelsetup.Millis(time.Since(start)))
 			return
 		}
 
-		slog.Debug("Cluster not ready, waiting...", "reason", reason, "elapsed", time.Since(start))
+		slog.Debug("Cluster not ready, waiting...", "reason", reason, "elapsed_ms", otelsetup.Millis(time.Since(start)))
 		time.Sleep(interval)
 	}
 
-	slog.Warn("Cluster readiness timeout, proceeding with recovery anyway", "maxWait", maxWait)
+	slog.Warn("Cluster readiness timeout, proceeding with recovery anyway", "max_wait_ms", otelsetup.Millis(maxWait))
 }
 
 // checkViperblockReady reports whether viperblock is reachable via NATS.

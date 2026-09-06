@@ -12,6 +12,7 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/network/ovn/nbdb"
 	"github.com/mulgadc/spinifex/spinifex/network/policy"
 	"github.com/mulgadc/spinifex/spinifex/network/topology"
+	"github.com/mulgadc/spinifex/spinifex/otelsetup"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 )
 
@@ -42,9 +43,66 @@ var (
 // reset re-syncs that view. Package var so tests can shrink it.
 var sbResetEscalateAfter = 3
 
+// Backoff applied to a guest port that burned its convergence deadline. Doubles
+// per consecutive failure from the base and holds at the cap. Package vars so
+// tests shorten them.
+var (
+	guestPortBackoffBase = time.Minute
+	guestPortBackoffMax  = 30 * time.Minute
+)
+
+// portBackoffUntil reports whether lspName is inside its convergence backoff,
+// and when that expires.
+func (r *reconciler) portBackoffUntil(lspName string) (time.Time, bool) {
+	r.portBackoffMu.Lock()
+	defer r.portBackoffMu.Unlock()
+	state, ok := r.portBackoff[lspName]
+	if !ok || !time.Now().Before(state.until) {
+		return time.Time{}, false
+	}
+	return state.until, true
+}
+
+// recordPortFailure counts another failed convergence for lspName and returns
+// the new consecutive-failure count and the backoff now in force.
+func (r *reconciler) recordPortFailure(lspName string) (int, time.Duration) {
+	r.portBackoffMu.Lock()
+	defer r.portBackoffMu.Unlock()
+	if r.portBackoff == nil {
+		r.portBackoff = map[string]portBackoffState{}
+	}
+	state := r.portBackoff[lspName]
+	state.failures++
+	backoff := guestPortBackoffBase << min(state.failures-1, 16)
+	if backoff > guestPortBackoffMax || backoff <= 0 {
+		backoff = guestPortBackoffMax
+	}
+	state.until = time.Now().Add(backoff)
+	r.portBackoff[lspName] = state
+	return state.failures, backoff
+}
+
+// clearPortBackoff drops any backoff for lspName, reporting whether one was held
+// so the caller can log the recovery rather than a routine convergence.
+func (r *reconciler) clearPortBackoff(lspName string) bool {
+	r.portBackoffMu.Lock()
+	defer r.portBackoffMu.Unlock()
+	if _, ok := r.portBackoff[lspName]; !ok {
+		return false
+	}
+	delete(r.portBackoff, lspName)
+	return true
+}
+
+// eniIDFromPort recovers the ENI a guest port belongs to. Telemetry carried only
+// the LSP name, which no operator can map back to a guest.
+func eniIDFromPort(lspName string) string {
+	return strings.TrimPrefix(lspName, "port-")
+}
+
 // applyVPCs ensures every intent VPC has a LogicalRouter. Stray OVN-only
 // routers are left alone.
-func (r *reconciler) applyVPCs(ctx context.Context, intent IntentState, actual ActualState) {
+func (r *reconciler) applyVPCs(ctx context.Context, intent IntentState, actual ActualState, res *passResult) {
 	for vpcID, spec := range intent.VPCs {
 		routerName := topology.VPCRouter(vpcID)
 		if _, ok := actual.Routers[routerName]; !ok {
@@ -57,6 +115,7 @@ func (r *reconciler) applyVPCs(ctx context.Context, intent IntentState, actual A
 			}
 			if _, _, err := r.ovn.EnsureLogicalRouter(ctx, lr); err != nil {
 				slog.Error("reconcile/apply: ensure VPC router failed", "vpc_id", vpcID, "err", err)
+				res.fail(classVPC, vpcID, err)
 				continue
 			}
 			actual.Routers[routerName] = struct{}{}
@@ -67,7 +126,7 @@ func (r *reconciler) applyVPCs(ctx context.Context, intent IntentState, actual A
 
 // applySubnets ensures every intent subnet has a LogicalSwitch, LRP, router LSP,
 // and DHCPOptions row. Each step is idempotent.
-func (r *reconciler) applySubnets(ctx context.Context, intent IntentState, actual ActualState) {
+func (r *reconciler) applySubnets(ctx context.Context, intent IntentState, actual ActualState, res *passResult) {
 	for subnetID, spec := range intent.Subnets {
 		switchName := topology.SubnetSwitch(subnetID)
 		routerName := topology.VPCRouter(spec.VPCID)
@@ -77,6 +136,7 @@ func (r *reconciler) applySubnets(ctx context.Context, intent IntentState, actua
 		gwIP, prefixBits, err := topology.SubnetGatewayCIDR(spec.CIDR)
 		if err != nil {
 			slog.Error("reconcile/apply: subnet gateway calc failed", "subnet_id", subnetID, "err", err)
+			res.fail(classSubnet, subnetID, err)
 			continue
 		}
 		gwCIDRString := fmt.Sprintf("%s/%d", gwIP, prefixBits)
@@ -92,6 +152,7 @@ func (r *reconciler) applySubnets(ctx context.Context, intent IntentState, actua
 			}
 			if _, _, err := r.ovn.EnsureLogicalSwitch(ctx, ls); err != nil {
 				slog.Error("reconcile/apply: ensure subnet switch failed", "subnet_id", subnetID, "err", err)
+				res.fail(classSubnet, subnetID, err)
 				continue
 			}
 			actual.Switches[switchName] = struct{}{}
@@ -109,6 +170,7 @@ func (r *reconciler) applySubnets(ctx context.Context, intent IntentState, actua
 			}
 			if err := r.ovn.CreateLogicalRouterPort(ctx, routerName, lrp); err != nil {
 				slog.Error("reconcile/apply: create subnet LRP failed", "subnet_id", subnetID, "err", err)
+				res.fail(classSubnet, subnetID, err)
 				continue
 			}
 			actual.RouterPorts[routerPortName] = struct{}{}
@@ -129,6 +191,7 @@ func (r *reconciler) applySubnets(ctx context.Context, intent IntentState, actua
 			}
 			if err := r.ovn.CreateLogicalSwitchPort(ctx, switchName, lsp); err != nil {
 				slog.Error("reconcile/apply: create subnet router-LSP failed", "subnet_id", subnetID, "err", err)
+				res.fail(classSubnet, subnetID, err)
 				continue
 			}
 		}
@@ -147,6 +210,7 @@ func (r *reconciler) applySubnets(ctx context.Context, intent IntentState, actua
 			}
 			if _, dErr := r.ovn.CreateDHCPOptions(ctx, opts); dErr != nil {
 				slog.Warn("reconcile/apply: create DHCP options failed (non-fatal)", "subnet_id", subnetID, "err", dErr)
+				res.fail(classSubnet, subnetID, dErr)
 			}
 		case !maps.Equal(existing.Options, want):
 			// Converge, don't leave create-time values in place. Toggling
@@ -154,6 +218,7 @@ func (r *reconciler) applySubnets(ctx context.Context, intent IntentState, actua
 			// the wide figure on an encrypted path blackholes large segments.
 			if dErr := r.ovn.UpdateDHCPOptionsOptions(ctx, existing.UUID, want); dErr != nil {
 				slog.Warn("reconcile/apply: update DHCP options failed (non-fatal)", "subnet_id", subnetID, "err", dErr)
+				res.fail(classSubnet, subnetID, dErr)
 			} else {
 				slog.Info("reconcile/apply: converged DHCP options", "subnet_id", subnetID, "mtu", want["mtu"])
 			}
@@ -167,15 +232,17 @@ func (r *reconciler) applySubnets(ctx context.Context, intent IntentState, actua
 // applySGs ensures every intent SG has a port group; when pruneOrphans is true,
 // deletes sg_* PGs with no matching intent SG. Startup passes false to avoid
 // deleting in-flight resources before peer subscribers have converged.
-func (r *reconciler) applySGs(ctx context.Context, intent IntentState, actual ActualState, pruneOrphans bool) {
+func (r *reconciler) applySGs(ctx context.Context, intent IntentState, actual ActualState, pruneOrphans bool, res *passResult) {
 	for groupID, spec := range intent.SGs {
 		if err := r.topology.EnsureSGPortGroup(ctx, groupID); err != nil {
 			slog.Error("reconcile/apply: EnsureSGPortGroup failed", "sg", groupID, "err", err)
+			res.fail(classSG, groupID, err)
 			continue
 		}
 		actual.PortGroups[topology.SecurityGroupPortGroup(groupID)] = struct{}{}
 		if err := r.sg.EnsureSG(ctx, spec); err != nil {
 			slog.Error("reconcile/apply: EnsureSG failed", "sg", groupID, "err", err)
+			res.fail(classSG, groupID, err)
 		}
 	}
 
@@ -196,6 +263,7 @@ func (r *reconciler) applySGs(ctx context.Context, intent IntentState, actual Ac
 		}
 		if err := r.topology.DeleteSGPortGroupByName(ctx, pgName); err != nil {
 			slog.Warn("reconcile/apply: orphan DeleteSGPortGroupByName failed", "pg", pgName, "err", err)
+			res.fail(classSG, pgName, err)
 			continue
 		}
 		delete(actual.PortGroups, pgName)
@@ -207,7 +275,7 @@ func (r *reconciler) applySGs(ctx context.Context, intent IntentState, actual Ac
 // SGIDs. Existing ports use diff-based UpdatePortGroupMemberships to avoid gaps.
 // When pruneOrphans is true, ENI LSPs with no matching intent ENI are torn down;
 // startup passes false so in-flight ports survive until subscribers converge.
-func (r *reconciler) applyPorts(ctx context.Context, intent IntentState, actual ActualState, pruneOrphans bool) {
+func (r *reconciler) applyPorts(ctx context.Context, intent IntentState, actual ActualState, pruneOrphans bool, res *passResult) {
 	for portID, spec := range intent.Ports {
 		portName := topology.Port(portID)
 		switchName := topology.SubnetSwitch(spec.SubnetID)
@@ -234,11 +302,14 @@ func (r *reconciler) applyPorts(ctx context.Context, intent IntentState, actual 
 					"spinifex:vpc_id":    spec.VPCID,
 				},
 			}
-			if dhcpOpts, derr := r.ovn.FindDHCPOptionsByExternalID(ctx, "spinifex:subnet_id", spec.SubnetID); derr == nil && dhcpOpts != nil {
-				lsp.DHCPv4Options = &dhcpOpts.UUID
+			if !spec.SuppressDHCP {
+				if dhcpOpts, derr := r.ovn.FindDHCPOptionsByExternalID(ctx, "spinifex:subnet_id", spec.SubnetID); derr == nil && dhcpOpts != nil {
+					lsp.DHCPv4Options = &dhcpOpts.UUID
+				}
 			}
 			if err := r.ovn.CreateLogicalSwitchPortInGroups(ctx, switchName, lsp, desiredPGs); err != nil {
 				slog.Error("reconcile/apply: create ENI port failed", "port", portName, "err", err)
+				res.fail(classPort, portName, err)
 			}
 			continue
 		}
@@ -246,6 +317,7 @@ func (r *reconciler) applyPorts(ctx context.Context, intent IntentState, actual 
 		currentPGs, err := r.ovn.ListPortGroupsForPort(ctx, portName)
 		if err != nil {
 			slog.Warn("reconcile/apply: list port groups for port failed", "port", portName, "err", err)
+			res.fail(classPort, portName, err)
 			continue
 		}
 		addPGs, removePGs := diffSets(desiredPGs, currentPGs)
@@ -254,23 +326,25 @@ func (r *reconciler) applyPorts(ctx context.Context, intent IntentState, actual 
 		}
 		if err := r.ovn.UpdatePortGroupMemberships(ctx, portName, addPGs, removePGs); err != nil {
 			slog.Warn("reconcile/apply: update port group memberships failed", "port", portName, "err", err)
+			res.fail(classPort, portName, err)
 		}
 	}
 
 	if !pruneOrphans {
 		return
 	}
-	r.pruneOrphanPorts(ctx, intent)
+	r.pruneOrphanPorts(ctx, intent, res)
 }
 
 // pruneOrphanPorts deletes guest LSPs whose spinifex:eni_id has no matching
 // intent ENI, closing the create-only gap that leaks ports across instance
 // terminate and host reinstall. DeletePort clears PG memberships then removes
 // the LSP (composed cascade).
-func (r *reconciler) pruneOrphanPorts(ctx context.Context, intent IntentState) {
+func (r *reconciler) pruneOrphanPorts(ctx context.Context, intent IntentState, res *passResult) {
 	lsps, err := r.ovn.ListLogicalSwitchPorts(ctx)
 	if err != nil {
 		slog.Warn("reconcile/apply: list LSPs for orphan prune failed", "err", err)
+		res.fail(classPort, "orphan-prune", err)
 		return
 	}
 	for i := range lsps {
@@ -284,6 +358,7 @@ func (r *reconciler) pruneOrphanPorts(ctx context.Context, intent IntentState) {
 		spec := topology.PortSpec{PortID: eniID, SubnetID: lsps[i].ExternalIDs["spinifex:subnet_id"]}
 		if err := r.topology.DeletePort(ctx, spec); err != nil {
 			slog.Warn("reconcile/apply: orphan ENI DeletePort failed", "port", lsps[i].Name, "err", err)
+			res.fail(classPort, lsps[i].Name, err)
 			continue
 		}
 		slog.Info("reconcile/apply: removed orphan ENI port", "port", lsps[i].Name, "eni_id", eniID)
@@ -294,14 +369,15 @@ func (r *reconciler) pruneOrphanPorts(ctx context.Context, intent IntentState) {
 // existing IGWs. AttachIGW is idempotent and must run even when the gateway
 // switch port already exists: its already-attached path re-ensures host state
 // (routed-NAT ingress routes) that survives in OVN but not across reboots.
-func (r *reconciler) applyIGWs(ctx context.Context, intent IntentState, actual ActualState) {
+func (r *reconciler) applyIGWs(ctx context.Context, intent IntentState, actual ActualState, res *passResult) {
 	for vpcID, spec := range intent.IGWs {
 		if err := r.igw.AttachIGW(ctx, spec); err != nil {
 			slog.Error("reconcile/apply: AttachIGW failed", "vpc_id", vpcID, "err", err)
+			res.fail(classIGW, vpcID, err)
 			continue
 		}
 		actual.ExternalSwch[vpcID] = struct{}{}
-		r.rebindGatewayChassis(ctx, vpcID, eipProbeIP(intent, vpcID))
+		r.rebindGatewayChassis(ctx, vpcID, eipProbeIP(intent, vpcID), res)
 	}
 }
 
@@ -319,19 +395,23 @@ func eipProbeIP(intent IntentState, vpcID string) string {
 }
 
 // rebindGatewayChassis re-asserts chassis priority tuples on the gateway LRP.
-func (r *reconciler) rebindGatewayChassis(ctx context.Context, vpcID, eipIP string) {
+func (r *reconciler) rebindGatewayChassis(ctx context.Context, vpcID, eipIP string, res *passResult) {
 	if len(r.chassis) == 0 {
 		return
 	}
 	gwPortName := topology.GatewayRouterPort(vpcID)
 	lrp, err := r.ovn.GetLogicalRouterPort(ctx, gwPortName)
 	if err != nil {
+		slog.Warn("reconcile/apply: gateway LRP read failed; skipping chassis rebind and datapath gate",
+			"vpc_id", vpcID, "port", gwPortName, "err", err)
+		res.fail(classIGW, vpcID, err)
 		return
 	}
 	for i, chassis := range r.chassis {
 		priority := max(20-(i*5), 1)
 		if err := r.ovn.SetGatewayChassis(ctx, gwPortName, chassis, priority); err != nil {
 			slog.Warn("reconcile/apply: SetGatewayChassis failed", "vpc_id", vpcID, "chassis", chassis, "err", err)
+			res.fail(classIGW, vpcID, err)
 		}
 	}
 	r.ensureGatewayClaimed(ctx, topology.GatewayChassisRedirectPort(vpcID))
@@ -405,7 +485,7 @@ func (r *reconciler) ensureGatewayDatapath(ctx context.Context, vpcID, gwIP, eip
 		}
 		if time.Now().After(deadline) {
 			slog.Error("reconcile/apply: gateway datapath did not recover after uplink repair; external connectivity degraded",
-				"vpc_id", vpcID, "target", target, "timeout", gatewayDatapathTimeout)
+				"vpc_id", vpcID, "target", target, "timeout_ms", otelsetup.Millis(gatewayDatapathTimeout))
 			return
 		}
 		select {
@@ -476,7 +556,7 @@ func (r *reconciler) ensureGatewayClaimed(ctx context.Context, crPortName string
 		}
 		if time.Now().After(deadline) {
 			slog.Error("reconcile/apply: gateway SB chassis claim did not converge; floating IPs may be unreachable",
-				"port", crPortName, "timeout", gatewayClaimTimeout)
+				"port", crPortName, "timeout_ms", otelsetup.Millis(gatewayClaimTimeout))
 			return
 		}
 		select {
@@ -492,12 +572,13 @@ func (r *reconciler) ensureGatewayClaimed(ctx context.Context, crPortName string
 // proves the gateway-chassis flow exists, not the gatewayLRP->guest hop, so a guest
 // whose port has not converged (e.g. just after a host reboot) stays dark while
 // every other signal is green.
-func (r *reconciler) applyEIPs(ctx context.Context, intent IntentState, _ ActualState) {
+func (r *reconciler) applyEIPs(ctx context.Context, intent IntentState, _ ActualState, res *passResult) {
 	for _, spec := range r.floatingIPSpecs(intent) {
 		if err := r.nat.AddEIP(ctx, spec); err != nil {
 			slog.Error("reconcile/apply: AddEIP failed", "external_ip", spec.ExternalIP, "logical_ip", spec.LogicalIP, "err", err)
+			res.fail(classEIP, spec.ExternalIP, err)
 		}
-		r.ensureGuestPortDatapath(ctx, spec.VPCID, spec.PortName)
+		r.ensureGuestPortDatapath(ctx, spec)
 	}
 }
 
@@ -549,19 +630,21 @@ func (r *reconciler) floatingIPSpecs(intent IntentState) []policy.EIPSpec {
 // and union its ports into the live set so a mid-pass launch counts as live; skip the
 // prune entirely if the re-read fails rather than risk a false sweep against a snapshot
 // known to be stale.
-func (r *reconciler) pruneOrphanEIPs(ctx context.Context, intent IntentState) {
+func (r *reconciler) pruneOrphanEIPs(ctx context.Context, intent IntentState, res *passResult) {
 	live := make(map[string]struct{}, len(intent.Ports)+len(intent.EIPs))
 	addLivePorts(live, intent)
 	if r.reloadIntent != nil {
 		fresh, err := r.reloadIntent(ctx)
 		if err != nil {
 			slog.Warn("reconcile/apply: fresh intent re-read failed; skipping orphan EIP prune", "err", err)
+			res.fail(classEIP, "orphan-prune", err)
 			return
 		}
 		addLivePorts(live, fresh)
 	}
 	if pruned, err := r.nat.PruneOrphanEIPs(ctx, live); err != nil {
 		slog.Warn("reconcile/apply: orphan EIP prune failed", "err", err)
+		res.fail(classEIP, "orphan-prune", err)
 	} else if pruned > 0 {
 		slog.Info("reconcile/apply: pruned orphan dnat_and_snat rows", "count", pruned)
 	}
@@ -586,14 +669,14 @@ func addLivePorts(live map[string]struct{}, intent IntentState) {
 // drop gate. Public IPs come from two disjoint sources: auto-assigned and ELB
 // addresses recorded on the ENI (intent.Ports) and user EIPs in the EIP bucket
 // (intent.EIPs). Both need the same /32 reroute above the gate.
-func (r *reconciler) applyPublicInstanceEgress(ctx context.Context, intent IntentState, _ ActualState) {
+func (r *reconciler) applyPublicInstanceEgress(ctx context.Context, intent IntentState, _ ActualState, res *passResult) {
 	for _, p := range intent.Ports {
 		if p.PublicIP.IsValid() {
-			r.ensureEIPEgressExemption(ctx, intent, p.VPCID, p.SubnetID, p.PrivateIP.String())
+			r.ensureEIPEgressExemption(ctx, intent, p.VPCID, p.SubnetID, p.PrivateIP.String(), res)
 		}
 	}
 	for _, e := range intent.EIPs {
-		r.ensureEIPEgressExemption(ctx, intent, e.VPCID, subnetIDForIP(intent.Subnets, e.LogicalIP), e.LogicalIP)
+		r.ensureEIPEgressExemption(ctx, intent, e.VPCID, subnetIDForIP(intent.Subnets, e.LogicalIP), e.LogicalIP, res)
 	}
 }
 
@@ -605,7 +688,7 @@ func (r *reconciler) applyPublicInstanceEgress(ctx context.Context, intent Inten
 // the datapath; the instance's dnat_and_snat supplies SNAT. Scoped to subnets that
 // actually carry a drop gate: routed subnets egress via their priority-1000 reroute
 // and need no exemption, so the gate presence bounds the blast radius.
-func (r *reconciler) ensureEIPEgressExemption(ctx context.Context, intent IntentState, vpcID, subnetID, instanceIP string) {
+func (r *reconciler) ensureEIPEgressExemption(ctx context.Context, intent IntentState, vpcID, subnetID, instanceIP string, res *passResult) {
 	if subnetID == "" {
 		slog.Warn("reconcile/apply: public instance maps to no subnet; skipping egress exemption",
 			"vpc_id", vpcID, "instance_ip", instanceIP)
@@ -617,6 +700,7 @@ func (r *reconciler) ensureEIPEgressExemption(ctx context.Context, intent Intent
 	if err := r.igw.EnsureEIPInstanceEgress(ctx, vpcID, subnetID, instanceIP); err != nil {
 		slog.Error("reconcile/apply: EnsureEIPInstanceEgress failed",
 			"vpc_id", vpcID, "subnet_id", subnetID, "instance_ip", instanceIP, "err", err)
+		res.fail(classPublicEgress, instanceIP, err)
 	}
 }
 
@@ -642,8 +726,17 @@ func subnetIDForIP(subnets map[string]topology.SubnetSpec, ip string) string {
 // not once: post-reboot the guest tap is replumbed seconds after this runs, so a
 // single early nudge fires before the port exists and never binds it. No-op when no
 // verifier is wired or the EIP carries no guest port.
-func (r *reconciler) ensureGuestPortDatapath(ctx context.Context, vpcID, lspName string) {
+func (r *reconciler) ensureGuestPortDatapath(ctx context.Context, spec policy.EIPSpec) {
+	vpcID, lspName := spec.VPCID, spec.PortName
 	if r.gwClaim == nil || lspName == "" {
+		return
+	}
+	// A port with no tap behind it never binds, so without this every cycle pays
+	// the full nudge sequence and files another ERROR for a guest that is gone.
+	if until, held := r.portBackoffUntil(lspName); held {
+		slog.Debug("reconcile/apply: guest port still in convergence backoff; not re-probing",
+			"vpc_id", vpcID, "lsp", lspName, "eni_id", eniIDFromPort(lspName),
+			"retry_in_ms", otelsetup.Millis(time.Until(until)))
 		return
 	}
 	deadline := time.Now().Add(guestPortDatapathTimeout)
@@ -657,7 +750,11 @@ func (r *reconciler) ensureGuestPortDatapath(ctx context.Context, vpcID, lspName
 			return
 		}
 		if up {
-			if nudged {
+			if r.clearPortBackoff(lspName) {
+				slog.Info("reconcile/apply: guest port datapath recovered after repeated failures",
+					"vpc_id", vpcID, "lsp", lspName, "eni_id", eniIDFromPort(lspName),
+					"external_ip", spec.ExternalIP, "logical_ip", spec.LogicalIP)
+			} else if nudged {
 				slog.Info("reconcile/apply: guest port datapath converged after recompute", "vpc_id", vpcID, "lsp", lspName)
 			}
 			return
@@ -673,8 +770,13 @@ func (r *reconciler) ensureGuestPortDatapath(ctx context.Context, vpcID, lspName
 			resetEscalated = r.escalateSBReset(ctx, "vpc_id", vpcID, "lsp", lspName)
 		}
 		if time.Now().After(deadline) {
+			failures, backoff := r.recordPortFailure(lspName)
 			slog.Error("reconcile/apply: guest port datapath did not converge; EIP ingress may be unreachable",
-				"vpc_id", vpcID, "lsp", lspName, "timeout", guestPortDatapathTimeout)
+				"vpc_id", vpcID, "lsp", lspName, "eni_id", eniIDFromPort(lspName),
+				"external_ip", spec.ExternalIP, "logical_ip", spec.LogicalIP,
+				"consecutive_failures", failures,
+				"timeout_ms", otelsetup.Millis(guestPortDatapathTimeout),
+				"retry_in_ms", otelsetup.Millis(backoff))
 			return
 		}
 		select {
@@ -686,43 +788,47 @@ func (r *reconciler) ensureGuestPortDatapath(ctx context.Context, vpcID, lspName
 }
 
 // applyNATGWs runs every intent NAT gateway through NATManager.AddNATGateway.
-func (r *reconciler) applyNATGWs(ctx context.Context, intent IntentState, _ ActualState) {
+func (r *reconciler) applyNATGWs(ctx context.Context, intent IntentState, _ ActualState, res *passResult) {
 	for _, spec := range intent.NATGWs {
 		if err := r.nat.AddNATGateway(ctx, spec); err != nil {
 			slog.Warn("reconcile/apply: AddNATGateway failed (likely already exists)",
 				"natgw_id", spec.NATGatewayID, "subnet_cidr", spec.SubnetCIDR, "err", err)
+			res.fail(classNATGW, spec.NATGatewayID, err)
 		}
 	}
 }
 
 // applyIGWRoutes installs per-subnet egress reroute policies from intent.
 // Closes the bootstrap race: events fire before subscribers attach; KV retains the route.
-func (r *reconciler) applyIGWRoutes(ctx context.Context, intent IntentState, _ ActualState) {
+func (r *reconciler) applyIGWRoutes(ctx context.Context, intent IntentState, _ ActualState, res *passResult) {
 	for _, spec := range intent.IGWRoutes {
 		if err := r.igw.EnsureSubnetEgress(ctx, spec.VPCID, spec.SubnetID, spec.DestCIDR); err != nil {
 			slog.Error("reconcile/apply: EnsureSubnetEgress failed",
 				"vpc_id", spec.VPCID, "subnet_id", spec.SubnetID, "cidr", spec.DestCIDR.String(), "err", err)
+			res.fail(classIGWRoute, spec.SubnetID, err)
 		}
 	}
 }
 
 // applyNATGWRoutes is the NATGW priority sibling of applyIGWRoutes.
-func (r *reconciler) applyNATGWRoutes(ctx context.Context, intent IntentState, _ ActualState) {
+func (r *reconciler) applyNATGWRoutes(ctx context.Context, intent IntentState, _ ActualState, res *passResult) {
 	for _, spec := range intent.NATGWRoutes {
 		if err := r.igw.EnsureNATGatewaySubnetEgress(ctx, spec.VPCID, spec.SubnetID, spec.DestCIDR); err != nil {
 			slog.Error("reconcile/apply: EnsureNATGatewaySubnetEgress failed",
 				"vpc_id", spec.VPCID, "subnet_id", spec.SubnetID, "cidr", spec.DestCIDR.String(), "err", err)
+			res.fail(classNATGWRoute, spec.SubnetID, err)
 		}
 	}
 }
 
 // applyDropGates installs DROP policies for subnets with an attached IGW but
 // no 0.0.0.0/0 route, preventing unintended egress via the VPC default route.
-func (r *reconciler) applyDropGates(ctx context.Context, intent IntentState, _ ActualState) {
+func (r *reconciler) applyDropGates(ctx context.Context, intent IntentState, _ ActualState, res *passResult) {
 	for _, spec := range intent.DropGates {
 		if err := r.igw.EnsureSubnetEgressDrop(ctx, spec.VPCID, spec.SubnetID, spec.DestCIDR); err != nil {
 			slog.Error("reconcile/apply: EnsureSubnetEgressDrop failed",
 				"vpc_id", spec.VPCID, "subnet_id", spec.SubnetID, "cidr", spec.DestCIDR.String(), "err", err)
+			res.fail(classDropGate, spec.SubnetID, err)
 		}
 	}
 }

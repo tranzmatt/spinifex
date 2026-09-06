@@ -1,6 +1,7 @@
 package handlers_iam
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/mulgadc/bluebottle/pkg/iampolicy"
@@ -20,6 +21,52 @@ var rdsInternalActions = []string{
 	"rds:SubmitDBStateChange",
 	"rds:PollDBCommands",
 	"rds:GetDBBootstrapConfig",
+}
+
+func TestParseBuiltinManagedPolicies(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     map[string]string
+		wantErr string
+	}{
+		{
+			name: "valid document",
+			raw: map[string]string{
+				"arn:valid": `{"Version":"2012-10-17","Statement":[]}`,
+			},
+		},
+		{
+			name: "malformed document",
+			raw: map[string]string{
+				"arn:malformed": `{`,
+			},
+			wantErr: "parse managed policy arn:malformed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsed, err := parseBuiltinManagedPolicies(tt.raw)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				assert.Nil(t, parsed)
+				return
+			}
+			require.NoError(t, err)
+			assert.Len(t, parsed, len(tt.raw))
+		})
+	}
+}
+
+func TestNewIAMServiceImpl_PropagatesBuiltinManagedPolicyParseError(t *testing.T) {
+	parseErr := errors.New("malformed builtin policy")
+	previousErr := builtinManagedPolicyParseErr
+	builtinManagedPolicyParseErr = parseErr
+	t.Cleanup(func() { builtinManagedPolicyParseErr = previousErr })
+
+	_, err := NewIAMServiceImpl(t.Context(), nil, make([]byte, 32), 1)
+	require.ErrorIs(t, err, parseErr)
+	assert.ErrorContains(t, err, "init builtin managed policies")
 }
 
 // A role whose permissions come entirely from an attached AWS-managed ARN has to
@@ -43,7 +90,7 @@ func TestRDSManagedShims_GrantNoInternalAction(t *testing.T) {
 		doc, ok := builtinManagedPolicyDoc(arn)
 		require.True(t, ok, "arn %q", arn)
 		for _, action := range rdsInternalActions {
-			assert.Equal(t, iampolicy.Deny, iampolicy.Evaluate(action, "*", []PolicyDocument{doc}),
+			assert.Equal(t, iampolicy.Deny, iampolicy.EvaluateWithKeys(action, "*", []PolicyDocument{doc}, nil),
 				"%s must not grant %s", arn, action)
 		}
 	}
@@ -65,7 +112,7 @@ func TestRDSFullAccessShim_GrantsTheCustomerSurface(t *testing.T) {
 		"rds:DescribeEvents",
 	}
 	for _, action := range granted {
-		assert.Equal(t, iampolicy.Allow, iampolicy.Evaluate(action, "*", []PolicyDocument{doc}),
+		assert.Equal(t, iampolicy.Allow, iampolicy.EvaluateWithKeys(action, "*", []PolicyDocument{doc}, nil),
 			"AmazonRDSFullAccess must grant %s", action)
 	}
 }
@@ -78,13 +125,13 @@ func TestRDSReadOnlyAccessShim_GrantsReadsOnly(t *testing.T) {
 
 	for _, action := range []string{"rds:DescribeDBInstances", "rds:DescribeDBSnapshots",
 		"rds:DescribeDBParameters", "rds:ListTagsForResource"} {
-		assert.Equal(t, iampolicy.Allow, iampolicy.Evaluate(action, "*", []PolicyDocument{doc}),
+		assert.Equal(t, iampolicy.Allow, iampolicy.EvaluateWithKeys(action, "*", []PolicyDocument{doc}, nil),
 			"AmazonRDSReadOnlyAccess must grant %s", action)
 	}
 	for _, action := range []string{"rds:CreateDBInstance", "rds:DeleteDBInstance",
 		"rds:ModifyDBInstance", "rds:StopDBInstance", "rds:AddTagsToResource",
 		"rds:RestoreDBInstanceFromDBSnapshot"} {
-		assert.Equal(t, iampolicy.Deny, iampolicy.Evaluate(action, "*", []PolicyDocument{doc}),
+		assert.Equal(t, iampolicy.Deny, iampolicy.EvaluateWithKeys(action, "*", []PolicyDocument{doc}, nil),
 			"AmazonRDSReadOnlyAccess must not grant %s", action)
 	}
 }

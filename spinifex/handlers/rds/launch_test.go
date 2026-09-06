@@ -26,12 +26,20 @@ import (
 const (
 	testCustomerAccount = "123456789012"
 	testDBSubnet        = "subnet-customer-db"
-	testEngineAMI       = "ami-rds-postgres-18"
+	// The customer subnet's CIDR, resolved so the launcher can configure the
+	// customer ENI statically. Gives a gateway of 10.0.0.1, matching the fake
+	// customer ENI IPs CreateNetworkInterface hands out.
+	testDBSubnetCIDR = "10.0.0.0/24"
+	testEngineAMI    = "ami-rds-postgres-18"
 
 	// The persisted endpoint a replace re-attaches: its address is the DNS
 	// target and its MAC is what the replacement VM's NIC has to come up with.
 	testEndpointIP  = "10.20.30.40"
 	testEndpointMAC = "02:00:00:00:aa:01"
+
+	// The RDS system group the system NIC carries, in place of the system VPC's
+	// mutually-permissive default group.
+	testSystemSG = "sg-rdssystem"
 )
 
 // --- Fakes ---
@@ -193,6 +201,14 @@ type fakeENIs struct {
 	// replace must refuse to mint a replacement address for.
 	describeMissing bool
 	modifyErr       error
+
+	// The region's RDS system group, ensured per launch. Recording both halves of
+	// the lookup-or-create is what makes its idempotence observable.
+	sgCreated        []*ec2.CreateSecurityGroupInput
+	sgDescribed      []*ec2.DescribeSecurityGroupsInput
+	sgExisting       string
+	sgExistingGroups []*ec2.SecurityGroup
+	sgCreateErr      error
 }
 
 var _ launchVPCProvisioner = (*fakeENIs)(nil)
@@ -252,6 +268,40 @@ func (f *fakeENIs) ModifyNetworkInterfaceAttribute(_ context.Context, in *ec2.Mo
 	}
 	f.modified = append(f.modified, in)
 	return &ec2.ModifyNetworkInterfaceAttributeOutput{}, nil
+}
+
+// DescribeSubnets answers the customer subnet's CIDR, which the launcher
+// resolves into the prefix and gateway it configures the customer ENI with.
+func (f *fakeENIs) DescribeSubnets(_ context.Context, in *ec2.DescribeSubnetsInput, _ string) (*ec2.DescribeSubnetsOutput, error) {
+	var subnets []*ec2.Subnet
+	for _, id := range aws.StringValueSlice(in.SubnetIds) {
+		subnets = append(subnets, &ec2.Subnet{SubnetId: aws.String(id), CidrBlock: aws.String(testDBSubnetCIDR)})
+	}
+	return &ec2.DescribeSubnetsOutput{Subnets: subnets}, nil
+}
+
+func (f *fakeENIs) DescribeSecurityGroups(_ context.Context, in *ec2.DescribeSecurityGroupsInput, _ string) (*ec2.DescribeSecurityGroupsOutput, error) {
+	f.sgDescribed = append(f.sgDescribed, in)
+	if f.sgExistingGroups != nil {
+		return &ec2.DescribeSecurityGroupsOutput{SecurityGroups: f.sgExistingGroups}, nil
+	}
+	if f.sgExisting == "" {
+		return &ec2.DescribeSecurityGroupsOutput{}, nil
+	}
+	return &ec2.DescribeSecurityGroupsOutput{
+		SecurityGroups: []*ec2.SecurityGroup{{GroupId: aws.String(f.sgExisting)}},
+	}, nil
+}
+
+// A created group is found by the next describe, as the real API would have it:
+// that is what a second launch's idempotence rests on.
+func (f *fakeENIs) CreateSecurityGroup(_ context.Context, in *ec2.CreateSecurityGroupInput, _ string) (*ec2.CreateSecurityGroupOutput, error) {
+	if f.sgCreateErr != nil {
+		return nil, f.sgCreateErr
+	}
+	f.sgCreated = append(f.sgCreated, in)
+	f.sgExisting = testSystemSG
+	return &ec2.CreateSecurityGroupOutput{GroupId: aws.String(f.sgExisting)}, nil
 }
 
 // fakeLauncher stands in for the system-instance launcher.
@@ -528,7 +578,10 @@ func TestLaunchDBInstanceVMWiresBothNICs(t *testing.T) {
 	assert.Equal(t, utils.GlobalAccountID, h.enis.accts[0])
 	assert.True(t, strings.HasPrefix(aws.StringValue(sysENI.SubnetId), "subnet-rdssys"),
 		"the primary NIC must land in the RDS system VPC, got %s", aws.StringValue(sysENI.SubnetId))
-	assert.Empty(t, sysENI.Groups, "the system NIC is unreachable from any customer VPC and needs no security group")
+	// Its own ingress-free group, not the system VPC's default one — whose sole
+	// rule admits every other member of itself, which is every DB VM there is.
+	assert.Equal(t, []string{testSystemSG}, aws.StringValueSlice(sysENI.Groups))
+	assert.Equal(t, testSystemSG, out.SystemSGID)
 
 	// The customer-facing ENI is created in the customer's account and subnet,
 	// with the customer's security groups: it is the only ingress path.
@@ -540,6 +593,13 @@ func TestLaunchDBInstanceVMWiresBothNICs(t *testing.T) {
 		assert.Equal(t, tags.ManagedByRDS, tagOf(eni.TagSpecifications, tags.ManagedByKey))
 		assert.Equal(t, "mydb", tagOf(eni.TagSpecifications, rdsInstanceTagKey))
 	}
+
+	// Only the customer endpoint ENI is statically addressed; the system NIC
+	// still needs its OVN DHCP lease for IMDS bootstrap.
+	assert.Empty(t, tagOf(sysENI.TagSpecifications, tags.DHCPDisabledKey),
+		"the system NIC must keep DHCP")
+	assert.Equal(t, tags.DHCPDisabledValue, tagOf(custENI.TagSpecifications, tags.DHCPDisabledKey),
+		"the customer endpoint ENI must be marked to suppress DHCP")
 
 	// The VM itself: a system-account instance off the engine AMI, carrying the
 	// managed-by tag that hides it from the customer's EC2 API, with the
@@ -559,11 +619,90 @@ func TestLaunchDBInstanceVMWiresBothNICs(t *testing.T) {
 		ENIIP:     out.CustomerENIIP,
 		SubnetID:  testDBSubnet,
 		AccountID: testCustomerAccount,
+		// The endpoint address lives on this NIC, so it has to survive the
+		// terminate half of a replace the way the datadir volume does.
+		DeleteOnTermination: aws.Bool(false),
+		// Resolved from the customer subnet's CIDR so the guest configures this
+		// NIC statically instead of depending on the OVN DHCP lease.
+		ENICIDRPrefix: 24,
+		Gateway:       "10.0.0.1",
 	}, in.ExtraENIs[0], "the extra NIC must carry the customer account, or the daemon updates the wrong ENI record")
 	assert.Equal(t, "#cloud-config\n", in.UserData)
 	assert.Equal(t, "arn:aws:iam::000000000000:instance-profile/rdsInstanceRole", in.IamInstanceProfileArn)
 
 	assert.Equal(t, "i-rds0001", out.InstanceID)
+}
+
+// The group is per region and shared by every DB VM, so a second launch has to
+// find the first one's rather than accumulate a group per instance.
+func TestLaunchDBInstanceVMReusesTheSystemSecurityGroup(t *testing.T) {
+	t.Parallel()
+	h := newLaunchHarness()
+
+	first, err := LaunchDBInstanceVM(t.Context(), h.deps(), testLaunchInput())
+	require.NoError(t, err)
+	second, err := LaunchDBInstanceVM(t.Context(), h.deps(), testLaunchInput())
+	require.NoError(t, err)
+
+	assert.Equal(t, first.SystemSGID, second.SystemSGID)
+	require.Len(t, h.enis.sgCreated, 1, "the region's system group is shared, not minted per DB instance")
+
+	created := h.enis.sgCreated[0]
+	assert.Equal(t, SystemSecurityGroupName("ap-southeast-2"), aws.StringValue(created.GroupName))
+	assert.Equal(t, tags.ManagedByRDS, tagOf(created.TagSpecifications, tags.ManagedByKey))
+
+	// The name and the VPC together are the lookup key: a group of that name in
+	// some customer VPC must not be adopted for the system NIC.
+	require.NotEmpty(t, h.enis.sgDescribed)
+	filters := map[string]string{}
+	for _, f := range h.enis.sgDescribed[0].Filters {
+		filters[aws.StringValue(f.Name)] = aws.StringValue(f.Values[0])
+	}
+	assert.Equal(t, SystemSecurityGroupName("ap-southeast-2"), filters["group-name"])
+	assert.NotEmpty(t, filters["vpc-id"])
+}
+
+// There is no fallback to nil groups, because that fallback is the bug: an ENI
+// created with none lands in the VPC's default group.
+func TestLaunchDBInstanceVMFailsWhenTheSystemSecurityGroupCannotBeEnsured(t *testing.T) {
+	t.Parallel()
+	h := newLaunchHarness()
+	h.enis.sgCreateErr = errors.New("vpcd unavailable")
+
+	_, err := LaunchDBInstanceVM(t.Context(), h.deps(), testLaunchInput())
+	require.Error(t, err)
+	assert.Empty(t, h.enis.created, "no NIC may be created before its security group exists")
+	assert.Nil(t, h.launcher.input)
+}
+
+func TestLaunchDBInstanceVMRejectsAnExistingSystemSecurityGroupWithIngress(t *testing.T) {
+	t.Parallel()
+	h := newLaunchHarness()
+	h.enis.sgExistingGroups = []*ec2.SecurityGroup{{
+		GroupId: aws.String(testSystemSG),
+		IpPermissions: []*ec2.IpPermission{{
+			IpProtocol: aws.String("-1"),
+		}},
+	}}
+
+	_, err := LaunchDBInstanceVM(t.Context(), h.deps(), testLaunchInput())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has ingress rules")
+	assert.Empty(t, h.enis.created, "an unvalidated group must never reach a system NIC")
+}
+
+func TestLaunchDBInstanceVMRejectsMultipleExistingSystemSecurityGroups(t *testing.T) {
+	t.Parallel()
+	h := newLaunchHarness()
+	h.enis.sgExistingGroups = []*ec2.SecurityGroup{
+		{GroupId: aws.String(testSystemSG)},
+		{GroupId: aws.String("sg-rdssystem02")},
+	}
+
+	_, err := LaunchDBInstanceVM(t.Context(), h.deps(), testLaunchInput())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "found 2 groups")
+	assert.Empty(t, h.enis.created, "an ambiguous group must never reach a system NIC")
 }
 
 func TestLaunchDBInstanceVMAttachesTheDataVolume(t *testing.T) {
@@ -814,5 +953,41 @@ func TestLaunchDBInstanceVMFailsWithoutAnEngineAMI(t *testing.T) {
 	_, err := LaunchDBInstanceVM(t.Context(), h.deps(), testLaunchInput())
 	require.ErrorIs(t, err, ErrEngineAMINotFound,
 		"a missing engine image must be a named failure, never a fallback to some other AMI")
+	code, _, ok := awserrors.ResolveErrorDetail(err)
+	require.True(t, ok, "the launch must not swallow the code on its way out")
+	assert.Equal(t, awserrors.ErrorInvalidParameterCombination, code)
 	assert.Empty(t, h.enis.created)
+}
+
+func TestResolveEngineAMINotFoundCarriesAClientCode(t *testing.T) {
+	t.Parallel()
+	h := newLaunchHarness()
+	h.images.images = nil
+
+	_, err := resolveEngineAMI(t.Context(), h.images, "postgres", "18")
+	require.ErrorIs(t, err, ErrEngineAMINotFound)
+
+	code, message, ok := awserrors.ResolveErrorDetail(err)
+	require.True(t, ok,
+		"an uncoded error reaches the caller as a retried ServerInternal, which says nothing about what is missing")
+	assert.Equal(t, awserrors.ErrorInvalidParameterCombination, code)
+	assert.Contains(t, message, "version 18 for postgres")
+	assert.Contains(t, message, "spinifex-rds-postgres",
+		"the message names the image an operator has to import")
+}
+
+func TestResolveEngineAMINotFoundWithoutARequestedVersion(t *testing.T) {
+	t.Parallel()
+	h := newLaunchHarness()
+	h.images.images = nil
+
+	_, err := resolveEngineAMI(t.Context(), h.images, "mariadb", "")
+	require.ErrorIs(t, err, ErrEngineAMINotFound)
+
+	code, message, ok := awserrors.ResolveErrorDetail(err)
+	require.True(t, ok)
+	assert.Equal(t, awserrors.ErrorInvalidParameterCombination, code)
+	assert.Contains(t, message, "an engine image for mariadb",
+		"an unset version must not read back as an empty one")
+	assert.Contains(t, message, "spinifex-rds-mariadb")
 }

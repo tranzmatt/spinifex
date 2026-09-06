@@ -128,8 +128,9 @@ func (s *Service) appendEvent(ctx context.Context, accountID, sourceType, source
 		if err == nil {
 			return nil
 		}
-		// jetstream.ErrKeyExists on Update is a revision mismatch, not a duplicate.
-		if !errors.Is(err, jetstream.ErrKeyExists) {
+		// A revision mismatch is a lost race with another appender, not a
+		// duplicate: re-read the ring and append to what they wrote.
+		if !errors.Is(err, jetstream.ErrKeyRevisionMismatch) {
 			return err
 		}
 	}
@@ -234,9 +235,9 @@ func (s *Service) projectEvent(accountID string, event Event) *rds.Event {
 	}
 	switch event.SourceType {
 	case EventSourceTypeDBInstance:
-		out.SourceArn = aws.String(DBInstanceARN(s.region, accountID, event.SourceIdentifier))
+		out.SourceArn = aws.String(FormatARN(ResourceKindDBInstance, s.region, accountID, event.SourceIdentifier))
 	case EventSourceTypeDBSnapshot:
-		out.SourceArn = aws.String(DBSnapshotARN(s.region, accountID, event.SourceIdentifier))
+		out.SourceArn = aws.String(FormatARN(ResourceKindDBSnapshot, s.region, accountID, event.SourceIdentifier))
 	}
 	return out
 }

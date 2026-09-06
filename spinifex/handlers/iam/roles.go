@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/mulgadc/spinifex/spinifex/arn"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/kvutil"
 	"github.com/mulgadc/spinifex/spinifex/utils"
@@ -72,7 +73,7 @@ func (s *IAMServiceImpl) CreateRole(accountID string, input *iam.CreateRoleInput
 		RoleName:                 roleName,
 		RoleID:                   roleID,
 		AccountID:                accountID,
-		ARN:                      fmt.Sprintf("arn:aws:iam::%s:role%s%s", accountID, path, roleName),
+		ARN:                      arn.FormatIAMPath(arn.IAMRole, accountID, path, roleName),
 		Path:                     path,
 		Description:              aws.StringValue(input.Description),
 		AssumeRolePolicyDocument: *input.AssumeRolePolicyDocument,
@@ -571,42 +572,18 @@ func (s *IAMServiceImpl) getRole(ctx context.Context, accountID, roleName string
 // to one role at once) write the same record concurrently. mutate reports
 // whether it changed the record; a false return commits nothing.
 func (s *IAMServiceImpl) updateRoleCAS(ctx context.Context, accountID, roleName string, mutate func(*Role) (bool, error)) error {
-	key := accountID + "." + roleName
-	for range roleCASMaxRetries {
-		entry, err := s.rolesBucket.Get(ctx, key)
-		if err != nil {
-			if errors.Is(err, jetstream.ErrKeyNotFound) {
-				return errors.New(awserrors.ErrorIAMNoSuchEntity)
-			}
-			return fmt.Errorf("get role: %w", err)
-		}
-
-		var role Role
-		if err := json.Unmarshal(entry.Value(), &role); err != nil {
-			return fmt.Errorf("unmarshal role: %w", err)
-		}
-
-		changed, err := mutate(&role)
-		if err != nil {
-			return err
-		}
-		if !changed {
-			return nil
-		}
-
-		data, err := json.Marshal(&role)
-		if err != nil {
-			return fmt.Errorf("marshal role: %w", err)
-		}
-		if _, err := s.rolesBucket.Update(ctx, key, data, entry.Revision()); err != nil {
-			if errors.Is(err, jetstream.ErrKeyExists) {
-				continue // CAS conflict — another writer won, re-read and retry.
-			}
-			return fmt.Errorf("update role: %w", err)
-		}
-		return nil
-	}
-	return errors.New(awserrors.ErrorServerInternal)
+	_, err := kvutil.Update(ctx, s.rolesBucket, accountID+"."+roleName, kvutil.CASConfig{
+		Attempts: roleCASMaxRetries,
+		NotFound: errors.New(awserrors.ErrorIAMNoSuchEntity),
+		Exhausted: func(string, int) error {
+			// Only a CAS conflict reaches here, so the role is contended rather than
+			// broken; say so, or the caller's InternalError has no cause anywhere.
+			slog.Error("IAM role CAS retries exhausted under contention",
+				"accountID", accountID, "roleName", roleName, "attempts", roleCASMaxRetries)
+			return errors.New(awserrors.ErrorServerInternal)
+		},
+	}, mutate)
+	return err
 }
 
 // findInstanceProfilesForRole scans the instance-profiles bucket for any

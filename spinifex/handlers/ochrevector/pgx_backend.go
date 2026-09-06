@@ -119,6 +119,30 @@ func (b *pgxBackend) EnsureAccount(ctx context.Context, accountID string) error 
 	return nil
 }
 
+// RegrantAccount grants the account role full privileges on every table and
+// sequence currently in its schema. A restore imports a dump taken with
+// --no-owner/--no-privileges as the master role, which recreates each object
+// owned by the master role rather than the account role; this closes that
+// gap so query/ingest access is unaffected by which role ran the restore.
+func (b *pgxBackend) RegrantAccount(ctx context.Context, accountID string) error {
+	if err := validateAccountID(accountID); err != nil {
+		return err
+	}
+	schema := sanitizeIdent(schemaName(accountID))
+	role := sanitizeIdent(roleName(accountID))
+
+	// #nosec G201 -- schema/role are sanitized, validated identifiers; GRANT
+	// does not accept bound parameters.
+	if _, err := b.pool.Exec(ctx, fmt.Sprintf(`GRANT ALL ON ALL TABLES IN SCHEMA %s TO %s`, schema, role)); err != nil {
+		return fmt.Errorf("ochrevector: regrant tables for account %s: %w", accountID, err)
+	}
+	// #nosec G201 -- schema/role are sanitized, validated identifiers.
+	if _, err := b.pool.Exec(ctx, fmt.Sprintf(`GRANT ALL ON ALL SEQUENCES IN SCHEMA %s TO %s`, schema, role)); err != nil {
+		return fmt.Errorf("ochrevector: regrant sequences for account %s: %w", accountID, err)
+	}
+	return nil
+}
+
 // withAccountTx runs fn inside a transaction scoped to accountID: SET LOCAL
 // ROLE to the account's role and SET LOCAL search_path to its schema, so
 // every statement fn issues is enforced by Postgres' own grants — even a
@@ -197,6 +221,25 @@ func (b *pgxBackend) CreateIndex(ctx context.Context, accountID string, spec Ind
 		}
 		return nil
 	})
+}
+
+// IndexExists reports whether indexID's backing table exists under
+// accountID's schema. to_regclass resolves to NULL for a schema or table
+// that is not there rather than erroring, so no account role or search_path
+// setup is needed for this read-only lookup.
+func (b *pgxBackend) IndexExists(ctx context.Context, accountID, indexID string) (bool, error) {
+	if err := validateAccountID(accountID); err != nil {
+		return false, err
+	}
+	if err := validateIndexID(indexID); err != nil {
+		return false, err
+	}
+	qualified := schemaName(accountID) + "." + tableName(indexID)
+	var regclass *string
+	if err := b.pool.QueryRow(ctx, `SELECT to_regclass($1)::text`, qualified).Scan(&regclass); err != nil {
+		return false, fmt.Errorf("ochrevector: check index %s exists for account %s: %w", indexID, accountID, err)
+	}
+	return regclass != nil, nil
 }
 
 // DropIndex drops indexID's backing table under accountID's schema. Idempotent:

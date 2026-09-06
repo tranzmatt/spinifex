@@ -31,12 +31,6 @@ const (
 	// would pay the whole storage cost above for a fraction of the coverage.
 	defaultBackupRetentionDays = 7
 
-	// The UTC blocks an unnamed window is assigned inside. Deliberately disjoint:
-	// the two derived windows then cannot overlap, which is the pair AWS refuses
-	// to accept and the pair that would quiesce an engine mid-maintenance.
-	defaultBackupWindowBlock      = "03:00-11:00" //nolint:gosec // a UTC window block, not a credential
-	defaultMaintenanceWindowBlock = "11:00-19:00"
-
 	// How many automated snapshots one retention pass may delete. A pass that
 	// under-collects is corrected by the next one two minutes later; a pass that
 	// walks an unbounded number of snapshots is not.
@@ -58,6 +52,13 @@ const (
 	// until the next one — a missed window is never backfilled.
 	automatedBackupRetryBase     = time.Minute
 	automatedBackupRetryShiftCap = 3
+)
+
+// The UTC blocks an unnamed window is assigned inside. Deliberately disjoint,
+// so derived backup and maintenance windows cannot overlap.
+var (
+	defaultBackupWindowBlock      = dailyWindow{start: 3 * time.Hour, end: 11 * time.Hour}
+	defaultMaintenanceWindowBlock = dailyWindow{start: 11 * time.Hour, end: 19 * time.Hour}
 )
 
 // The operator-tunable backup settings: bounds and defaults, never a per-instance
@@ -114,20 +115,15 @@ func (s *Service) maintenanceWindowBlock() dailyWindow {
 	return s.windowBlock(s.deps.Backup.MaintenanceWindowBlock, defaultMaintenanceWindowBlock, "maintenance")
 }
 
-func (s *Service) windowBlock(configured, fallback, kind string) dailyWindow {
+func (s *Service) windowBlock(configured string, fallback dailyWindow, kind string) dailyWindow {
 	if configured != "" {
 		if block, err := parseDailyWindow("block", configured); err == nil {
 			return block
 		}
 		slog.Warn("rds: the configured "+kind+" window block is malformed; using the built-in block",
-			"block", configured, "fallback", fallback)
+			"block", configured, "fallback", fallback.String())
 	}
-	block, err := parseDailyWindow("block", fallback)
-	if err != nil {
-		// Unreachable: the fallbacks are constants this package's tests parse.
-		panic("rds: built-in " + kind + " window block is malformed: " + err.Error())
-	}
-	return block
+	return fallback
 }
 
 // The window in force for this instance. A record that names one uses it; one
@@ -368,7 +364,7 @@ func (s *Service) runMaintenanceWindow(ctx context.Context, kv jetstream.KeyValu
 	rec.Status = StatusModifying
 	rec.UpdatedAt = now
 	if err := updateJSON(ctx, kv, DBInstanceKey(rec.DBInstanceIdentifier), rev, rec); err != nil {
-		if errors.Is(err, jetstream.ErrKeyExists) {
+		if errors.Is(err, jetstream.ErrKeyRevisionMismatch) {
 			// Something else moved the record between the read and here; the next
 			// pass re-reads and the window is still open.
 			return false, nil
@@ -434,7 +430,7 @@ func (s *Service) DescribeDBInstanceAutomatedBackups(ctx context.Context,
 		if rec.BackupRetentionPeriod <= 0 {
 			continue
 		}
-		stamps, err := ListAutomatedBackupStamps(ctx, kv, id)
+		stamps, err := listNames(ctx, kv, AutomatedBackupsPrefix(id))
 		if err != nil {
 			return nil, err
 		}
@@ -476,7 +472,7 @@ func (s *Service) projectAutomatedBackup(rec *DBInstanceRecord, snapshots int) *
 	}
 	out := &rds.DBInstanceAutomatedBackup{
 		DBInstanceIdentifier:  aws.String(rec.DBInstanceIdentifier),
-		DBInstanceArn:         aws.String(DBInstanceARN(s.region, rec.AccountID, rec.DBInstanceIdentifier)),
+		DBInstanceArn:         aws.String(FormatARN(ResourceKindDBInstance, s.region, rec.AccountID, rec.DBInstanceIdentifier)),
 		Region:                aws.String(s.region),
 		Status:                aws.String(status),
 		Engine:                aws.String(rec.Engine),

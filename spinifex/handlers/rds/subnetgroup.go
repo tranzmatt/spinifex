@@ -105,7 +105,7 @@ func (s *Service) DescribeDBSubnetGroups(ctx context.Context, input *rds.Describ
 		}
 	}
 
-	names, err := ListDBSubnetGroupNames(ctx, kv)
+	names, err := listNames(ctx, kv, DBSubnetGroupsPrefix())
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +277,7 @@ func (s *Service) projectSubnetGroup(rec *DBSubnetGroupRecord) *rds.DBSubnetGrou
 	out := &rds.DBSubnetGroup{
 		DBSubnetGroupName:        aws.String(rec.Name),
 		DBSubnetGroupDescription: aws.String(rec.Description),
-		DBSubnetGroupArn:         aws.String(DBSubnetGroupARN(s.region, rec.AccountID, rec.Name)),
+		DBSubnetGroupArn:         aws.String(FormatARN(ResourceKindDBSubnetGroup, s.region, rec.AccountID, rec.Name)),
 		SubnetGroupStatus:        aws.String(subnetGroupStatusComplete),
 		VpcId:                    aws.String(rec.VpcID),
 	}

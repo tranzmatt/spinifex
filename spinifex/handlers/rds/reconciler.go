@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
+	"github.com/mulgadc/spinifex/spinifex/kvlease"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -76,37 +77,62 @@ type Reconciler struct {
 	svc    *Service
 	holder string
 
-	mu     sync.Mutex
-	leader bool
+	lease    *kvlease.Lease
+	leaseErr error
 
 	// The payloads already reported as stuck pending. The condition persists
 	// until an operator acts, so without this the event would be re-recorded
 	// every sweep and crowd the bounded ring.
 	reportedMu      sync.Mutex
 	reportedPending map[string]string
+
+	// The region's RDS system security group, resolved once. Ensuring it per
+	// instance per pass would be a VPC and group describe for every DB VM every
+	// 15s; the group is regional and nothing deletes it per instance.
+	systemSGMu sync.Mutex
+	systemSGID string
 }
 
 // holder identifies this daemon in the lease.
 func NewReconciler(svc *Service, holder string) *Reconciler {
-	return &Reconciler{svc: svc, holder: holder, reportedPending: make(map[string]string)}
+	r := &Reconciler{svc: svc, holder: holder, reportedPending: make(map[string]string)}
+	r.lease, r.leaseErr = kvlease.New(kvlease.Config{
+		Name:   "rds/reconciler",
+		Bucket: r.leaderBucket,
+		Key:    reconcilerLeaderKey,
+		Holder: holder,
+		TTL:    KVBucketRDSLeaderTTL,
+		Renew:  leaseRefresh,
+		Retry:  leaseRefresh,
+	})
+	return r
 }
 
 // Drives the leadership and reconcile loop until ctx is cancelled. Intended as
 // a daemon-boot goroutine; panics are the caller's recover concern.
 func (r *Reconciler) Run(ctx context.Context) {
-	leaseTicker := time.NewTicker(leaseRefresh)
+	if r.leaseErr != nil {
+		slog.ErrorContext(ctx, "rds reconciler: lease config invalid", "holder", r.holder, "err", r.leaseErr)
+		return
+	}
+	leadershipCtx, cancelLeadership := context.WithCancel(ctx)
+	leadershipDone := make(chan struct{})
+	go func() {
+		defer close(leadershipDone)
+		r.lease.Run(leadershipCtx)
+	}()
+	defer func() {
+		cancelLeadership()
+		<-leadershipDone
+	}()
+
 	reconcileTicker := time.NewTicker(reconcileInterval)
-	defer leaseTicker.Stop()
 	defer reconcileTicker.Stop()
 
-	r.evaluateLeadership(ctx)
 	for {
 		select {
 		case <-ctx.Done():
-			r.relinquish()
 			return
-		case <-leaseTicker.C:
-			r.evaluateLeadership(ctx)
 		case <-reconcileTicker.C:
 			if !r.isLeader() {
 				continue
@@ -126,63 +152,7 @@ func (r *Reconciler) AcquireClusterLease() (func(), bool) {
 }
 
 func (r *Reconciler) isLeader() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.leader
-}
-
-func (r *Reconciler) evaluateLeadership(ctx context.Context) {
-	won := r.acquireOrRefresh(ctx)
-	r.mu.Lock()
-	was := r.leader
-	r.leader = won
-	r.mu.Unlock()
-
-	switch {
-	case won && !was:
-		slog.Info("rds reconciler: elected leader", "holder", r.holder)
-	case !won && was:
-		slog.Info("rds reconciler: lost leadership", "holder", r.holder)
-	}
-}
-
-// Claims the lease, or refreshes it (resetting the TTL) when we already hold it.
-func (r *Reconciler) acquireOrRefresh(ctx context.Context) bool {
-	kv, err := r.leaderBucket(ctx)
-	if err != nil {
-		return false
-	}
-	if _, err := kv.Create(ctx, reconcilerLeaderKey, []byte(r.holder)); err == nil {
-		return true
-	}
-	entry, err := kv.Get(ctx, reconcilerLeaderKey)
-	if err != nil {
-		return false
-	}
-	if string(entry.Value()) != r.holder {
-		return false
-	}
-	if _, err := kv.Put(ctx, reconcilerLeaderKey, []byte(r.holder)); err != nil {
-		return false
-	}
-	return true
-}
-
-// Releases the lease on shutdown so the next leader is elected immediately
-// rather than after the TTL.
-func (r *Reconciler) relinquish() {
-	// Run's ctx is already cancelled by the time this is called, so the release
-	// runs on its own — a cancelled ctx would fail the delete.
-	ctx := context.Background()
-	kv, err := r.leaderBucket(ctx)
-	if err != nil {
-		return
-	}
-	if entry, gerr := kv.Get(ctx, reconcilerLeaderKey); gerr == nil && string(entry.Value()) == r.holder {
-		if err := kv.Delete(ctx, reconcilerLeaderKey); err != nil {
-			slog.Debug("rds reconciler: release lease failed", "holder", r.holder, "err", err)
-		}
-	}
+	return r.lease.Held()
 }
 
 func (r *Reconciler) leaderBucket(ctx context.Context) (jetstream.KeyValue, error) {
@@ -251,6 +221,10 @@ func (r *Reconciler) reconcileInstance(ctx context.Context, kv jetstream.KeyValu
 	if err := r.reportStalePendingBootstrap(ctx, kv, accountID, &rec); err != nil {
 		return err
 	}
+	remediated, err := r.remediateSystemENISG(ctx, kv, rev, &rec)
+	if err != nil || remediated {
+		return err
+	}
 	switch rec.Status {
 	case StatusCreating:
 		return r.reconcileCreating(ctx, kv, rev, accountID, &rec)
@@ -269,6 +243,67 @@ func (r *Reconciler) reconcileInstance(ctx context.Context, kv jetstream.KeyValu
 	default:
 		return nil
 	}
+}
+
+// Moves a system NIC launched before the RDS system security group existed onto
+// it, once. Reports whether it acted, so the caller yields this pass and the
+// status handler runs on the next tick against a fresh revision.
+//
+// vpcd applies the requested group list declaratively, so this removes the ENI
+// from the system VPC's default group rather than merely adding the new one
+// alongside it — and that default group is the whole of the exposure.
+func (r *Reconciler) remediateSystemENISG(ctx context.Context, kv jetstream.KeyValue,
+	rev uint64, rec *DBInstanceRecord) (bool, error) {
+	if rec.SystemENIID == "" || rec.Status == StatusDeleting {
+		return false, nil
+	}
+	sgID, err := r.ensuredSystemSG(ctx)
+	if err != nil {
+		return false, err
+	}
+	if rec.SystemSGID == sgID {
+		return false, nil
+	}
+
+	if _, err := r.svc.deps.Launch.VPC.ModifyNetworkInterfaceAttribute(ctx, &ec2.ModifyNetworkInterfaceAttributeInput{
+		NetworkInterfaceId: aws.String(rec.SystemENIID),
+		Groups:             aws.StringSlice([]string{sgID}),
+	}, utils.GlobalAccountID); err != nil {
+		return false, fmt.Errorf("rds: move the system NIC of %s onto %s: %w", rec.DBInstanceIdentifier, sgID, err)
+	}
+	// Recorded only once vpcd has accepted the change, so a failure above is
+	// retried next pass rather than remembered as done.
+	rec.SystemSGID = sgID
+	if _, err := updateJSONRevision(ctx, kv, DBInstanceKey(rec.DBInstanceIdentifier), rev, rec); err != nil {
+		return false, err
+	}
+	slog.InfoContext(ctx, "rds: system NIC moved onto the RDS system security group",
+		"dbInstance", rec.DBInstanceIdentifier, "eniId", rec.SystemENIID, "groupId", sgID)
+	return true, nil
+}
+
+// The region's system security group, ensured on first use and then cached for
+// the life of the process.
+func (r *Reconciler) ensuredSystemSG(ctx context.Context) (string, error) {
+	r.systemSGMu.Lock()
+	defer r.systemSGMu.Unlock()
+	if r.systemSGID != "" {
+		return r.systemSGID, nil
+	}
+	deps := r.svc.deps.Launch
+	if deps.VPC == nil || deps.Config == nil {
+		return "", errors.New("rds reconciler: no VPC path is configured to place system NICs on their own security group")
+	}
+	refs, err := EnsureSystemVPC(ctx, deps.SystemVPC, &deps.Config.RDS, utils.GlobalAccountID, deps.Config.Region)
+	if err != nil {
+		return "", err
+	}
+	sgID, err := EnsureSystemSecurityGroup(ctx, deps.VPC, utils.GlobalAccountID, deps.Config.Region, refs.VpcID)
+	if err != nil {
+		return "", err
+	}
+	r.systemSGID = sgID
+	return sgID, nil
 }
 
 // An available instance whose payload is still staged bootstrapped against an
@@ -566,7 +601,7 @@ func (r *Reconciler) resolveCreatingSnapshot(ctx context.Context, kv jetstream.K
 	if snapshotID == "" {
 		if err := kv.Delete(ctx, DBSnapshotKey(rec.DBSnapshotIdentifier), jetstream.LastRevision(rev)); err != nil {
 			switch {
-			case errors.Is(err, jetstream.ErrKeyNotFound), errors.Is(err, jetstream.ErrKeyExists):
+			case errors.Is(err, jetstream.ErrKeyNotFound), errors.Is(err, jetstream.ErrKeyRevisionMismatch):
 				// A concurrent completion or delete owns the newer revision.
 				return nil
 			default:
@@ -587,7 +622,7 @@ func (r *Reconciler) resolveCreatingSnapshot(ctx context.Context, kv jetstream.K
 	// conservative reading is the one that never overstates the snapshot.
 	rec.CrashConsistent = true
 	if err := updateJSON(ctx, kv, DBSnapshotKey(rec.DBSnapshotIdentifier), rev, rec); err != nil {
-		if errors.Is(err, jetstream.ErrKeyExists) {
+		if errors.Is(err, jetstream.ErrKeyRevisionMismatch) {
 			return nil
 		}
 		return err
@@ -689,7 +724,7 @@ func (r *Reconciler) transition(ctx context.Context, kv jetstream.KeyValue, rev 
 	rec.UpdatedAt = time.Now().UTC()
 
 	if err := updateJSON(ctx, kv, DBInstanceKey(rec.DBInstanceIdentifier), rev, rec); err != nil {
-		if errors.Is(err, jetstream.ErrKeyExists) {
+		if errors.Is(err, jetstream.ErrKeyRevisionMismatch) {
 			slog.DebugContext(ctx, "rds reconciler: transition lost a revision race; retrying next pass",
 				"dbInstance", rec.DBInstanceIdentifier, "to", to)
 			return nil

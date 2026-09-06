@@ -14,12 +14,14 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"uuid"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/eks"
 	"github.com/aws/aws-sdk-go/service/iam"
-	"github.com/google/uuid"
+	"github.com/mulgadc/bluebottle/pkg/auth"
+	"github.com/mulgadc/spinifex/spinifex/arn"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	"github.com/mulgadc/spinifex/spinifex/instancetypes"
@@ -77,13 +79,6 @@ const ngCASMaxRetries = 16
 // absent. Callers translate to the AWS shape (ResourceNotFoundException) at the
 // service boundary.
 var ErrNodegroupNotFound = errors.New("eks: nodegroup not found")
-
-// NodegroupARN composes a nodegroup ARN matching the AWS shape
-// (.../nodegroup/{cluster}/{ng}/{uuid}). The trailing UUID is the per-nodegroup
-// discriminator AWS appends; it is generated once at create time and persisted.
-func NodegroupARN(region, accountID, cluster, ng, id string) string {
-	return fmt.Sprintf("arn:aws:eks:%s:%s:nodegroup/%s/%s/%s", region, accountID, cluster, ng, id)
-}
 
 // PutNodegroupRecord writes the record unconditionally.
 func PutNodegroupRecord(ctx context.Context, kv jetstream.KeyValue, rec *NodegroupRecord) error {
@@ -280,7 +275,7 @@ func (s *EKSServiceImpl) createNodegroup(ctx context.Context, acctKV jetstream.K
 	rec := &NodegroupRecord{
 		ClusterName:    cluster,
 		Name:           ng,
-		Arn:            NodegroupARN(s.deps.Region, accountID, cluster, ng, uuid.NewString()),
+		Arn:            arn.FormatEKSNodegroup(s.deps.Region, accountID, cluster, ng, uuid.NewV4().String()),
 		Status:         eks.NodegroupStatusCreating,
 		Subnets:        subnets,
 		InstanceTypes:  instanceTypes,
@@ -574,7 +569,7 @@ func (s *EKSServiceImpl) launchOneWorker(ctx context.Context, rec *NodegroupReco
 		instanceType = rec.InstanceTypes[0]
 	}
 	subnet := rec.Subnets[0]
-	shortID := uuid.NewString()[:8]
+	shortID := uuid.NewV4().String()[:8]
 
 	region := s.deps.Region
 	suffix := s.deps.InternalSuffix
@@ -677,7 +672,7 @@ func (s *EKSServiceImpl) selectWorkerHost(ctx context.Context, instanceType stri
 			counts[host]++
 		}
 	}
-	rand.Shuffle(len(hosts), func(i, j int) { hosts[i], hosts[j] = hosts[j], hosts[i] })
+	rand.Shuffle(len(hosts), func(i, j int) { hosts[i], hosts[j] = hosts[j], hosts[i] }) //nolint:gosec // worker spread, not cryptographic
 	best := hosts[0]
 	for _, h := range hosts[1:] {
 		if counts[h] < counts[best] {
@@ -711,9 +706,14 @@ func gatewayHostIP(gatewayURL string) string {
 // provider, mirroring the implicit instance profile real EKS creates for a node
 // role. Idempotent: concurrent worker launches converge on the same profile.
 func (s *EKSServiceImpl) ensureNodeInstanceProfile(accountID, nodeRoleARN string) (string, error) {
-	roleName := roleNameFromARN(nodeRoleARN)
-	if roleName == "" {
-		return "", fmt.Errorf("node role ARN %q has no role name", nodeRoleARN)
+	roleAccount, roleName, err := auth.ParseRoleARN(nodeRoleARN)
+	if err != nil {
+		return "", fmt.Errorf("node role ARN %q: %w", nodeRoleARN, err)
+	}
+	// The profile is created under the caller's account, so a role from another
+	// account would silently bind a name that account does not own.
+	if roleAccount != accountID {
+		return "", fmt.Errorf("node role ARN %q is not in account %s", nodeRoleARN, accountID)
 	}
 	profileName := roleName
 
@@ -764,15 +764,6 @@ func (s *EKSServiceImpl) attachRoleToProfile(accountID, profileName, roleName, p
 		return "", fmt.Errorf("add role %q to instance profile %q: %w", roleName, profileName, err)
 	}
 	return profileARN, nil
-}
-
-// roleNameFromARN extracts the role name from an arn:aws:iam::<acct>:role/<name>
-// ARN, returning "" when the ARN does not carry the :role/ segment.
-func roleNameFromARN(arn string) string {
-	if _, after, ok := strings.Cut(arn, ":role/"); ok {
-		return after
-	}
-	return ""
 }
 
 func (s *EKSServiceImpl) describeNodegroup(ctx context.Context, acctKV jetstream.KeyValue, input *eks.DescribeNodegroupInput) (*eks.DescribeNodegroupOutput, error) {
@@ -836,7 +827,7 @@ func (s *EKSServiceImpl) updateNodegroupConfig(ctx context.Context, acctKV jetst
 	}
 
 	return &eks.UpdateNodegroupConfigOutput{Update: &eks.Update{
-		Id:        aws.String(uuid.NewString()),
+		Id:        aws.String(uuid.NewV4().String()),
 		Status:    aws.String(eks.UpdateStatusSuccessful),
 		Type:      aws.String(eks.UpdateTypeConfigUpdate),
 		CreatedAt: aws.Time(rec.ModifiedAt),
@@ -1037,7 +1028,7 @@ func (s *EKSServiceImpl) casPutNodegroup(ctx context.Context, kv jetstream.KeyVa
 		return false, fmt.Errorf("marshal nodegroup %s: %w", rec.Name, err)
 	}
 	if _, err := kv.Update(ctx, NodegroupKey(rec.ClusterName, rec.Name), data, rev); err != nil {
-		if errors.Is(err, jetstream.ErrKeyExists) {
+		if errors.Is(err, jetstream.ErrKeyRevisionMismatch) {
 			return false, nil
 		}
 		return false, fmt.Errorf("kv update nodegroup %s: %w", rec.Name, err)

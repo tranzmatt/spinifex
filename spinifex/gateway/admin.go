@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"uuid"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/utils"
@@ -23,7 +23,9 @@ var adminMethods = map[string]bool{
 	"CreateAccount":           true,
 	"DeleteAccount":           true,
 	"DescribeAccountDeletion": true,
+	"GetAccountQuota":         true,
 	"ListAccounts":            true,
+	"PutAccountQuota":         true,
 }
 
 // AdminMethodNames returns the callable /admin/<Method> names in sorted order.
@@ -79,7 +81,7 @@ type adminErrorDetail struct {
 // Authorization is fail-closed at every step and every denial returns the same
 // AccessDenied, so a caller cannot probe which gate rejected it.
 func (gw *GatewayConfig) Admin_Request(w http.ResponseWriter, r *http.Request) {
-	requestID := uuid.NewString()
+	requestID := uuid.NewV4().String()
 	w.Header().Set("X-Amzn-Requestid", requestID)
 
 	method := chi.URLParam(r, "method")
@@ -129,6 +131,10 @@ func (gw *GatewayConfig) Admin_Request(w http.ResponseWriter, r *http.Request) {
 		output, err = gw.adminDescribeAccountDeletion(ctx, body)
 	case "ListAccounts":
 		output, err = gw.adminListAccounts(ctx, body)
+	case "GetAccountQuota":
+		output, err = gw.adminGetAccountQuota(ctx, body)
+	case "PutAccountQuota":
+		output, err = gw.adminPutAccountQuota(ctx, body)
 	default:
 		// Unreachable: adminMethods gates the switch. Fail closed anyway so
 		// adding a name to the map without a case cannot silently return 200.

@@ -53,7 +53,10 @@ func (gw *GatewayConfig) ecrOperationAuthorization(next http.Handler) http.Handl
 				gateway_ecr.WriteError(w, http.StatusServiceUnavailable, "UNKNOWN", "authorization unavailable")
 				return
 			}
-			if err := gw.evaluatePrincipalPolicy(principal, policy.IAMAction("ecr", req.Action), resource); err != nil {
+			if err := gw.evaluatePrincipalPolicyResources(
+				principal, policy.IAMAction("ecr", req.Action), []string{resource},
+				requestConditionKeys(r, principal),
+			); err != nil {
 				if err.Error() == awserrors.ErrorInternalError {
 					// IAM/STS/NATS dependency failure: fail closed, never dispatch.
 					gateway_ecr.WriteError(w, http.StatusServiceUnavailable, "UNKNOWN", "authorization unavailable")

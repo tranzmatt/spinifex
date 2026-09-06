@@ -10,7 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mulgadc/spinifex/spinifex/kvutil"
 	"github.com/mulgadc/spinifex/spinifex/migrate"
+	"github.com/mulgadc/spinifex/spinifex/otelsetup"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/spinifex/spinifex/vm"
 	"github.com/nats-io/nats.go"
@@ -257,146 +259,6 @@ func (m *JetStreamManager) recoverTerminatedKVBucket(ctx context.Context) (jetst
 	}, &m.terminatedKV, TerminatedInstanceBucketVersion)
 }
 
-// maxCASRetries bounds the optimistic-concurrency retry loop in casUpdate.
-// A conflict this many times in a row means sustained write contention on
-// the key, not a single overlapping update — callers should surface an error.
-const maxCASRetries = 5
-
-// isRevisionConflict reports whether err is the nats.go "wrong last
-// sequence" error that KeyValue.Update/Create return when the key's
-// revision no longer matches what the caller expected, i.e. a concurrent
-// writer won the race. The jetstream package surfaces this as
-// jetstream.ErrKeyExists for both Update (stale revision) and Create (key already present).
-func isRevisionConflict(err error) bool {
-	return errors.Is(err, jetstream.ErrKeyExists)
-}
-
-// casUpdate performs an optimistic-concurrency read-modify-write against kv:
-// Get the current entry (or start from a zero value when absent and
-// createIfAbsent is set), apply mutate to the decoded value, then commit via
-// Update/Create using the observed revision. A concurrent writer that changes
-// the key between Get and Update/Create is detected via a revision conflict
-// and retried, bounded by maxCASRetries.
-func casUpdate[T any](ctx context.Context, kv jetstream.KeyValue, key string, mutate func(*T), createIfAbsent bool) (*T, error) {
-	var lastErr error
-	for range maxCASRetries {
-		var value T
-		var revision uint64
-
-		entry, err := kv.Get(ctx, key)
-		switch {
-		case err == nil:
-			if uerr := json.Unmarshal(entry.Value(), &value); uerr != nil {
-				return nil, uerr
-			}
-			revision = entry.Revision()
-		case errors.Is(err, jetstream.ErrKeyNotFound) && createIfAbsent:
-			revision = 0
-		default:
-			return nil, err
-		}
-
-		mutate(&value)
-
-		data, merr := json.Marshal(&value)
-		if merr != nil {
-			return nil, merr
-		}
-
-		if revision == 0 {
-			_, err = kv.Create(ctx, key, data)
-		} else {
-			_, err = kv.Update(ctx, key, data, revision)
-		}
-		if err == nil {
-			return &value, nil
-		}
-		if isRevisionConflict(err) {
-			lastErr = err
-			continue
-		}
-		return nil, err
-	}
-	return nil, fmt.Errorf("CAS update exhausted %d retries for key %s: %w", maxCASRetries, key, lastErr)
-}
-
-// casPut writes data to key under kv using optimistic concurrency: it reads
-// the current revision (or treats the key as absent, using Create, when
-// createIfAbsent is set) then commits via Update/Create, retrying on a
-// revision conflict up to maxCASRetries. This is the "replace wholesale"
-// counterpart to casUpdate, for values (like vm.VM, which embeds a
-// sync.Mutex) that cannot be safely decoded into and copied out of a shared
-// struct value.
-func casPut(ctx context.Context, kv jetstream.KeyValue, key string, data []byte, createIfAbsent bool) error {
-	var lastErr error
-	for range maxCASRetries {
-		var revision uint64
-
-		entry, err := kv.Get(ctx, key)
-		switch {
-		case err == nil:
-			revision = entry.Revision()
-		case errors.Is(err, jetstream.ErrKeyNotFound) && createIfAbsent:
-			revision = 0
-		default:
-			return err
-		}
-
-		if revision == 0 {
-			_, err = kv.Create(ctx, key, data)
-		} else {
-			_, err = kv.Update(ctx, key, data, revision)
-		}
-		if err == nil {
-			return nil
-		}
-		if isRevisionConflict(err) {
-			lastErr = err
-			continue
-		}
-		return err
-	}
-	return fmt.Errorf("CAS put exhausted %d retries for key %s: %w", maxCASRetries, key, lastErr)
-}
-
-// casClaim atomically removes key from kv, decoding its current value into T
-// first — the delete-side counterpart to casPut/casUpdate. It is the
-// primitive an exclusive "claim" is built on: at most one caller can ever
-// observe a successful delete for a given revision, so at most one caller
-// gets back a non-nil value. A concurrent writer that changes the key
-// between Get and Delete (another claim, or an unrelated update) is
-// detected via a revision conflict and retried, bounded by maxCASRetries,
-// so a losing racer only fails outright when the key is truly gone
-// (notFound) or retries are exhausted.
-func casClaim[T any](ctx context.Context, kv jetstream.KeyValue, key string) (value *T, notFound bool, err error) {
-	var lastErr error
-	for range maxCASRetries {
-		entry, gerr := kv.Get(ctx, key)
-		if gerr != nil {
-			if errors.Is(gerr, jetstream.ErrKeyNotFound) {
-				return nil, true, nil
-			}
-			return nil, false, gerr
-		}
-
-		var v T
-		if uerr := json.Unmarshal(entry.Value(), &v); uerr != nil {
-			return nil, false, uerr
-		}
-
-		if derr := kv.Delete(ctx, key, jetstream.LastRevision(entry.Revision())); derr != nil {
-			if isRevisionConflict(derr) {
-				lastErr = derr
-				continue
-			}
-			return nil, false, derr
-		}
-
-		return &v, false, nil
-	}
-	return nil, false, fmt.Errorf("CAS claim exhausted %d retries for key %s: %w", maxCASRetries, key, lastErr)
-}
-
 // Heartbeat represents a daemon's periodic health status published to cluster KV.
 //
 // AvailableVCPU / AvailableMem are observability-only (host - allocated,
@@ -466,9 +328,9 @@ func (m *JetStreamManager) WriteClusterShutdown(state *ClusterShutdownState) err
 	if m.clusterKV == nil {
 		return errors.New("cluster state KV not initialized")
 	}
-	_, err := casUpdate(context.Background(), m.clusterKV, "cluster.shutdown", func(s *ClusterShutdownState) {
-		*s = *state
-	}, true)
+	_, err := kvutil.Update(context.Background(), m.clusterKV, "cluster.shutdown",
+		kvutil.CASConfig{CreateIfAbsent: true},
+		func(s *ClusterShutdownState) (bool, error) { *s = *state; return true, nil })
 	return err
 }
 
@@ -480,7 +342,8 @@ func (m *JetStreamManager) UpdateClusterShutdown(mutate func(*ClusterShutdownSta
 	if m.clusterKV == nil {
 		return nil, errors.New("cluster state KV not initialized")
 	}
-	return casUpdate(context.Background(), m.clusterKV, "cluster.shutdown", mutate, false)
+	return kvutil.Update(context.Background(), m.clusterKV, "cluster.shutdown", kvutil.CASConfig{},
+		func(s *ClusterShutdownState) (bool, error) { mutate(s); return true, nil })
 }
 
 // UpdateMgmtIPAM atomically applies mutate to the mgmt-ipam record for
@@ -496,7 +359,9 @@ func (m *JetStreamManager) UpdateMgmtIPAM(subnet string, mutate func(*MgmtIPReco
 	if m.clusterKV == nil {
 		return nil, errors.New("cluster state KV not initialized")
 	}
-	return casUpdate(context.Background(), m.clusterKV, mgmtIPAMKeyPrefix+subnet, mutate, createIfAbsent)
+	return kvutil.Update(context.Background(), m.clusterKV, mgmtIPAMKeyPrefix+subnet,
+		kvutil.CASConfig{CreateIfAbsent: createIfAbsent},
+		func(r *MgmtIPRecord) (bool, error) { mutate(r); return true, nil })
 }
 
 // ReadClusterShutdown reads the cluster shutdown state from KV.
@@ -644,7 +509,7 @@ func (m *JetStreamManager) WriteStateBytesBestEffort(nodeID string, jsonData []b
 			m.obs.RecordKVSyncFailure(InstanceStateBucket, err)
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			slog.Warn("KV sync timed out (best-effort)", "key", key, "timeout", timeout)
+			slog.Warn("KV sync timed out (best-effort)", "key", key, "timeout_ms", otelsetup.Millis(timeout))
 			return
 		}
 		slog.Warn("KV sync failed (best-effort)", "key", key, "err", err)
@@ -817,7 +682,7 @@ func (m *JetStreamManager) WriteStoppedInstance(instanceID string, instance *vm.
 	}
 
 	key := StoppedInstancePrefix + instanceID
-	err = casPut(context.Background(), m.kv, key, jsonData, true)
+	err = kvutil.Put(context.Background(), m.kv, key, kvutil.CASConfig{CreateIfAbsent: true}, jsonData)
 	if err != nil {
 		if isStreamUnavailable(err) {
 			slog.Warn("KV stream unavailable, attempting recovery", "operation", "WriteStoppedInstance", "key", key, "err", err)
@@ -825,7 +690,7 @@ func (m *JetStreamManager) WriteStoppedInstance(instanceID string, instance *vm.
 			if recoverErr != nil {
 				return err
 			}
-			if retryErr := casPut(context.Background(), kv, key, jsonData, true); retryErr != nil {
+			if retryErr := kvutil.Put(context.Background(), kv, key, kvutil.CASConfig{CreateIfAbsent: true}, jsonData); retryErr != nil {
 				return retryErr
 			}
 			slog.Debug("Wrote stopped instance to JetStream KV (after recovery)", "key", key, "instanceId", instanceID)
@@ -923,7 +788,7 @@ func (m *JetStreamManager) ClaimStoppedInstance(instanceID string) (*vm.VM, erro
 	}
 
 	key := StoppedInstancePrefix + instanceID
-	instance, notFound, err := casClaim[vm.VM](context.Background(), m.kv, key)
+	instance, notFound, err := kvutil.Claim[vm.VM](context.Background(), m.kv, key, kvutil.CASConfig{})
 	if err != nil {
 		if isStreamUnavailable(err) {
 			slog.Warn("KV stream unavailable, attempting recovery", "operation", "ClaimStoppedInstance", "key", key, "err", err)
@@ -931,7 +796,7 @@ func (m *JetStreamManager) ClaimStoppedInstance(instanceID string) (*vm.VM, erro
 			if recoverErr != nil {
 				return nil, err
 			}
-			instance, notFound, err = casClaim[vm.VM](context.Background(), kv, key)
+			instance, notFound, err = kvutil.Claim[vm.VM](context.Background(), kv, key, kvutil.CASConfig{})
 			if err != nil {
 				return nil, err
 			}
@@ -961,7 +826,8 @@ func (m *JetStreamManager) UpdateStoppedInstance(instanceID string, mutate func(
 	}
 
 	key := StoppedInstancePrefix + instanceID
-	updated, err := casUpdate(context.Background(), m.kv, key, mutate, false)
+	apply := func(v *vm.VM) (bool, error) { mutate(v); return true, nil }
+	updated, err := kvutil.Update(context.Background(), m.kv, key, kvutil.CASConfig{}, apply)
 	if err != nil {
 		if isStreamUnavailable(err) {
 			slog.Warn("KV stream unavailable, attempting recovery", "operation", "UpdateStoppedInstance", "key", key, "err", err)
@@ -969,7 +835,7 @@ func (m *JetStreamManager) UpdateStoppedInstance(instanceID string, mutate func(
 			if recoverErr != nil {
 				return nil, err
 			}
-			return casUpdate(context.Background(), kv, key, mutate, false)
+			return kvutil.Update(context.Background(), kv, key, kvutil.CASConfig{}, apply)
 		}
 		return nil, err
 	}
@@ -1055,7 +921,7 @@ func (m *JetStreamManager) WriteTerminatedInstance(instanceID string, instance *
 	}
 
 	key := TerminatedInstancePrefix + instanceID
-	err = casPut(context.Background(), m.terminatedKV, key, jsonData, true)
+	err = kvutil.Put(context.Background(), m.terminatedKV, key, kvutil.CASConfig{CreateIfAbsent: true}, jsonData)
 	if err != nil {
 		if isStreamUnavailable(err) {
 			slog.Warn("KV stream unavailable, attempting recovery", "operation", "WriteTerminatedInstance", "key", key, "err", err)
@@ -1063,7 +929,7 @@ func (m *JetStreamManager) WriteTerminatedInstance(instanceID string, instance *
 			if recoverErr != nil {
 				return err
 			}
-			if retryErr := casPut(context.Background(), kv, key, jsonData, true); retryErr != nil {
+			if retryErr := kvutil.Put(context.Background(), kv, key, kvutil.CASConfig{CreateIfAbsent: true}, jsonData); retryErr != nil {
 				return retryErr
 			}
 			slog.Debug("Wrote terminated instance to JetStream KV (after recovery)", "key", key, "instanceId", instanceID)
@@ -1088,7 +954,8 @@ func (m *JetStreamManager) UpdateTerminatedInstance(instanceID string, mutate fu
 	}
 
 	key := TerminatedInstancePrefix + instanceID
-	updated, err := casUpdate(context.Background(), m.terminatedKV, key, mutate, false)
+	apply := func(v *vm.VM) (bool, error) { mutate(v); return true, nil }
+	updated, err := kvutil.Update(context.Background(), m.terminatedKV, key, kvutil.CASConfig{}, apply)
 	if err != nil {
 		if isStreamUnavailable(err) {
 			slog.Warn("KV stream unavailable, attempting recovery", "operation", "UpdateTerminatedInstance", "key", key, "err", err)
@@ -1096,7 +963,7 @@ func (m *JetStreamManager) UpdateTerminatedInstance(instanceID string, mutate fu
 			if recoverErr != nil {
 				return nil, err
 			}
-			return casUpdate(context.Background(), kv, key, mutate, false)
+			return kvutil.Update(context.Background(), kv, key, kvutil.CASConfig{}, apply)
 		}
 		return nil, err
 	}

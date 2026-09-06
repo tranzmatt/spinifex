@@ -23,6 +23,9 @@ type Deps struct {
 	CAKeyPath  string
 	// Overrides the file-backed CA loader in tests.
 	LoadCA CALoader
+	// Overrides the size of the RSA key each serving cert is minted with. Zero
+	// takes defaultServingCertKeyBits, which is what production runs.
+	ServingCertKeyBits int
 	// The cluster master key the staged bootstrap password is encrypted under.
 	// Mandatory: without it a create cannot stage a password at all, so it is
 	// resolved at construction rather than per operation.
@@ -61,6 +64,9 @@ type Deps struct {
 	// Overrides how long a stop waits for the fleet to report the VM down.
 	// Zero takes defaultVMStopTimeout.
 	VMStopTimeout time.Duration
+	// Overrides how long an apply-params command waits for the agent to
+	// answer. Zero takes defaultApplyParamsTimeout.
+	ApplyParamsTimeout time.Duration
 	// Override the modify lease lifetime and renewal cadence in tests. A zero
 	// TTL takes the default; a refresh outside (0, TTL) derives as TTL/3.
 	ModifyLeaseTTL     time.Duration
@@ -111,6 +117,13 @@ func (s *Service) vmStopTimeout() time.Duration {
 		return s.deps.VMStopTimeout
 	}
 	return defaultVMStopTimeout
+}
+
+func (s *Service) applyParamsTimeout() time.Duration {
+	if s.deps.ApplyParamsTimeout > 0 {
+		return s.deps.ApplyParamsTimeout
+	}
+	return defaultApplyParamsTimeout
 }
 
 func (s *Service) failureGrace() time.Duration {

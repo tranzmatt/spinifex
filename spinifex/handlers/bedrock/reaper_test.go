@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/spinifex/spinifex/config"
+	gateway_bedrock "github.com/mulgadc/spinifex/spinifex/gateway/bedrock"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go/jetstream"
@@ -123,7 +124,7 @@ func (f *reaperFixture) ready(t *testing.T) EndpointRecord {
 // endpoint that has been up and quiet for a while.
 func (f *reaperFixture) age(t *testing.T, readyAgo, activeAgo time.Duration) EndpointRecord {
 	t.Helper()
-	key := EndpointKey(utils.GlobalAccountID, testModelID)
+	key := resolveKey(utils.GlobalAccountID, testModelID)
 	rec, rev, found, err := getFullJSON(t.Context(), f.kv, key)
 	require.NoError(t, err)
 	require.True(t, found)
@@ -139,7 +140,7 @@ func (f *reaperFixture) age(t *testing.T, readyAgo, activeAgo time.Duration) End
 
 func (f *reaperFixture) current(t *testing.T) (EndpointRecord, bool) {
 	t.Helper()
-	rec, _, found, err := getFullJSON(t.Context(), f.kv, EndpointKey(utils.GlobalAccountID, testModelID))
+	rec, _, found, err := getFullJSON(t.Context(), f.kv, resolveKey(utils.GlobalAccountID, testModelID))
 	require.NoError(t, err)
 	return rec, found
 }
@@ -177,7 +178,7 @@ func TestReaper_NeverReapsPinnedEndpoint(t *testing.T) {
 	f.ready(t)
 	f.age(t, time.Hour, time.Hour)
 
-	key := EndpointKey(utils.GlobalAccountID, testModelID)
+	key := resolveKey(utils.GlobalAccountID, testModelID)
 	rec, rev, _, err := getFullJSON(t.Context(), f.kv, key)
 	require.NoError(t, err)
 	rec.Pinned = true
@@ -283,6 +284,64 @@ func TestReaper_ScrapeFailuresEscalateToRelaunch(t *testing.T) {
 	assert.EqualValues(t, 2, f.harness.launcher.launchCount.Load(), "the endpoint must be relaunched, not just removed")
 }
 
+// A pinned endpoint is operator/commitment-managed: a persistent scrape
+// failure must never make the reaper tear it down, exactly as it never
+// idle-reclaims one.
+func TestReaper_PinnedEndpointNotReapedOnScrapeFailure(t *testing.T) {
+	f := newReaperFixture(t, ReaperDeps{IdleTTL: time.Hour})
+	f.ready(t)
+
+	key := resolveKey(utils.GlobalAccountID, testModelID)
+	rec, rev, found, err := getFullJSON(t.Context(), f.kv, key)
+	require.NoError(t, err)
+	require.True(t, found)
+	rec.Pinned = true
+	require.NoError(t, updateJSON(t.Context(), f.kv, key, rev, rec))
+
+	f.transport.breakScrapes()
+	for range maxScrapeFailures + 2 {
+		require.NoError(t, f.reaper.sweepOnce(t.Context()))
+	}
+
+	got, found := f.current(t)
+	require.True(t, found, "a pinned endpoint is never reaped on scrape failure")
+	assert.Empty(t, f.harness.launcher.terminated)
+	assert.Positive(t, got.ScrapeFailures, "the failure is still counted and logged")
+}
+
+// A service-only bundle (no generative vLLM member) exposes no vLLM load
+// metrics, so it is liveness-probed on /health and kept warm rather than
+// idle-scraped and reaped — even with an aggressive idle TTL and aged
+// timestamps that would reap a vLLM endpoint instantly.
+func TestReaper_ServiceOnlyBundleLivenessProbedNotReaped(t *testing.T) {
+	f := newReaperFixture(t, ReaperDeps{IdleTTL: time.Nanosecond})
+
+	const embedModelID = "embed-only-bundle"
+	key := resolveKey(utils.GlobalAccountID, embedModelID)
+	_, err := createJSONRevision(t.Context(), f.kv, key, EndpointRecord{
+		AccountID:    utils.GlobalAccountID,
+		ModelID:      embedModelID,
+		State:        StateReady,
+		BaseURL:      "http://10.0.0.1:8001",
+		PrivateIP:    "10.0.0.1",
+		Members:      map[string]MemberEndpoint{embedModelID: {Port: 8001, Family: gateway_bedrock.FamilyTEI}},
+		ReadyAt:      time.Now().Add(-time.Hour),
+		LastActiveAt: time.Now().Add(-time.Hour),
+		Generation:   1,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, f.reaper.sweepOnce(t.Context()))
+
+	rec, rev, found, err := getFullJSON(t.Context(), f.kv, key)
+	require.NoError(t, err)
+	require.True(t, found, "a warm service bundle is never idle-reaped")
+	assert.Empty(t, f.harness.launcher.terminated)
+	assert.Zero(t, f.transport.scrapeCount(), "a service-only bundle is never scraped for vLLM metrics")
+	assert.Zero(t, rec.ScrapeFailures, "a healthy /health probe leaves no failures")
+	_ = rev
+}
+
 func TestReaper_SuccessfulScrapeResetsFailureCount(t *testing.T) {
 	f := newReaperFixture(t, ReaperDeps{IdleTTL: time.Hour})
 	f.ready(t)
@@ -319,7 +378,7 @@ func TestReaper_UnchangedObservationWritesNothing(t *testing.T) {
 // scrapes neither, so a launch in progress cannot be torn down under it.
 func TestReaper_SkipsNonReadyRecords(t *testing.T) {
 	f := newReaperFixture(t, ReaperDeps{IdleTTL: time.Nanosecond})
-	key := EndpointKey(utils.GlobalAccountID, testModelID)
+	key := resolveKey(utils.GlobalAccountID, testModelID)
 	_, err := createJSONRevision(t.Context(), f.kv, key, EndpointRecord{
 		AccountID: utils.GlobalAccountID, ModelID: testModelID, State: StateStarting, Generation: 1,
 	})
@@ -336,40 +395,41 @@ func TestReaper_LeaseAdmitsOneLeader(t *testing.T) {
 	f := newReaperFixture(t, ReaperDeps{})
 	other := NewReaper(f.svc, "node-b", ReaperDeps{})
 
-	f.reaper.evaluateLeadership(t.Context())
-	other.evaluateLeadership(t.Context())
+	require.True(t, f.reaper.lease.TryAcquire(t.Context()))
+	require.False(t, other.lease.TryAcquire(t.Context()),
+		"two nodes must never sweep the same endpoints at once")
 
 	assert.True(t, f.reaper.IsLeader())
-	assert.False(t, other.IsLeader(), "two nodes must never sweep the same endpoints at once")
+	assert.False(t, other.IsLeader())
 
 	// A refresh by the holder keeps it, and does not hand it away.
-	f.reaper.evaluateLeadership(t.Context())
+	require.True(t, f.reaper.lease.TryAcquire(t.Context()))
 	assert.True(t, f.reaper.IsLeader())
 }
 
 // Releasing on shutdown is what makes a rolling restart cost seconds rather
 // than a full lease TTL of no reclaim.
-func TestReaper_RelinquishFreesTheLeaseImmediately(t *testing.T) {
+func TestReaper_ReleaseFreesTheLeaseImmediately(t *testing.T) {
 	f := newReaperFixture(t, ReaperDeps{})
 	other := NewReaper(f.svc, "node-b", ReaperDeps{})
 
-	f.reaper.evaluateLeadership(t.Context())
+	f.reaper.lease.TryAcquire(t.Context())
 	require.True(t, f.reaper.IsLeader())
 
-	f.reaper.relinquish()
-	other.evaluateLeadership(t.Context())
+	f.reaper.lease.Release(t.Context())
+	other.lease.TryAcquire(t.Context())
 	assert.True(t, other.IsLeader())
 }
 
 // A node that lost the election does no work at all, so a leaderless gap
 // delays a reclaim rather than duplicating one.
 func TestReaper_NonLeaderSweepsNothing(t *testing.T) {
-	f := newReaperFixture(t, ReaperDeps{Interval: 5 * time.Millisecond, LeaseRefresh: time.Hour, IdleTTL: time.Nanosecond})
+	f := newReaperFixture(t, ReaperDeps{Interval: 5 * time.Millisecond, IdleTTL: time.Nanosecond})
 	f.ready(t)
 	f.age(t, time.Hour, time.Hour)
 
 	holder := NewReaper(f.svc, "node-b", ReaperDeps{})
-	holder.evaluateLeadership(t.Context())
+	holder.lease.TryAcquire(t.Context())
 	require.True(t, holder.IsLeader())
 
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Millisecond)
@@ -390,4 +450,24 @@ func TestEndpointRecord_LastActive(t *testing.T) {
 	assert.Equal(t, active, EndpointRecord{ReadyAt: ready, LastActiveAt: active}.LastActive())
 	assert.Equal(t, ready, EndpointRecord{ReadyAt: ready}.LastActive(),
 		"an endpoint quiet since launch is idle since launch, not since the zero time")
+}
+
+// Shutdown must delete the lease key before Run returns. The daemon waits on Run
+// via its shutdown group, so a key left behind parks the next election for the
+// full TTL rather than freeing it immediately.
+func TestReaper_RunReleasesLeaseOnShutdown(t *testing.T) {
+	f := newReaperFixture(t, ReaperDeps{Interval: time.Hour})
+	require.NoError(t, f.reaper.leaseErr)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { defer close(done); f.reaper.Run(ctx) }()
+	require.Eventually(t, f.reaper.IsLeader, 2*time.Second, 20*time.Millisecond)
+
+	cancel()
+	<-done
+
+	other := NewReaper(f.svc, "node-b", ReaperDeps{})
+	assert.True(t, other.lease.TryAcquire(t.Context()),
+		"Run returned with the lease key still present")
 }

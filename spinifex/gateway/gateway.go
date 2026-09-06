@@ -11,13 +11,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/google/uuid"
 	"github.com/mulgadc/bluebottle/pkg/auth"
 	"github.com/mulgadc/bluebottle/pkg/iampolicy"
 	bbotel "github.com/mulgadc/bluebottle/pkg/otelsetup"
@@ -334,7 +335,7 @@ const clusterUnavailableMsg = "cluster unavailable: NATS disconnected — check 
 // format. It emits XML directly (not via GenerateEC2ErrorResponse) to ensure the
 // /local/status hint is preserved in <Message>.
 func (gw *GatewayConfig) writeClusterUnavailable(w http.ResponseWriter, _ *http.Request, svc string) {
-	requestID := uuid.NewString()
+	requestID := uuid.NewV4().String()
 
 	// EKS and ECS use AWS JSON 1.1.
 	if svc == "eks" || svc == "ecs" {
@@ -379,7 +380,7 @@ func (gw *GatewayConfig) writeClusterUnavailable(w http.ResponseWriter, _ *http.
 
 // writeThrottleError writes the service-appropriate throttle rejection response.
 func (gw *GatewayConfig) writeThrottleError(w http.ResponseWriter, r *http.Request) {
-	requestID := uuid.NewString()
+	requestID := uuid.NewV4().String()
 	svc, _ := r.Context().Value(ctxService).(string)
 
 	errorCode := awserrors.ErrorRequestLimitExceeded
@@ -514,22 +515,36 @@ func isNATSTransient(err error) bool {
 		errors.Is(err, nats.ErrNoStreamResponse))
 }
 
-// checkPolicy evaluates IAM policies against resource "*".
-// Shorthand for checkPolicyResource(r, service, action, "*").
-func (gw *GatewayConfig) checkPolicy(r *http.Request, service, action string) error {
-	return gw.checkPolicyResource(r, service, action, "*")
+// readBoundedBody reads a request body under the same cap the signed path
+// applies, so a body read ahead of the policy gate can neither be used to
+// bypass the gate nor to exhaust memory. On the signed path sigv4.Parse has
+// already buffered and rewound these bytes, so this re-reads a buffer.
+func readBoundedBody(r *http.Request) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, sigv4.MaxPayloadLen+1))
+	if err != nil {
+		return nil, errors.New(awserrors.ErrorInvalidParameterValue)
+	}
+	if int64(len(body)) > sigv4.MaxPayloadLen {
+		return nil, errors.New(awserrors.ErrorRequestEntityTooLarge)
+	}
+	return body, nil
 }
 
-// checkPolicyResource evaluates IAM policies against a specific resource ARN.
-// Root users bypass evaluation. A nil IAMService is a server fault and an
-// unauthenticated request is denied — neither can reach a gated handler through
-// the route tree. Used by EC2 paths that enforce iam:PassRole before attaching
-// an instance profile.
-func (gw *GatewayConfig) checkPolicyResource(r *http.Request, service, action, resource string) error {
+// checkPolicy evaluates IAM policies against the literal resource "*", so it
+// grants account-wide: a caller's resource-scoped statements do not participate
+// at all, neither a Deny that fences a resource nor an Allow that names one.
+// Prefer checkPolicyResources with the request's real ARNs: where the
+// identifier arrives in a JSON body, read the body ahead of the gate and
+// resolve it there rather than settling for "*".
+func (gw *GatewayConfig) checkPolicy(r *http.Request, service, action string) error {
+	return gw.checkPolicyResources(r, service, action, []string{"*"})
+}
+
+// checkPolicyResources evaluates every resource against one resolved policy
+// snapshot. Used when one API request authorizes multiple resource ARNs.
+func (gw *GatewayConfig) checkPolicyResources(r *http.Request, service, action string, resources []string) error {
 	// Every dispatcher — query-protocol and REST-JSON alike — reaches this
-	// point with its resolved action, so telemetry enrichment lives here
-	// rather than duplicated per REST-JSON handler. Runs before the IAM
-	// checks below so it still fires when IAM is unconfigured.
+	// point with its resolved action, so telemetry enrichment lives here.
 	recordResolvedAction(r.Context(), service, action)
 
 	if gw.IAMService == nil {
@@ -566,7 +581,37 @@ func (gw *GatewayConfig) checkPolicyResource(r *http.Request, service, action, r
 		assumedRoleID:     mustCtxString(r, ctxAssumedRoleID),
 		underlyingRoleARN: mustCtxString(r, ctxUnderlyingRoleARN),
 	}
-	return gw.evaluatePrincipalPolicy(principal, policy.IAMAction(service, action), resource)
+	return gw.evaluatePrincipalPolicyResources(principal, policy.IAMAction(service, action), resources,
+		requestConditionKeys(r, principal))
+}
+
+// requestConditionKeys resolves the IAM condition context keys available on the
+// AWS API path. s3:prefix has no meaning here and is deliberately absent, so a
+// policy conditioned on it does not fire.
+//
+// Every key is omitted rather than set empty when unknown: an empty value reads
+// as a real value that matches nothing, and on a Deny that silently widens
+// access instead of narrowing it.
+func requestConditionKeys(r *http.Request, principal principalContext) iampolicy.ConditionKeys {
+	keys := iampolicy.ConditionKeys{
+		iampolicy.KeySecureTransport: strconv.FormatBool(r.TLS != nil),
+	}
+	// aws:username is user-only in AWS. A role session's identity is the
+	// caller-chosen RoleSessionName, so gating authorization on it here would
+	// let any principal that may assume the role satisfy the condition at will.
+	if principal.principalType == principalTypeUser && principal.identity != "" {
+		keys[iampolicy.KeyUsername] = principal.identity
+	}
+	if principal.accountID != "" {
+		keys[iampolicy.KeyPrincipalAccount] = principal.accountID
+	}
+	// Derived from the request rather than read from the context: the OCI
+	// registry chain never runs SigV4AuthMiddleware, so a context-carried
+	// address would be absent there and every aws:SourceIp condition inert.
+	if ip := utils.ClientIP(r.RemoteAddr); ip != "" {
+		keys[iampolicy.KeySourceIP] = ip
+	}
+	return keys
 }
 
 // mustCtxString reads a string context value, defaulting to "" for an absent
@@ -576,12 +621,11 @@ func mustCtxString(r *http.Request, key contextKey) string {
 	return v
 }
 
-// evaluatePrincipalPolicy is the request-shape-independent core of policy
-// enforcement: given an already-resolved principal (from SigV4 or, for /v2/*
-// ECR requests, a freshly rehydrated token identity), it resolves the
-// principal's current policies and evaluates iamAction against resource.
-// A nil IAMService fails closed here, matching checkPolicyResource.
-func (gw *GatewayConfig) evaluatePrincipalPolicy(principal principalContext, iamAction, resource string) error {
+// evaluatePrincipalPolicyResources resolves policies once and evaluates every
+// resource in the request against that same snapshot.
+func (gw *GatewayConfig) evaluatePrincipalPolicyResources(
+	principal principalContext, iamAction string, resources []string, keys iampolicy.ConditionKeys,
+) error {
 	if gw.IAMService == nil {
 		slog.Error("evaluatePrincipalPolicy: IAM service not available", "action", iamAction)
 		return errors.New(awserrors.ErrorInternalError)
@@ -644,11 +688,13 @@ func (gw *GatewayConfig) evaluatePrincipalPolicy(principal principalContext, iam
 		return errors.New(awserrors.ErrorInternalError)
 	}
 
-	if iampolicy.Evaluate(iamAction, resource, policies) == iampolicy.Deny {
-		slog.Info("evaluatePrincipalPolicy: access denied", "identity", logIdentity, "action", iamAction, "resource", resource)
-		return errors.New(awserrors.ErrorAccessDenied)
+	for _, resource := range resources {
+		if iampolicy.EvaluateWithKeys(iamAction, resource, policies, keys) == iampolicy.Deny {
+			slog.Info("evaluatePrincipalPolicy: access denied",
+				"identity", logIdentity, "action", iamAction, "resource", resource)
+			return errors.New(awserrors.ErrorAccessDenied)
+		}
 	}
-
 	return nil
 }
 
@@ -656,7 +702,7 @@ func (gw *GatewayConfig) ErrorHandler(w http.ResponseWriter, r *http.Request, er
 	svc, _ := gw.GetService(r)
 	slog.Debug("ErrorHandler", "service", svc, "error", err.Error())
 
-	var requestId = uuid.NewString()
+	var requestId = uuid.NewV4().String()
 	code, message, exists := awserrors.ResolveErrorDetail(err)
 	if !exists {
 		slog.Warn("Unknown error code", "error", err.Error())

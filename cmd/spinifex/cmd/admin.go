@@ -25,8 +25,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/mulgadc/spinifex/spinifex/admin"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/mulgadc/spinifex/spinifex/ebsmetadata"
@@ -415,15 +415,11 @@ func init() {
 	imagesRemoveCmd.Flags().String("image-id", "", "AMI ID to remove (required)")
 	imagesRemoveCmd.Flags().Bool("force", false, "Bypass dependency, ownership and config-corrupt checks (salvage mode)")
 	imagesRemoveCmd.Flags().Bool("yes", false, "Skip interactive confirmation prompt")
-	if err := imagesRemoveCmd.MarkFlagRequired("image-id"); err != nil {
-		panic(err)
-	}
+	_ = imagesRemoveCmd.MarkFlagRequired("image-id")
 
 	imagesPromoteCmd.Flags().String("image-id", "", "AMI ID to promote to system image (required)")
 	imagesPromoteCmd.Flags().Bool("yes", false, "Skip interactive confirmation prompt")
-	if err := imagesPromoteCmd.MarkFlagRequired("image-id"); err != nil {
-		panic(err)
-	}
+	_ = imagesPromoteCmd.MarkFlagRequired("image-id")
 }
 
 const bytesPerGiB = 1024 * 1024 * 1024
@@ -2649,7 +2645,7 @@ func runAccountCreate(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	reservationOwner := "spx-cli-" + uuid.NewString()
+	reservationOwner := "spx-cli-" + uuid.NewV4().String()
 	switch err := names.Reserve(ctx, name, reservationOwner); {
 	case errors.Is(err, handlers_iam.ErrNameTaken):
 		fmt.Fprintf(os.Stderr, "Error: account %q already exists\n", name)

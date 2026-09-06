@@ -1,6 +1,7 @@
 ---
 title: "Spinifex Vision Pipeline on Cisco UCS"
-description: "A YOLO11m object-detection + Qwen2-VL scene-captioning pipeline on Spinifex, streaming from a shared Predastore bucket across two independent EC2-compatible instances, with Intel AMX and NVIDIA L4 acceleration compared head-to-head."
+seoTitle: "Spinifex Vision Pipeline on Cisco UCS — Spinifex Docs"
+description: "A YOLO11m detection and Qwen2-VL captioning pipeline streaming from a shared Predastore bucket across two EC2 instances, with Intel AMX and NVIDIA L4 compared."
 category: "Reference Architectures"
 tags:
   - cisco
@@ -13,8 +14,8 @@ tags:
   - predastore
   - terraform
 resources:
-  - title: "cisco-ucs-vision-pipeline (Terraform workbook, scripts)"
-    url: "https://github.com/mulgadc/cisco-ucs-vision-pipeline"
+  - title: "Benchmark and workload materials (CISCO-refarch)"
+    url: "https://github.com/tomnewton-mulga/CISCO-refarch"
   - title: "Multi-Node Install"
     url: "/docs/install-multi-node"
   - title: "VPC Networking"
@@ -23,8 +24,8 @@ resources:
     url: "/docs/launching-instances"
   - title: "GPU Passthrough"
     url: "/docs/gpu-passthrough"
-  - title: "Platform benchmark (companion document)"
-    url: "../cisco-ucs-platform-benchmark/README.md"
+  - title: "Cisco UCS: AWS-compatible cloud at the edge (companion document)"
+    url: "/docs/cisco-ucs-platform-benchmark"
   - title: "Ultralytics YOLO"
     url: "https://docs.ultralytics.com"
   - title: "AWS: Accelerate CPU-based AI inference with Intel AMX on EC2"
@@ -47,7 +48,7 @@ cluster running Spinifex: real-time object detection plus a vision-language mode
 producing plain-English scene descriptions, both streaming from the same shared Predastore
 (S3-compatible) bucket as two entirely independent EC2-compatible instances.
 
-**Companion documents:** [Spinifex Platform Benchmark on Cisco UCS](../cisco-ucs-platform-benchmark/README.md) · [vLLM Serving on Cisco UCS: Intel AMX vs NVIDIA L4](../cisco-ucs-llm-serving/README.md)
+**Companion architectures:** [Cisco UCS: AWS-compatible cloud at the edge](/docs/cisco-ucs-platform-benchmark) · [vLLM Serving on Cisco UCS: Intel AMX vs NVIDIA L4](/docs/cisco-ucs-llm-serving)
 
 ### Platform
 

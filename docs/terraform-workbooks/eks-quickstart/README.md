@@ -1,6 +1,7 @@
 ---
 title: "EKS Quickstart"
-description: "Stand up a minimal managed-Kubernetes cluster and a browsable Spinifex-themed demo app — VPC, IAM roles, an EKS cluster, a one- or three-worker node group, an ECR repository, and a load-balanced web page — using Terraform on Spinifex."
+seoTitle: "Terraform EKS Quickstart on Spinifex — Spinifex Docs"
+description: "Stand up a minimal managed Kubernetes cluster with Terraform: a VPC, IAM roles, an EKS cluster, a worker node group, an ECR repository, and a demo web app."
 category: "Terraform Workbooks"
 tags:
   - terraform
@@ -108,7 +109,7 @@ Set the worker count with `node_desired_size` (`1` for a single node, `3` for an
 tofu apply -var node_desired_size=3
 ```
 
-Once the cluster is `ACTIVE`, **build and push the demo image** to the ECR repository this created (full commands in [`../demo-app/README.md`](../demo-app/README.md)):
+Once the cluster is `ACTIVE`, **build and push the demo image** to the ECR repository this created (full commands in [`docs/terraform-workbooks/demo-app`](https://github.com/mulgadc/spinifex/blob/main/docs/terraform-workbooks/demo-app/README.md)):
 
 ```bash
 cd ../demo-app

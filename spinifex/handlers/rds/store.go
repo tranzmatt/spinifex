@@ -215,19 +215,22 @@ func GetOrCreateSystemBucket(ctx context.Context, js jetstream.JetStream) (jetst
 	return kv, nil
 }
 
-// kvutil.GetOrCreateBucket exposes no TTL knob, so the lease bucket takes the
-// direct CreateKeyValue path and falls back to an open on already-exists.
+// kvutil.GetOrCreateBucket exposes no TTL knob, so the lease bucket attaches
+// directly and creates only when absent.
 func InitLeaderBucket(ctx context.Context, js jetstream.JetStream) (jetstream.KeyValue, error) {
-	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket:  KVBucketRDSLeader,
-		History: 1,
-		TTL:     KVBucketRDSLeaderTTL,
-	})
+	// Attach before create. This runs on every reconcile tick, and CreateKeyValue
+	// against a bucket that exists with any other config is a STREAM.CREATE the
+	// meta leader answers with an error, so creating first bills one per tick.
+	kv, err := js.KeyValue(ctx, KVBucketRDSLeader)
+	if errors.Is(err, jetstream.ErrBucketNotFound) {
+		kv, err = js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+			Bucket:  KVBucketRDSLeader,
+			History: 1,
+			TTL:     KVBucketRDSLeaderTTL,
+		})
+	}
 	if err != nil {
-		kv, err = js.KeyValue(ctx, KVBucketRDSLeader)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create or open RDS leader bucket %s: %w", KVBucketRDSLeader, err)
-		}
+		return nil, fmt.Errorf("failed to create or open RDS leader bucket %s: %w", KVBucketRDSLeader, err)
 	}
 	if err := migrate.DefaultRegistry.RunKV(ctx, KVBucketRDSLeader, kv, KVBucketRDSLeaderVersion); err != nil {
 		return nil, fmt.Errorf("migrate %s: %w", KVBucketRDSLeader, err)
@@ -274,10 +277,6 @@ func ListDBSnapshotIDs(ctx context.Context, kv jetstream.KeyValue) ([]string, er
 		names[i] = kvKeySegmentIdentifier(name)
 	}
 	return names, nil
-}
-
-func ListDBSubnetGroupNames(ctx context.Context, kv jetstream.KeyValue) ([]string, error) {
-	return listNames(ctx, kv, DBSubnetGroupsPrefix())
 }
 
 // Walks the .../meta keys, which is what makes a group's own record findable
@@ -344,12 +343,6 @@ func ListAutomatedBackups(ctx context.Context, kv jetstream.KeyValue) (map[strin
 	return indexed, nil
 }
 
-// One instance's automated-backup stamps, for the callers that already know
-// which instance they are acting on.
-func ListAutomatedBackupStamps(ctx context.Context, kv jetstream.KeyValue, dbInstanceIdentifier string) ([]string, error) {
-	return listNames(ctx, kv, AutomatedBackupsPrefix(dbInstanceIdentifier))
-}
-
 // The DB instance and timestamp a backups/ key names. The instance identifier
 // cannot contain a slash, so anything shaped otherwise belongs to a key space
 // this does not own.
@@ -367,10 +360,6 @@ func splitAutomatedBackupKey(key string) (string, string, bool) {
 		return "", "", false
 	}
 	return id, stamp, true
-}
-
-func ListRetainedVolumeIDs(ctx context.Context, kv jetstream.KeyValue) ([]string, error) {
-	return listNames(ctx, kv, RetainedVolumesPrefix())
 }
 
 // The leaf names directly under prefix. A nested key belongs to a sub-space and

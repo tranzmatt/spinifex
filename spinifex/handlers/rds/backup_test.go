@@ -86,7 +86,7 @@ func (h *snapshotHarness) automatedStamps(t *testing.T, id string) []string {
 	t.Helper()
 	kv, err := h.svc.bucket(t.Context(), testAccountID)
 	require.NoError(t, err)
-	stamps, err := ListAutomatedBackupStamps(t.Context(), kv, id)
+	stamps, err := listNames(t.Context(), kv, AutomatedBackupsPrefix(id))
 	require.NoError(t, err)
 	return stamps
 }
@@ -321,13 +321,8 @@ func TestWindowBlock_FallsBackToTheBuiltInBlock(t *testing.T) {
 		MaintenanceWindowBlock: "19:00",
 	}})
 
-	builtIn, err := parseDailyWindow("block", defaultBackupWindowBlock)
-	require.NoError(t, err)
-	assert.Equal(t, builtIn, svc.backupWindowBlock())
-
-	builtIn, err = parseDailyWindow("block", defaultMaintenanceWindowBlock)
-	require.NoError(t, err)
-	assert.Equal(t, builtIn, svc.maintenanceWindowBlock())
+	assert.Equal(t, defaultBackupWindowBlock, svc.backupWindowBlock())
+	assert.Equal(t, defaultMaintenanceWindowBlock, svc.maintenanceWindowBlock())
 }
 
 func TestValidateRetentionPeriod_BoundsTheRetention(t *testing.T) {
@@ -739,7 +734,7 @@ func TestDescribeDBInstanceAutomatedBackups_ReportsTheBackupSet(t *testing.T) {
 	backup := out.DBInstanceAutomatedBackups[0]
 	assert.Equal(t, "active", aws.StringValue(backup.Status))
 	assert.Equal(t, testDBID, aws.StringValue(backup.DBInstanceIdentifier))
-	assert.Equal(t, DBInstanceARN(testRegion, testAccountID, testDBID), aws.StringValue(backup.DBInstanceArn))
+	assert.Equal(t, FormatARN(ResourceKindDBInstance, testRegion, testAccountID, testDBID), aws.StringValue(backup.DBInstanceArn))
 	assert.Equal(t, int64(7), aws.Int64Value(backup.BackupRetentionPeriod))
 	assert.Equal(t, testRegion, aws.StringValue(backup.Region))
 
@@ -820,7 +815,7 @@ func TestReconciler_ClusterLeaseFollowsLeadership(t *testing.T) {
 	require.NotNil(t, release)
 	assert.False(t, ok, "a node that does not hold the lease does not sweep")
 
-	h.rec.evaluateLeadership(t.Context())
+	require.True(t, h.rec.lease.TryAcquire(t.Context()))
 	release, ok = h.rec.AcquireClusterLease()
 	require.True(t, ok)
 

@@ -20,11 +20,13 @@ import (
 	"github.com/aws/aws-sdk-go/service/eks"
 	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/mulgadc/spinifex/spinifex/admin"
+	resourcearn "github.com/mulgadc/spinifex/spinifex/arn"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/config"
 	handlers_dns "github.com/mulgadc/spinifex/spinifex/handlers/dns"
 	handlers_iam "github.com/mulgadc/spinifex/spinifex/handlers/iam"
 	"github.com/mulgadc/spinifex/spinifex/handlers/sysinstance"
+	"github.com/mulgadc/spinifex/spinifex/kvlease"
 	"github.com/mulgadc/spinifex/spinifex/objectstore"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go"
@@ -289,6 +291,9 @@ const defaultK8sVersion = "1.32"
 
 // NewEKSServiceImpl initialises EKSServiceImpl, wiring the leader KV and reconciler registry.
 func NewEKSServiceImpl(deps EKSServiceDeps) (*EKSServiceImpl, error) {
+	if err := validateAddonCatalog(addonCatalog); err != nil {
+		return nil, fmt.Errorf("eks: validate add-on catalog: %w", err)
+	}
 	if deps.NATSConn == nil {
 		return nil, errors.New("eks: NewEKSServiceImpl nil NATSConn")
 	}
@@ -561,14 +566,14 @@ func (s *EKSServiceImpl) CreateCluster(ctx context.Context, input *eks.CreateClu
 	}
 
 	region := s.deps.Region
-	arn := fmt.Sprintf("arn:aws:eks:%s:%s:cluster/%s", region, accountID, name)
+	clusterARN := resourcearn.FormatEKSCluster(region, accountID, name)
 
 	publicAccess, privateAccess := endpointAccess(input.ResourcesVpcConfig)
 	publicCidrs := publicAccessCidrs(input.ResourcesVpcConfig, publicAccess)
 
 	meta := &ClusterMeta{
 		Name:    name,
-		Arn:     arn,
+		Arn:     clusterARN,
 		Status:  ClusterStatusCreating,
 		Version: deref(input.Version, defaultK8sVersion),
 		RoleArn: aws.StringValue(input.RoleArn),
@@ -1137,16 +1142,23 @@ func (s *EKSServiceImpl) acquireTeardownLease(ctx context.Context, accountID, cl
 		return func() {}, true
 	}
 	key := teardownLeaderKey(accountID, clusterName)
-	if _, err := s.leaderKV.Create(ctx, key, []byte(s.deps.HolderID)); err != nil {
+	lease, err := kvlease.New(kvlease.Config{
+		Name:   "eks/teardown",
+		Bucket: kvlease.StaticBucket(s.leaderKV),
+		Key:    key,
+		Holder: s.deps.HolderID,
+		Attrs:  []any{"account", accountID, "cluster", clusterName},
+		TTL:    KVBucketEKSLeaderTTL,
+		Renew:  defaultReconcileLeaseRefresh,
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "eks: teardown lease config invalid", "key", key, "err", err)
 		return nil, false
 	}
-	return func() {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := s.leaderKV.Delete(releaseCtx, key); err != nil {
-			slog.Warn("eks: teardown lease release failed (TTL will reap)", "key", key, "err", err)
-		}
-	}, true
+	if !lease.TryAcquire(ctx) {
+		return nil, false
+	}
+	return func() { lease.Release(ctx) }, true
 }
 
 // claimClusterName atomically claims the cluster meta key before any launch work.

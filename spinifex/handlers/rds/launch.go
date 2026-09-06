@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"slices"
 	"time"
 
@@ -52,6 +53,24 @@ const (
 // validation failure rather than launching something else.
 var ErrEngineAMINotFound = errors.New("rds: no AMI found for engine")
 
+// The catalog registers every engine's system image under this prefix, so the
+// error can name the image an operator has to import.
+const engineImageNamePrefix = "spinifex-rds-"
+
+// An engine image no deployment ever imported is a gap no retry closes, so the
+// failure carries a code: a bare error resolves to ServerInternal, which the
+// caller reads as a transient fault and retries.
+func engineAMINotFound(engine, version string) error {
+	requested := "an engine image for " + engine
+	if version != "" {
+		requested = "version " + version + " for " + engine
+	}
+	return fmt.Errorf("%w: %w", ErrEngineAMINotFound, awserrors.Errorf(
+		awserrors.ErrorInvalidParameterCombination,
+		"Cannot find %s; this deployment has no %s%s system image installed",
+		requested, engineImageNamePrefix, engine))
+}
+
 type launchVPCProvisioner interface {
 	CreateNetworkInterface(ctx context.Context, input *ec2.CreateNetworkInterfaceInput, accountID string) (*ec2.CreateNetworkInterfaceOutput, error)
 	DeleteNetworkInterface(ctx context.Context, input *ec2.DeleteNetworkInterfaceInput, accountID string) (*ec2.DeleteNetworkInterfaceOutput, error)
@@ -62,6 +81,14 @@ type launchVPCProvisioner interface {
 	// Re-associates the customer ENI's security groups in place, which is what
 	// makes a VpcSecurityGroupIds modify need no VM replace and no new IP.
 	ModifyNetworkInterfaceAttribute(ctx context.Context, input *ec2.ModifyNetworkInterfaceAttributeInput, accountID string) (*ec2.ModifyNetworkInterfaceAttributeOutput, error)
+	// The system NIC's own group, ensured per launch rather than at daemon
+	// start, so a deployment whose system VPC was rebuilt still gets one.
+	CreateSecurityGroup(ctx context.Context, input *ec2.CreateSecurityGroupInput, accountID string) (*ec2.CreateSecurityGroupOutput, error)
+	DescribeSecurityGroups(ctx context.Context, input *ec2.DescribeSecurityGroupsInput, accountID string) (*ec2.DescribeSecurityGroupsOutput, error)
+	// Read to configure the customer ENI statically: it must not depend on the
+	// OVN DHCP lease being renewed, so its prefix and gateway are resolved once
+	// at launch time instead.
+	DescribeSubnets(ctx context.Context, input *ec2.DescribeSubnetsInput, accountID string) (*ec2.DescribeSubnetsOutput, error)
 }
 
 // System-managed VMs get a mgmt-bridge NIC alongside their VPC NICs, which is
@@ -124,7 +151,10 @@ type LaunchOutput struct {
 	InstanceID string
 	// The system ENI is disposable — a replace makes a new one. The customer
 	// ENI is the stable endpoint: its IP is the DNS target and survives.
-	SystemENIID      string
+	SystemENIID string
+	// The region's RDS system group, re-derived on every launch so a record
+	// written before the group existed is corrected by the next replace.
+	SystemSGID       string
 	CustomerENIID    string
 	CustomerENIIP    string
 	DataVolumeID     string
@@ -160,6 +190,11 @@ func LaunchDBInstanceVM(ctx context.Context, deps LaunchDeps, in LaunchInput) (o
 	}
 	systemSubnetID := sysRefs.PrivateSubnetIDs[0]
 
+	systemSGID, err := EnsureSystemSecurityGroup(ctx, deps.VPC, utils.GlobalAccountID, region, sysRefs.VpcID)
+	if err != nil {
+		return nil, err
+	}
+
 	// Unwind in reverse creation order on any failure below. Each step appends
 	// its own undo as soon as the resource exists.
 	var rollback []func(context.Context)
@@ -187,8 +222,8 @@ func LaunchDBInstanceVM(ctx context.Context, deps LaunchDeps, in LaunchInput) (o
 		}
 	}()
 
-	systemENI, err := createLaunchENI(ctx, deps.VPC, utils.GlobalAccountID, systemSubnetID, nil,
-		"RDS management NIC for "+in.DBInstanceIdentifier, in.DBInstanceIdentifier)
+	systemENI, err := createLaunchENI(ctx, deps.VPC, utils.GlobalAccountID, systemSubnetID, []string{systemSGID},
+		"RDS management NIC for "+in.DBInstanceIdentifier, in.DBInstanceIdentifier, false)
 	if err != nil {
 		return nil, err
 	}
@@ -209,6 +244,15 @@ func LaunchDBInstanceVM(ctx context.Context, deps LaunchDeps, in LaunchInput) (o
 		})
 	}
 
+	// The customer ENI is configured statically, not via DHCP: OVN's 3600s
+	// lease is never renewed by the guest's one-shot udhcpc, so a DHCP customer
+	// ENI goes address-less an hour after boot. Resolve its prefix and gateway
+	// once here instead of depending on the lease surviving the VM's lifetime.
+	customerPrefix, customerGateway, err := customerENISubnetGateway(ctx, deps.VPC, in.AccountID, in.SubnetID)
+	if err != nil {
+		return nil, fmt.Errorf("rds: resolve customer subnet network for %s: %w", in.DBInstanceIdentifier, err)
+	}
+
 	sysOut, err := deps.Instance.LaunchSystemInstance(&sysinstance.SystemInstanceInput{
 		BootMode:     sysinstance.BootAMI,
 		ManagedBy:    tags.ManagedByRDS,
@@ -222,11 +266,17 @@ func LaunchDBInstanceVM(ctx context.Context, deps LaunchDeps, in LaunchInput) (o
 		ENIMac:    systemENI.mac,
 		ENIIP:     systemENI.ip,
 		ExtraENIs: []sysinstance.ExtraENIInput{{
-			ENIID:     customerENI.id,
-			ENIMac:    customerENI.mac,
-			ENIIP:     customerENI.ip,
-			SubnetID:  in.SubnetID,
-			AccountID: in.AccountID,
+			ENIID:         customerENI.id,
+			ENIMac:        customerENI.mac,
+			ENIIP:         customerENI.ip,
+			SubnetID:      in.SubnetID,
+			AccountID:     in.AccountID,
+			ENICIDRPrefix: customerPrefix,
+			Gateway:       customerGateway,
+			// The endpoint is the ENI's address, so it has to survive the
+			// terminate half of a replace the way the datadir volume does.
+			// A DeleteDBInstance deletes it explicitly once the VM is gone.
+			DeleteOnTermination: aws.Bool(false),
 		}},
 		UserData:              in.UserData,
 		IamInstanceProfileArn: in.IamInstanceProfileArn,
@@ -294,12 +344,14 @@ func LaunchDBInstanceVM(ctx context.Context, deps LaunchDeps, in LaunchInput) (o
 
 	slog.InfoContext(ctx, "rds: DB VM launched",
 		"dbInstance", in.DBInstanceIdentifier, "instanceId", instanceID, "ami", amiID,
-		"systemEni", systemENI.id, "customerEni", customerENI.id, "customerEniIp", customerENI.ip,
+		"systemEni", systemENI.id, "systemSg", systemSGID,
+		"customerEni", customerENI.id, "customerEniIp", customerENI.ip,
 		"dataVolume", volumeID, "device", device)
 
 	return &LaunchOutput{
 		InstanceID:          instanceID,
 		SystemENIID:         systemENI.id,
+		SystemSGID:          systemSGID,
 		CustomerENIID:       customerENI.id,
 		CustomerENIIP:       customerENI.ip,
 		DataVolumeID:        volumeID,
@@ -332,12 +384,22 @@ type launchENI struct {
 	mac string
 }
 
-// groups is nil for the system NIC, which is unreachable from any customer VPC
-// and so needs no security group of its own.
-func createLaunchENI(ctx context.Context, vpcSvc launchVPCProvisioner, accountID, subnetID string, groups []string, description, dbInstanceID string) (*launchENI, error) {
+// groups must be non-empty for either NIC: an ENI created with none is placed in
+// its VPC's default group, whose sole ingress rule admits every other member of
+// itself — which for the shared system VPC is every DB VM in the deployment.
+// suppressDHCP marks the customer endpoint ENI, which is always statically
+// addressed; the system/primary NIC keeps DHCP for IMDS bootstrap.
+func createLaunchENI(ctx context.Context, vpcSvc launchVPCProvisioner, accountID, subnetID string, groups []string, description, dbInstanceID string, suppressDHCP bool) (*launchENI, error) {
 	var groupIDs []*string
 	if len(groups) > 0 {
 		groupIDs = aws.StringSlice(groups)
+	}
+	eniTags := []*ec2.Tag{
+		{Key: aws.String(tags.ManagedByKey), Value: aws.String(tags.ManagedByRDS)},
+		{Key: aws.String(rdsInstanceTagKey), Value: aws.String(dbInstanceID)},
+	}
+	if suppressDHCP {
+		eniTags = append(eniTags, &ec2.Tag{Key: aws.String(tags.DHCPDisabledKey), Value: aws.String(tags.DHCPDisabledValue)})
 	}
 	out, err := vpcSvc.CreateNetworkInterface(ctx, &ec2.CreateNetworkInterfaceInput{
 		SubnetId:    aws.String(subnetID),
@@ -345,10 +407,7 @@ func createLaunchENI(ctx context.Context, vpcSvc launchVPCProvisioner, accountID
 		Groups:      groupIDs,
 		TagSpecifications: []*ec2.TagSpecification{{
 			ResourceType: aws.String("network-interface"),
-			Tags: []*ec2.Tag{
-				{Key: aws.String(tags.ManagedByKey), Value: aws.String(tags.ManagedByRDS)},
-				{Key: aws.String(rdsInstanceTagKey), Value: aws.String(dbInstanceID)},
-			},
+			Tags:         eniTags,
 		}},
 	}, accountID)
 	if err != nil {
@@ -374,7 +433,7 @@ func createLaunchENI(ctx context.Context, vpcSvc launchVPCProvisioner, accountID
 func resolveCustomerENI(ctx context.Context, vpcSvc launchVPCProvisioner, in LaunchInput) (*launchENI, error) {
 	if in.ExistingCustomerENI == "" {
 		return createLaunchENI(ctx, vpcSvc, in.AccountID, in.SubnetID, in.SecurityGroupIDs,
-			"RDS endpoint ENI for "+in.DBInstanceIdentifier, in.DBInstanceIdentifier)
+			"RDS endpoint ENI for "+in.DBInstanceIdentifier, in.DBInstanceIdentifier, true)
 	}
 
 	// The old VM is gone by now but its attachment record can outlive it, and a
@@ -406,6 +465,42 @@ func resolveCustomerENI(ctx context.Context, vpcSvc launchVPCProvisioner, in Lau
 	// Failing here is the only safe answer: minting a replacement would move the
 	// endpoint to a new address the DNS record and serving cert do not name.
 	return nil, fmt.Errorf("rds: endpoint ENI %s no longer exists", in.ExistingCustomerENI)
+}
+
+// customerENISubnetGateway resolves the customer subnet's prefix length and
+// gateway IP (network address +1), matching OVN's per-subnet router
+// placement (see network/topology.SubnetGatewayCIDR). Both are needed to
+// configure the customer ENI statically instead of via DHCP.
+func customerENISubnetGateway(ctx context.Context, vpcSvc launchVPCProvisioner, accountID, subnetID string) (prefixBits int, gateway string, err error) {
+	out, err := vpcSvc.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{
+		SubnetIds: aws.StringSlice([]string{subnetID}),
+	}, accountID)
+	if err != nil {
+		return 0, "", fmt.Errorf("rds: describe subnet %s: %w", subnetID, err)
+	}
+	if out == nil {
+		return 0, "", fmt.Errorf("rds: subnet %s not found", subnetID)
+	}
+	for _, subnet := range out.Subnets {
+		if aws.StringValue(subnet.SubnetId) != subnetID {
+			continue
+		}
+		_, ipNet, perr := net.ParseCIDR(aws.StringValue(subnet.CidrBlock))
+		if perr != nil {
+			return 0, "", fmt.Errorf("rds: subnet %s has an unparseable CIDR %q: %w",
+				subnetID, aws.StringValue(subnet.CidrBlock), perr)
+		}
+		ones, _ := ipNet.Mask.Size()
+		gw := ipNet.IP.To4()
+		if gw == nil {
+			return 0, "", fmt.Errorf("rds: subnet %s CIDR %q is not IPv4", subnetID, ipNet.String())
+		}
+		gwCopy := make(net.IP, len(gw))
+		copy(gwCopy, gw)
+		gwCopy[3]++
+		return ones, gwCopy.String(), nil
+	}
+	return 0, "", fmt.Errorf("rds: subnet %s not found", subnetID)
 }
 
 // Detach comes first because a terminated VM can leave the attachment record
@@ -441,48 +536,21 @@ func resolveEngineAMI(ctx context.Context, amiSvc launchAMIResolver, engine, ver
 		return "", fmt.Errorf("rds: describe %s AMI: %w", engine, err)
 	}
 	if out == nil {
-		return "", fmt.Errorf("%w: %s %s", ErrEngineAMINotFound, engine, version)
+		return "", engineAMINotFound(engine, version)
 	}
 
-	// Several builds of one engine version can be registered; skip malformed
-	// catalog entries and select the most recently imported usable image.
-	var newestID, newestCreated string
-	matches := 0
-	for _, image := range out.Images {
-		if image == nil || aws.StringValue(image.ImageId) == "" {
-			continue
-		}
-		// A GPU engine build carries the same engine tags, and DescribeImages
-		// filters have no negation, so drop it here or a newer GPU image would
-		// hijack an ordinary instance.
-		if hasTagKey(image, tags.GPUVendorKey) {
-			continue
-		}
-		matches++
-		created := aws.StringValue(image.CreationDate)
-		if newestID == "" || created > newestCreated {
-			newestID = aws.StringValue(image.ImageId)
-			newestCreated = created
-		}
-	}
+	// Several builds of one engine version can be registered; select the most
+	// recently imported usable image. A GPU engine build carries the same engine
+	// tags, so it is excluded or a newer GPU image would hijack an ordinary instance.
+	newestID, _, matches := utils.SelectNewestImage(out.Images, tags.GPUVendorKey)
 	if newestID == "" {
-		return "", fmt.Errorf("%w: %s %s", ErrEngineAMINotFound, engine, version)
+		return "", engineAMINotFound(engine, version)
 	}
 	if matches > 1 {
 		slog.WarnContext(ctx, "rds: multiple AMIs match the requested engine; using newest",
 			"engine", engine, "engineVersion", version, "imageId", newestID, "matches", matches)
 	}
 	return newestID, nil
-}
-
-// hasTagKey reports whether img carries a tag with the given key.
-func hasTagKey(img *ec2.Image, key string) bool {
-	for _, t := range img.Tags {
-		if aws.StringValue(t.Key) == key {
-			return true
-		}
-	}
-	return false
 }
 
 // Only the node running the VM subscribes the per-instance ec2.cmd subject, so

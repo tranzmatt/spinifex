@@ -166,6 +166,7 @@ func newDBInstanceRecord(accountID string, req *validatedCreate, placement *endp
 		Port:                 req.Port,
 		SubnetID:             placement.SubnetID,
 		VpcID:                placement.VpcID,
+		VpcCIDR:              placement.VpcCIDR,
 		VpcSecurityGroupIDs:  placement.SecurityGroupIDs,
 		DBSubnetGroupName:    req.DBSubnetGroupName,
 		DBParameterGroupName: req.DBParameterGroupName,
@@ -214,6 +215,7 @@ func (s *Service) recordLaunch(ctx context.Context, kv jetstream.KeyValue, key, 
 	rec.InstanceID = launched.InstanceID
 	rec.VMGeneration = firstVMGeneration
 	rec.SystemENIID = launched.SystemENIID
+	rec.SystemSGID = launched.SystemSGID
 	rec.ENIID = launched.CustomerENIID
 	rec.ENIPrivateIP = launched.CustomerENIIP
 	rec.DataVolumeID = launched.DataVolumeID
@@ -268,7 +270,7 @@ func (s *Service) rollbackDBInstanceReservation(ctx context.Context, kv jetstrea
 		if rollbackErr == nil || errors.Is(rollbackErr, jetstream.ErrKeyNotFound) {
 			return
 		}
-		if !errors.Is(rollbackErr, jetstream.ErrKeyExists) {
+		if !errors.Is(rollbackErr, jetstream.ErrKeyRevisionMismatch) {
 			break
 		}
 

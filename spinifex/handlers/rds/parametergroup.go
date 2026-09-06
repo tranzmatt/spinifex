@@ -217,7 +217,7 @@ func (s *Service) propagateParameterGroup(ctx context.Context, kv jetstream.KeyV
 		if !found || rec.DBParameterGroupName != name {
 			continue
 		}
-		if err := s.applyParameterGroup(ctx, kv, accountID, &rec, name, rec.DBInstanceClass); err != nil {
+		if err := s.applyParameterGroup(ctx, kv, accountID, &rec, name, rec.DBInstanceClass, false); err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -500,7 +500,7 @@ func (s *Service) projectParameterGroupRecord(rec *DBParameterGroupRecord) *rds.
 	return &rds.DBParameterGroup{
 		DBParameterGroupName:   aws.String(rec.Name),
 		DBParameterGroupFamily: aws.String(rec.Family),
-		DBParameterGroupArn:    aws.String(DBParameterGroupARN(s.region, rec.AccountID, rec.Name)),
+		DBParameterGroupArn:    aws.String(FormatARN(ResourceKindDBParameterGroup, s.region, rec.AccountID, rec.Name)),
 		Description:            aws.String(rec.Description),
 	}
 }

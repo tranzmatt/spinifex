@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
+	gateway_bedrock "github.com/mulgadc/spinifex/spinifex/gateway/bedrock"
+	"github.com/mulgadc/spinifex/spinifex/kvlease"
+	"github.com/mulgadc/spinifex/spinifex/otelsetup"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -17,23 +19,9 @@ import (
 const (
 	defaultReaperInterval = 30 * time.Second
 	defaultLeaseRefresh   = 20 * time.Second
-
-	// How long an endpoint must have been idle before its GPU is taken back.
-	// Cold start was measured at 4m12s for the smallest model this platform
-	// serves, so a TTL of a few multiples of that is what keeps a quiet-but-used
-	// model from becoming a cold-start generator. Scale-to-zero is a cost
-	// optimisation; a latency-sensitive workload buys warmth by pinning.
-	defaultIdleTTL = 15 * time.Minute
-
-	// How many consecutive failed scrapes mean the serving process is wedged
-	// rather than briefly busy. Long enough that a GC pause or a dropped packet
-	// is not an outage, short enough that a dead VM does not hold a device for a
-	// whole idleTTL.
-	maxScrapeFailures = 5
-
-	// Per-scrape budget. Generous next to the sweep interval, because a slow
-	// answer is still an answer and a timeout here counts as a failure.
-	defaultScrapeTimeout = 5 * time.Second
+	defaultIdleTTL        = 15 * time.Minute // How long an endpoint must have been idle before its GPU is taken back.
+	maxScrapeFailures     = 5                // How many consecutive failed scrapes mean the serving process is wedged rather than briefly busy.
+	defaultScrapeTimeout  = 5 * time.Second  // Per-scrape budget.
 )
 
 // ReaperDeps are the reaper's overridable knobs. Every zero value takes the
@@ -48,23 +36,27 @@ type ReaperDeps struct {
 // Reaper is the leader-elected idle-reclaim loop. One node holds the lease and
 // does the scraping and reaping; every node keeps serving the API, so a
 // leaderless gap delays a reclaim rather than failing a request.
-//
-// It reads idleness from the serving process's own Prometheus /metrics rather
-// than from gateway-reported activity: that keeps the daemon the single writer
-// of endpoint state, survives a gateway node dying mid-call, and works
-// unchanged with any number of gateways.
 type Reaper struct {
-	svc    *Service
-	holder string
-	deps   ReaperDeps
-
-	mu     sync.Mutex
-	leader bool
+	svc      *Service
+	holder   string
+	deps     ReaperDeps
+	lease    *kvlease.Lease
+	leaseErr error
 }
 
 // NewReaper builds the reaper for svc; holder identifies this daemon in the lease.
 func NewReaper(svc *Service, holder string, deps ReaperDeps) *Reaper {
-	return &Reaper{svc: svc, holder: holder, deps: deps}
+	r := &Reaper{svc: svc, holder: holder, deps: deps}
+	r.lease, r.leaseErr = kvlease.New(kvlease.Config{
+		Name:   "bedrock/reaper",
+		Bucket: r.leaderBucket,
+		Key:    leaderKey,
+		Holder: holder,
+		TTL:    KVBucketLeaderTTL,
+		Renew:  r.leaseRefresh(),
+		Retry:  r.leaseRefresh(),
+	})
+	return r
 }
 
 func (r *Reaper) interval() time.Duration {
@@ -98,19 +90,24 @@ func (r *Reaper) scrapeTimeout() time.Duration {
 // Run drives the leadership and sweep loop until ctx is cancelled. Intended as
 // a daemon-boot goroutine; panics are the caller's recover concern.
 func (r *Reaper) Run(ctx context.Context) {
-	leaseTicker := time.NewTicker(r.leaseRefresh())
+	if r.leaseErr != nil {
+		slog.ErrorContext(ctx, "bedrock reaper: lease config invalid", "holder", r.holder, "err", r.leaseErr)
+		return
+	}
 	sweepTicker := time.NewTicker(r.interval())
-	defer leaseTicker.Stop()
 	defer sweepTicker.Stop()
 
-	r.evaluateLeadership(ctx)
+	leaseDone := make(chan struct{})
+	go func() {
+		defer close(leaseDone)
+		r.lease.Run(ctx)
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
-			r.relinquish()
+			<-leaseDone
 			return
-		case <-leaseTicker.C:
-			r.evaluateLeadership(ctx)
 		case <-sweepTicker.C:
 			if !r.IsLeader() {
 				continue
@@ -124,64 +121,7 @@ func (r *Reaper) Run(ctx context.Context) {
 
 // IsLeader reports whether this node currently holds the reaper lease.
 func (r *Reaper) IsLeader() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.leader
-}
-
-func (r *Reaper) evaluateLeadership(ctx context.Context) {
-	won := r.acquireOrRefresh(ctx)
-	r.mu.Lock()
-	was := r.leader
-	r.leader = won
-	r.mu.Unlock()
-
-	switch {
-	case won && !was:
-		slog.Info("bedrock reaper: elected leader", "holder", r.holder)
-	case !won && was:
-		slog.Info("bedrock reaper: lost leadership", "holder", r.holder)
-	}
-}
-
-// acquireOrRefresh claims the lease, or refreshes it (resetting the TTL) when
-// this node already holds it.
-func (r *Reaper) acquireOrRefresh(ctx context.Context) bool {
-	kv, err := r.leaderBucket(ctx)
-	if err != nil {
-		return false
-	}
-	if _, err := kv.Create(ctx, leaderKey, []byte(r.holder)); err == nil {
-		return true
-	}
-	entry, err := kv.Get(ctx, leaderKey)
-	if err != nil {
-		return false
-	}
-	if string(entry.Value()) != r.holder {
-		return false
-	}
-	if _, err := kv.Put(ctx, leaderKey, []byte(r.holder)); err != nil {
-		return false
-	}
-	return true
-}
-
-// relinquish releases the lease on shutdown so the next leader is elected
-// immediately rather than after the TTL.
-func (r *Reaper) relinquish() {
-	// Run's ctx is already cancelled by the time this is called, so the release
-	// runs on its own — a cancelled ctx would fail the delete.
-	ctx := context.Background()
-	kv, err := r.leaderBucket(ctx)
-	if err != nil {
-		return
-	}
-	if entry, gerr := kv.Get(ctx, leaderKey); gerr == nil && string(entry.Value()) == r.holder {
-		if err := kv.Delete(ctx, leaderKey); err != nil {
-			slog.Debug("bedrock reaper: release lease failed", "holder", r.holder, "err", err)
-		}
-	}
+	return r.lease.Held()
 }
 
 func (r *Reaper) leaderBucket(ctx context.Context) (jetstream.KeyValue, error) {
@@ -217,10 +157,33 @@ func (r *Reaper) sweepOnce(ctx context.Context) error {
 	return errors.Join(failures...)
 }
 
-// sweepEndpoint decides one endpoint's fate from a single scrape.
+// reaperScrapesMetrics reports whether rec exposes the vLLM Prometheus series
+// idle-reclaim reads. Only a bundle with a generative (vLLM) member does; a
+// service-only bundle (embed/rerank) has no such load metrics and is
+// liveness-probed instead. A record with no members recorded (one predating
+// the Members field) is treated as vLLM, preserving the original behaviour.
+func reaperScrapesMetrics(rec EndpointRecord) bool {
+	if len(rec.Members) == 0 {
+		return true
+	}
+	for _, m := range rec.Members {
+		if m.Family == gateway_bedrock.FamilyMeta {
+			return true
+		}
+	}
+	return false
+}
+
+// sweepEndpoint decides one endpoint's fate from a single probe.
 func (r *Reaper) sweepEndpoint(ctx context.Context, kv jetstream.KeyValue, rec EndpointRecord) error {
 	scrapeCtx, cancel := context.WithTimeout(ctx, r.scrapeTimeout())
 	defer cancel()
+
+	// A bundle with no vLLM member exposes no load metrics to reclaim on, so
+	// it is kept warm and only liveness-probed rather than idle-scraped.
+	if !reaperScrapesMetrics(rec) {
+		return r.sweepLiveness(scrapeCtx, kv, rec)
+	}
 
 	sample, err := scrapeMetrics(scrapeCtx, r.svc.httpClient(), rec.BaseURL)
 	if err != nil {
@@ -237,17 +200,29 @@ func (r *Reaper) sweepEndpoint(ctx context.Context, kv jetstream.KeyValue, rec E
 	}
 
 	if r.shouldReap(updated, now) {
-		// Seconds as a plain number, not a time.Duration: slog renders a Duration
-		// as int64 nanoseconds in JSON, which no reader parses at a glance and
-		// which reaches the metrics sink in a unit nothing charts.
 		slog.InfoContext(ctx, "bedrock reaper: reclaiming an idle endpoint",
 			"model", rec.ModelID, "instanceId", rec.InstanceID,
-			"idleSeconds", int64(now.Sub(updated.LastActive()).Seconds()))
+			"idle_ms", otelsetup.Millis(now.Sub(updated.LastActive())))
 		if _, err := r.svc.Delete(ctx, &DeleteEndpointInput{ModelID: rec.ModelID}, utils.GlobalAccountID); err != nil {
 			return fmt.Errorf("reap idle endpoint: %w", err)
 		}
 		return nil
 	}
+	return r.persistObservation(ctx, kv, rec, updated)
+}
+
+// sweepLiveness keeps a service-only bundle (embed/rerank, no generative
+// member) up without idle-reclaim: it probes /health and only escalates a
+// persistently unreachable, unpinned endpoint. A healthy probe refreshes the
+// warm clock; there is deliberately no scale-to-zero for a bundle whose whole
+// purpose is to stay warm on the retrieval hot path.
+func (r *Reaper) sweepLiveness(ctx context.Context, kv jetstream.KeyValue, rec EndpointRecord) error {
+	if !probeOnce(ctx, r.svc.httpClient(), rec.BaseURL+"/health") {
+		return r.recordScrapeFailure(ctx, kv, rec, fmt.Errorf("liveness probe of %s/health failed", rec.BaseURL))
+	}
+	updated := rec
+	updated.ScrapeFailures = 0
+	updated.LastActiveAt = time.Now().UTC()
 	return r.persistObservation(ctx, kv, rec, updated)
 }
 
@@ -270,6 +245,17 @@ func (r *Reaper) shouldReap(rec EndpointRecord, now time.Time) bool {
 func (r *Reaper) recordScrapeFailure(ctx context.Context, kv jetstream.KeyValue, rec EndpointRecord, cause error) error {
 	updated := rec
 	updated.ScrapeFailures = rec.ScrapeFailures + 1
+
+	// A pinned endpoint is operator- or commitment-managed: the reaper never
+	// tears it down, exactly as shouldReap never idle-reclaims one. Keep
+	// counting and logging so the failure stays visible, but never escalate.
+	if rec.Pinned {
+		slog.WarnContext(ctx, "bedrock reaper: scrape failed for a pinned endpoint; not reaping",
+			"model", rec.ModelID, "instanceId", rec.InstanceID,
+			"consecutiveFailures", updated.ScrapeFailures, "err", cause)
+		return r.persistObservation(ctx, kv, rec, updated)
+	}
+
 	if updated.ScrapeFailures < maxScrapeFailures {
 		slog.WarnContext(ctx, "bedrock reaper: metrics scrape failed",
 			"model", rec.ModelID, "instanceId", rec.InstanceID,
@@ -301,7 +287,7 @@ func (r *Reaper) persistObservation(ctx context.Context, kv jetstream.KeyValue, 
 		prev.SuccessTotal == next.SuccessTotal && prev.ScrapeFailures == next.ScrapeFailures {
 		return nil
 	}
-	key := EndpointKey(utils.GlobalAccountID, next.ModelID)
+	key := resolveKey(utils.GlobalAccountID, next.ModelID)
 	current, rev, found, err := getFullJSON(ctx, kv, key)
 	if err != nil {
 		return err
@@ -313,7 +299,7 @@ func (r *Reaper) persistObservation(ctx context.Context, kv jetstream.KeyValue, 
 	}
 	next.Generation = current.Generation + 1
 	if err := updateJSON(ctx, kv, key, rev, next); err != nil {
-		if errors.Is(err, jetstream.ErrKeyExists) {
+		if errors.Is(err, jetstream.ErrKeyRevisionMismatch) {
 			return nil
 		}
 		return err

@@ -16,6 +16,7 @@ import (
 	"github.com/mulgadc/spinifex/spinifex/config"
 	"github.com/mulgadc/spinifex/spinifex/ebsmetadata"
 	"github.com/mulgadc/spinifex/spinifex/gpu"
+	handlers_ec2_vpc "github.com/mulgadc/spinifex/spinifex/handlers/ec2/vpc"
 	"github.com/mulgadc/spinifex/spinifex/tags"
 	"github.com/mulgadc/spinifex/spinifex/testutil"
 	spxtypes "github.com/mulgadc/spinifex/spinifex/types"
@@ -434,34 +435,52 @@ func TestRunInstance_WithTags(t *testing.T) {
 					{Key: aws.String("env"), Value: aws.String("dev")},
 				},
 			},
+			{
+				ResourceType: aws.String("volume"),
+				Tags:         []*ec2.Tag{{Key: aws.String("scope"), Value: aws.String("volume-only")}},
+			},
 		},
 	}
 
-	instance, _, err := svc.RunInstance(input)
+	instance, ec2Instance, err := svc.RunInstance(input)
 	require.NoError(t, err)
-	// Tags are stored in RunInstancesInput which is preserved on the VM
-	assert.Equal(t, input, instance.RunInstancesInput)
-	assert.Len(t, input.TagSpecifications, 1)
-	assert.Len(t, input.TagSpecifications[0].Tags, 2)
+
+	// DescribeInstances and tag filters read ec2Instance.Tags, not the echoed
+	// input, and only instance-scoped specs may land there.
+	got := map[string]string{}
+	for _, tag := range ec2Instance.Tags {
+		got[aws.StringValue(tag.Key)] = aws.StringValue(tag.Value)
+	}
+	assert.Equal(t, map[string]string{"Name": "test-vm", "env": "dev"}, got)
+	assert.Equal(t, ec2Instance.Tags, instance.Instance.Tags)
 }
 
-func TestRunInstance_WithPlacement(t *testing.T) {
-	instanceTypes := map[string]*ec2.InstanceTypeInfo{
-		"t3.micro": {InstanceType: aws.String("t3.micro")},
-	}
-	svc := &InstanceServiceImpl{instanceTypes: instanceTypes}
-
-	input := &ec2.RunInstancesInput{
-		ImageId:      aws.String("ami-012345"),
-		InstanceType: aws.String("t3.micro"),
-		Placement: &ec2.Placement{
-			GroupName: aws.String("my-pg"),
+// Placement is projected onto the VM by PrepareRunInstances, not RunInstance,
+// so the assertion has to be driven through the entry point that reads it.
+func TestPrepareRunInstances_ProjectsPlacementGroup(t *testing.T) {
+	instanceTypes, _ := defaultPrepareInstanceTypes()
+	svc := &InstanceServiceImpl{
+		config:        &config.Config{},
+		instanceTypes: instanceTypes,
+		amiLoader: &fakeAMILoader{byID: map[string]ebsmetadata.AMI{
+			"ami-1": {ImageOwnerAlias: "acc", PlatformDetails: "Linux/UNIX"},
+		}},
+		resourceMgr: &fakeResourceCapacityProvider{
+			instanceTypes: instanceTypes,
+			canAllocFn:    func(_ *ec2.InstanceTypeInfo, count int) int { return count },
 		},
 	}
 
-	instance, _, err := svc.RunInstance(input)
+	_, instances, _, err := svc.PrepareRunInstances(context.Background(), &ec2.RunInstancesInput{
+		InstanceType: aws.String("t3.micro"),
+		ImageId:      aws.String("ami-1"),
+		MinCount:     aws.Int64(1),
+		MaxCount:     aws.Int64(1),
+		Placement:    &ec2.Placement{GroupName: aws.String("my-pg")},
+	}, "acc", "")
 	require.NoError(t, err)
-	assert.Equal(t, "my-pg", *instance.RunInstancesInput.Placement.GroupName)
+	require.Len(t, instances, 1)
+	assert.Equal(t, "my-pg", instances[0].PlacementGroupName)
 }
 
 func TestParseVolumeParams_MultipleBlockDeviceMappings(t *testing.T) {
@@ -3165,6 +3184,55 @@ func TestPrepareRunInstances_PublicIPAutoAssigned(t *testing.T) {
 	}
 }
 
+// TestPrepareRunInstances_PublicIPWithoutAllocator covers a node whose external
+// IPAM never initialised. A nil *ExternalIPAM in the interface reads as non-nil,
+// so the launch used to deref a nil receiver and take the daemon down with the
+// ENI already persisted; both wirings must now fail closed and unwind the ENI.
+func TestPrepareRunInstances_PublicIPWithoutAllocator(t *testing.T) {
+	cases := []struct {
+		name string
+		ipam PublicIPAllocator
+	}{
+		{name: "typed_nil_external_ipam", ipam: (*handlers_ec2_vpc.ExternalIPAM)(nil)},
+		{name: "no_allocator_wired", ipam: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eni := &fakeENICreator{
+				subnet: &SubnetInfo{SubnetID: "subnet-1", VpcID: "vpc-1", MapPublicIpOnLaunch: true},
+				createOut: &ec2.CreateNetworkInterfaceOutput{
+					NetworkInterface: &ec2.NetworkInterface{
+						NetworkInterfaceId: aws.String("eni-no-ipam"),
+						MacAddress:         aws.String("aa:bb:cc:dd:ee:11"),
+						PrivateIpAddress:   aws.String("10.0.0.40"),
+						VpcId:              aws.String("vpc-1"),
+					},
+				},
+			}
+			deleter := &fakeENIDeleter{}
+			svc, prov := prepareSvcWithENI(t, eni, nil)
+			svc.eniDeleter = deleter
+			svc.SetRunInstancesDeps(svc.amiLoader, nil, eni, tc.ipam)
+
+			_, instances, _, err := svc.PrepareRunInstances(context.Background(), &ec2.RunInstancesInput{
+				InstanceType: aws.String("t3.micro"),
+				ImageId:      aws.String("ami-1"),
+				SubnetId:     aws.String("subnet-1"),
+				MinCount:     aws.Int64(1),
+				MaxCount:     aws.Int64(1),
+			}, "acc", "")
+
+			require.Error(t, err, "a public-IP launch with no allocator must fail, not boot an instance with no public address")
+			assert.Equal(t, awserrors.ErrorInsufficientAddressCapacity, err.Error())
+			assert.Empty(t, instances)
+			assert.Equal(t, 1, eni.detachCalls, "ENI must be detached before delete")
+			assert.Equal(t, []string{"eni-no-ipam"}, deleter.calls,
+				"the auto-created ENI must be deleted, otherwise it strands and blocks security group deletion")
+			assert.Len(t, prov.deallocated, 1, "capacity must be returned when the launch aborts")
+		})
+	}
+}
+
 // TestPrepareRunInstances_NATFailureRollsBackPublicIP verifies that a vpc.add-nat
 // failure drops the instance, clears the ENI public IP, releases the IPAM
 // lease, and deallocates capacity.
@@ -3530,6 +3598,17 @@ func TestRebootInstance_NotFound(t *testing.T) {
 	err := svc.RebootInstance(context.Background(), &vm.VM{ID: id}, spxtypes.EC2InstanceCommand{ID: id})
 	require.Error(t, err)
 	assert.Equal(t, awserrors.ErrorInvalidInstanceIDNotFound, err.Error())
+}
+
+func TestRebootInstance_QMPFailureReturnsInternalError(t *testing.T) {
+	id := "i-qmp-failure"
+	instance := &vm.VM{ID: id, Status: vm.StateRunning}
+	mgr := mgrWith(map[string]*vm.VM{id: instance})
+	svc := &InstanceServiceImpl{vmMgr: mgr}
+
+	err := svc.RebootInstance(context.Background(), instance, spxtypes.EC2InstanceCommand{ID: id})
+	require.Error(t, err)
+	assert.Equal(t, awserrors.ErrorServerInternal, err.Error())
 }
 
 // TestStartInstance_NotFound verifies that a missing instance returns

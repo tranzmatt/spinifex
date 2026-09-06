@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -19,8 +20,10 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/mulgadc/bluebottle/pkg/iampolicy"
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/mulgadc/spinifex/spinifex/admin"
+	"github.com/mulgadc/spinifex/spinifex/arn"
 	"github.com/mulgadc/spinifex/spinifex/awserrors"
 	"github.com/mulgadc/spinifex/spinifex/kvutil"
 	"github.com/mulgadc/spinifex/spinifex/migrate"
@@ -112,6 +115,9 @@ var _ IAMService = (*IAMServiceImpl)(nil)
 // clusterSize sets the replication factor; pass 1 for single-node or test setups.
 // The context bounds bucket creation and the schema migrations only.
 func NewIAMServiceImpl(ctx context.Context, natsConn *nats.Conn, masterKey []byte, clusterSize int) (*IAMServiceImpl, error) {
+	if builtinManagedPolicyParseErr != nil {
+		return nil, fmt.Errorf("init builtin managed policies: %w", builtinManagedPolicyParseErr)
+	}
 	if len(masterKey) != 32 {
 		return nil, fmt.Errorf("master key must be 32 bytes, got %d", len(masterKey))
 	}
@@ -334,7 +340,7 @@ func (s *IAMServiceImpl) CreateUser(accountID string, input *iam.CreateUserInput
 		UserName:         userName,
 		UserID:           userID,
 		AccountID:        accountID,
-		ARN:              fmt.Sprintf("arn:aws:iam::%s:user%s%s", accountID, path, userName),
+		ARN:              arn.FormatIAMPath(arn.IAMUser, accountID, path, userName),
 		Path:             path,
 		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
 		AccessKeys:       []string{},
@@ -740,7 +746,7 @@ func (s *IAMServiceImpl) SeedBootstrap(data *BootstrapData) error {
 		UserName:         "root",
 		UserID:           "AIDAAAAAAAAAAAAAAAAA",
 		AccountID:        utils.GlobalAccountID,
-		ARN:              fmt.Sprintf("arn:aws:iam::%s:root", utils.GlobalAccountID),
+		ARN:              arn.FormatIAMRoot(utils.GlobalAccountID),
 		Path:             "/",
 		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
 		AccessKeys:       []string{data.AccessKeyID},
@@ -831,7 +837,7 @@ func (s *IAMServiceImpl) seedAdminAccount(ctx context.Context, admin *AdminBoots
 	}
 
 	// Create AdministratorAccess policy
-	policyARN := fmt.Sprintf("arn:aws:iam::%s:policy/AdministratorAccess", admin.AccountID)
+	policyARN := arn.FormatIAMPath(arn.IAMPolicy, admin.AccountID, "/", "AdministratorAccess")
 	policyDoc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`
 	policyID, err := generateIAMID("ANPA")
 	if err != nil {
@@ -867,7 +873,7 @@ func (s *IAMServiceImpl) seedAdminAccount(ctx context.Context, admin *AdminBoots
 		UserName:         admin.UserName,
 		UserID:           adminUserID,
 		AccountID:        admin.AccountID,
-		ARN:              fmt.Sprintf("arn:aws:iam::%s:user/%s", admin.AccountID, admin.UserName),
+		ARN:              arn.FormatIAMPath(arn.IAMUser, admin.AccountID, "/", admin.UserName),
 		Path:             "/",
 		CreatedAt:        now,
 		AccessKeys:       []string{admin.AccessKeyID},
@@ -978,7 +984,7 @@ func (s *IAMServiceImpl) CreateAccount(name string) (*Account, error) {
 
 		newVal := []byte(strconv.FormatInt(nextID+1, 10))
 		if _, err := s.accountCounterBucket.Update(ctx, "next_id", newVal, entry.Revision()); err != nil {
-			if errors.Is(err, jetstream.ErrKeyExists) {
+			if errors.Is(err, jetstream.ErrKeyRevisionMismatch) {
 				continue // CAS conflict, retry
 			}
 			return nil, fmt.Errorf("update account counter: %w", err)
@@ -1186,7 +1192,7 @@ func (s *IAMServiceImpl) CreatePolicy(accountID string, input *iam.CreatePolicyI
 	policy := Policy{
 		PolicyName:     policyName,
 		PolicyID:       newPolicyID,
-		ARN:            fmt.Sprintf("arn:aws:iam::%s:policy%s%s", accountID, path, policyName),
+		ARN:            arn.FormatIAMPath(arn.IAMPolicy, accountID, path, policyName),
 		Path:           path,
 		Description:    aws.StringValue(input.Description),
 		PolicyDocument: *input.PolicyDocument,
@@ -2013,9 +2019,63 @@ func ValidatePolicyDocument(docJSON string) (*PolicyDocument, error) {
 		if len(stmt.Resource) == 0 {
 			return nil, fmt.Errorf("statement %d: Resource is required", i)
 		}
+		if err := validateStatementRestrictions(i, stmt); err != nil {
+			return nil, err
+		}
 	}
 
 	return &doc, nil
+}
+
+// validateStatementRestrictions rejects the clauses the evaluator cannot enforce,
+// so an identity policy is never accepted with an inert restriction on it.
+// Conditions inside the supported allowlist are accepted and enforced.
+func validateStatementRestrictions(i int, stmt Statement) error {
+	if isRawJSONNonEmpty(stmt.Principal) {
+		return fmt.Errorf("statement %d: Principal is not valid on an identity policy; use a resource or trust policy instead", i)
+	}
+	if len(stmt.NotAction) > 0 {
+		return fmt.Errorf("statement %d: NotAction blocks are not supported in this release; use Action with an explicit list instead", i)
+	}
+	if len(stmt.NotResource) > 0 {
+		return fmt.Errorf("statement %d: NotResource blocks are not supported in this release; use Resource with an explicit list instead", i)
+	}
+	for op, keys := range stmt.Condition {
+		for key, values := range keys {
+			if !iampolicy.SupportedCondition(op, key) {
+				return fmt.Errorf("statement %d: Condition operator %q on key %q is not supported in this release", i, op, key)
+			}
+			if err := validateConditionValues(i, op, key, values); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validateConditionValues rejects leaf values the matcher can only ever compare
+// false. An allowlisted operator over an unparseable value is still an inert
+// restriction, which is the failure this validation exists to prevent.
+func validateConditionValues(i int, op, key string, values ConditionValue) error {
+	if len(values) == 0 {
+		return fmt.Errorf("statement %d: Condition operator %q on key %q has no value", i, op, key)
+	}
+	for _, v := range values {
+		switch op {
+		case iampolicy.OpIPAddress:
+			if _, prefixErr := netip.ParsePrefix(v); prefixErr != nil {
+				if _, addrErr := netip.ParseAddr(v); addrErr != nil {
+					return fmt.Errorf("statement %d: Condition %s on key %q: %q is not a valid IP address or CIDR block",
+						i, op, key, v)
+				}
+			}
+		case iampolicy.OpBool:
+			if !strings.EqualFold(v, "true") && !strings.EqualFold(v, "false") {
+				return fmt.Errorf("statement %d: Condition %s on key %q: %q is not true or false", i, op, key, v)
+			}
+		}
+	}
+	return nil
 }
 
 // summaryQuotaDefaults holds the static SummaryMap entries returned by

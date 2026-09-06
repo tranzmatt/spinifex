@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mulgadc/spinifex/spinifex/otelsetup"
 	"log/slog"
 	"regexp"
 	"sync"
@@ -236,7 +237,7 @@ func (l *volumeLeases) release(ctx context.Context, lease *volumeLease) {
 	}
 
 	if err := l.kv.Delete(ctx, lease.key, jetstream.LastRevision(revision)); err != nil {
-		slog.Warn("volume lease: delete failed, entry will expire", "volume", lease.volume, "ttl", volumeLeaseTTL, "err", err)
+		slog.Warn("volume lease: delete failed, entry will expire", "volume", lease.volume, "ttl_ms", otelsetup.Millis(volumeLeaseTTL), "err", err)
 		return
 	}
 	slog.Info("volume lease released", "volume", lease.volume, "generation", lease.generation)
@@ -289,7 +290,9 @@ func (lease *volumeLease) renew(ctx context.Context) bool {
 		return true
 	case errors.Is(err, context.Canceled):
 		return false
-	case errors.Is(err, jetstream.ErrKeyExists), errors.Is(err, jetstream.ErrKeyNotFound), isWrongLastSequence(err):
+	// Update reports a lost race as ErrKeyRevisionMismatch on every replica
+	// count; ErrKeyExists only ever matched it by code on a single replica.
+	case errors.Is(err, jetstream.ErrKeyRevisionMismatch), errors.Is(err, jetstream.ErrKeyNotFound):
 		lease.mu.Lock()
 		lease.lost = true
 		lease.mu.Unlock()
@@ -301,13 +304,6 @@ func (lease *volumeLease) renew(ctx context.Context) bool {
 		slog.Warn("volume lease: renewal failed", "volume", lease.volume, "err", err)
 		return true
 	}
-}
-
-// isWrongLastSequence reports whether err is JetStream refusing a write whose
-// expected revision no longer matches, which is how a lost lease presents.
-func isWrongLastSequence(err error) bool {
-	var apiErr *jetstream.APIError
-	return errors.As(err, &apiErr) && apiErr.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequence
 }
 
 // leaseOwner names this node in the lease entries it writes. A daemon with no

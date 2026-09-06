@@ -18,6 +18,7 @@ import (
 
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/mulgadc/spinifex/spinifex/admin"
+	"github.com/mulgadc/spinifex/spinifex/otelsetup"
 	"github.com/mulgadc/spinifex/spinifex/types"
 	"github.com/mulgadc/spinifex/spinifex/utils"
 	"github.com/mulgadc/viperblock/viperblock"
@@ -39,11 +40,11 @@ func endSpanWithResponseError(span trace.Span, respErr string) {
 	span.End()
 }
 
-// loadStateRetryAttempts / loadStateRetryBaseDelay tune the mount-time retry
-// loop (5 attempts at 200ms * 1.5^n ≈ 3.7s; well under the 30s NATS timeout).
+// The default mount retry budget is five attempts over about 1.6 seconds of
+// backoff. Config fields override these values for isolated tests.
 const (
-	loadStateRetryAttempts  = 5
-	loadStateRetryBaseDelay = 200 * time.Millisecond
+	defaultLoadStateRetryAttempts  = 5
+	defaultLoadStateRetryBaseDelay = 200 * time.Millisecond
 )
 
 // retryLoadState invokes loadFn with exponential backoff (delay * 3/2 each step)
@@ -67,20 +68,19 @@ func retryLoadState(volume string, attempts int, baseDelay time.Duration, sleep 
 			break
 		}
 		slog.Warn("LoadState transient failure, retrying",
-			"volume", volume, "attempt", attempt, "delay", delay, "err", err)
+			"volume", volume, "attempt", attempt, "delay_ms", otelsetup.Millis(delay), "err", err)
 		sleep(delay)
 		delay = delay * 3 / 2
 	}
 	return fmt.Errorf("LoadState exhausted %d retries: %w", attempts, err)
 }
 
-// loadStateWithRetry calls vb.LoadStateCtx with the production retry budget
-// (loadStateRetryAttempts / loadStateRetryBaseDelay). The context matters
-// beyond cancellation: the S3 backend only emits a span per request when the
-// request carries one, so the no-context variant makes this time invisible.
-func loadStateWithRetry(ctx context.Context, vb *viperblock.VB, volume string) error {
+// loadStateWithRetry keeps the caller's context on every backend request so
+// cancellation and tracing span all attempts.
+func loadStateWithRetry(ctx context.Context, cfg *Config, vb *viperblock.VB, volume string) error {
+	attempts, baseDelay := cfg.loadStateRetryPolicy()
 	load := func() error { return vb.LoadStateCtx(ctx) }
-	return retryLoadState(volume, loadStateRetryAttempts, loadStateRetryBaseDelay, time.Sleep, load)
+	return retryLoadState(volume, attempts, baseDelay, time.Sleep, load)
 }
 
 var serviceName = "viperblock"
@@ -159,10 +159,14 @@ type Config struct {
 	masterKey *masterkey.Key
 
 	// s3HTTPClient is shared by every viperblock backend this service builds.
-	// One client per volume would be one connection pool per volume, so every
-	// engine open and state read would pay its own TLS handshake.
+	// One client per volume would create a connection pool per volume.
 	s3HTTPClientOnce sync.Once
 	s3HTTPClient     *http.Client
+
+	// Per-service retry knobs avoid mutable package state in tests. Zero values
+	// select the production defaults.
+	loadStateRetryAttempts  int
+	loadStateRetryBaseDelay time.Duration
 
 	// sealVolume overrides how a detached volume is sealed to predastore.
 	// Nil means sealVolumeVB, the real seal. Tests that need a seal to FAIL
@@ -216,6 +220,18 @@ func (cfg *Config) buildVB(ctx context.Context, volumeName string) (*viperblock.
 		return nil, 0, nil, err
 	}
 	return vb, cacheSize, lease, nil
+}
+
+func (cfg *Config) loadStateRetryPolicy() (int, time.Duration) {
+	attempts := cfg.loadStateRetryAttempts
+	if attempts <= 0 {
+		attempts = defaultLoadStateRetryAttempts
+	}
+	baseDelay := cfg.loadStateRetryBaseDelay
+	if baseDelay <= 0 {
+		baseDelay = defaultLoadStateRetryBaseDelay
+	}
+	return attempts, baseDelay
 }
 
 type Service struct {
@@ -330,7 +346,8 @@ func readVolumeState(ctx context.Context, cfg *Config, volumeName string) (viper
 		state, rerr = vb.ReadStateCtx(ctx)
 		return rerr
 	}
-	if err := retryLoadState(volumeName, loadStateRetryAttempts, loadStateRetryBaseDelay, time.Sleep, read); err != nil {
+	attempts, baseDelay := cfg.loadStateRetryPolicy()
+	if err := retryLoadState(volumeName, attempts, baseDelay, time.Sleep, read); err != nil {
 		return viperblock.VBState{}, fmt.Errorf("read state: %w", err)
 	}
 	return state, nil
@@ -372,7 +389,7 @@ func openVolumeVB(ctx context.Context, cfg *Config, volumeName string) (*viperbl
 	if err := vb.Backend.InitCtx(ctx); err != nil {
 		return nil, nil, fmt.Errorf("backend init: %w", err)
 	}
-	if err := loadStateWithRetry(ctx, vb, volumeName); err != nil {
+	if err := loadStateWithRetry(ctx, cfg, vb, volumeName); err != nil {
 		return nil, nil, fmt.Errorf("load state: %w", err)
 	}
 
